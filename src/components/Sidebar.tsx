@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
-import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
+import { openConflicts, openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
 import { openRouteInOtherPane } from "../panes";
 import {
   addGroup,
@@ -10,7 +10,7 @@ import {
   setGroupCollapsed,
 } from "../favoritesStore";
 import { itemKind, resolveDrop, visibleRows, type FavRow } from "../favoritesLayout";
-import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, advanceConflictCursor, openActionContextMenu, type ContextMenuAction } from "../ui";
+import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, openActionContextMenu, type ContextMenuAction } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
 import { backend, type KnownGraph } from "../backend";
@@ -508,8 +508,9 @@ export function Sidebar(props: {
 
 // Concord L3: the calm badge. A conflict is a persistent object, not an
 // interruption — it waits here, never opens a modal, never blocks anything, and
-// survives restarts because the queue is derived from disk. Clicking walks to
-// the next conflicted page, where the resolution actually happens.
+// survives restarts because the queue is derived from disk. Clicking opens the
+// conflict overview (GH #536), whatever N is; the page-to-page walk lives in
+// the in-page panel.
 export function ConflictQueueBadge(): JSX.Element {
   const count = () => conflictQueue().length;
   return (
@@ -517,12 +518,7 @@ export function ConflictQueueBadge(): JSX.Element {
       <button
         class="conflict-queue-badge"
         title="Review the pages that need a decision"
-        onClick={() => {
-          const next = advanceConflictCursor();
-          // Address the exact FILE: a conflict object is about one path, and a
-          // duplicate-day journal would otherwise resolve to the canonical file.
-          if (next) openPageTarget({ name: next.page_name, pageKind: next.kind, path: next.page_path });
-        }}
+        onClick={() => openConflicts()}
       >
         <span class="conflict-queue-dot" aria-hidden="true" />
         {count()} conflict{count() === 1 ? "" : "s"}

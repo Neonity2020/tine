@@ -3,6 +3,7 @@ import { Sidebar } from "./components/Sidebar";
 import { isPublishedExport } from "./publishedBackend";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
+import { ConflictOverview } from "./components/ConflictOverview";
 import { QuickSwitcher } from "./components/QuickSwitcher";
 // pdf.js (~hundreds of KB) is heavy and most sessions never open a PDF — load
 // the viewer only when one is opened.
@@ -585,12 +586,14 @@ function PaneTabSplitPreview(props: { paneId: string }): JSX.Element {
 
 function PaneContent(props: { router: PaneRouter }): JSX.Element {
   return (
-    <Show
-      when={props.router.route().kind === "query"}
-      fallback={<PageView />}
-    >
-      <QueryWorkspace route={props.router.route() as QueryRoute} router={props.router} focusSource={focusedPaneId() === props.router.paneId} />
-    </Show>
+    <Switch fallback={<PageView />}>
+      <Match when={props.router.route().kind === "query"}>
+        <QueryWorkspace route={props.router.route() as QueryRoute} router={props.router} focusSource={focusedPaneId() === props.router.paneId} />
+      </Match>
+      <Match when={props.router.route().kind === "conflicts"}>
+        <ConflictOverview router={props.router} />
+      </Match>
+    </Switch>
   );
 }
 

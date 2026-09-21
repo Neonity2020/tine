@@ -541,6 +541,7 @@ export function openRouteInOtherPane(route: Route, sourcePaneId = focusedPaneId(
     // source context (matching the embryo-switcher flow) — openInNewTab here
     // would leave a stray duplicate tab beside the target.
     if (route.kind === "journals") router.openJournals();
+    else if (route.kind === "conflicts") router.openConflicts();
     else if (route.kind === "query") router.replaceActiveRoute(route);
     else if (route.kind === "pdf" || route.kind === "invalid") router.replaceActiveRoute(route);
     else if (route.block) router.openPageAtBlock(route.name, route.pageKind, route.block, route.path);

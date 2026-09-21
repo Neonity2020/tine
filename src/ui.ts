@@ -583,9 +583,6 @@ export function conflictObjectFor(
     || (conflict.source === "live-save" && name !== undefined && conflict.page_name === name)
   );
 }
-// Where the badge left off, so repeated clicks WALK the queue instead of parking
-// on its first item. Transient session state: the queue itself is derived.
-let conflictCursor = 0;
 const artifactArrivalToasts = new Map<number, Set<string>>();
 // Inventory calls include several awaited filesystem walks. Only the newest
 // refresh episode may publish: a conflicts-changed scan begun before Apply can
@@ -615,7 +612,6 @@ export function settleArtifactConflict(id: string): void {
   if (!settled) return;
   ++artifactConflictRefreshGeneration;
   replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
-  resetConflictCursor();
   switch (settled.source) {
     case "sync-copy": {
       const copy = settled.sides.find((side) => side.role === "theirs")?.path;
@@ -634,19 +630,6 @@ export function settleArtifactConflict(id: string): void {
     }
   }
   retireSettledArtifactArrivalToasts(artifactConflictQueue);
-}
-/** The next conflict to visit, cycling. `undefined` when the queue is empty. */
-export function advanceConflictCursor(): ConflictObject | undefined {
-  const queue = conflictQueue();
-  if (!queue.length) return undefined;
-  conflictCursor = conflictCursor % queue.length;
-  const next = queue[conflictCursor];
-  conflictCursor = (conflictCursor + 1) % queue.length;
-  return next;
-}
-/** Reset the walk (a fresh queue makes the old position meaningless). */
-export function resetConflictCursor(): void {
-  conflictCursor = 0;
 }
 
 /** Re-derive the queue when an external change touched a page that is IN it.
@@ -694,12 +677,10 @@ export async function refreshSyncConflicts(notify: "new" | false = false): Promi
   }
   try {
     const previousIds = new Set(artifactConflictQueue.map((conflict) => conflict.id));
-    const before = conflictQueue().map((c) => c.id).join("\u0000");
     const queue = await backend().conflictQueue();
     if (generation !== artifactConflictRefreshGeneration) return;
     replaceArtifactConflictQueue(queue);
     retireSettledArtifactArrivalToasts(queue);
-    if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
     if (notify === "new") {
       const arrived = queue.filter((conflict) =>
         conflict.source === "sync-copy" && !previousIds.has(conflict.id)

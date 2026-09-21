@@ -40,6 +40,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   (compact-projection campaign P0; no user-visible change).
 
 ### Added
+- Clicking **N conflicts** opens a **Conflicts** page listing every page that needs a decision, grouped by source, with how many blocks are left on each. Click a page to resolve it, or shift-click to keep the list in view beside it; rows disappear as pages are resolved. The conflict lists in Settings → Backups & recovery moved there, including **Discard copy** for a sync copy whose page no longer exists. Suggested by EllisMorrow (GH #536).
 
 - Running with `TINE_DEBUG=1` (or `--debug`) now records the search index's
   lifecycle: when a validation starts reading the graph, how long that read

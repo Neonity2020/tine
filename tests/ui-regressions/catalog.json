@@ -11363,6 +11363,37 @@
       "notes": "Real touch Chromium reproduces pointerup dispatch, focused-editor bridge handoff, toolbar replacement, and duplicate synthesized click on eb1f83d3. Scrolled strip loses its position; packet preserves toolbar ownership and consumes only the matching pointer click. Pass-after: six actual touch structural cases, rapid independent taps and horizontal swipe pass; same DOM and scroll retained. Native Android/iOS acceptance pending."
     },
     {
+      "id": "UI-CONFLICT-OVERVIEW-ROUTE-536",
+      "title": "The N conflicts badge opens one overview of every conflicted page, with block counts, that stays usable while pages are resolved",
+      "family": "concord-conflict-queue",
+      "sources": {
+        "issues": [
+          536
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ConflictQueueBadge.test.tsx::opens the conflict overview, whatever the count",
+          "src/components/ConflictOverview.test.tsx::lists every conflicted page by source with its block count, absent shown as —",
+          "src/components/ConflictOverview.test.tsx::opens the exact conflicted file, or the right sidebar on shift-click",
+          "src/components/ConflictOverview.test.tsx::discards a sync copy by its own file, after confirmation",
+          "src/components/ConflictOverview.test.tsx::stays a valid page when nothing is left",
+          "src/components/ConflictOverview.test.tsx::drops a row as soon as the queue re-derives without it",
+          "src/components/Settings.conflictInventory.test.tsx::still points there for a stray copy whose page is gone",
+          "src/session.test.ts::restores a conflict overview tab instead of dropping it (GH #536)"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Source: EllisMorrow on discussion #534, design in #536. Clicking the badge walked to the next conflicted page, so after a large sync or branch switch there was no view of what was left. It now opens a built-in `conflicts` route rendered from the live queue (never a graph file): rows grouped by source, the side labels, `k blocks` or — when not computed, Open (exact file; shift/middle-click to the right sidebar so the overview stays visible), and Discard copy for sync copies, including a copy whose page is gone. The Settings inventory panels moved there; Settings keeps a pointer. The page-to-page cursor (advanceConflictCursor) is removed; the in-page up/down walk between blocks is unchanged. Duplicate journal days keep their Settings panel. No cross-page bulk resolution, by design. Fail-before: the badge test fails against the previous Sidebar (it navigated to a page instead). Checked visually with scripts/shot-conflict-queue.mjs at desktop and phone widths."
+    },
+    {
       "id": "UI-LINK-AUTOCOMPLETE-ALIAS-OWNER-558",
       "title": "Typing a page alias after [[ offers it and says which page it belongs to",
       "family": "link-autocomplete",

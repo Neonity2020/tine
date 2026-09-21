@@ -51,6 +51,15 @@ describe("persisted split session", () => {
     expect(parsed.snapshots.get("main")?.tabs[0].history[0]).toEqual(pdf);
   });
 
+  it("restores a conflict overview tab instead of dropping it (GH #536)", () => {
+    resetPaneLayoutToSingle({
+      tabs: [{ history: [{ kind: "journals" }, { kind: "conflicts" }], pos: 1, pinned: false }],
+      activeIndex: 0,
+    });
+    const parsed = parsePersistedSession(JSON.stringify(buildPersistedSession()))!;
+    expect(parsed.snapshots.get("main")?.tabs[0].history).toEqual([{ kind: "journals" }, { kind: "conflicts" }]);
+  });
+
   it("migrates a legacy dedicated PDF beside the intact desktop layout", () => {
     const raw = JSON.stringify({
       ...buildPersistedSession(),

@@ -154,10 +154,10 @@ What happens to a recognized conflict copy:
 - It is **not indexed as a page** — it never appears in the page list, search,
   or autocomplete, so it cannot duplicate the real page (or hijack the page's
   identity through a `title::` property).
-- It is surfaced in **Settings → Backups & recovery → Sync conflict copies**,
-  where you can review a block-by-block diff against the current page and
-  merge either side (or both) per block, or discard the copy (recoverable from
-  trash).
+- It joins the conflict queue and is listed on the **Conflicts** page (the
+  `N conflicts` badge opens it). Its page shows a block-by-block review against
+  the copy, where you merge either side (or both) per block; the Conflicts page
+  can also discard the copy (recoverable from trash).
 - Tine never renames, rewrites, or deletes a conflict copy on its own.
 
 Only the exact generated shapes above are treated as conflict copies. A real
@@ -198,8 +198,7 @@ Tine therefore **quarantines** marker-bearing files:
 - **Every save to it is refused** (including force-save) with a message naming
   the markers found. Tine never rewrites a file that carries unresolved merge
   markers.
-- Affected files are listed in **Settings → Backups & recovery → VCS merge
-  conflicts**.
+- Affected files are listed on the **Conflicts** page.
 - You can resolve it **inside Tine**, block by block, on the page itself (see
   *Resolving conflicts* below) — or where it belongs in your VCS or an external
   editor. Either way, as soon as the markers are gone from disk the page becomes
@@ -216,7 +215,12 @@ lone `=======` divider line never triggers the quarantine on its own.
 Everything that needs your judgement — a retained live draft whose file changed,
 a sync tool's conflict copy, or a page carrying VCS merge markers — appears in
 **one queue**, shown as a quiet `N conflicts` badge at the bottom of the sidebar.
-Clicking it walks you to the next conflicted page.
+Clicking it opens the **Conflicts** page: a built-in route (like the journals
+view), rendered from the live queue and never written into the graph, that lists
+every conflicted page grouped by source, with the number of blocks still needing
+a decision ("—" when Tine did not compute it). Clicking a row opens that page;
+shift- or middle-click opens it in the right sidebar so the list stays in view.
+Rows disappear as each page is resolved (GH #536).
 
 Disk artifacts are derived afresh on every scan. A live draft has no disk
 artifact to derive from, so Tine preserves its exact draft, base, and reviewed
@@ -311,11 +315,12 @@ and the losing side stays recoverable.
 ### Where each surface lives
 
 Resolution happens **only on the page**. Live draft conflicts appear there
-automatically and in the sidebar queue. **Settings → Backups & recovery** is the
-*inventory* for disk artifacts: it lists the conflict copies and marker-bearing
-files in your graph, offers **Review in page…** to take you to the one you pick,
-and keeps the two actions the page cannot offer — **Discard copy**, and the case
-of a copy whose original page no longer exists at all.
+automatically and in the sidebar queue. The **Conflicts** page is the
+*inventory*: it lists everything in the queue, takes you to the page you pick,
+and keeps the two things the page cannot offer — **Discard copy**, and the case
+of a copy whose original page no longer exists at all. Settings → Backups &
+recovery only points to it; it used to hold a second copy of this list, which
+moved in GH #536 so that one queue has one list.
 
 (Earlier versions also had a block-by-block merge dialog inside Settings. It is
 gone: two surfaces over the same conflict opened with different pre-selections,

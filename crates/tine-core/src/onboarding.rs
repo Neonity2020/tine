@@ -677,6 +677,8 @@ mod tests {
         assert!(page.markdown.contains("Try opening again"));
         assert!(page.markdown.contains("If Tine refuses to save a page"));
         assert!(page.markdown.contains("Review unsaved"));
+        assert!(page.markdown.contains("opens the **Conflicts** page"));
+        assert!(!page.markdown.contains("Review in page"));
 
         let index = GUIDE_TEMPLATES
             .iter()

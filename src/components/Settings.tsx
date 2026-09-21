@@ -58,7 +58,7 @@ import {
   refreshJournalConflicts,
   syncConflicts,
   refreshSyncConflicts,
-  vcsMarkerConflicts,
+  conflictQueue,
   type SettingsTabId,
 } from "../ui";
 import { interfaceZoom, zoomIn, zoomOut, zoomReset } from "../zoom";
@@ -112,7 +112,7 @@ import {
   themeVersionIsRevoked,
   uninstallThemePackage,
 } from "../themes/manager";
-import { openPage, openFile, openPageTarget } from "../router";
+import { openConflicts, openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
@@ -131,7 +131,7 @@ import {
   isTauri,
   type BackupInfo,
 } from "../backend";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, PageEntry } from "../types";
 import { ConflictFileRow } from "./JournalConflictFileRow";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
@@ -2558,8 +2558,7 @@ export function SettingsConflictPanels(): JSX.Element {
     <>
       <JournalFilenamePanel />
       <JournalConflictsPanel />
-      <SyncConflictsPanel />
-      <VcsMarkerConflictsPanel />
+      <ConflictOverviewPointer />
     </>
   );
 }
@@ -2721,134 +2720,38 @@ function JournalFilenamePanel(): JSX.Element {
   );
 }
 
-// Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
-// (git/Fossil `<<<<<<<` / `=======` / `>>>>>>>` lines). They stay readable, but
-// Tine refuses to save them: re-serializing would re-indent the column-0
-// markers and break the VCS's own conflict detection (Concord invariant 3).
-// This panel is the INVENTORY: which files are affected and why. Resolution
-// happens at the page (Concord L4) or in the user's own VCS.
-function VcsMarkerConflictsPanel(): JSX.Element {
-  return (
-    <Show when={vcsMarkerConflicts().length}>
-      <div class="settings-section" style={{ "margin-top": "18px" }}>
-        VCS merge conflicts
-      </div>
-      <div class="settings-hint settings-block">
-        Files listed here contain unresolved version-control merge markers (git/Fossil). They stay
-        readable, but Tine refuses to save them so the markers are never mangled.{" "}
-        <strong>Review in page</strong> opens the file and resolves the merge there, block by
-        block; resolving it in your version-control tool instead clears this list on its own.
-      </div>
-      <For each={vcsMarkerConflicts()}>
-        {(c) => (
-          <div class="settings-block sync-conflict-row">
-            <div class="sync-conflict-head">
-              <span class="settings-asset-name">{c.name}</span>
-              <span class="sync-conflict-tag mono">{c.markers.join(" ")}</span>
-            </div>
-            <div class="journal-conflict-preview mono">{c.path}</div>
-            <span class="journal-conflict-actions">
-              <button
-                class="settings-btn"
-                title="Open the file and resolve the merge there, block by block"
-                onClick={() => reviewInPage(c.path, c.name, c.kind)}
-              >
-                Review in page…
-              </button>
-            </span>
-          </div>
-        )}
-      </For>
-    </Show>
-  );
-}
-
-// Sync-tool conflict copies (Syncthing/Dropbox `*.sync-conflict-*` files). They're
-// excluded from the page list (so they don't show as garbage pages) and surfaced
-// here so the user can review a per-block diff against the winning page and merge,
-// or just discard the copy. Never auto-merged / auto-deleted (ADR 0007).
-function SyncConflictsPanel(): JSX.Element {
+// Concord inventory (GH #536): sync conflict copies, marker-bearing files and
+// the copy whose page is gone used to be listed here AND walked from the badge.
+// They now live on one surface, the Conflicts overview, which the `N conflicts`
+// badge opens; Settings only points there. Two lists over the same queue drift,
+// which is ADR 0057's reason for removing the old in-Settings merge dialog.
+function ConflictOverviewPointer(): JSX.Element {
   void refreshSyncConflicts(); // refresh when the Backups tab opens
-  const discard = async (c: SyncConflict) => {
-    const name = c.path.split("/").pop() ?? c.path;
-    if (
-      !(await backend().confirm(
-        `Discard the conflict copy “${name}”?\n\n` +
-          `It moves to logseq/.tine-trash (recoverable). The current “${c.base_name}” is left as-is.`
-      ))
-    )
-      return;
-    try {
-      await backend().trashSyncConflict(c.path);
-      pushToast(`Discarded ${name}`, "success");
-      await refreshSyncConflicts();
-    } catch (e) {
-      pushToast(`Couldn’t discard it: ${String(e)}`, "error");
-    }
-  };
+  const count = () => conflictQueue().length + syncConflicts().filter((c) => !c.base_path).length;
   return (
-    <Show when={syncConflicts().length}>
+    <Show when={count()}>
       <div class="settings-section" style={{ "margin-top": "18px" }}>
-        Sync conflict copies
+        Conflicts
       </div>
       <div class="settings-hint settings-block">
-        Syncthing and Dropbox leave a <code>*.sync-conflict-*</code> copy when the same page was
-        edited on two devices. Tine keeps these out of your page list.{" "}
-        <strong>Review in page</strong> opens the page and resolves it there, block by block, next
-        to the content itself; <strong>Discard copy</strong> trashes it (recoverable) and leaves
-        the current page unchanged.
+        {count()} {count() === 1 ? "item needs" : "items need"} a decision: sync conflict copies,
+        version-control merge markers, or unsaved drafts. The Conflicts page lists them, with
+        block counts and <strong>Discard copy</strong> for sync copies; the{" "}
+        <strong>N conflicts</strong> badge in the sidebar opens it too.
       </div>
-      <For each={syncConflicts()}>
-        {(c) => (
-          <div class="settings-block sync-conflict-row">
-            <div class="sync-conflict-head">
-              <span class="settings-asset-name">{c.base_name}</span>
-              <span class="sync-conflict-tag mono">{c.tag}</span>
-            </div>
-            <div class="journal-conflict-preview">{c.preview || "(empty)"}</div>
-            <Show
-              when={c.base_path}
-              fallback={
-                <div class="settings-hint">
-                  The page this shadows no longer exists — discard the copy, or restore it in Logseq.
-                </div>
-              }
-            >
-              <span class="journal-conflict-actions">
-                <button
-                  class="settings-btn"
-                  title="Open the page and resolve it there, block by block"
-                  onClick={() => reviewInPage(c.base_path!, c.base_name, c.kind)}
-                >
-                  Review in page…
-                </button>
-              </span>
-            </Show>
-            <span class="journal-conflict-actions">
-              <button class="settings-btn settings-btn-danger" onClick={() => void discard(c)}>
-                Discard copy
-              </button>
-            </span>
-          </div>
-        )}
-      </For>
+      <span class="journal-conflict-actions">
+        <button
+          class="settings-btn"
+          onClick={() => {
+            openConflicts();
+            closeSettings();
+          }}
+        >
+          Open conflicts
+        </button>
+      </span>
     </Show>
   );
-}
-
-// Concord P5: ONE resolution surface. The Settings panels are the INVENTORY —
-// what exists on disk that needs judgement, including a copy whose page is gone
-// and the discard action, which the page cannot offer. Resolution itself happens
-// at the page, where the blocks are. The Settings modal that used to duplicate
-// it is gone: two surfaces over the same data drift, and these two already had
-// diverging defaults (the modal opened on "mine", the page on the suggested or
-// no-loss choice) — the same hazard one level up from the two block-facet
-// renderers, and from the two diff-row renderers the P4 lane collapsed.
-function reviewInPage(path: string, name: string, kind: "page" | "journal"): void {
-  // Address the exact FILE: a duplicate-day journal would otherwise resolve to
-  // the canonical file rather than the one carrying the conflict.
-  openPageTarget({ name, pageKind: kind, path });
-  closeSettings();
 }
 
 function FilesTab(props: { search: string }): JSX.Element {

@@ -4,6 +4,7 @@ import { render } from "solid-js/web";
 const inventory = vi.hoisted(() => ({
   copies: [] as unknown[],
   markers: [] as unknown[],
+  queue: [] as unknown[],
 }));
 
 vi.mock("../backend", async (importOriginal) => {
@@ -14,7 +15,7 @@ vi.mock("../backend", async (importOriginal) => {
     backend: () => ({
       listSyncConflicts: async () => inventory.copies,
       listVcsMarkerConflicts: async () => inventory.markers,
-      conflictQueue: async () => [],
+      conflictQueue: async () => inventory.queue,
       listJournalConflicts: async () => [],
       listJournalFilenameMigrations: async () => [],
       confirm: async () => false,
@@ -24,27 +25,28 @@ vi.mock("../backend", async (importOriginal) => {
 });
 
 import { SettingsConflictPanels } from "./Settings";
-import { closeSettings, openSettings, setSyncConflicts, setVcsMarkerConflicts, settingsOpen } from "../ui";
+import { closeSettings, openSettings, setConflictQueue, setSyncConflicts, setVcsMarkerConflicts, settingsOpen } from "../ui";
 import { paneRouter, resetPaneLayoutToSingle } from "../panes";
 
-// Concord P5: the Settings conflict surfaces are the INVENTORY, not a second
-// resolution UI. The block-level merge modal that used to live here is gone —
-// two surfaces over the same data drift, and these two already opened with
-// DIFFERENT defaults. What Settings keeps is exactly what the page cannot do:
-// list what exists (including a copy whose winner page is gone), discard a copy,
-// and send the user to the page where resolution happens.
+// Concord P5 made Settings the conflict INVENTORY and the page the one
+// resolution surface. GH #536 moved that inventory to the Conflicts overview,
+// which the `N conflicts` badge opens: two lists over one queue drift. Settings
+// keeps a pointer, and it must still appear for a copy whose page is gone,
+// which the queue itself does not carry.
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 beforeEach(() => {
   inventory.copies = [];
   inventory.markers = [];
+  inventory.queue = [];
 });
 
 afterEach(() => {
   closeSettings();
   setSyncConflicts([]);
   setVcsMarkerConflicts([]);
+  setConflictQueue([]);
   document.body.innerHTML = "";
 });
 
@@ -60,8 +62,10 @@ function mount() {
   return { root, dispose };
 }
 
+const buttons = (root: HTMLElement) => [...root.querySelectorAll("button")].map((b) => b.textContent ?? "");
+
 describe("the Settings conflict inventory", () => {
-  it("sends a conflict copy to its page instead of opening a merge modal", async () => {
+  it("points to the Conflicts overview instead of keeping a second list", async () => {
     inventory.copies = [
       {
         path: "pages/Note.sync-conflict-20260818-101010-AAAAAAA.md",
@@ -72,29 +76,34 @@ describe("the Settings conflict inventory", () => {
         preview: "TODO ship the beta",
       },
     ];
+    inventory.queue = [
+      {
+        id: "copy:pages/Note.sync-conflict-20260818-101010-AAAAAAA.md",
+        source: "sync-copy",
+        page_name: "Note",
+        page_path: "pages/Note.md",
+        kind: "page",
+        sides: [],
+        block_conflicts: 2,
+      },
+    ];
     const { root, dispose } = mount();
     try {
       await tick();
-      const review = [...root.querySelectorAll("button")].find((b) =>
-        b.textContent?.includes("Review in page")
-      )!;
-      expect(review).toBeTruthy();
-      review.click();
       await tick();
-      // Resolution happens at the page — addressed by its exact FILE, so a
-      // duplicate-day journal cannot resolve to the canonical one instead.
-      const route = paneRouter("main").route();
-      expect(route).toMatchObject({ kind: "page", name: "Note", path: "pages/Note.md" });
+      expect(buttons(root).some((b) => b.includes("Review in page"))).toBe(false);
+      expect(buttons(root).some((b) => b.includes("Discard copy"))).toBe(false);
+      [...root.querySelectorAll("button")].find((b) => b.textContent?.includes("Open conflicts"))!.click();
+      await tick();
+      expect(paneRouter("main").route()).toEqual({ kind: "conflicts" });
       expect(settingsOpen()).toBe(false);
-      // ...and no modal was opened anywhere.
       expect(document.querySelector(".sync-merge-overlay")).toBeNull();
-      expect(document.querySelector(".sync-merge-modal")).toBeNull();
     } finally {
       dispose();
     }
   });
 
-  it("keeps the one thing the page cannot do: a stray whose page is gone, and discard", async () => {
+  it("still points there for a stray copy whose page is gone", async () => {
     inventory.copies = [
       {
         path: "pages/Gone.sync-conflict-20260818-101010-BBBBBBB.md",
@@ -108,36 +117,22 @@ describe("the Settings conflict inventory", () => {
     const { root, dispose } = mount();
     try {
       await tick();
-      // No page exists to resolve it at, so no in-page affordance is offered...
-      expect(
-        [...root.querySelectorAll("button")].some((b) => b.textContent?.includes("Review in page"))
-      ).toBe(false);
-      expect(root.textContent).toContain("no longer exists");
-      // ...but discarding it is still reachable, which is why this panel stays.
-      expect(
-        [...root.querySelectorAll("button")].some((b) => b.textContent?.includes("Discard copy"))
-      ).toBe(true);
+      await tick();
+      // The queue omits it (there is no page to resolve at), so the pointer
+      // must count it or the discard it needs would be unreachable.
+      expect(root.textContent).toContain("1 item needs a decision");
+      expect(buttons(root).some((b) => b.includes("Open conflicts"))).toBe(true);
     } finally {
       dispose();
     }
   });
 
-  it("offers the same in-page route for a marker-bearing file", async () => {
-    inventory.markers = [
-      { path: "pages/Merged.md", name: "Merged", kind: "page", markers: ["<<<<<<<", ">>>>>>>"] },
-    ];
+  it("shows nothing when nothing needs a decision", async () => {
     const { root, dispose } = mount();
     try {
       await tick();
-      [...root.querySelectorAll("button")]
-        .find((b) => b.textContent?.includes("Review in page"))!
-        .click();
       await tick();
-      expect(paneRouter("main").route()).toMatchObject({
-        kind: "page",
-        name: "Merged",
-        path: "pages/Merged.md",
-      });
+      expect(buttons(root).some((b) => b.includes("Open conflicts"))).toBe(false);
     } finally {
       dispose();
     }

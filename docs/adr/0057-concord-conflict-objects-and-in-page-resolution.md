@@ -148,3 +148,17 @@ supply a body; artifact bodies pass the same one-block/org validity gate, are
 labeled with their provenance in the UI, and are re-derived at apply time from
 the same `base_rev`-guarded bytes. Design + Phase 2 spec:
 `tine-agents/specs/concord-intrablock-merge.md`.
+
+## Addendum (2026-09-21) — one inventory: the Conflicts route (GH #536)
+
+The Settings inventory panels (sync conflict copies, VCS merge markers, the
+orphaned copy) and the badge's page-to-page walk are replaced by one built-in
+`conflicts` route, which the `N conflicts` badge opens whatever N is. It is
+rendered from the live queue and never persisted in the graph, for the same
+reason this ADR removed the in-Settings merge dialog: two surfaces over one
+queue drift. Settings keeps a pointer. Duplicate journal days keep their
+Settings panel for now, since their in-page review already carries the per-file
+actions. Cross-page bulk resolution is deliberately not included; if a
+conflict-storm report arrives, the one bulk gesture worth adding is "Apply
+suggested everywhere", which decides nothing the ledger has not already
+pre-selected.

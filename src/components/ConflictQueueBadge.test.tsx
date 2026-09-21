@@ -1,13 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { ConflictQueueBadge } from "./Sidebar";
+import * as routerModule from "../router";
 import { __setBackendForTest, type Backend } from "../backend";
 import {
-  advanceConflictCursor,
   conflictQueue,
   refreshConflictQueueIfTouched,
   refreshSyncConflicts,
-  resetConflictCursor,
   setConflictQueue,
   settleArtifactConflict,
   setToasts,
@@ -25,7 +24,6 @@ afterEach(() => {
   document.body.innerHTML = "";
   __setBackendForTest(null);
   setConflictQueue([]);
-  resetConflictCursor();
   setToasts([]);
 });
 
@@ -71,13 +69,25 @@ describe("the conflict queue badge", () => {
     }
   });
 
-  it("walks the queue on repeated activation instead of parking on the first", () => {
+  it("opens the conflict overview, whatever the count", async () => {
+    // GH #536: the badge used to walk to the next conflicted page, so with many
+    // pages there was no view of what was left. It now opens one overview.
     setConflictQueue([object("markers:a", "Alpha"), object("markers:b", "Beta")]);
-    expect(advanceConflictCursor()?.page_name).toBe("Alpha");
-    expect(advanceConflictCursor()?.page_name).toBe("Beta");
-    expect(advanceConflictCursor()?.page_name).toBe("Alpha");
-    setConflictQueue([]);
-    expect(advanceConflictCursor()).toBeUndefined();
+    const opened: string[] = [];
+    const spy = vi.spyOn(routerModule, "openConflicts").mockImplementation(() => { opened.push("conflicts"); });
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <ConflictQueueBadge />, host);
+    try {
+      await flush();
+      const badge = host.querySelector<HTMLButtonElement>(".conflict-queue-badge")!;
+      badge.click();
+      badge.click();
+      expect(opened).toEqual(["conflicts", "conflicts"]);
+    } finally {
+      dispose();
+      spy.mockRestore();
+    }
   });
 
   it("is refreshed from the derived backend queue, and empties safely on failure", async () => {

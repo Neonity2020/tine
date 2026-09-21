@@ -120,6 +120,7 @@ function validRoute(r: unknown, seenViewIds: Set<string>): Route | null {
   if (!r || typeof r !== "object") return null;
   const o = r as Record<string, unknown>;
   if (o.kind === "journals") return { kind: "journals" };
+  if (o.kind === "conflicts") return { kind: "conflicts" };
   if (o.kind === "query") {
     const presentation = normalizeQueryPresentation(o.presentation);
     if (!(typeof o.id === "string" && o.id.length > 0 && o.id.length <= 128
@@ -272,6 +273,7 @@ function parseLayoutNode(
 
 function serializeRoute(route: Route): Route {
   if (route.kind === "journals") return { kind: "journals" };
+  if (route.kind === "conflicts") return { kind: "conflicts" };
   if (route.kind === "query") {
     return {
       kind: "query", id: route.id, sourceKind: route.sourceKind,

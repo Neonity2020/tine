@@ -314,7 +314,7 @@ export function PageView(): JSX.Element {
     );
     void (async () => {
       try {
-        if (r.kind === "query" || r.kind === "pdf" || r.kind === "invalid") {
+        if (r.kind === "query" || r.kind === "pdf" || r.kind === "invalid" || r.kind === "conflicts") {
           // Non-page workspaces are rendered by PaneLeaf, not PageView. Keep
           // this guard so the page loader never interprets a virtual route or
           // PDF asset as a graph page file.

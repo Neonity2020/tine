@@ -1,0 +1,144 @@
+import { For, Show, onMount, type JSX } from "solid-js";
+import { backend } from "../backend";
+import type { PaneRouter } from "../router";
+import type { ConflictObject, ConflictSource, SyncConflict } from "../types";
+import { conflictQueue, openPageInSidebar, pushToast, refreshSyncConflicts, syncConflicts } from "../ui";
+
+// Concord overview (GH #536): every page that needs a decision, in one place,
+// rendered from the live conflict queue and never written to the graph. It is
+// the INVENTORY; resolution still happens on the page, next to the blocks.
+// Rows vanish as the queue re-derives after each Apply, so the overview keeps
+// itself current by construction.
+
+const GROUPS: { source: ConflictSource; title: string }[] = [
+  { source: "live-save", title: "Unsaved drafts" },
+  { source: "sync-copy", title: "Sync conflict copies" },
+  { source: "vcs-markers", title: "Version-control merge markers" },
+  { source: "duplicate-journal", title: "Duplicate journal days" },
+];
+
+export function conflictSourceLabel(conflict: ConflictObject): string {
+  const side = (role: "mine" | "theirs") => conflict.sides.find((s) => s.role === role)?.label;
+  switch (conflict.source) {
+    case "live-save":
+      return "unsaved draft";
+    case "sync-copy":
+      return `sync copy · ${side("theirs") ?? "conflict copy"}`;
+    case "vcs-markers":
+      return `merge markers · ${side("mine") ?? "local"} vs ${side("theirs") ?? "merged-in"}`;
+    case "duplicate-journal":
+      return `${conflict.sides.length} files for one day`;
+  }
+}
+
+/** Absent is not zero: a count Tine did not compute shows "—", never "0". */
+export function conflictBlockCount(conflict: ConflictObject): string {
+  const count = conflict.block_conflicts;
+  if (count === undefined || count === null) return "—";
+  return `${count} block${count === 1 ? "" : "s"}`;
+}
+
+/** The conflict copy's own file, for a sync-copy object. */
+function copyPath(conflict: ConflictObject): string | undefined {
+  return conflict.sides.find((s) => s.role === "theirs")?.path ?? undefined;
+}
+
+async function discardCopy(path: string, pageName: string): Promise<void> {
+  const name = path.split("/").pop() ?? path;
+  const confirmed = await backend().confirm(
+    `Discard the conflict copy “${name}”?\n\n` +
+      `It moves to logseq/.tine-trash (recoverable). The current “${pageName}” is left as-is.`,
+  );
+  if (!confirmed) return;
+  try {
+    await backend().trashSyncConflict(path);
+    pushToast(`Discarded ${name}`, "success");
+    await refreshSyncConflicts();
+  } catch (e) {
+    pushToast(`Couldn’t discard it: ${String(e)}`, "error");
+  }
+}
+
+export function ConflictOverview(props: { router: PaneRouter }): JSX.Element {
+  onMount(() => void refreshSyncConflicts());
+  const orphans = (): SyncConflict[] => syncConflicts().filter((c) => !c.base_path);
+  const open = (conflict: ConflictObject, event: MouseEvent) => {
+    // Address the exact FILE: a duplicate-day journal would otherwise resolve to
+    // the canonical file rather than the one carrying the conflict.
+    const target = { name: conflict.page_name, pageKind: conflict.kind, path: conflict.page_path };
+    // Shift- or middle-click keeps the overview in view beside the page.
+    if (event.shiftKey || event.button === 1) openPageInSidebar(target);
+    else props.router.openPageTarget(target);
+  };
+  const total = () => conflictQueue().length + orphans().length;
+  return (
+    <div class="conflict-overview">
+      <h1 class="page-title">Conflicts</h1>
+      <Show
+        when={total() > 0}
+        fallback={<p class="conflict-overview-empty">No conflicts. Pages that need a decision appear here.</p>}
+      >
+        <p class="conflict-overview-hint">
+          Each page is resolved on the page itself, block by block. Shift-click opens it in the
+          right sidebar so this list stays in view.
+        </p>
+        <For each={GROUPS}>
+          {(group) => {
+            const rows = () => conflictQueue().filter((c) => c.source === group.source);
+            const extra = () => (group.source === "sync-copy" ? orphans() : []);
+            return (
+              <Show when={rows().length || extra().length}>
+                <section class="conflict-overview-group" aria-label={group.title}>
+                  <h2>{group.title}</h2>
+                  <For each={rows()}>
+                    {(conflict) => (
+                      <div class="conflict-overview-row">
+                        <button
+                          class="conflict-overview-open"
+                          title="Open the page to resolve it (shift-click: right sidebar)"
+                          onClick={(event) => open(conflict, event)}
+                          onAuxClick={(event) => { if (event.button === 1) open(conflict, event); }}
+                        >
+                          {conflict.page_name}
+                        </button>
+                        <span class="conflict-overview-source">{conflictSourceLabel(conflict)}</span>
+                        <span class="conflict-overview-count">{conflictBlockCount(conflict)}</span>
+                        <Show when={conflict.source === "sync-copy" && copyPath(conflict)}>
+                          {(path) => (
+                            <button
+                              class="settings-btn settings-btn-danger"
+                              onClick={() => void discardCopy(path(), conflict.page_name)}
+                            >
+                              Discard copy
+                            </button>
+                          )}
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                  <For each={extra()}>
+                    {(copy) => (
+                      <div class="conflict-overview-row">
+                        <span class="conflict-overview-open conflict-overview-orphan">{copy.base_name}</span>
+                        <span class="conflict-overview-source">
+                          sync copy · {copy.tag || "conflict copy"} · its page no longer exists
+                        </span>
+                        <span class="conflict-overview-count">—</span>
+                        <button
+                          class="settings-btn settings-btn-danger"
+                          onClick={() => void discardCopy(copy.path, copy.base_name)}
+                        >
+                          Discard copy
+                        </button>
+                      </div>
+                    )}
+                  </For>
+                </section>
+              </Show>
+            );
+          }}
+        </For>
+      </Show>
+    </div>
+  );
+}

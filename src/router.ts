@@ -74,6 +74,9 @@ export function pageTargetMatchesLoaded(
 
 export type Route =
   | { kind: "journals" }
+  /** The conflict overview (GH #536): rendered from the live conflict queue,
+   *  never a file in the graph. */
+  | { kind: "conflicts" }
   | QueryRoute
   | PdfRoute
   | InvalidRoute
@@ -195,6 +198,7 @@ export interface PaneRouter {
   ): void;
   openPageTarget(target: PageTarget, opts?: { inPlace?: boolean }): void;
   openJournals(opts?: { inPlace?: boolean }): void;
+  openConflicts(opts?: { inPlace?: boolean }): void;
   openPdf(route: PdfRoute, opts?: { inPlace?: boolean }): void;
   updateActivePdfViewState(state: { page?: number; scale?: number }): void;
   closePdf(): Promise<boolean>;
@@ -247,6 +251,7 @@ export function tabRoute(t: Tab): Route {
 
 export function routeTitle(r: Route): string {
   if (r.kind === "journals") return "Journals";
+  if (r.kind === "conflicts") return "Conflicts";
   if (r.kind === "pdf") return r.label.trim() || r.filename;
   if (r.kind === "invalid") return r.title;
   if (r.kind === "query") {
@@ -261,7 +266,7 @@ export function routeTitle(r: Route): string {
 
 export function sameRoute(a: Route, b: Route): boolean {
   if (a.kind !== b.kind) return false;
-  if (a.kind === "journals") return true;
+  if (a.kind === "journals" || a.kind === "conflicts") return true;
   if (a.kind === "query") return a.id === (b as QueryRoute).id;
   if (a.kind === "pdf") return a.viewId === (b as PdfRoute).viewId;
   if (a.kind === "invalid") return a === b;
@@ -678,6 +683,10 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
 
   function openJournals(opts: { inPlace?: boolean } = {}) {
     navigate({ kind: "journals" }, { sticky: !opts.inPlace });
+  }
+
+  function openConflicts(opts: { inPlace?: boolean } = {}) {
+    navigate({ kind: "conflicts" }, { sticky: !opts.inPlace });
   }
 
   function openPdf(pdfRoute: PdfRoute, opts: { inPlace?: boolean } = {}) {
@@ -1204,6 +1213,7 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     openPage,
     openPageTarget,
     openJournals,
+    openConflicts,
     openPdf,
     updateActivePdfViewState,
     closePdf,
@@ -1329,6 +1339,10 @@ export function openPageTarget(target: PageTarget, opts: { inPlace?: boolean } =
 
 export function openJournals(opts: { inPlace?: boolean } = {}) {
   focusedRouterInstance().openJournals(opts);
+}
+
+export function openConflicts(opts: { inPlace?: boolean } = {}) {
+  focusedRouterInstance().openConflicts(opts);
 }
 
 export function openQueryInNewTab(
