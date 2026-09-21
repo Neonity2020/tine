@@ -208,6 +208,10 @@ export const safeClose = createSafeCloseCoordinator({
     if (!discard) openUnsavedRecovery();
     return discard;
   },
+  recordDiscard: (reason) => backend().diagnosticFrontendEvent(
+    "close_discarded_unsaved", undefined, undefined, undefined, undefined, undefined,
+    reason, unsavedRecoveryPages().length,
+  ),
   flushSession,
   setTransition: setGraphTransitioning,
   notifyPdfFailure: () => {

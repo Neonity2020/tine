@@ -17,6 +17,9 @@ export interface SafeCloseDeps {
   flushPdfWork(): Promise<boolean>;
   flushAll(): Promise<boolean>;
   confirmDiscard(reason: DiscardReason): Promise<boolean>;
+  /** The user accepted losing work. Recorded so a session that discarded drafts
+   *  does not read as an ordinary clean exit in the debug report (GH #540). */
+  recordDiscard?(reason: DiscardReason): Promise<void>;
   flushSession(): Promise<void>;
   setTransition(active: boolean): void;
   notifyPdfFailure(): void;
@@ -114,13 +117,19 @@ export function createSafeCloseCoordinator(deps: SafeCloseDeps): SafeCloseCoordi
 
       if (outcome !== true) {
         let discard = false;
+        const reason: DiscardReason = outcome === STILL_RUNNING ? "still-saving" : "failed";
         try {
-          discard = await deps.confirmDiscard(outcome === STILL_RUNNING ? "still-saving" : "failed");
+          discard = await deps.confirmDiscard(reason);
         } catch {
           deps.notifyConfirmationFailure();
           return "rejected";
         }
         if (!discard) return "rejected";
+        try {
+          await bounded(deps.recordDiscard?.(reason) ?? Promise.resolve(), 1000, undefined);
+        } catch {
+          // Diagnostics never block a close the user has already confirmed.
+        }
       }
 
       try {

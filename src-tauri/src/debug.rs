@@ -617,7 +617,15 @@ pub(crate) fn diagnostic_frontend_event(
     delay_ms: Option<u64>,
     updater_stage: Option<String>,
     updater_cause: Option<String>,
+    close_reason: Option<String>,
+    pages: Option<u64>,
 ) {
+    if kind == "close_discarded_unsaved" {
+        if let Some(fields) = close_discard_fields(close_reason.as_deref(), pages) {
+            record_fixed_event("runtime.close_discarded_unsaved", fields);
+        }
+        return;
+    }
     if kind == "updater_failure" {
         let Some(stage) = updater_stage.filter(|value| {
             matches!(
@@ -665,6 +673,19 @@ pub(crate) fn diagnostic_frontend_event(
     fields.insert("column".into(), json!(column));
     fields.insert("delayMs".into(), json!(delay_ms));
     record_fixed_event("frontend.health", fields);
+}
+
+/// The user closed Tine through the unsaved-changes warning and chose to
+/// discard. `runtime.clean_shutdown` is still true of that process, so without
+/// this event a session that lost drafts looked like any other clean exit
+/// (DanTremonti, GH #540). Only a fixed reason token and a page count are
+/// kept: never page titles, which the report promises to exclude.
+fn close_discard_fields(reason: Option<&str>, pages: Option<u64>) -> Option<Map<String, Value>> {
+    let reason = reason.filter(|value| matches!(*value, "failed" | "still-saving"))?;
+    let mut fields = Map::new();
+    fields.insert("reason".into(), json!(reason));
+    fields.insert("pages".into(), json!(pages.unwrap_or(0)));
+    Some(fields)
 }
 
 #[tauri::command]
@@ -1133,6 +1154,20 @@ mod tests {
         assert!(!production.contains("fields.insert(\"detail\""));
         assert!(production.contains("verboseDebugLogIncluded\": false"));
         assert!(production.contains("record_fixed_event(\"watcher.batch\", fields)"));
+    }
+
+    #[test]
+    fn a_close_that_discards_drafts_records_only_a_fixed_reason_and_a_count() {
+        let fields = close_discard_fields(Some("failed"), Some(3)).unwrap();
+        assert_eq!(fields.get("reason"), Some(&json!("failed")));
+        assert_eq!(fields.get("pages"), Some(&json!(3)));
+        assert_eq!(fields.len(), 2);
+        assert!(close_discard_fields(Some("still-saving"), None).is_some());
+        for refused in [None, Some(""), Some("My secret page"), Some("/home/someone/graph")] {
+            assert!(close_discard_fields(refused, Some(1)).is_none(), "{refused:?}");
+        }
+        let production = include_str!("debug.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("record_fixed_event(\"runtime.close_discarded_unsaved\", fields)"));
     }
 
     #[test]

@@ -99,6 +99,25 @@ describe("GH #161 shared safe-close transaction", () => {
     expect(safeClose.inFlight()).toBe(false);
   });
 
+  it("records a discard only when the user accepts losing work, and a failing record never blocks the close (GH #540)", async () => {
+    const declined = harness({ flushAll: vi.fn(async () => false), confirmDiscard: vi.fn(async () => false), recordDiscard: vi.fn(async () => {}) });
+    await expect(declined.safeClose.prepare()).resolves.toBe("rejected");
+    expect(declined.deps.recordDiscard).not.toHaveBeenCalled();
+
+    const accepted = harness({
+      flushAll: vi.fn(async () => false),
+      confirmDiscard: vi.fn(async () => true),
+      recordDiscard: vi.fn(async () => { throw new Error("backend gone"); }),
+    });
+    await expect(accepted.safeClose.prepare()).resolves.toBe("accepted");
+    expect(accepted.deps.recordDiscard).toHaveBeenCalledExactlyOnceWith("failed");
+    expect(accepted.deps.flushSession).toHaveBeenCalledOnce();
+
+    const saved = harness({ recordDiscard: vi.fn(async () => {}) });
+    await expect(saved.safeClose.prepare()).resolves.toBe("accepted");
+    expect(saved.deps.recordDiscard).not.toHaveBeenCalled();
+  });
+
   it("enrolls pending PDF state before page flush and rejects a failed PDF drain", async () => {
     const order: string[] = [];
     const { deps, safeClose, transitions } = harness({

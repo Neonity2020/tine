@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- Diagnostic reports now record when Tine was closed through the
+  unsaved-changes warning with the user choosing to discard, with the reason
+  (a failed save or one still running) and the number of affected pages, but
+  no page names. Before, such a session read as an ordinary clean exit
+  (GH #540).
+
 - Internal: compact-projection P1 moved tine-storage through v0.25.0 and
   v0.26.0. v0.25.0 deletes the Managed
   Storage half of the crate (durable batches, local journals, sealed digests,

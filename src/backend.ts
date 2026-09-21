@@ -3,6 +3,7 @@
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
 import { createSignal } from "solid-js";
+import type { DiscardReason } from "./safeClose";
 import { notifyGraphRebound } from "./modeHooks";
 import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
 import type { GraphSearchConsumer, GraphSearchDisplayOptions } from "./editor/queryIr";
@@ -1067,12 +1068,14 @@ export interface Backend {
   saveGraphVerificationReport(text: string): Promise<boolean>;
   onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
     updaterStage?: string,
     updaterCause?: string,
+    closeReason?: DiscardReason,
+    pages?: number,
   ): Promise<void>;
   /** Whether the recorded session counts as live from now on. Mobile only: the
    *  OS reaps a backgrounded app without notice, and that is not a crash
@@ -2140,12 +2143,14 @@ class TauriBackend implements Backend {
     return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
   }
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
     updaterStage?: string,
     updaterCause?: string,
+    closeReason?: DiscardReason,
+    pages?: number,
   ) {
     return this.call<void>("diagnostic_frontend_event", {
       kind,
@@ -2154,6 +2159,8 @@ class TauriBackend implements Backend {
       delayMs,
       updaterStage,
       updaterCause,
+      closeReason,
+      pages,
     });
   }
   diagnosticSessionActive(active: boolean) {
