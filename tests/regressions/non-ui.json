@@ -4745,6 +4745,31 @@
  "notes": "Every ProjectionSemanticRefusal (merge markers, a dropped preamble, a page-header property moved into the outline, an Org file that cannot round-trip) reached the frontend as `reason code: unknown`: retried at 100/300 ms, then a transient 'after 3 tries' toast, then a page that silently never saved while each further edit repeated the cycle (GH #546 screenshot; DanTremonti's GH #540 report; the remaining gap after GH #535). The refusal is a verdict on the draft's content, so direct_save_failure_code now maps that marker type to `refused.data_preservation` (no retry) in one arm covering every producer, and the frontend shows one sticky, deduplicated message per page with a Review unsaved action (the close-path recovery panel: Copy draft, Open page), dismissed when the page saves or leaves the working set. Fail-before: the core tests return `unknown`; the store test sees 6 save attempts instead of 4 without the frontend policy change. The firewall itself is unchanged."
 },
 {
+ "id": "REG-LIVE-CONFLICT-REVIEW-AFTER-REVOKE-490",
+ "title": "A save conflict whose one-shot review authority was revoked early can still be captured, reviewed after a restart, and resolved",
+ "family": "live-save-conflict",
+ "sources": {
+  "issues": [
+   490
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests.rs::gh490_a_conflict_whose_authority_was_revoked_is_still_captured_and_reviewable",
+   "crates/tine-core/src/model_tests.rs::gh490_a_restored_captureless_capsule_is_reviewed_against_the_disk"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "User outcome: after a save conflict, the banner 'Your draft and the current file both changed' stayed up but its comparison failed with 'live conflict authority is missing or already consumed' -- and after a restart it failed on every attempt, with no way to clear it. Mechanism (verified in core): a refused save mints a process-local one-shot token; any watcher reconcile of that path (sync_file_checked, including the echo of the write that caused the conflict) and, on Windows, any uncertain delete/rename anywhere in the graph (revoke_all_conflict_authority) revokes it. Landing between the refusal and capture_live_save_conflict, the capture failed, the capsule was stored without disk_rev, and the review routed to the dead token forever. Fix: the token is a preference, never a precondition -- a capture whose token is gone is taken from the disk as it is now (with the editor's loaded base when this process still has it), and a capsule without disk_rev whose token is gone (restart, or a Managed-era epoch -1) is reviewed durably. Apply still rechecks the displayed disk revision under the page lock, so nothing is authorized that the durable path did not already allow; the revocation rules are unchanged. Fail-before: with both fallbacks disabled, the capture test panics at the capture and the restore test at the review. Scope note: the reporter's own v0.6.982 failure is more likely the file-absent-under-a-captured-draft case fixed by a1f0c512 (v0.6.983); this row covers the remaining mechanism, found while investigating #490. Not run natively on Windows."
+},
+{
  "id": "REG-GRAPH-TEXT-HARDLINK-RENAME-571",
  "title": "A page that is also hard-linked elsewhere (git-annex, deduplication) can be renamed, restored after a crash, and edited externally without discarding the warm index",
  "family": "direct-save",

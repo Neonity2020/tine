@@ -133,6 +133,14 @@ pub struct LiveSaveConflictCapture {
     pub disk_rev: String,
 }
 
+/// Which authority a live-conflict capsule review was computed under: the
+/// process-local one-shot token, or the disk revision the review displayed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiveSaveConflictReviewAuthority {
+    Live { conflict_epoch: u64 },
+    Durable { expected_disk_rev: String },
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ConflictAuthority {
     pub(super) snapshot: ConflictSnapshot,

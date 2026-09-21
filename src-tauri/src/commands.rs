@@ -2624,38 +2624,25 @@ pub(crate) async fn conflict_capsule_diff(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        {
-            let graph = slot.graph();
-            if disk_rev.is_some() {
-                let diff = graph
-                    .durable_live_save_conflict_diff(&page, base_text.as_deref())
-                    .map_err(CommandError::from)?;
-                // The capsule selects recovery mode; the newly displayed
-                // disk snapshot supplies authority for this review.
-                let expected_disk_rev = diff.conflict_rev.clone();
-                Ok(ConflictCapsuleReview {
-                    diff,
-                    authority: ConflictCapsuleAuthority::DirectDurable { expected_disk_rev },
-                })
-            } else {
-                let conflict_epoch = u64::try_from(conflict_epoch).map_err(|_| {
-                    CommandError::prose("direct conflict capsule has no live observation")
-                })?;
-                let diff = graph
-                    .live_save_conflict_diff(
-                        &page,
-                        base_rev.as_deref(),
-                        tine_core::ConflictOverride {
-                            observation_epoch: conflict_epoch,
-                        },
-                    )
-                    .map_err(CommandError::from)?;
-                Ok(ConflictCapsuleReview {
-                    diff,
-                    authority: ConflictCapsuleAuthority::DirectLive { conflict_epoch },
-                })
+        let (diff, authority) = slot
+            .graph()
+            .review_live_save_conflict_capsule(
+                &page,
+                base_rev.as_deref(),
+                conflict_epoch,
+                base_text.as_deref(),
+                disk_rev.as_deref(),
+            )
+            .map_err(CommandError::from)?;
+        let authority = match authority {
+            tine_core::LiveSaveConflictReviewAuthority::Live { conflict_epoch } => {
+                ConflictCapsuleAuthority::DirectLive { conflict_epoch }
             }
-        }
+            tine_core::LiveSaveConflictReviewAuthority::Durable { expected_disk_rev } => {
+                ConflictCapsuleAuthority::DirectDurable { expected_disk_rev }
+            }
+        };
+        Ok(ConflictCapsuleReview { diff, authority })
     })
     .await
     .map_err(CommandError::worker)?

@@ -48,6 +48,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- A save conflict no longer ends up with a comparison that can never load. If
+  Tine lost track of the conflict in the split second after it happened (for
+  example because another page was deleted or renamed at that moment on
+  Windows), the comparison failed, and after a restart it failed every time.
+  Tine now compares your draft with the file as it is on disk instead, as it
+  already does for any conflict it restores after a restart (GH #490).
 - A page whose first bullet is a numbered-list item keeps saving. Making the
   first bullet of a new page a numbered item and then typing its text could
   leave the file holding only `logseq.order-list-type:: number`, with every

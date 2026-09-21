@@ -47,6 +47,14 @@ and preserves the newer bytes for another review. The native and browser review
 adapters share this rule, covered by
 `rehydrates a durable live conflict and applies the currently reviewed disk revision`
 and `concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk`.
+The process-local one-shot token is only a preference, never a precondition
+for a review: a capture whose token a watcher event already revoked is taken
+from the current disk snapshot, and a capsule without a stored disk revision
+whose token is gone (after a restart, or a Managed-era `conflict_epoch = -1`)
+is reviewed on that same durable path (GH #490,
+`gh490_a_conflict_whose_authority_was_revoked_is_still_captured_and_reviewable`,
+`gh490_a_restored_captureless_capsule_is_reviewed_against_the_disk`). This
+authorizes nothing new, because Apply still rechecks the displayed revision.
 This state is recovery material only: it grants no graph authority, and no
 byte is written into the user's graph.
 

@@ -267,8 +267,10 @@ export function PageConflictResolution(props: { conflict: ConflictObject; unavai
           // fallback) carries only a session-scoped observation epoch, which is
           // dead after a restart. Pin the reviewed disk revision on it so the
           // restored capsule re-observes the file durably instead of replaying
-          // that epoch (this is what the pre-capsule resource did).
-          if (review.authority.kind === "direct_live") {
+          // that epoch (this is what the pre-capsule resource did). A capsule
+          // whose epoch was already dead is reviewed durably (GH #490); pin
+          // that too, so it stops asking for the dead epoch at all.
+          if (review.authority.kind === "direct_live" || !live.disk_rev) {
             void updateLiveSaveConflictDiskRev(c.page_name, review.diff.conflict_rev);
           }
           return review.diff;

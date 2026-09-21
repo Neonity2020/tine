@@ -615,9 +615,19 @@ impl Graph {
         })
     }
 
-    /// Capture the complete restart-recoverable presentation while the original
-    /// one-shot editor authority is still live. This inspects but does not
-    /// consume that authority.
+    /// Capture the complete restart-recoverable presentation. While the
+    /// original one-shot editor authority is still live this inspects (never
+    /// consumes) it, so the review shows the exact disk bytes that were refused.
+    ///
+    /// When that authority is already gone -- any watcher reconcile of the path
+    /// (including the echo of the write that caused the conflict) or, on
+    /// Windows, any uncertain delete/rename anywhere in the graph revokes it
+    /// in the gap before this call -- the capture is taken from the disk as it
+    /// is now instead (GH #490). That is exactly the capture a restart
+    /// recovers from, and resolution rechecks its `disk_rev` under the page
+    /// lock, so nothing is authorized that the durable path would not.
+    /// Refusing here used to leave a banner whose review could never load
+    /// after a restart.
     pub fn capture_live_save_conflict(
         &self,
         page: &PageDto,
@@ -625,7 +635,12 @@ impl Graph {
         presented: ConflictOverride,
     ) -> io::Result<LiveSaveConflictCapture> {
         let (path, theirs_text, base_text) =
-            self.live_save_conflict_parts(page, base_rev, presented)?;
+            match self.live_save_conflict_parts(page, base_rev, presented) {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    return self.durable_live_save_conflict_capture(page, base_rev);
+                }
+                parts => parts?,
+            };
         let theirs_text = theirs_text.unwrap_or_default();
         let mine = page_dto_document(page)?;
         let theirs = parse_doc(&path, &theirs_text);
@@ -640,6 +655,75 @@ impl Graph {
             diff,
             base_text,
         })
+    }
+
+    /// The durable capture: the review against the disk as it is now, with the
+    /// editor's loaded base when this process still holds it.
+    fn durable_live_save_conflict_capture(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+    ) -> io::Result<LiveSaveConflictCapture> {
+        let base_text = {
+            let write = self.admit_graph_text_writer()?;
+            let (path, _) = self.save_target(&write, page)?;
+            page.activation
+                .map(EditorActivation::from_u64)
+                .and_then(|activation| self.editor_activation_baseline(&path, activation, base_rev))
+        };
+        let diff = self.durable_live_save_conflict_diff(page, base_text.as_deref())?;
+        Ok(LiveSaveConflictCapture {
+            disk_rev: diff.conflict_rev.clone(),
+            diff,
+            base_text,
+        })
+    }
+
+    /// Review an app-private live-conflict capsule. A capsule with a captured
+    /// `disk_rev`, or one whose session-scoped authority is gone (after a
+    /// restart, or revoked by a watcher event before the capture ran), is
+    /// reviewed durably against the disk as it is now. Only a capsule still
+    /// holding live authority in this process uses it (GH #490: a restored
+    /// captureless capsule used to fail this review on every attempt).
+    pub fn review_live_save_conflict_capsule(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        conflict_epoch: i64,
+        base_text: Option<&str>,
+        disk_rev: Option<&str>,
+    ) -> io::Result<(
+        crate::sync_diff::SyncConflictDiff,
+        LiveSaveConflictReviewAuthority,
+    )> {
+        if disk_rev.is_none() {
+            if let Ok(observation_epoch) = u64::try_from(conflict_epoch) {
+                match self.live_save_conflict_diff(
+                    page,
+                    base_rev,
+                    ConflictOverride { observation_epoch },
+                ) {
+                    Ok(diff) => {
+                        return Ok((
+                            diff,
+                            LiveSaveConflictReviewAuthority::Live {
+                                conflict_epoch: observation_epoch,
+                            },
+                        ))
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let diff = self.durable_live_save_conflict_diff(page, base_text)?;
+        // The capsule selects recovery mode; the newly displayed disk snapshot
+        // supplies authority for this review.
+        let expected_disk_rev = diff.conflict_rev.clone();
+        Ok((
+            diff,
+            LiveSaveConflictReviewAuthority::Durable { expected_disk_rev },
+        ))
     }
 
     /// Recompute a durable live-conflict review against the disk as it exists
