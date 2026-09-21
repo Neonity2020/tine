@@ -14,7 +14,7 @@ import {
   fullWidthRefReplace,
   pageInsert,
   tagInsert,
-  orderAcItems,
+  orderAcItems, aliasOfLabel,
   COMMANDS,
   advancedBlockInsertion,
   filterAdvancedBlockCommands,
@@ -146,7 +146,7 @@ import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
-import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock, resolveAlias, pageIdentityKey } from "../ui";
+import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock, resolveAlias } from "../ui";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
 import { seedAssetBlob } from "../assetCache";
 import { openInNewTab, type Route } from "../router";
@@ -1633,16 +1633,10 @@ export function Editor(props: { id: string }): JSX.Element {
     const pages = await (cap ? cap.quickSwitch(t.query, 100) : backend().quickSwitch(t.query, 100));
     const cur = ac();
     if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
-    // An authored alias is offered as itself, so the alias text is what gets
-    // inserted; the row names the page it belongs to (GH #558, GH #482).
-    const aliasBadge = (name: string): Pick<AcItem, "sub"> => {
-      const owner = resolveAlias(name);
-      return pageIdentityKey(owner) === pageIdentityKey(name) ? {} : { sub: `alias of ${owner}` };
-    };
-    const pageItem = (name: string): AcItem =>
-      t.kind === "page"
-        ? { label: name, insert: pageInsert(name), ...aliasBadge(name) }
-        : { label: `#${name}`, insert: tagInsert(name), ...aliasBadge(name) }; // tag context reads "#name"
+    const pageItem = (name: string): AcItem => ({
+      ...(t.kind === "page" ? { label: name, insert: pageInsert(name) } : { label: `#${name}`, insert: tagInsert(name) }), // tag context reads "#name"
+      sub: aliasOfLabel(name, resolveAlias(name)),
+    });
     const createItem: AcItem =
       t.kind === "page"
         ? { label: `Create "${q}"`, insert: pageInsert(q) }

@@ -4686,6 +4686,34 @@
   "failBefore": "proven"
  },
  "notes": "GH #406. The reporter's timings grew faster than the graph. Cause: the portable case/NFC name check (validate_graph_text_portable_aliases_path_local) listed every entry of each ancestor directory on EVERY write, so the rename's write phase cost rewritten files x pages/ entries - measured at 0.16 ms per write on a 500-file folder, 2.2 ms at 8,000 and 4.5 ms at 16,000, about 80-85% of the write phase. The rename transaction now lists each directory once (PortableListingBatch) for its in-place referrer rewrites; a file creation (the moved page) still checks live, because a published twin cannot always be withdrawn on rollback. Fail-before: 2 vs 30 referrers listed pages/ 16 vs 72 times; after, equal. The mid-rename twin tests arm the write hook at a later mutation so the batch is provably stale; without the live creation check the destination published next to its twin and the rollback could not withdraw it (necessity run). Optimized Linux fixture, 8,000 pages: 800 referrers 2,637 ms -> 844 ms; 500/2k/8k pages 16x the pages cost 17.7x the time (was 29x). Not addressed here: every rename still reads every graph file (~5-6x the raw read floor), and the frontend reloads the whole graph afterwards (tracked with GH #535's targeted refresh). The reporter's negative follow-up on the earlier partial fix (REG-DIRECT-RENAME-LITERAL-SCANNER-406) stands; Windows latency is unmeasured."
+},
+{
+ "id": "REG-NUMBERED-FIRST-BULLET-HEADER-540",
+ "title": "An empty numbered item as a page's first bullet stays a list item and the page keeps saving",
+ "family": "page-header-save",
+ "sources": {
+  "issues": [
+   540,
+   546
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "native",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/tests/gh540_numbered_first_bullet.rs::an_empty_numbered_first_bullet_stays_a_list_item_and_the_page_keeps_saving",
+   "crates/tine-core/tests/gh540_numbered_first_bullet.rs::a_properties_only_first_bullet_of_page_properties_still_becomes_the_header",
+   "src/store.test.ts::stays a list item, so typing its text keeps saving",
+   "src/store.test.ts::keeps the block-scoped property list identical to the Rust promotion rule"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #540, DanTremonti's report (v0.6.984, Linux): a new namespaced page, first bullet made a numbered item, then its text typed; the file stayed the 32-byte `logseq.order-list-type:: number` and every later save was refused in 0-4 ms as `reason code: unknown` until restart. Cause: the numbered-list command leaves an empty first bullet whose raw is exactly that property line, and both the frontend fold (projectPageDto) and the Rust promotion (first_root_is_promotable_page_header) took a properties-only first bullet for page-header properties (the GH #198 canonicalization), writing it as the unbulleted preamble. The typed text then moved that 'header' property back into the outline, which the GH #163 firewall refuses with an untyped error. On this branch before the fix the GH #546 reconciliation made it worse: the store adopted the fold, so the typed text was never serialized at all. OG keeps such a bullet a bullet because the property sits under an empty title line and its serializer promotes only a first block whose first line holds `:: ` (file/core.cljs transform-content); Tine's raw has no empty title line, so a block-scoped key (id, heading, collapsed, background-color, logseq.order-list-type) now disqualifies promotion on both sides, kept identical by a source guard. Reproduced byte-for-byte in core before the fix; the Rust and store numbered-item tests each fail without their half of the fix (the alias test is the GH #198 neighbour and passes either way). Not addressed: the firewall refusal is still untyped (`unknown`) and retried, so any other route into it still reads as a stuck save; EllisMorrow's original multi-day report remains unexplained."
 }
 ]
 }

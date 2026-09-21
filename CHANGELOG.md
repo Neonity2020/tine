@@ -47,6 +47,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- A page whose first bullet is a numbered-list item keeps saving. Making the
+  first bullet of a new page a numbered item and then typing its text could
+  leave the file holding only `logseq.order-list-type:: number`, with every
+  later save of that page failing (`reason code: unknown`) until Tine was
+  restarted. Tine had taken the empty numbered item for page properties; it now
+  stays a list item (GH #540).
 - Typing a page's alias after `[[` or `#` now offers it, and the row says
   which page it is an alias of. Choosing it inserts the alias as you wrote it,
   and the link opens the real page (GH #558, GH #482).

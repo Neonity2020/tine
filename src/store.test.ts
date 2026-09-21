@@ -3751,3 +3751,43 @@ describe("GH #546 — page-header properties saved while the user is still typin
     expect(pageToDto("Test")?.blocks).toEqual([]);
   });
 });
+
+describe("GH #540 — an empty numbered item as a page's first bullet", () => {
+  it("stays a list item, so typing its text keeps saving", async () => {
+    // The numbered-list command leaves an empty first bullet whose raw is
+    // exactly `logseq.order-list-type:: number`. Folding that into the page
+    // header made the list page properties; the text typed next then either
+    // jammed every save as `reason code: unknown` or, once the store adopted
+    // the fold (GH #546), was never saved at all.
+    load([blk("logseq.order-list-type:: number")]);
+    markDirty("Test");
+    const saved: PageDto[] = [];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
+      saved.push(dto);
+      return { revision: "gh540-rev" };
+    });
+    try {
+      await flushPage("Test");
+    } finally {
+      saveSpy.mockRestore();
+    }
+    expect(saved).toHaveLength(1);
+    expect(saved[0].pre_block ?? null).toBeNull();
+    expect(saved[0].blocks.map((b) => b.raw)).toEqual(["logseq.order-list-type:: number"]);
+
+    setRaw(doc.pages[0].roots[0], "Dosa\nlogseq.order-list-type:: number");
+    const dto = pageToDto("Test");
+    expect(dto?.pre_block ?? null).toBeNull();
+    expect(dto?.blocks.map((b) => b.raw)).toEqual(["Dosa\nlogseq.order-list-type:: number"]);
+  });
+
+  it("keeps the block-scoped property list identical to the Rust promotion rule", async () => {
+    const { readFileSync } = await import("node:fs");
+    const rust = readFileSync("crates/tine-core/src/model/page_header.rs", "utf8");
+    const body = /BLOCK_SCOPED_PROPERTY_KEYS: &\[&str\] = &\[([^\]]*)\]/.exec(rust)?.[1] ?? "";
+    const rustKeys = [...body.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    const { BLOCK_SCOPED_PROPERTY_KEYS } = await import("./store/mutationPlans");
+    expect(rustKeys.length).toBeGreaterThan(0);
+    expect([...BLOCK_SCOPED_PROPERTY_KEYS]).toEqual(rustKeys);
+  });
+});

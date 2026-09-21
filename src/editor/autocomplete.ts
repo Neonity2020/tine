@@ -5,6 +5,7 @@ import { TEMPLATE_VARS } from "./templateVars";
 import { QUERY_MACRO_SCAFFOLD, QUERY_MACRO_SCAFFOLD_CARET } from "./queryMacroName";
 import { isBareTagPrefix, tagRef } from "../tags";
 import { propertyKeyNorm } from "../render/block";
+import { pageIdentityKey } from "../pageIdentity";
 
 export type TriggerKind =
   | "page"
@@ -383,6 +384,15 @@ function canonicalCompare<T extends NamedAutocompleteItem<unknown>>(a: T, b: T):
  * lifecycle but deliberately expose no rows; the editor also skips quickSwitch
  * for them. Nonblank results are canonical-name ordered so graph/index order is
  * never an accidental Enter policy. */
+/** The `[[`/`#` row label for a suggestion that is an authored alias. Core
+ *  offers an alias as its own row, so choosing it inserts the alias text; the
+ *  label names the page it belongs to (GH #558, GH #482). `owner` is the name
+ *  resolved through the alias map, where an existing page wins, so an ordinary
+ *  page gets no label. */
+export function aliasOfLabel(name: string, owner: string): string | undefined {
+  return pageIdentityKey(owner) === pageIdentityKey(name) ? undefined : `alias of ${owner}`;
+}
+
 export function orderAcItems<T>(
   matches: readonly NamedAutocompleteItem<T>[],
   createItem: NamedAutocompleteItem<T>,
