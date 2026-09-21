@@ -347,6 +347,11 @@ expectations, no obligations, either way. 🌱
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/martinkoutecky)
 · [GitHub Sponsors](https://github.com/sponsors/martinkoutecky)
 
+## Unofficial Tine Resources
+
+* [Tana to Tine](https://github.com/mikob/tine/tree/tana-to-tine) - Convert Tana workspaces to Tine.
+
+
 ## Acknowledgements
 
 Tine is an independent reimplementation, not a fork — the codebase is original Rust + SolidJS and
