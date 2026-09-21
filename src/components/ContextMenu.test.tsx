@@ -31,6 +31,8 @@ import { backend } from "../backend";
 import { clearClipboardPayload, peekClipboardPayload } from "../clipboard";
 import { mainPaneRouter, tabs } from "../router";
 import { editingId, endEdit } from "../editorController";
+import { PUBLISHED_META_NAME } from "../publishedBackend";
+import { publishedPermalinkUrl } from "../publishedPermalink";
 
 describe("PageMenu page-kind availability", () => {
   it("keeps rename page-only but exposes delete for pages and journals", () => {
@@ -55,6 +57,8 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
     closeContextMenu();
     closeExportModal();
     clearTransientLayersForTest();
+    document.querySelector(`meta[name="${PUBLISHED_META_NAME}"]`)?.remove();
+    setToasts([]);
     document.body.innerHTML = "";
   });
 
@@ -268,6 +272,35 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
       "show-in-folder", "open-default-app", "page-properties",
       "carry-unfinished", "delete-journal",
     ]);
+    dispose();
+  });
+
+  it("copies page and block permalinks from a published export", () => {
+    const meta = document.createElement("meta");
+    meta.name = PUBLISHED_META_NAME;
+    meta.content = "snapshot.json";
+    document.head.appendChild(meta);
+    load(true);
+    setDoc("byId", "parent", "raw", "Parent\nid:: parent-stable");
+    const writeText = vi.spyOn(backend(), "writeText").mockResolvedValue();
+    const dispose = mount(() => <ContextMenu />);
+
+    openPageContextMenu(10, 10, "P", "page", true);
+    const pageAction = document.querySelector<HTMLButtonElement>('[data-page-action-id="copy-page-link"]');
+    expect(pageAction?.textContent?.trim()).toBe("Copy page link");
+    pageAction!.click();
+    expect(writeText).toHaveBeenCalledWith(publishedPermalinkUrl({ kind: "page", page: "P" }));
+    expect(toasts().at(-1)?.message).toBe("Copied page link");
+
+    openContextMenu(10, 10, "parent");
+    const blockAction = [...document.querySelectorAll<HTMLButtonElement>(".ctx-item")]
+      .find((item) => item.textContent?.trim() === "Copy block link");
+    expect(blockAction).toBeDefined();
+    blockAction!.click();
+    expect(writeText).toHaveBeenLastCalledWith(
+      publishedPermalinkUrl({ kind: "block", block: "parent-stable" }),
+    );
+    expect(toasts().at(-1)?.message).toBe("Copied block link");
     dispose();
   });
 

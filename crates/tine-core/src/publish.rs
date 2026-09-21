@@ -1069,11 +1069,11 @@ struct Ctx<'a> {
     /// copied into `<leaf>/assets/` and the link rewritten, through this sink.
     /// `None` keeps the graph site's `../assets/<file>` links.
     asset_sink: Option<&'a RefCell<AssetSink<'a>>>,
-    /// Query exports only (Stage 2): where the renderer is, so each query
+    /// Published apps only: where the renderer is, so each query
     /// runs exactly as the app will ask for it (its page as `current page`,
     /// its host block's `tine.*` properties merged into the view).
     scope: Option<&'a RefCell<app_export::RenderScope>>,
-    /// Query exports with an app: every executed query, keyed as the app asks.
+    /// Published apps: every executed query, keyed as the app asks.
     recorder: Option<&'a RefCell<app_export::QueryRecorder>>,
 }
 
@@ -3230,9 +3230,78 @@ fn path_rel(root: &Path, path: &Path) -> PathBuf {
 /// Only pages with `public:: true` are published, unless
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
+    publish_graph_to(
+        graph,
+        PublicationOutput {
+            parent: PathBuf::new(),
+            leaf: "publish".to_string(),
+            replace: true,
+        },
+    )
+    .map(|outcome| (outcome.path, outcome.pages))
+}
+
+/// Export public pages to a caller-selected directory under the graph root.
+/// The output capability remains graph-relative and uses the same staged,
+/// recoverable commit as the in-app publisher.
+pub fn publish_graph_to(graph: &Graph, output: PublicationOutput) -> io::Result<PublishOutcome> {
     let (pages, sources) = capture_direct_publication_sources(graph)?;
+    let mut target = PublicationTarget::graph_site();
+    // A nested output cannot keep the graph site's historical `../assets/`
+    // links: its pages sit more than one level below the graph. Make that
+    // portable case self-contained through the existing bounded asset copier.
+    if !output.parent.as_os_str().is_empty() {
+        target.asset_budget_bytes = Some(QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES);
+    }
+    target.output = output;
     graph.with_publication_query_reader(&sources, |reader| {
-        publish_graph_documents_with_queries(graph, pages, reader)
+        publish_graph_documents_inner(graph, pages, Some(reader), &target)
+    })
+}
+
+/// Export the public graph as the read-only app with the static HTML site as a
+/// no-JavaScript and `file://` fallback. `home_page` must be one of the pages
+/// selected by the graph's publication settings.
+pub fn publish_graph_app(
+    graph: &Graph,
+    bundle: std::sync::Arc<app_export::PublishedAppBundle>,
+    name: &str,
+    home_page: &str,
+) -> io::Result<PublishOutcome> {
+    publish_graph_app_to(
+        graph,
+        bundle,
+        name,
+        app_export::AppHome::Page(home_page.to_string()),
+        PublicationOutput {
+            parent: PathBuf::new(),
+            leaf: "publish".to_string(),
+            replace: true,
+        },
+    )
+}
+
+/// Export the read-only app to a caller-selected directory under the graph.
+pub fn publish_graph_app_to(
+    graph: &Graph,
+    bundle: std::sync::Arc<app_export::PublishedAppBundle>,
+    name: &str,
+    home: app_export::AppHome,
+    output: PublicationOutput,
+) -> io::Result<PublishOutcome> {
+    let (pages, sources) = capture_direct_publication_sources(graph)?;
+    let mut target = PublicationTarget::graph_site();
+    if !output.parent.as_os_str().is_empty() {
+        target.asset_budget_bytes = Some(QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES);
+    }
+    target.output = output;
+    target.app = Some(app_export::AppPublication {
+        name: name.to_string(),
+        bundle,
+        home,
+    });
+    graph.with_publication_query_reader(&sources, |reader| {
+        publish_graph_documents_inner(graph, pages, Some(reader), &target)
     })
 }
 
@@ -3306,9 +3375,10 @@ fn publish_graph_documents(
         .map(|outcome| (outcome.path, outcome.pages))
 }
 
-/// Render one already-authoritative document capture while every query surface
-/// reads the supplied coherent current-main snapshot.
-pub(crate) fn publish_graph_documents_with_queries(
+/// Render one test capture while every query reads the supplied coherent
+/// snapshot. Production callers capture directly through the public entrypoints.
+#[cfg(test)]
+fn publish_graph_documents_with_queries(
     graph: &Graph,
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
     queries: &dyn PublicationQueryRead,
@@ -3368,7 +3438,7 @@ pub struct PublicationTarget {
     /// local asset into `<leaf>/assets/` under this byte budget. `None`: the
     /// site keeps linking the graph's sibling `assets/` directory.
     pub asset_budget_bytes: Option<u64>,
-    /// `Some`: also publish the read-only app under `app/` (query exports).
+    /// `Some`: also publish the read-only app under `app/`.
     pub app: Option<app_export::AppPublication>,
 }
 
@@ -3586,10 +3656,13 @@ pub(crate) fn publish_graph_documents_inner(
             over_budget: None,
         })
     });
-    // Stage 2: a query export runs every query as the app will ask for it
-    // (`scope`) and, when it also ships the app, records each answer.
+    // A published app runs every query as the app will ask for it (`scope`)
+    // and records each answer. The static-only graph publisher needs neither.
     let is_query_export = matches!(target.selection, PublicationSelection::Paths(_));
-    let scope = is_query_export.then(|| RefCell::new(app_export::RenderScope::default()));
+    let scope = target
+        .app
+        .as_ref()
+        .map(|_| RefCell::new(app_export::RenderScope::default()));
     let recorder = target
         .app
         .as_ref()
@@ -3684,45 +3757,87 @@ pub(crate) fn publish_graph_documents_inner(
         match (app.bundle.index(), &recorder) {
             (Some(index), Some(recorder)) => {
                 let index_html = app_export::rewrite_index(index, &app.name)?;
-                // The export's own query, run for the app's home page: its
-                // lookup key is the home page, its binding and view are the
-                // reviewed ones, and the host block stays out (GH #469).
                 let taken: HashSet<String> = public
                     .iter()
                     .map(|(name, _, _)| crate::refs::page_key(name))
                     .collect();
-                let home_name = app_export::home_page_name(&app.name, &taken);
-                if let Some(scope) = &scope {
-                    let mut scope = scope.borrow_mut();
-                    scope.page = Some(home_name.clone());
-                    scope.block_properties = app.query.properties();
-                    scope.nesting = 0;
-                }
-                let input = app.query.dialect().input();
-                let overrides = QueryRunOverrides {
-                    context: Some(ExecutionContext {
-                        current_page: app.query.current_page.clone(),
-                    }),
-                    view: app.query.view.clone(),
-                    properties: Some(app.query.properties()),
-                    host_block_id: app.query.host_block_id.clone(),
+                let (home_name, synthetic_home) = match &app.home {
+                    app_export::AppHome::Query(query) => {
+                        // The export's own query, run for the app's synthetic
+                        // home under the reviewed binding and view (GH #469).
+                        let home_name = app_export::home_page_name(&app.name, &taken);
+                        if let Some(scope) = &scope {
+                            let mut scope = scope.borrow_mut();
+                            scope.page = Some(home_name.clone());
+                            scope.block_properties = query.properties();
+                            scope.nesting = 0;
+                        }
+                        let input = query.dialect().input();
+                        let overrides = QueryRunOverrides {
+                            context: Some(ExecutionContext {
+                                current_page: query.current_page.clone(),
+                            }),
+                            view: query.view.clone(),
+                            properties: Some(query.properties()),
+                            host_block_id: query.host_block_id.clone(),
+                        };
+                        run_static_query_with(
+                            &query.argument(),
+                            input,
+                            !matches!(input, crate::query::QueryInput::MacroTql),
+                            &ctx,
+                            overrides,
+                        )
+                        .map_err(|html| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "The export's query could not be run for the app: {}",
+                                    app_export::strip_tags(&html)
+                                ),
+                            )
+                        })?;
+                        (home_name, Some(query))
+                    }
+                    app_export::AppHome::Page(requested) => {
+                        let wanted = crate::refs::page_key(requested);
+                        let Some((name, _, _)) = public
+                            .iter()
+                            .find(|(name, _, _)| crate::refs::page_key(name) == wanted)
+                        else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "The published app home page \"{requested}\" is not public."
+                                ),
+                            ));
+                        };
+                        ((*name).to_string(), None)
+                    }
+                    app_export::AppHome::Auto => {
+                        let configured = graph.config.default_home.as_deref();
+                        let selected = configured
+                            .and_then(|requested| {
+                                let wanted = crate::refs::page_key(requested);
+                                public
+                                    .iter()
+                                    .find(|(name, _, _)| crate::refs::page_key(name) == wanted)
+                            })
+                            .or_else(|| {
+                                public.iter().find(|(name, _, _)| {
+                                    crate::refs::page_key(name) == "welcome to tine"
+                                })
+                            })
+                            .or_else(|| public.first())
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    "The published app has no public page to use as its home.",
+                                )
+                            })?;
+                        (selected.0.to_string(), None)
+                    }
                 };
-                run_static_query_with(
-                    &app.query.argument(),
-                    input,
-                    !matches!(input, crate::query::QueryInput::MacroTql),
-                    &ctx,
-                    overrides,
-                )
-                .map_err(|html| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "The export's query could not be run for the app: {}",
-                            app_export::strip_tags(&html)
-                        ),
-                    )
-                })?;
                 // The closed sub-graph: every graph-shaped answer the app
                 // needs (backlinks, block-ref counts, aliases, icons) comes
                 // from the selected pages and nothing else (I-8).
@@ -3745,7 +3860,7 @@ pub(crate) fn publish_graph_documents_inner(
                 let queries = std::mem::take(&mut recorder.borrow_mut().queries);
                 let snapshot_json = app_export::build_snapshot(app_export::SnapshotInputs {
                     name: &app.name,
-                    home: &app.query,
+                    synthetic_home,
                     closed: &closed.graph,
                     pages: &closed_pages,
                     queries,

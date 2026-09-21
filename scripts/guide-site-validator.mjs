@@ -45,3 +45,19 @@ export function validateGuideSiteLinks(dir) {
   }
   if (failures.length) throw new Error(`Guide link validation failed:\n${failures.join("\n")}`);
 }
+
+export function validateLiveGuide(dir) {
+  const root = fs.readFileSync(path.join(dir, "index.html"), "utf8");
+  const app = fs.readFileSync(path.join(dir, "app", "index.html"), "utf8");
+  const snapshot = JSON.parse(fs.readFileSync(path.join(dir, "app", "snapshot.json"), "utf8"));
+  const failures = [];
+  if (!root.includes('src="app-redirect.js"')) failures.push("root does not load the live-app redirect");
+  if (!app.includes('<meta name="tine-published" content="snapshot.json">')) {
+    failures.push("app shell lacks the published-snapshot marker");
+  }
+  if (snapshot.name !== "Tine Guide") failures.push("snapshot is not named Tine Guide");
+  if (snapshot.home !== "Welcome to Tine") failures.push("snapshot does not open Welcome to Tine");
+  if (!Array.isArray(snapshot.pages) || snapshot.pages.length === 0) failures.push("snapshot has no Guide pages");
+  if (snapshot.pages?.some((page) => page.read_only !== true)) failures.push("snapshot contains a writable page");
+  if (failures.length) throw new Error(`Live Guide validation failed:\n${failures.join("\n")}`);
+}

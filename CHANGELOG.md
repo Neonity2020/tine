@@ -42,6 +42,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Added
 - Clicking **N conflicts** opens a **Conflicts** page listing every page that needs a decision, grouped by source, with how many blocks are left on each. Click a page to resolve it, or shift-click to keep the list in view beside it; rows disappear as pages are resolved. The conflict lists in Settings → Backups & recovery moved there, including **Discard copy** for a sync copy whose page no longer exists. Suggested by EllisMorrow (GH #536).
 
+- Live exports now have shareable page and block links. With one pane and one
+  tab, the browser address follows navigation; the page and block menus provide
+  explicit copy actions, and opening a link restores its page or block in the
+  read-only exported app (GH #182).
+- Tine's desktop binary now has a documented command-line interface: `--help`
+  and `--version`; explicit `open` and `capture` commands; create-only static
+  and live graph exports with graph-relative output and an explicit `--replace`;
+  and a read-only `doctor` check. Existing `tine GRAPH` and `--capture`
+  invocations remain compatible. Linux packages install a generated `man tine`
+  page (GH #567).
 - Running with `TINE_DEBUG=1` (or `--debug`) now records the search index's
   lifecycle: when a validation starts reading the graph, how long that read
   took, how many pages it queued, each worker turn's duration and rows, and when

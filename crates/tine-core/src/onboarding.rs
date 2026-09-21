@@ -132,6 +132,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Reference/Platforms and mobile",
         markdown: include_str!("templates/platforms-and-mobile.md"),
     },
+    GuideTemplate {
+        title: "Reference/Command line",
+        markdown: include_str!("templates/command-line.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -679,6 +683,9 @@ mod tests {
         assert!(page.markdown.contains("Review unsaved"));
         assert!(page.markdown.contains("opens the **Conflicts** page"));
         assert!(!page.markdown.contains("Review in page"));
+        assert!(page.markdown.contains("Copy page link"));
+        assert!(page.markdown.contains("Copy block link"));
+        assert!(page.markdown.contains("one pane with one tab"));
 
         let index = GUIDE_TEMPLATES
             .iter()
@@ -1955,6 +1962,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_line_reference_covers_the_shipped_surface_and_safety_defaults() {
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Reference/Command line")
+            .expect("command-line reference is registered")
+            .markdown;
+        for promised in [
+            "tine --help",
+            "tine --version",
+            "tine open GRAPH",
+            "tine capture",
+            "tine export static GRAPH",
+            "tine export live GRAPH",
+            "tine doctor GRAPH",
+            "--replace",
+            "graph-relative",
+        ] {
+            assert!(page.contains(promised), "Guide omitted {promised}");
+        }
     }
 
     #[cfg(unix)]

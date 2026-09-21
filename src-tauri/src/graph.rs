@@ -36,7 +36,11 @@ pub(crate) fn resolve_root(path: &str) -> Option<String> {
             }
         }
     }
-    std::env::args().skip(1).find(|arg| !arg.starts_with('-'))
+    #[cfg(desktop)]
+    if let crate::cli::LaunchRequest::Open(path) = crate::cli::launch_request_env() {
+        return Some(path.display().to_string());
+    }
+    None
 }
 
 /// The remembered-graph lookup retains its historical best-effort semantics:

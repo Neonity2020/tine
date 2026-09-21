@@ -1,4 +1,4 @@
-//! Publish a query, Stage 2: the read-only app over a baked snapshot.
+//! The read-only published app over a baked snapshot.
 //!
 //! A query export (`published-queries/<folder>/`) additionally carries
 //! `app/`: the frontend bundle the exporting binary itself embeds, plus
@@ -7,7 +7,9 @@
 //! sub-graph and nothing else (I-8). The static site stays the no-JS fallback;
 //! its `index.html` redirects to `app/` when served over HTTP.
 //!
-//! Spec: `tine-agents/specs/notes/2026-09-14-publish-query-stage2.md`.
+//! A whole-graph publication can use the same app and open a selected source
+//! page directly; the public Guide uses that form. Query-export semantics are
+//! specified in `tine-agents/specs/notes/2026-09-14-publish-query-stage2.md`.
 
 use crate::doc;
 use crate::model::{Graph, PageDto, PageEntry, PageKind, RefGroup};
@@ -173,12 +175,24 @@ impl HomeQuery {
     }
 }
 
-/// What a query export asks for beyond the static site.
+/// What a published app asks for beyond the static site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPublication {
     pub name: String,
     pub bundle: Arc<PublishedAppBundle>,
-    pub query: HomeQuery,
+    pub home: AppHome,
+}
+
+/// Which page opens first in a published app. Query exports synthesize a page
+/// that owns the exported query; a whole-graph publication opens one of the
+/// selected source pages directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppHome {
+    Query(HomeQuery),
+    Page(String),
+    /// Prefer the graph's configured home when it is selected, then
+    /// `Welcome to Tine`, then the first selected page alphabetically.
+    Auto,
 }
 
 /// The execution-side parse of a `<% current page %>` macro: the substituted
@@ -212,7 +226,7 @@ pub struct QuerySnapshot {
 }
 
 /// Collects [`QuerySnapshot`]s while the static renderer runs; attached to the
-/// render context of a query export.
+/// render context of a published app.
 #[derive(Debug, Default)]
 pub(crate) struct QueryRecorder {
     pub queries: Vec<QuerySnapshot>,
@@ -378,7 +392,8 @@ pub(crate) const STATIC_APP_NOTE: &str = "<p class=\"publish-app-note\">Serve th
 
 pub(crate) struct SnapshotInputs<'a> {
     pub name: &'a str,
-    pub home: &'a HomeQuery,
+    /// `Some` only for a query export's synthetic home page.
+    pub synthetic_home: Option<&'a HomeQuery>,
     /// The selection-closed sub-graph (built from the public projection only).
     pub closed: &'a Graph,
     /// The public projection: entry + captured document, sorted by name.
@@ -406,31 +421,36 @@ struct Snapshot<'a> {
 /// `app/snapshot.json` bytes for one export (§3).
 pub(crate) fn build_snapshot(inputs: SnapshotInputs<'_>) -> io::Result<Vec<u8>> {
     let closed = inputs.closed;
-    let mut pages = Vec::with_capacity(inputs.pages.len() + 1);
+    let extra_home = usize::from(inputs.synthetic_home.is_some());
+    let mut pages = Vec::with_capacity(inputs.pages.len() + extra_home);
     let names: Vec<&str> = inputs
         .pages
         .iter()
         .map(|(entry, _)| entry.name.as_str())
         .collect();
-    let home_markdown = home_markdown(inputs.home, &names);
-    let mut home =
-        crate::model::markdown_page_dto(inputs.home_name, inputs.home_name, &home_markdown)?;
-    home.read_only = true;
-    pages.push(home);
+    if let Some(home) = inputs.synthetic_home {
+        let home_markdown = home_markdown(home, &names);
+        let mut home =
+            crate::model::markdown_page_dto(inputs.home_name, inputs.home_name, &home_markdown)?;
+        home.read_only = true;
+        pages.push(home);
+    }
     for (entry, document) in inputs.pages {
         let mut dto = crate::model::page_dto_checked(entry, document)?;
         dto.read_only = true;
         dto.path = entry.rel_path.clone();
         pages.push(dto);
     }
-    let mut entries = Vec::with_capacity(inputs.pages.len() + 1);
-    entries.push(PageEntry {
-        name: inputs.home_name.to_string(),
-        kind: PageKind::Page,
-        date_key: None,
-        rel_path: String::new(),
-        path: std::path::PathBuf::new(),
-    });
+    let mut entries = Vec::with_capacity(inputs.pages.len() + extra_home);
+    if inputs.synthetic_home.is_some() {
+        entries.push(PageEntry {
+            name: inputs.home_name.to_string(),
+            kind: PageKind::Page,
+            date_key: None,
+            rel_path: String::new(),
+            path: std::path::PathBuf::new(),
+        });
+    }
     entries.extend(closed.list_pages());
     let mut backlinks = BTreeMap::new();
     for (entry, _) in inputs.pages {

@@ -450,7 +450,7 @@ pub(crate) fn publish_query_documents(
             .map(|bundle| super::app_export::AppPublication {
                 name: request.name.clone(),
                 bundle: std::sync::Arc::clone(bundle),
-                query: super::app_export::HomeQuery {
+                home: super::app_export::AppHome::Query(super::app_export::HomeQuery {
                     source: request.query.clone(),
                     advanced: request.advanced,
                     simple_dialect: request.simple_dialect,
@@ -458,7 +458,7 @@ pub(crate) fn publish_query_documents(
                     view: request.view.clone(),
                     host_block_id: request.host_block_id.clone(),
                     host_properties: request.host_properties.clone(),
-                },
+                }),
             }),
     };
     let pages = capture

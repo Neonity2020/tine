@@ -1,5 +1,5 @@
-//! Build the static public Guide site from Tine's onboarding demo graph, using
-//! Tine's OWN HTML export — so the public Guide dogfoods the publish feature.
+//! Build the public Guide from Tine's onboarding demo graph as the read-only
+//! published app, with Tine's static HTML export retained as its fallback.
 //!
 //! Scaffolds the demo graph in a temp dir, publishes ALL its pages, and writes a
 //! self-contained site into the given output dir (e.g. `website/guide`). The demo
@@ -12,14 +12,16 @@
 //! Guide self-contained under one directory, the emitted HTML is rewritten to
 //! `assets/<file>` and the graph's `assets/` is copied in alongside the pages.
 //!
-//! Usage: cargo run -q -p tine-core --example build-guide-site -- website/guide
+//! Usage: cargo run -q -p tine-core --example build-guide-site -- website/guide dist
 //! (Re-run after changing the demo templates in src/templates/.)
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
 use tine_core::onboarding::create_demo_graph;
-use tine_core::publish::publish_graph;
+use tine_core::publish::app_export::PublishedAppBundle;
+use tine_core::publish::publish_graph_app;
 use tine_core::Graph;
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -37,11 +39,46 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn collect_app_bundle(root: &Path, dir: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+    for entry in fs::read_dir(dir).expect("read frontend bundle") {
+        let entry = entry.expect("frontend bundle entry");
+        let path = entry.path();
+        if entry
+            .file_type()
+            .expect("frontend bundle entry type")
+            .is_dir()
+        {
+            collect_app_bundle(root, &path, files);
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("frontend asset under bundle root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if PublishedAppBundle::ships(&relative) {
+            files.push((relative, fs::read(&path).expect("read frontend asset")));
+        }
+    }
+}
+
+fn app_bundle(root: &Path) -> PublishedAppBundle {
+    let mut files = Vec::new();
+    collect_app_bundle(root, root, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    PublishedAppBundle { files }
+}
+
 fn main() {
     let out = PathBuf::from(
         std::env::args()
             .nth(1)
-            .expect("usage: build-guide-site <out_dir>   (e.g. website/guide)"),
+            .expect("usage: build-guide-site <out_dir> <frontend_dist>"),
+    );
+    let frontend = PathBuf::from(
+        std::env::args()
+            .nth(2)
+            .expect("usage: build-guide-site <out_dir> <frontend_dist>"),
     );
 
     let tmp = std::env::temp_dir().join("tine-guide-site-build");
@@ -57,8 +94,14 @@ fn main() {
         .attach_direct_projection(projection_dir.path().join("direct.sqlite"))
         .expect("open main projection");
     graph.warm_cache();
-    let (publish_dir, count) = publish_graph(&graph).expect("publish demo graph");
-    let publish_dir = PathBuf::from(publish_dir);
+    let outcome = publish_graph_app(
+        &graph,
+        Arc::new(app_bundle(&frontend)),
+        "Tine Guide",
+        "Welcome to Tine",
+    )
+    .expect("publish live demo graph");
+    let publish_dir = PathBuf::from(&outcome.path);
 
     // Fresh output dir = the published pages, with self-contained asset paths.
     let _ = fs::remove_dir_all(&out);
@@ -78,5 +121,9 @@ fn main() {
     }
 
     let _ = fs::remove_dir_all(&tmp);
-    println!("published {count} pages -> {}", out.display());
+    println!(
+        "published {} pages as the live Guide -> {}",
+        outcome.pages,
+        out.display()
+    );
 }

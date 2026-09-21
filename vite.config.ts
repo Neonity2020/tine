@@ -24,6 +24,8 @@ const BUILD_TIME = reproBuildTime();
 // can name the exact build. Empty string if git isn't available (e.g. a source
 // tarball build); the About tab hides the row when it's empty.
 function gitCommit(): string {
+  const explicit = process.env.TINE_BUILD_COMMIT;
+  if (explicit !== undefined) return explicit;
   try {
     return execSync("git rev-parse --short HEAD", { encoding: "utf8" }).trim();
   } catch {
