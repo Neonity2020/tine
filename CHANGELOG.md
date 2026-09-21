@@ -82,6 +82,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   reads the pages anyway, instead of starting a second whole-graph pass that
   then delayed the index further; on Windows this doubled the time to a
   working search on 10,000 pages (GH #543).
+- Opening a large graph for the first time no longer throws away the
+  page-reading pass when today's journal, or any other page whose file has
+  not changed, is opened while it runs. Tine then read and parsed every page
+  a second time before search could start. An edit made during the pass
+  still restarts it (GH #543).
 - Advanced queries written the way Logseq's documentation and many
   `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
   or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or

@@ -149,23 +149,27 @@ impl Graph {
         // atomic with a finishing owner clearing its active flight. The nested
         // order is flight -> cache; installation holds only cache and releases it
         // before `finish_page_build` takes flight, so there is no inverse nesting.
-        let completed = {
+        let (completed, structural) = {
             let cache = self.cache.read().unwrap();
             let current_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            if current_generation != expected_generation {
+            let structural = self
+                .cache_structural_gen
+                .load(std::sync::atomic::Ordering::Acquire);
+            let completed = if current_generation != expected_generation {
                 Some(PageBuildOutcome::GenerationDrift)
             } else if cache.is_some() {
                 Some(PageBuildOutcome::AlreadyAvailable)
             } else {
                 None
-            }
+            };
+            (completed, structural)
         };
         if let Some(outcome) = completed {
-            let flight = Arc::new(PageBuildFlight::new(expected_generation));
+            let flight = Arc::new(PageBuildFlight::new(expected_generation, structural));
             flight.complete(outcome);
             return (flight, false);
         }
-        let flight = Arc::new(PageBuildFlight::new(expected_generation));
+        let flight = Arc::new(PageBuildFlight::new(expected_generation, structural));
         *active = Some(Arc::clone(&flight));
         drop(active);
         #[cfg(test)]
@@ -194,7 +198,7 @@ impl Graph {
             return flight.wait();
         }
         let built = self.load_all_pages_with_permit(permit);
-        let outcome = PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+        let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
         self.finish_page_build(&flight, outcome);
         outcome
     }
@@ -204,16 +208,20 @@ impl Graph {
     /// disk_revs so a reader never observes a fresh rev paired with a stale cache.
     pub(super) fn install_built(
         &self,
-        expected_generation: u64,
+        flight: &PageBuildFlight,
         built: PageCacheBuild,
     ) -> PageCacheInstallOutcome {
+        let expected_generation = flight.expected_generation;
         #[cfg(test)]
         if self
             .page_build_test
             .drift_before_install
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
+            // Real drift: a structural move, which no revision match excuses.
             self.cache_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.cache_structural_gen
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         let PageCacheBuild {
@@ -232,19 +240,29 @@ impl Graph {
             .map(|(e, d, _)| (e, Arc::new(d)))
             .collect();
         let index = build_page_cache_index(&pages);
+        let page_list: Vec<PageEntry> = pages.iter().map(|(entry, _)| entry.clone()).collect();
+        // Publish cache + revs atomically under the cache lock (cache → disk_revs
+        // order), but only at a generation that still describes what the owner
+        // parsed. A cache that another publisher already supplied is likewise
+        // never overwritten.
+        let mut guard = self.cache.write().unwrap();
+        // Opening a page publishes it even when its bytes are unchanged; a
+        // cold open does that for today's journal while this parse runs, and
+        // discarding the parse for it sent the next reader into a second
+        // whole-graph parse (GH #543). Such a move leaves the parse current.
+        let Some(generation) = self.generation_after_benign_drift(
+            expected_generation,
+            flight.expected_structural,
+            |path| revs.get(path).map(String::as_str),
+        ) else {
+            return PageCacheInstallOutcome::GenerationDrift;
+        };
+        let expected_generation = generation;
         let effective_index = Arc::new(build_effective_identity_index(
             expected_generation,
             &pages,
             failures.clone(),
         ));
-        let page_list = pages.iter().map(|(entry, _)| entry.clone()).collect();
-        // Publish cache + revs atomically under the cache lock (cache → disk_revs
-        // order), but only at the exact generation the owner parsed. A cache that
-        // another publisher already supplied is likewise never overwritten.
-        let mut guard = self.cache.write().unwrap();
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != expected_generation {
-            return PageCacheInstallOutcome::GenerationDrift;
-        }
         if guard.is_some() && self.page_index_failures.read().unwrap().is_empty() {
             return PageCacheInstallOutcome::AlreadyAvailable;
         }
@@ -298,8 +316,7 @@ impl Graph {
             let (flight, owner) = self.claim_page_build(expected_generation);
             if owner {
                 let built = self.load_all_pages_with_permit(&permit);
-                let outcome =
-                    PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+                let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
                 self.finish_page_build(&flight, outcome);
             } else {
                 let _ = flight.wait();
@@ -622,10 +639,26 @@ impl Graph {
         structural: u64,
         sources: &[(PageEntry, String)],
     ) -> Option<u64> {
-        use std::sync::atomic::Ordering;
+        let read: std::collections::HashMap<&Path, &str> = sources
+            .iter()
+            .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
+            .collect();
         // Every mover publishes its session record and bumps both counters
         // under the cache write lock, so this read lock sees them together.
         let _cache = self.cache.read().unwrap();
+        self.generation_after_benign_drift(read_at, structural, |path| read.get(path).copied())
+    }
+
+    /// The shared rule behind `warm_generation_after_drift` and cold
+    /// installation. The caller holds the cache lock (read or write), which
+    /// every mover takes to publish its session record and bump the counters.
+    fn generation_after_benign_drift<'a>(
+        &self,
+        read_at: u64,
+        structural: u64,
+        read: impl Fn(&Path) -> Option<&'a str>,
+    ) -> Option<u64> {
+        use std::sync::atomic::Ordering;
         let current = self.cache_gen.load(Ordering::Acquire);
         if current == read_at {
             return Some(current);
@@ -634,16 +667,12 @@ impl Graph {
             return None;
         }
         let config = self.config.parse_config().digest();
-        let read: std::collections::HashMap<&Path, &str> = sources
-            .iter()
-            .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
-            .collect();
         self.session_page_ids
             .read()
             .unwrap()
             .iter()
             .all(|(path, ids)| {
-                ids.config == config && read.get(path.as_path()) == Some(&ids.revision.as_str())
+                ids.config == config && read(path.as_path()) == Some(ids.revision.as_str())
             })
             .then_some(current)
     }
@@ -690,8 +719,7 @@ impl Graph {
                     pages: Vec::new(),
                     failures: vec![failure],
                 };
-                let outcome =
-                    PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+                let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
                 self.finish_page_build(&flight, outcome);
                 return outcome.installed() && !cancelled();
             }
@@ -755,7 +783,7 @@ impl Graph {
             self.finish_page_build(&flight, PageBuildOutcome::Cancelled);
             return false;
         }
-        let outcome = PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+        let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
         self.finish_page_build(&flight, outcome);
         outcome.installed() && !cancelled()
     }

@@ -112,14 +112,18 @@ impl From<PageCacheInstallOutcome> for PageBuildOutcome {
 
 pub(super) struct PageBuildFlight {
     pub(super) expected_generation: u64,
+    /// `cache_structural_gen` at the claim: with the parsed revisions, it
+    /// tells a harmless generation move from real drift at installation.
+    pub(super) expected_structural: u64,
     outcome: std::sync::Mutex<Option<PageBuildOutcome>>,
     completed: std::sync::Condvar,
 }
 
 impl PageBuildFlight {
-    pub(super) fn new(expected_generation: u64) -> Self {
+    pub(super) fn new(expected_generation: u64, expected_structural: u64) -> Self {
         Self {
             expected_generation,
+            expected_structural,
             outcome: std::sync::Mutex::new(None),
             completed: std::sync::Condvar::new(),
         }

@@ -4889,13 +4889,23 @@ fn install_built_publishes_only_at_its_exact_generation() {
         let permit = graph.admit_retained_graph_text_writer().unwrap();
         let expected = graph.cache_generation();
         let built = graph.load_all_pages_with_permit(&permit);
+        let flight = PageBuildFlight::new(
+            expected,
+            graph
+                .cache_structural_gen
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         if drift {
+            // A structural move (removal or invalidation) is real drift.
             graph
                 .cache_gen
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
+            graph
+                .cache_structural_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
 
-        let outcome = graph.install_built(expected, built);
+        let outcome = graph.install_built(&flight, built);
 
         if drift {
             assert_eq!(outcome, PageCacheInstallOutcome::GenerationDrift);
@@ -15898,3 +15908,77 @@ mod journal_lookup;
 
 #[path = "model_tests_advanced_queries.rs"]
 mod advanced_queries;
+
+/// Opening an unchanged page during the cold parse publishes it and moves the
+/// cache generation. The parse must still install: discarding it made the
+/// next reader parse the whole graph again (GH #543).
+#[test]
+fn gh543_cold_parse_survives_an_unchanged_page_open() {
+    let dir = scratch("gh543-cold-parse-unchanged");
+    for index in 0..3 {
+        fs::write(
+            dir.join("pages").join(format!("Existing{index}.md")),
+            "- unchanged\n",
+        )
+        .unwrap();
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    let pause = Arc::new(PageBuildTestPause::new());
+    *graph.page_build_test.owner_pause.lock().unwrap() = Some(Arc::clone(&pause));
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache_cancellable(|| false))
+    };
+    pause.reached.wait();
+    let entry = graph
+        .entry_for_path(&dir.join("pages/Existing0.md"))
+        .unwrap();
+    graph.load_page(&entry).unwrap();
+    pause.release.wait();
+    let completed = warmer.join().unwrap();
+    *graph.page_build_test.owner_pause.lock().unwrap() = None;
+    let first_parses = graph.page_build_parses_test();
+    graph.with_pages(|_| ());
+    let total_parses = graph.page_build_parses_test();
+    graph
+        .wait_for_direct_projection_for_test(std::time::Duration::from_secs(5))
+        .unwrap();
+    graph.detach_direct_projection(std::time::Duration::from_secs(5));
+    let _ = fs::remove_dir_all(&dir);
+    assert!(completed, "the cold pass was discarded");
+    assert_eq!(total_parses, first_parses, "a second whole-graph parse ran");
+}
+
+/// An edit that lands after the cold parse read the page is real drift: the
+/// parse holds the old bytes and must not install over the edit.
+#[test]
+fn gh543_cold_parse_still_yields_to_an_edit_after_it_read_the_page() {
+    let dir = scratch("gh543-cold-parse-edited");
+    fs::write(dir.join("pages/Existing.md"), "- unchanged\n").unwrap();
+    let graph = Graph::open(&dir);
+    let permit = graph.admit_retained_graph_text_writer().unwrap();
+    let flight = PageBuildFlight::new(
+        graph.cache_generation(),
+        graph
+            .cache_structural_gen
+            .load(std::sync::atomic::Ordering::Acquire),
+    );
+    let built = graph.load_all_pages_with_permit(&permit);
+    drop(permit);
+    let entry = graph
+        .entry_for_path(&dir.join("pages/Existing.md"))
+        .unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    let base = page.rev.clone().unwrap();
+    page.blocks[0].raw = "changed".into();
+    graph.save_page(&page, Some(&base)).unwrap();
+
+    assert_eq!(
+        graph.install_built(&flight, built),
+        PageCacheInstallOutcome::GenerationDrift
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
