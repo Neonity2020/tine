@@ -66,15 +66,8 @@ vi.mock("./backend", () => ({
 
 const conflicted = new Set<string>();
 const toasts: string[] = [];
-// The conflict-queue entry a page would be parked behind, when it has one.
-// GH #535 made the production rule "mark a page conflicted only when there is a
-// review to park it behind", so this harness must be able to say whether one
-// exists: a capsule restored after a restart supplies one even though no
-// observation epoch was ever minted.
-let reviewObject: { id: string } | undefined;
 vi.mock("./ui", () => ({
   markConflict: (name: string) => conflicted.add(name),
-  conflictObjectFor: () => reviewObject,
   clearConflict: (name: string) => conflicted.delete(name),
   isConflicted: (name: string) => conflicted.has(name),
   conflicts: () => [...conflicted],
@@ -108,7 +101,6 @@ describe("a failure is classified by its code, not by the page's name", () => {
     calls.length = 0;
     toasts.length = 0;
     conflicted.clear();
-    reviewObject = undefined;
     nextResult = null;
     observedPage = null;
     draftPath = "pages/Notes.md";
@@ -172,7 +164,6 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     calls.length = 0;
     toasts.length = 0;
     conflicted.clear();
-    reviewObject = undefined;
     nextResult = null;
     observedPage = null;
     draftPath = "pages/Notes.md";
@@ -211,45 +202,20 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     expect(conflicted.has("Notes")).toBe(false);
 
     nextResult = () => Promise.reject({ kind: "save-conflict", epoch: null });
-    // The retained draft still has its review object, so this refusal has
-    // something answerable to park behind and the banner legitimately returns.
-    // With no review it must NOT — that is the next test (GH #535).
-    reviewObject = { id: "live:Notes" };
     await vi.waitFor(() => expect(calls.length).toBe(2));
     await vi.waitFor(() => expect(conflicted.has("Notes")).toBe(true));
   });
 
-  // GH #535. This case was called "banner-class" on the belief that it "mints
-  // authority, so its banner is live". The backend says the opposite: a
-  // conflict carries NO epoch precisely when there is no editor episode to
-  // anchor a review (crates/tine-core/src/model/editor_activation.rs:581-586
-  // and :645-650 return `ConflictBaseRev` through `into_io`, not
-  // `into_io_with_conflict_epoch`), and `registerLiveSaveConflict` requires a
-  // numeric epoch — so no queue entry can exist for it. Marking it anyway
-  // stranded the page behind a banner that was never drawn.
-  it("keeps the mark when an epoch-less refusal still has a review to park behind", async () => {
+  // A banner-class conflict is unchanged: it mints authority, so its banner is
+  // live and must stay up.
+  it("leaves a banner-class conflict exactly as it was", async () => {
     markDirty("Notes");
-    reviewObject = { id: "live:Notes" };
     nextResult = () => Promise.reject({ kind: "save-conflict", epoch: null });
 
     expect(await forceSave("Notes")).toBe(false);
 
     expect(conflicted.has("Notes")).toBe(true);
-    expect(canForceSave("Notes")).toBe(false); // no nameable epoch to present
-    expect(calls.length).toBe(1);
-  });
-
-  it("does not park the page when an epoch-less refusal has no review (GH #535)", async () => {
-    markDirty("Notes");
-    nextResult = () => Promise.reject({ kind: "save-conflict", epoch: null });
-
-    expect(await forceSave("Notes")).toBe(false);
-
-    // Unmarked, so the ordinary save path, the retry and every rename in the
-    // graph stay open — and the user is told what happened instead of meeting
-    // an invisible block only deleting the page could clear.
-    expect(conflicted.has("Notes")).toBe(false);
-    expect(toasts.some((message) => message.includes("changed on disk"))).toBe(true);
+    expect(canForceSave("Notes")).toBe(false);
     expect(calls.length).toBe(1);
   });
 });

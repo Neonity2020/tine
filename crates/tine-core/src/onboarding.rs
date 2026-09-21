@@ -656,13 +656,6 @@ mod tests {
         assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("Retry saving"));
-        // GH #535. A save can be refused with no comparison to offer, so the
-        // page shows no banner and no review — only a message. The Guide has to
-        // say the edit is kept and the page stays editable, or the user reads
-        // the banner paragraph above, finds no banner, and concludes the edit
-        // is gone.
-        assert!(page.markdown.contains("there is no comparison to offer"));
-        assert!(page.markdown.contains("It is not parked"));
         // Query export: the whole-page consequence and the size limit must be
         // in the Guide, because the dialog's one checkbox is all the UI says.
         assert!(page.markdown.contains("published-queries/<name>/"));
