@@ -4659,6 +4659,33 @@
   "failBefore": "proven"
  },
  "notes": "GH #546. Page-header properties authored as the flagless properties-only first bullet are folded into pre_block by the frontend projection (GH #198). That fold rewrites the file but was never reconciled into the store, so from that save on the store held the header as an ordinary root with an empty preBlock while the file held it as a preamble. The next keystroke leaving the bullet transiently not properties-only then proposed pre_block:null plus a property-bearing outline block - exactly what the GH #163 data-preservation firewall refuses. That refusal is built by projection_semantic_refusal, which carries no typed DirectSaveError, so direct_save_failure_code falls through to its Unknown default; 'unknown' is absent from the frontend's non-retryable denylist, so the save was retried at 100 ms and 300 ms and the third failure pushed the reporter's red toast, verbatim, while the block was still being edited. A successful save now marks the folded root as the page header (compare-and-swap on the exact folded text), which hands the page to the header path: it folds byte-identically and defers while invalid instead of contradicting the file. Separately, autosave no longer reports an invalid header at all - it fires shortly after a typing pause, so a half-written header is the ordinary state of an unfinished edit - and the validation message moved to where the header editor closes, which is the reporter's stated expectation. Deferring is safe only because the store now knows what the file holds: on a page whose file has no preamble the same shape still saves as outline, so an unconditional defer would have made such a page never save."
+},
+{
+ "id": "REG-RENAME-PORTABLE-LISTING-QUADRATIC-406",
+ "title": "Renaming a page costs time linear in the graph, not in referrers times folder size",
+ "family": "page-rename",
+ "sources": {
+  "issues": [
+   406
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "native",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_rename_cost_tests.rs::rename_lists_each_directory_a_bounded_number_of_times_regardless_of_referrers",
+   "crates/tine-core/src/model_rename_cost_tests.rs::a_case_twin_appearing_mid_rename_still_refuses_and_rolls_back",
+   "crates/tine-core/src/model_rename_cost_tests.rs::a_referrer_twin_appearing_mid_rename_leaves_the_rename_all_or_nothing",
+   "crates/tine-core/tests/gh406_rename_cost.rs"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #406. The reporter's timings grew faster than the graph. Cause: the portable case/NFC name check (validate_graph_text_portable_aliases_path_local) listed every entry of each ancestor directory on EVERY write, so the rename's write phase cost rewritten files x pages/ entries - measured at 0.16 ms per write on a 500-file folder, 2.2 ms at 8,000 and 4.5 ms at 16,000, about 80-85% of the write phase. The rename transaction now lists each directory once (PortableListingBatch) for its in-place referrer rewrites; a file creation (the moved page) still checks live, because a published twin cannot always be withdrawn on rollback. Fail-before: 2 vs 30 referrers listed pages/ 16 vs 72 times; after, equal. The mid-rename twin tests arm the write hook at a later mutation so the batch is provably stale; without the live creation check the destination published next to its twin and the rollback could not withdraw it (necessity run). Optimized Linux fixture, 8,000 pages: 800 referrers 2,637 ms -> 844 ms; 500/2k/8k pages 16x the pages cost 17.7x the time (was 29x). Not addressed here: every rename still reads every graph file (~5-6x the raw read floor), and the frontend reloads the whole graph afterwards (tracked with GH #535's targeted refresh). The reporter's negative follow-up on the earlier partial fix (REG-DIRECT-RENAME-LITERAL-SCANNER-406) stands; Windows latency is unmeasured."
 }
 ]
 }

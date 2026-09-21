@@ -47,6 +47,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- Renaming a page that many other pages link to is much faster in a large
+  graph. Every file the rename rewrote re-listed the whole pages folder to
+  check for names that differ only in case or accents, so the cost grew with
+  the number of linking pages times the size of the folder; the folder is now
+  listed once per rename. On an 8,000-page graph, a rename touching 800 pages
+  went from about 2.6 s to 0.8 s of file work, and time now grows in step with
+  the graph. The rename still reads every file once, and the app still reloads
+  the graph afterwards (GH #406).
 - Renaming a page no longer stops working for the whole graph until you delete
   and recreate a page. When a save was refused because the file had changed on
   disk, Tine could mark the page conflicted without being able to offer it for

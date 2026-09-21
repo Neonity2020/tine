@@ -1,6 +1,7 @@
 //! Graph's page rename and delete: the rename transaction (with its editor
 //! lifecycle), page deletion, and the page-mutation target and external-scope guards.
 
+use super::graph_text_targets::PortableListingBatch;
 use super::*;
 use crate::direct_projection::PageSetChange;
 
@@ -486,6 +487,9 @@ impl Graph {
         // external replacement at the syscall boundary is preserved as an inode.
         let mut written: Vec<(&Edit, Option<PathBuf>)> = Vec::new();
         let result: io::Result<()> = (|| {
+            // GH #406: list each directory once for the whole write phase
+            // instead of once per written file (see `PortableListingBatch`).
+            let listings = PortableListingBatch::begin();
             for e in &edits {
                 // Phase 2 can be far in the past for a large graph. Recheck this
                 // exact file immediately before its write so an external editor or
@@ -499,12 +503,19 @@ impl Graph {
                         self.graph_text_create_dir_all(&write, parent)?;
                     }
                 }
-                self.graph_text_atomic_write_from_transaction_inventory(
-                    &write,
-                    &e.dst,
-                    e.new_content.as_bytes(),
-                    e.is_move && e.dst != e.src,
-                )?;
+                let publish = || {
+                    self.graph_text_atomic_write_from_transaction_inventory(
+                        &write,
+                        &e.dst,
+                        e.new_content.as_bytes(),
+                        e.is_move && e.dst != e.src,
+                    )
+                };
+                if e.is_move && e.dst != e.src {
+                    listings.suspended(publish)?;
+                } else {
+                    publish()?;
+                }
                 written.push((e, None));
                 if e.is_move && e.dst != e.src {
                     rename_source_remove_failpoint()?;
@@ -524,6 +535,7 @@ impl Graph {
                     }
                 }
             }
+            drop(listings);
             Ok(())
         })();
         if let Err(err) = result {

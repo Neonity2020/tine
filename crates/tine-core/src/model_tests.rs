@@ -10006,6 +10006,9 @@ fn creation_refuses_historical_arbitrary_and_explicit_semantic_owners() {
 #[path = "model_alias_admission_tests.rs"]
 mod alias_admission;
 
+#[path = "model_rename_cost_tests.rs"]
+mod rename_cost;
+
 /// GH #366's literal reporter page name. Unicode itself must not make an
 /// otherwise ordinary Direct Files creation ambiguous; the neighboring test
 /// retains the fail-closed NFC/NFD collision boundary.

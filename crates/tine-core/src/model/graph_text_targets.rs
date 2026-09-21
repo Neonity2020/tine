@@ -241,31 +241,85 @@ impl Graph {
             let mut next = Vec::new();
 
             for prefix in prefixes {
-                for entry in prefix.directory.entries()? {
-                    all_entries = all_entries
-                        .checked_add(1)
-                        .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
-                    if all_entries > limits.all_entries {
-                        return Err(graph_text_inventory_limit_error("all directory entries"));
+                // GH #406: inside a multi-file transaction the directory was
+                // listed once, indexed by portable identity, so only the
+                // entries sharing the requested component's identity are
+                // visited. Outside one, every entry is streamed as before.
+                let batched = portable_listing_batch_get(&prefix.directory, &prefix.relative)?;
+                let entries: Box<
+                    dyn Iterator<Item = io::Result<(Option<String>, PortableEntryType)>>,
+                > = match &batched {
+                    Some(listing) => {
+                        all_entries =
+                            all_entries.checked_add(listing.entries).ok_or_else(|| {
+                                graph_text_inventory_limit_error("all directory entries")
+                            })?;
+                        if all_entries > limits.all_entries {
+                            return Err(graph_text_inventory_limit_error("all directory entries"));
+                        }
+                        path_bytes = path_bytes
+                            .checked_add(listing.path_bytes_under(&prefix.relative)?)
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate path bytes")
+                            })?;
+                        if path_bytes > limits.path_bytes {
+                            return Err(graph_text_inventory_limit_error("aggregate path bytes"));
+                        }
+                        Box::new(listing.sharing_identity_with(requested_component).map(
+                            |(name, file_type)| {
+                                Ok((
+                                    Some(name.clone()),
+                                    PortableEntryType::Known(file_type.clone()),
+                                ))
+                            },
+                        ))
                     }
-                    let entry = entry?;
-                    let name = entry.file_name();
-                    let Some(name) = name.to_str() else {
+                    None => {
+                        #[cfg(test)]
+                        GRAPH_TEXT_PORTABLE_DIRECTORY_LISTINGS
+                            .with(|count| count.set(count.get().saturating_add(1)));
+                        Box::new(prefix.directory.entries()?.map(|entry| {
+                            entry.map(|entry| {
+                                (
+                                    entry.file_name().into_string().ok(),
+                                    PortableEntryType::Live(entry),
+                                )
+                            })
+                        }))
+                    }
+                };
+                for listed in entries {
+                    if batched.is_none() {
+                        all_entries = all_entries.checked_add(1).ok_or_else(|| {
+                            graph_text_inventory_limit_error("all directory entries")
+                        })?;
+                        if all_entries > limits.all_entries {
+                            return Err(graph_text_inventory_limit_error("all directory entries"));
+                        }
+                    }
+                    let (name, entry) = listed?;
+                    let Some(name) = name.as_deref() else {
                         // GraphTextPath is UTF-8 by contract, so this entry cannot
                         // share the requested portable component identity.
                         continue;
                     };
-                    let relative_len = prefix
-                        .relative
-                        .len()
-                        .checked_add(usize::from(!prefix.relative.is_empty()))
-                        .and_then(|length| length.checked_add(name.len()))
-                        .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
-                    path_bytes = path_bytes
-                        .checked_add(usize_to_u64(relative_len)?)
-                        .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
-                    if path_bytes > limits.path_bytes {
-                        return Err(graph_text_inventory_limit_error("aggregate path bytes"));
+                    if batched.is_none() {
+                        let relative_len = prefix
+                            .relative
+                            .len()
+                            .checked_add(usize::from(!prefix.relative.is_empty()))
+                            .and_then(|length| length.checked_add(name.len()))
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate path bytes")
+                            })?;
+                        path_bytes = path_bytes
+                            .checked_add(usize_to_u64(relative_len)?)
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate path bytes")
+                            })?;
+                        if path_bytes > limits.path_bytes {
+                            return Err(graph_text_inventory_limit_error("aggregate path bytes"));
+                        }
                     }
                     if !PortablePathKey::graph_text_component_matches(
                         name,
@@ -991,4 +1045,165 @@ impl Graph {
             }
         }
     }
+}
+
+/// One directory as the portable-alias check sees it, listed once and indexed
+/// by portable (case/NFC) identity. Built only inside a
+/// [`PortableListingBatch`].
+pub(super) struct PortableListing {
+    /// Every entry, UTF-8 or not: the same count the streaming path charges.
+    entries: usize,
+    /// UTF-8 entries and the sum of their name bytes, to charge the same
+    /// aggregate path bytes the streaming path does without re-walking.
+    utf8_entries: usize,
+    utf8_name_bytes: usize,
+    by_identity: std::collections::HashMap<PortablePathKey, Vec<(String, cap_std::fs::FileType)>>,
+}
+
+impl PortableListing {
+    fn read(directory: &Dir) -> io::Result<Self> {
+        #[cfg(test)]
+        GRAPH_TEXT_PORTABLE_DIRECTORY_LISTINGS
+            .with(|count| count.set(count.get().saturating_add(1)));
+        let mut listing = Self {
+            entries: 0,
+            utf8_entries: 0,
+            utf8_name_bytes: 0,
+            by_identity: std::collections::HashMap::new(),
+        };
+        for entry in directory.entries()? {
+            listing.entries = listing
+                .entries
+                .checked_add(1)
+                .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            listing.utf8_entries += 1;
+            listing.utf8_name_bytes = listing
+                .utf8_name_bytes
+                .checked_add(name.len())
+                .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
+            let file_type = entry.file_type()?;
+            listing
+                .by_identity
+                .entry(PortablePathKey::from_graph_text_path(&name))
+                .or_default()
+                .push((name, file_type));
+        }
+        Ok(listing)
+    }
+
+    /// Exactly the aggregate path bytes the streaming path charges for this
+    /// directory: `relative/name` for every UTF-8 entry.
+    fn path_bytes_under(&self, relative: &str) -> io::Result<u64> {
+        let per_entry_prefix = relative.len() + usize::from(!relative.is_empty());
+        per_entry_prefix
+            .checked_mul(self.utf8_entries)
+            .and_then(|prefixes| prefixes.checked_add(self.utf8_name_bytes))
+            .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))
+            .and_then(usize_to_u64)
+    }
+
+    fn sharing_identity_with<'a>(
+        &'a self,
+        component: &str,
+    ) -> impl Iterator<Item = &'a (String, cap_std::fs::FileType)> + 'a {
+        self.by_identity
+            .get(&PortablePathKey::from_graph_text_path(component))
+            .into_iter()
+            .flatten()
+    }
+}
+
+pub(super) enum PortableEntryType {
+    Live(cap_std::fs::DirEntry),
+    Known(cap_std::fs::FileType),
+}
+
+impl PortableEntryType {
+    fn file_type(&self) -> io::Result<cap_std::fs::FileType> {
+        match self {
+            Self::Live(entry) => entry.file_type(),
+            Self::Known(file_type) => Ok(file_type.clone()),
+        }
+    }
+}
+
+thread_local! {
+    static PORTABLE_LISTING_BATCH: std::cell::RefCell<
+        Option<std::collections::HashMap<String, std::rc::Rc<PortableListing>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Share directory listings across the portable-alias checks of ONE
+/// multi-file transaction on this thread (GH #406).
+///
+/// Without it a page rename that rewrites k files of a folder holding N
+/// entries lists that folder k times — k x N work, 80% of an 800-referrer
+/// rename on an 8,000-page `pages/`.
+///
+/// A batched listing is older than the per-file listing it replaces, which
+/// widens the check's existing race window (listing -> write) from one file
+/// to the transaction's write phase. That is acceptable only for in-place
+/// rewrites of existing files, where a missed twin means the rewrite lands
+/// exactly as it would have in the old window. A CREATION publishes a new
+/// name and runs through [`PortableListingBatch::suspended`], so its check
+/// stays live. Do not add a post-write re-validation instead: a refusal there
+/// cannot always roll back, because restoring a file next to its new twin is
+/// itself refused, and a half-rolled-back rename is worse than either outcome.
+/// The guard is thread-local, so a save on another thread never sees it.
+pub(super) struct PortableListingBatch {
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl PortableListingBatch {
+    pub(super) fn begin() -> Self {
+        PORTABLE_LISTING_BATCH.with(|batch| {
+            let mut batch = batch.borrow_mut();
+            debug_assert!(batch.is_none(), "portable listing batches do not nest");
+            *batch = Some(std::collections::HashMap::new());
+        });
+        Self {
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    /// Run `f` with the batch set aside, so its checks list directories live.
+    /// A file CREATION must use this: its check is the last line of defence
+    /// before a new name is published, and a published twin cannot always be
+    /// withdrawn again on rollback (the withdrawal itself refuses the twin).
+    pub(super) fn suspended<T>(&self, f: impl FnOnce() -> T) -> T {
+        let listings = PORTABLE_LISTING_BATCH.with(|batch| batch.borrow_mut().take());
+        let result = f();
+        PORTABLE_LISTING_BATCH.with(|batch| *batch.borrow_mut() = listings);
+        result
+    }
+}
+
+impl Drop for PortableListingBatch {
+    fn drop(&mut self) {
+        PORTABLE_LISTING_BATCH.with(|batch| *batch.borrow_mut() = None);
+    }
+}
+
+/// The batched listing of `directory` (named `relative` under the graph root),
+/// listing it on first use; `None` outside a batch.
+fn portable_listing_batch_get(
+    directory: &Dir,
+    relative: &str,
+) -> io::Result<Option<std::rc::Rc<PortableListing>>> {
+    PORTABLE_LISTING_BATCH.with(|batch| {
+        let mut batch = batch.borrow_mut();
+        let Some(listings) = batch.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(listing) = listings.get(relative) {
+            return Ok(Some(listing.clone()));
+        }
+        let listing = std::rc::Rc::new(PortableListing::read(directory)?);
+        listings.insert(relative.to_owned(), listing.clone());
+        Ok(Some(listing))
+    })
 }

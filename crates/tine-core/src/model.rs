@@ -550,6 +550,7 @@ thread_local! {
     static GRAPH_TEXT_PARSE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static GRAPH_TEXT_PORTABLE_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_TEXT_PORTABLE_DIRECTORY_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_TEXT_EVENT_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -852,10 +853,10 @@ fn graph_text_write_after_identity_check_hook() {}
 
 #[cfg(test)]
 fn graph_text_write_before_mutation_hook() -> io::Result<()> {
-    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| match hook.borrow_mut().take() {
-        Some(hook) => hook(),
-        None => Ok(()),
-    })
+    // Take the hook and release the borrow before running it, so a hook can
+    // re-arm itself to fire on a later mutation.
+    let hook = GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| hook.borrow_mut().take());
+    hook.map_or(Ok(()), |hook| hook())
 }
 
 #[cfg(not(test))]
