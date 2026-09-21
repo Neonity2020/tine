@@ -7,11 +7,13 @@ import { doc, loadSingle, pageByName, resetStore } from "../store";
 import { initParser } from "../render/parse";
 import type { BlockDto, PageDto, PageEntry } from "../types";
 import { Block } from "./Block";
+import { setAliasMap } from "../ui";
 
 beforeAll(() => initParser());
 
 afterEach(() => {
   vi.restoreAllMocks();
+  setAliasMap({});
   resetStore();
   document.body.innerHTML = "";
 });
@@ -144,6 +146,34 @@ describe("reference authoring", () => {
         [...document.body.querySelectorAll(".autocomplete .ac-label")].map((row) => row.textContent),
       ).toEqual(["小明", "小明的家", "我是小明"]));
       expect(document.body.textContent).not.toContain('Create "小明"');
+    } finally {
+      dispose();
+    }
+  });
+
+  it("labels an alias suggestion with the page it belongs to and inserts the alias (GH #558, GH #482)", async () => {
+    // Core returns an authored alias as its own row, on its owner's file.
+    vi.spyOn(backend(), "quickSwitch").mockResolvedValue([
+      { name: "Tine greet", kind: "page", date_key: null, path: "pages/Welcome to Tine.md" },
+      entry("Tinsel"),
+    ]);
+    setAliasMap({ "tine greet": "Welcome to Tine", "welcome to tine": "Welcome to Tine", tinsel: "Tinsel" });
+    loadSingle(page("[[Tin]]"));
+    startEditing("reference-authoring", 5);
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Reference authoring")?.roots ?? []}>{(id) => <Block id={id} />}</For>
+    ));
+    try {
+      const textarea = root.querySelector("textarea.block-editor") as HTMLTextAreaElement;
+      inputAt(textarea, "[[Tin]]", 5);
+      const rowFor = (label: string) => [...document.body.querySelectorAll(".autocomplete .ac-label")]
+        .find((row) => row.textContent === label)?.parentElement;
+      await vi.waitFor(() => expect(rowFor("Tine greet")).toBeTruthy());
+      expect(rowFor("Tine greet")?.querySelector(".ac-sub")?.textContent).toBe("alias of Welcome to Tine");
+      // An ordinary page carries no alias badge.
+      expect(rowFor("Tinsel")?.querySelector(".ac-sub")).toBeNull();
+      (rowFor("Tine greet") as HTMLElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      await vi.waitFor(() => expect(textarea.value.trim()).toBe("[[Tine greet]]"));
     } finally {
       dispose();
     }

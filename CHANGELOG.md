@@ -47,6 +47,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- Typing a page's alias after `[[` or `#` now offers it, and the row says
+  which page it is an alias of. Choosing it inserts the alias as you wrote it,
+  and the link opens the real page (GH #558, GH #482).
 - One page that cannot be saved no longer blocks every rename in the graph.
   A rename used to need every open page saved first, so a single page whose
   save kept being refused made every rename fail until you deleted and

@@ -1036,6 +1036,8 @@ mod tests {
         assert!(reference
             .markdown
             .contains("checked when you finish editing that header"));
+        // An alias completion row names the page it belongs to (GH #558).
+        assert!(reference.markdown.contains("labelled **alias of** its page"));
     }
 
     #[test]

@@ -11363,6 +11363,32 @@
       "notes": "Real touch Chromium reproduces pointerup dispatch, focused-editor bridge handoff, toolbar replacement, and duplicate synthesized click on eb1f83d3. Scrolled strip loses its position; packet preserves toolbar ownership and consumes only the matching pointer click. Pass-after: six actual touch structural cases, rapid independent taps and horizontal swipe pass; same DOM and scroll retained. Native Android/iOS acceptance pending."
     },
     {
+      "id": "UI-LINK-AUTOCOMPLETE-ALIAS-OWNER-558",
+      "title": "Typing a page alias after [[ offers it and says which page it belongs to",
+      "family": "link-autocomplete",
+      "sources": {
+        "issues": [
+          558,
+          482
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.referenceAuthoring.test.tsx::labels an alias suggestion with the page it belongs to and inserts the alias (GH #558, GH #482)",
+          "crates/tine-core/src/model_tests.rs::quick_switch_offers_each_matching_authored_alias_before_and_after_readiness"
+        ],
+        "scenario": "link-autocomplete.alias-row-names-owner",
+        "failBefore": "proven"
+      },
+      "notes": "GH #558 (Windows, v0.6.982) and GH #482 (v0.6.981): typing a page alias after [[ did not offer that page. Membership was fixed on master by 5435566b: quick_switch returns each matching authored alias as its own row on its owner's file, before and after the projection is ready. Following Brikas's comment on #558, the alias text is inserted as written (a link that resolves to the owner) rather than being swapped for the canonical title. This change adds the missing indication: an alias row carries an 'alias of <page>' label, taken from the per-graph alias map, where an existing file wins a colliding name, so an ordinary page never gets the label. Fail-before: the label test fails without the change (no .ac-sub). Not verified natively on Windows."
+    },
+    {
       "id": "UI-PAGE-RENAME-FLUSH-DIAGNOSTIC-535",
       "title": "One page that cannot save no longer blocks every rename in the graph",
       "family": "page-rename",
