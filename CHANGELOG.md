@@ -65,6 +65,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Reopening a large graph no longer re-reads every page when a page is
+  opened while Tine is still checking its search index. Opening today's
+  journal during that check used to discard it and parse the whole graph,
+  which on 10,000 pages delayed a working search by several seconds on each
+  launch (GH #543).
 - Advanced queries written the way Logseq's documentation and many
   `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
   or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or

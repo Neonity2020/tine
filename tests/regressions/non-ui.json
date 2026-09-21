@@ -5069,6 +5069,34 @@
   "failBefore": "On the pre-fix tree: a_hard_linked_page_can_be_renamed failed 'annex: graph text files alias one physical resource: pages/Old.md has link count 2'; an_external_edit_to_a_hard_linked_page_keeps_the_identity_index_warm reported invalidated: true, exact_updates: 0; the recovery test's predecessor pinned that checked open REFUSED the graph."
  },
  "notes": "After the save fix, three paths still refused on a raw link count. (1) The rename transaction's move source and editor recovery: a move keeps the inode, so no name can diverge, and the MS-REF-GRAPH-TEXT-ALIAS divergence comes only from temp+rename publication, so the check defended nothing; the referrer rewrites are ordinary publications, already allowed. (2) The checked-open recovery sweep refused the WHOLE graph over a recovery artifact with a second link, which git-annex's assistant produces under .git/annex/watchtmp. (3) The exact watcher delta required link count 1 while a complete build admits any, so every external edit of an annexed graph discarded the warm identity index and the next create or rename paid a whole-graph rebuild. All three now accept a link outside graph-text scope. Two GRAPH pages on one inode stay refused where the sibling can be named (Martin, 2026-09-20): the rename inventory refuses with both paths and changes nothing (asserted in the rename test), and an exact delta with resources.len() != 1 falls back to a rebuild. Windows/Google Drive (GH #571) is covered structurally: the Windows link count comes from GetFileInformationByHandle and no path now refuses on it; not run on Windows."
+},
+{
+ "id": "REG-WARM-REOPEN-DRIFT-ON-PAGE-OPEN-543",
+ "title": "Opening a page while the index is being checked at launch does not force a whole-graph parse",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_a_page_opened_during_the_warm_read_keeps_the_warm"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 warm-reopen follow-up. The launch-time warm validation reads every page to confirm the stored index is current (5.6 s for 10,000 pages on the Windows verify runner). Opening today's journal meanwhile publishes the page even when its bytes are unchanged; that moved the cache generation, the warm abandoned on drift, and every warm reopen fell back to a whole-graph parse (16 s to a working search, run 35643784742). A generation move made only of one-page publications whose session revisions equal what the warm read no longer discards it: removals and whole-cache invalidations move a separate structural counter and still count as drift. gh543_a_page_opened_during_the_warm_read_keeps_the_warm fails on the old any-move rule (unchanged case parses the whole graph) and checks that an edit or a new page written during the warm is indexed. Windows re-measure pending."
 }
 ]
 }

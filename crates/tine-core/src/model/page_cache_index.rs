@@ -146,6 +146,9 @@ pub(super) struct PageBuildTestState {
     /// GH #543: pause one warm validation after it has announced itself and
     /// before it reads page bytes, so a test can land a query in that window.
     pub(super) warm_validation_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause one warm validation after it has read every page and before it
+    /// checks the generation, so a test can publish a page it already read.
+    pub(super) warm_read_done_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) joined: std::sync::Mutex<usize>,
     pub(super) joined_changed: std::sync::Condvar,
     pub(super) force_warm_failure: std::sync::atomic::AtomicBool,

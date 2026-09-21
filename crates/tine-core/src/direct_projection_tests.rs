@@ -8424,3 +8424,99 @@ fn gh550_launch_reads_of_changed_and_new_pages_settle_without_failing() {
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 }
+
+/// GH #543: opening a page while the warm is reading the graph must not throw
+/// that read away. A launch opens today's journal during the warm, and opening
+/// publishes the page even when its bytes are unchanged. On a 10,000-page
+/// Windows graph the warm's read took 5.6 s; the publication moved the cache
+/// generation, the warm abandoned on drift, and every warm reopen fell back to
+/// parsing the whole graph (16 s to a working search on the verify runner).
+/// A real edit to a page the warm has already read must still be caught.
+#[test]
+fn gh543_a_page_opened_during_the_warm_read_keeps_the_warm() {
+    let _serial = serialize_projection_tests();
+    for case in ["unchanged", "edited", "created"] {
+        let root = scratch(&format!("gh543-open-during-warm-{case}"));
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("journals/2026_09_21.md"), "- DONE today\n").unwrap();
+        for page in 0..8 {
+            std::fs::write(
+                root.join(format!("pages/p-{page}.md")),
+                format!("- TODO page {page}\n"),
+            )
+            .unwrap();
+        }
+        let database =
+            scratch(&format!("gh543-open-during-warm-{case}-db")).join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+            release_projection(&graph);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database.clone()).unwrap();
+        let pause = graph.pause_next_warm_after_read_test();
+        let warm = {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || graph.warm_cache())
+        };
+        // The warm has read every page, today's journal included.
+        pause.reached.wait();
+        let opened = match case {
+            // A page the warm never saw: a warm that let this move pass would
+            // validate an inventory without it and drop its rows.
+            "created" => {
+                let created = root.join("pages/created.md");
+                std::fs::write(&created, "- TODO created after the warm read\n").unwrap();
+                created
+            }
+            "edited" => {
+                let journal = root.join("journals/2026_09_21.md");
+                std::fs::write(&journal, "- TODO today, edited after the warm read it\n").unwrap();
+                journal
+            }
+            _ => root.join("journals/2026_09_21.md"),
+        };
+        let entry = graph
+            .entry_for_path(&opened)
+            .expect("the page has an entry");
+        graph.load_page(&entry).expect("the page opens");
+        pause.release.wait();
+        warm.join().unwrap();
+        wait_ready(&graph);
+
+        if case == "unchanged" {
+            assert!(
+                !graph.has_parsed_cache_test() && graph.page_build_parses_test() == 0,
+                "an unchanged page opened during the warm read threw the warm away \
+                 and parsed the whole graph"
+            );
+        }
+        let projected = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route")
+            .groups;
+        assert_eq!(
+            signature(&projected),
+            signature(
+                &crate::query::run_query_bounded(graph.as_ref(), "(task TODO)", 100, 1_000_000)
+                    .groups
+            ),
+            "{case}: the index must answer what the files say"
+        );
+        assert_eq!(
+            projected.len(),
+            if case == "unchanged" { 8 } else { 9 },
+            "{case}: the TODO written during the warm is indexed exactly when it exists"
+        );
+        release_projection(graph.as_ref());
+        drop(graph);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+}

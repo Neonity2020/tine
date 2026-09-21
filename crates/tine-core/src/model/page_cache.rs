@@ -452,6 +452,9 @@ impl Graph {
         let Ok(permit) = self.admit_retained_graph_text_writer() else {
             return Outcome::Unavailable;
         };
+        let structural = self
+            .cache_structural_gen
+            .load(std::sync::atomic::Ordering::Acquire);
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
             return Outcome::Unavailable;
@@ -487,14 +490,52 @@ impl Graph {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+        #[cfg(test)]
+        {
+            let pause = self
+                .page_build_test
+                .warm_read_done_pause
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
+        }
+        let read_at = generation;
+        let abandoned = || {
             crate::direct_projection::projection_diag(|| {
                 format!(
                     "warm abandoned on drift after {}ms",
                     warm_started.elapsed().as_millis()
                 )
             });
-            return Outcome::Retry;
+            Outcome::Retry
+        };
+        let Some(mut generation) = self.warm_generation_after_drift(read_at, structural, &sources)
+        else {
+            return abandoned();
+        };
+        if generation != read_at {
+            // Each of those publications queued a delta, and the queue does
+            // not take a warm beside them. Let the worker settle them (the
+            // image already holds these revisions, so they lower nothing),
+            // then check again at whatever generation that leaves.
+            if !projection.wait_for_queued_deltas(std::time::Duration::from_secs(2)) {
+                return abandoned();
+            }
+            let Some(settled) = self.warm_generation_after_drift(read_at, structural, &sources)
+            else {
+                return abandoned();
+            };
+            generation = settled;
+            crate::direct_projection::projection_diag(|| {
+                format!(
+                    "warm kept across generations {read_at}..{generation}: \
+                     only pages it read were published, at the revisions it read"
+                )
+            });
         }
         crate::direct_projection::projection_diag(|| {
             format!(
@@ -555,6 +596,51 @@ impl Graph {
             crate::direct_projection::WarmOutcome::Failed => Outcome::Unavailable,
             crate::direct_projection::WarmOutcome::FreshBuildRequired => Outcome::Retry,
         }
+    }
+
+    /// The generation a finished warm inventory read may be queued at, or
+    /// `None` when it must be read again.
+    ///
+    /// Opening a page publishes it even when its bytes are unchanged, and a
+    /// launch opens today's journal while the warm is still reading. On a
+    /// 10,000-page Windows graph that read takes seconds, and throwing it away
+    /// for that publication sent every warm reopen to a whole-graph parse
+    /// (GH #543). A move is harmless when nothing structural happened and
+    /// every page this session has published carries exactly the revision
+    /// and parse configuration the warm read for it: the warm then describes
+    /// the current state. Anything else, including a record the warm cannot
+    /// match (a page it did not read, or one published before an external
+    /// change it saw), is treated as drift, as before.
+    fn warm_generation_after_drift(
+        &self,
+        read_at: u64,
+        structural: u64,
+        sources: &[(PageEntry, String)],
+    ) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        // Every mover publishes its session record and bumps both counters
+        // under the cache write lock, so this read lock sees them together.
+        let _cache = self.cache.read().unwrap();
+        let current = self.cache_gen.load(Ordering::Acquire);
+        if current == read_at {
+            return Some(current);
+        }
+        if self.cache_structural_gen.load(Ordering::Acquire) != structural {
+            return None;
+        }
+        let config = self.config.parse_config().digest();
+        let read: std::collections::HashMap<&Path, &str> = sources
+            .iter()
+            .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
+            .collect();
+        self.session_page_ids
+            .read()
+            .unwrap()
+            .iter()
+            .all(|(path, ids)| {
+                ids.config == config && read.get(path.as_path()) == Some(&ids.revision.as_str())
+            })
+            .then_some(current)
     }
 
     fn publish_page_index_failures(&self, generation: u64, mut failures: Vec<String>) {
@@ -682,8 +768,11 @@ impl Graph {
 
     /// Move the cache generation as a save would, without a save: a warm
     /// validation that observes it abandons, exactly as on a racing edit.
+    /// There is no page to check the move against, so it counts as structural.
     #[cfg(test)]
     pub(crate) fn drift_generation_test(&self) {
+        self.cache_structural_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -711,6 +800,15 @@ impl Graph {
         pause
     }
 
+    /// GH #543 test hook: pause the NEXT warm validation after it has read
+    /// every page and before it checks whether the generation moved.
+    #[cfg(test)]
+    pub(crate) fn pause_next_warm_after_read_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.warm_read_done_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
     #[cfg(test)]
     pub(crate) fn has_parsed_cache_test(&self) -> bool {
         self.cache.read().unwrap().is_some()
@@ -730,6 +828,8 @@ impl Graph {
                                                  // a reader that loads the new gen then reads the cache sees None (and
                                                  // rebuilds from disk) rather than the stale pre-invalidation content — same
                                                  // gen-after-content ordering as cache_upsert.
+        self.cache_structural_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         drop(guard);
@@ -1148,6 +1248,8 @@ impl Graph {
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
+        self.cache_structural_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         let newgen = self
             .cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release)
@@ -1209,6 +1311,8 @@ impl Graph {
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
+        self.cache_structural_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         let newgen = self
             .cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release)

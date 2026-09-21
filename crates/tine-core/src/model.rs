@@ -359,6 +359,13 @@ pub struct Graph {
     /// captures this before reading disk and rebuilds if a mutation raced it
     /// (which would otherwise install stale content over a concurrent save).
     cache_gen: std::sync::atomic::AtomicU64,
+    /// Moved, under the cache write lock and before `cache_gen`, by every
+    /// generation move that is not a one-page upsert: a removal or a whole
+    /// cache invalidation. A warm validation that sees `cache_gen` move while
+    /// this stays put knows each move published one page and its session
+    /// revision, so it can check those pages against what it read instead of
+    /// rereading the whole graph (GH #543).
+    cache_structural_gen: std::sync::atomic::AtomicU64,
     /// Raw watcher callbacks publish an O(1) admission barrier before their
     /// debounced reconciliation. The app registry admits only one Graph slot per
     /// canonical root, so this frontier is instance-local and cannot be cleared
