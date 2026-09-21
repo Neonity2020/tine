@@ -1163,11 +1163,24 @@ mod tests {
         assert_eq!(fields.get("pages"), Some(&json!(3)));
         assert_eq!(fields.len(), 2);
         assert!(close_discard_fields(Some("still-saving"), None).is_some());
-        for refused in [None, Some(""), Some("My secret page"), Some("/home/someone/graph")] {
-            assert!(close_discard_fields(refused, Some(1)).is_none(), "{refused:?}");
+        for refused in [
+            None,
+            Some(""),
+            Some("My secret page"),
+            Some("/home/someone/graph"),
+        ] {
+            assert!(
+                close_discard_fields(refused, Some(1)).is_none(),
+                "{refused:?}"
+            );
         }
-        let production = include_str!("debug.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(production.contains("record_fixed_event(\"runtime.close_discarded_unsaved\", fields)"));
+        let production = include_str!("debug.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            production.contains("record_fixed_event(\"runtime.close_discarded_unsaved\", fields)")
+        );
     }
 
     #[test]
