@@ -162,3 +162,109 @@ fn gh385_non_page_entries_do_not_block_absent_journal_activation_or_rename() {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
+/// GH #332: one entry the graph-wide read walk cannot admit used to fail the
+/// whole inventory, leaving zero pages, so every page opened blank. Each shape
+/// must now leave every readable page listed and loadable.
+#[cfg(unix)]
+#[test]
+fn gh332_one_unadmittable_entry_does_not_empty_the_page_list() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    type Setup = fn(&Path);
+    let shapes: [(&str, Setup, bool); 5] = [
+        (
+            "fifo",
+            |root| {
+                fs::create_dir_all(root.join("misc")).unwrap();
+                let path =
+                    std::ffi::CString::new(root.join("misc/pipe").as_os_str().as_bytes().to_vec())
+                        .unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+            },
+            false,
+        ),
+        (
+            "non-utf8-image-name",
+            |root| {
+                fs::create_dir_all(root.join("draws")).unwrap();
+                fs::write(
+                    root.join("draws").join(OsStr::from_bytes(b"caf\xe9.png")),
+                    b"x",
+                )
+                .unwrap();
+            },
+            false,
+        ),
+        (
+            "unreadable-folder",
+            |root| {
+                fs::create_dir_all(root.join("lost+found")).unwrap();
+                fs::set_permissions(root.join("lost+found"), fs::Permissions::from_mode(0o000))
+                    .unwrap();
+            },
+            false,
+        ),
+        (
+            "unreadable-nested-page",
+            |root| {
+                fs::create_dir_all(root.join("notes")).unwrap();
+                fs::write(root.join("notes/x.md"), "- x\n").unwrap();
+                fs::set_permissions(root.join("notes/x.md"), fs::Permissions::from_mode(0o000))
+                    .unwrap();
+            },
+            true,
+        ),
+        (
+            "unreadable-page",
+            |root| {
+                fs::write(root.join("pages/Locked.md"), "- locked\n").unwrap();
+                fs::set_permissions(
+                    root.join("pages/Locked.md"),
+                    fs::Permissions::from_mode(0o000),
+                )
+                .unwrap();
+            },
+            true,
+        ),
+    ];
+    for (tag, setup, reported) in shapes {
+        let root = scratch(&format!("gh332-{tag}"));
+        // Steve's sample journal, byte for byte.
+        fs::write(root.join("journals/2026_09_01.md"), "- Text Journal\n-\n").unwrap();
+        fs::write(root.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        setup(&root);
+        let graph = Graph::open(&root);
+
+        let names: Vec<_> = graph
+            .list_pages()
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .collect();
+        assert!(
+            names.contains(&"pages/Alpha.md".to_owned()),
+            "{tag}: {names:?}"
+        );
+        assert!(
+            names.contains(&"journals/2026_09_01.md".to_owned()),
+            "{tag}: {names:?}"
+        );
+        let alpha = graph
+            .load_named("Alpha", PageKind::Page)
+            .unwrap_or_else(|error| panic!("{tag}: {error}"))
+            .unwrap_or_else(|| panic!("{tag}: Alpha opened as an absent page"));
+        assert_eq!(alpha.blocks[0].raw, "alpha", "{tag}");
+        assert_eq!(
+            !graph.page_index_failures().is_empty(),
+            reported,
+            "{tag}: {:?}",
+            graph.page_index_failures()
+        );
+
+        for entry in ["lost+found", "notes/x.md", "pages/Locked.md"] {
+            let _ = fs::set_permissions(root.join(entry), fs::Permissions::from_mode(0o755));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+}

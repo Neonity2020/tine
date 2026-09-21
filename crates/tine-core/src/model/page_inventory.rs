@@ -58,11 +58,11 @@ impl Graph {
     /// the reason is left in `page_index_failures`.
     fn exact_page_inventory_from_disk(&self) -> Option<Vec<PageEntry>> {
         let built = self.admit_retained_graph_text_writer().and_then(|permit| {
-            let entries = self.graph_text_entries(&permit)?;
+            let (entries, skipped) = self.graph_text_entries_and_skipped(&permit)?;
             let limits = graph_text_inventory_limits();
             let mut raw_bytes = 0_u64;
             let mut effective = Vec::with_capacity(entries.len());
-            let mut failures = Vec::new();
+            let mut failures = skipped;
             for entry in entries {
                 let loaded = self.graph_text_read_optional_text_with_identity(&permit, &entry.path);
                 let parsed = match loaded {

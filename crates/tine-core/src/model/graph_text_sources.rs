@@ -51,7 +51,7 @@ impl Graph {
         budget: Option<&RetainedContentBudget>,
     ) -> io::Result<(Vec<PageEntry>, Option<RetainedContentReservation>)> {
         let roots = self.configured_text_inventory_roots(permit)?;
-        let (entries, reservation, _) = self.text_entries_with_limits_and_budget(
+        let (entries, reservation, _, _) = self.text_entries_with_limits_and_budget(
             permit,
             include_sync_conflicts,
             limits,
@@ -67,6 +67,16 @@ impl Graph {
         permit: &GraphTextWritePermit,
     ) -> io::Result<Vec<PageEntry>> {
         Ok(self.graph_text_inventory(permit)?.0)
+    }
+
+    /// [`Self::graph_text_entries`] plus the entries the read walk had to skip
+    /// (GH #332), which a page build records as page index failures.
+    pub(super) fn graph_text_entries_and_skipped(
+        &self,
+        permit: &GraphTextWritePermit,
+    ) -> io::Result<(Vec<PageEntry>, Vec<String>)> {
+        let (entries, _, skipped) = self.graph_text_inventory(permit)?;
+        Ok((entries, skipped))
     }
 
     /// Enumerate every user-visible Markdown/Org source file using the same
@@ -315,8 +325,9 @@ impl Graph {
     ) -> io::Result<(
         Vec<PageEntry>,
         std::collections::HashMap<PathBuf, ContentDigest>,
+        Vec<String>,
     )> {
-        let (entries, _, identities) = self.text_entries_with_limits_and_budget(
+        let (entries, _, identities, skipped) = self.text_entries_with_limits_and_budget(
             permit,
             false,
             graph_text_inventory_limits(),
@@ -324,6 +335,6 @@ impl Graph {
             vec![("", 0)],
             true,
         )?;
-        Ok((entries, identities))
+        Ok((entries, identities, skipped))
     }
 }

@@ -80,6 +80,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   not downloaded). Such an entry also no longer stops today's journal from
   being created or pages from being renamed, and a day that cannot be opened
   no longer hides all the others (GH #385).
+- A graph no longer opens with every page blank because one item in its folder
+  cannot be read (for example a locked file, an unreadable folder, or a file
+  with an unusual name). Tine now skips that item and shows the rest. Opening a
+  large graph also no longer freezes the app for several seconds while it
+  checks for conflict copies (GH #332).
 
 - A save conflict no longer ends up with a comparison that can never load. If
   Tine lost track of the conflict in the split second after it happened (for

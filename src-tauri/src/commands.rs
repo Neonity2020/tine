@@ -2320,21 +2320,43 @@ pub(crate) async fn apply_journal_filename_migrations(
 
 /// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
 /// user to review + reconcile instead of them showing as garbage pages.
+///
+/// Async + `spawn_blocking` (GH #332): this reads every page file. As a sync
+/// command it ran on the main thread and froze every other command for
+/// 10-16 s on a large Windows graph.
 #[tauri::command]
-pub(crate) fn list_sync_conflicts(
+pub(crate) async fn list_sync_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::SyncConflict>, CommandError> {
-    with_filesystem_graph(&state, |g| Ok(g.list_sync_conflicts()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| Ok(g.list_sync_conflicts()))
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
 /// (git/Fossil). They stay readable but saves to them are refused, so the
 /// conflicts panel and the page banner can explain why.
+///
+/// Async + `spawn_blocking` (GH #332): this reads every page file. As a sync
+/// command it ran on the main thread and froze every other command for
+/// 10-16 s on a large Windows graph.
 #[tauri::command]
-pub(crate) fn list_vcs_marker_conflicts(
+pub(crate) async fn list_vcs_marker_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::VcsMarkerConflict>, CommandError> {
-    with_filesystem_graph(&state, |g| Ok(g.list_vcs_marker_conflicts()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| Ok(g.list_vcs_marker_conflicts()))
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// The Concord conflict queue (L3): ONE derived inventory of everything on disk

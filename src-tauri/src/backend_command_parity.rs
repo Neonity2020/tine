@@ -903,6 +903,25 @@ mod tests {
         false
     }
 
+    /// Commands that read every page file must not run on the main thread: a
+    /// sync `#[tauri::command]` does, and blocks every other command until it
+    /// finishes (GH #332 measured 10-16 s at startup on a large Windows graph).
+    #[test]
+    fn whole_graph_conflict_listings_are_async() {
+        let commands = include_str!("commands.rs");
+        for name in [
+            "list_sync_conflicts",
+            "list_vcs_marker_conflicts",
+            "conflict_queue",
+        ] {
+            assert!(
+                commands.contains(&format!("pub(crate) async fn {name}(")),
+                "{name} reads every page file; keep it `async` + `spawn_blocking` \
+                 (exemplar: conflict_queue in commands.rs)"
+            );
+        }
+    }
+
     /// Everything the frontend asks for must exist. A name that is not
     /// registered fails at runtime with "command not found", on whatever page
     /// happens to call it.

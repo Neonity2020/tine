@@ -17,6 +17,7 @@ impl Graph {
         Vec<PageEntry>,
         Option<RetainedContentReservation>,
         std::collections::HashMap<PathBuf, ContentDigest>,
+        Vec<String>,
     )> {
         struct PendingDirectory {
             directory: Dir,
@@ -47,6 +48,31 @@ impl Graph {
         let mut portable_paths = std::collections::BTreeMap::new();
         let mut portable_paths_charge =
             RetainedHeapCharge::new(budget, "graph text portable path identity map")?;
+        // GH #332: the graph-wide READ inventory skips an entry it cannot admit
+        // instead of failing the whole walk. One FIFO, unreadable folder or
+        // oddly named image anywhere under the root used to leave the page
+        // cache with zero pages, so every page opened blank. A page file that
+        // cannot be admitted is reported here (the caller records it as a page
+        // index failure, so the source is not treated as complete). An
+        // unreadable folder or a non-page entry is simply not graph text Tine
+        // can see; reporting it would keep a graph whose root holds, say,
+        // `System Volume Information` on the uncached listing path forever.
+        // The configured walk (writes) and the limits stay fail-closed.
+        let mut skipped = Vec::new();
+        macro_rules! admit_or_skip {
+            ($result:expr, $relative:expr, $may_hold_page:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) if graph_wide => {
+                        if $may_hold_page {
+                            skipped.push(format!("{}: {error}", $relative));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+        }
         for (relative, depth) in roots {
             if depth > limits.directory_depth {
                 return Err(graph_text_inventory_limit_error("graph directory depth"));
@@ -116,7 +142,16 @@ impl Graph {
         }) = pending.pop()
         {
             let pending_path_charge = owned_path_upper_bound(&path)?;
-            for entry in directory.entries()? {
+            let entries = match directory.entries() {
+                Ok(entries) => entries,
+                Err(_) if graph_wide && depth > 0 => {
+                    pending_paths
+                        .shrink(pending_path_charge, "graph inventory pending owned paths")?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
                 #[cfg(test)]
                 if graph_wide {
                     GRAPH_TEXT_INVENTORY_ENTRY_VISITS
@@ -128,9 +163,21 @@ impl Graph {
                 if all_entries > limits.all_entries {
                     return Err(graph_text_inventory_limit_error("all directory entries"));
                 }
-                let entry = entry?;
+                let entry = admit_or_skip!(entry, self.rel_path(&path), false);
                 let name = entry.file_name();
                 let Some(name_text) = name.to_str() else {
+                    if graph_wide {
+                        // Not nameable as graph text. Report it only when it
+                        // looks like a page file.
+                        let lossy = name.to_string_lossy();
+                        if is_page_file(&path.join(&name)) {
+                            skipped.push(format!(
+                                "{}/{lossy}: graph text entry name is not UTF-8",
+                                self.rel_path(&path)
+                            ));
+                        }
+                        continue;
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "graph text entry name is not UTF-8",
@@ -156,7 +203,8 @@ impl Graph {
                 if path_bytes > limits.path_bytes {
                     return Err(graph_text_inventory_limit_error("aggregate path bytes"));
                 }
-                let file_type = entry.file_type()?;
+                let file_type =
+                    admit_or_skip!(entry.file_type(), child_relative, is_page_file(&child_path));
                 // The configured walk resolves page identities and rewrites
                 // page text; entries that can never be a page are not its
                 // business. Hidden entries (an Emacs `.#name.org` lock
@@ -194,8 +242,16 @@ impl Graph {
                     if graph_wide && !self.graph_text_scope.is_eligible(&child_relative) {
                         continue;
                     }
-                    let file = open_projection_file_nofollow(&directory, name_text)?;
-                    let resource = canonical_projection_file_resource_id(&file)?;
+                    let file = admit_or_skip!(
+                        open_projection_file_nofollow(&directory, name_text),
+                        child_relative,
+                        true
+                    );
+                    let resource = admit_or_skip!(
+                        canonical_projection_file_resource_id(&file),
+                        child_relative,
+                        true
+                    );
                     if graph_wide {
                         graph_file_identities.insert(child_path.clone(), resource);
                     }
@@ -261,7 +317,11 @@ impl Graph {
                             .or_insert(child_relative.clone());
                     }
                     let page = if graph_wide {
-                        self.graph_inventory_entry(&child_path)?
+                        admit_or_skip!(
+                            self.graph_inventory_entry(&child_path),
+                            child_relative,
+                            true
+                        )
                     } else {
                         self.graph_text_inventory_entry(&child_path)?
                     };
@@ -279,6 +339,15 @@ impl Graph {
                     continue;
                 }
                 if !file_type.is_dir() {
+                    if graph_wide {
+                        // A FIFO, socket or device is never graph text.
+                        if is_page_file(&child_path) {
+                            skipped.push(format!(
+                                "{child_relative}: graph text entry is not a regular file"
+                            ));
+                        }
+                        continue;
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("graph text entry is not a regular file: {child_relative}"),
@@ -302,9 +371,21 @@ impl Graph {
                 if directory_count > limits.directories {
                     return Err(graph_text_inventory_limit_error("directory count"));
                 }
-                projection_real_directory(&directory, name_text)?;
-                let child = open_projection_dir_nofollow(&directory, name_text)?;
-                let resource = canonical_projection_directory_resource_id(&child)?;
+                admit_or_skip!(
+                    projection_real_directory(&directory, name_text),
+                    child_relative,
+                    false
+                );
+                let child = admit_or_skip!(
+                    open_projection_dir_nofollow(&directory, name_text),
+                    child_relative,
+                    false
+                );
+                let resource = admit_or_skip!(
+                    canonical_projection_directory_resource_id(&child),
+                    child_relative,
+                    false
+                );
                 directory_resources_charge.grow(
                     checked_add_bytes(
                         conservative_btree_entry_bytes::<ContentDigest, String>()?,
@@ -313,11 +394,15 @@ impl Graph {
                     "graph inventory directory identity map",
                 )?;
                 if let Some(first) = directory_resources.insert(resource, child_relative.clone()) {
-                    return Err(graph_text_inventory_alias_error(
-                        "directories",
-                        &first,
-                        &child_relative,
-                    ));
+                    admit_or_skip!(
+                        Err::<(), _>(graph_text_inventory_alias_error(
+                            "directories",
+                            &first,
+                            &child_relative,
+                        )),
+                        child_relative,
+                        false
+                    );
                 }
                 if pending.len() == limits.pending_directories {
                     return Err(graph_text_inventory_limit_error("pending directories"));
@@ -344,7 +429,7 @@ impl Graph {
             pending_paths.shrink(pending_path_charge, "graph inventory pending owned paths")?;
         }
         out.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        Ok((out, out_charge.reservation, graph_file_identities))
+        Ok((out, out_charge.reservation, graph_file_identities, skipped))
     }
 
     /// Return the non-overlapping roots that must be walked for a configured-root

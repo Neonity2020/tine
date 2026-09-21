@@ -37,12 +37,18 @@ impl Graph {
         })
     }
 
-    fn page_build_entries(&self, permit: &GraphTextWritePermit) -> Result<Vec<PageEntry>, String> {
+    /// The page inventory plus the entries the read walk skipped (GH #332).
+    /// Skipped entries become page index failures, so the source is never
+    /// reported complete while a page may be missing from it.
+    fn page_build_entries(
+        &self,
+        permit: &GraphTextWritePermit,
+    ) -> Result<(Vec<PageEntry>, Vec<String>), String> {
         #[cfg(test)]
         self.page_build_test
             .enumerations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.graph_text_entries(permit)
+        self.graph_text_entries_and_skipped(permit)
             .map_err(|error| format!("graph-text-scope: {error}"))
     }
 
@@ -57,8 +63,8 @@ impl Graph {
         &self,
         permit: &GraphTextWritePermit,
     ) -> PageCacheBuild {
-        let entries = match self.page_build_entries(permit) {
-            Ok(entries) => entries,
+        let (entries, skipped) = match self.page_build_entries(permit) {
+            Ok(inventory) => inventory,
             Err(failure) => {
                 return PageCacheBuild {
                     pages: Vec::new(),
@@ -66,6 +72,16 @@ impl Graph {
                 };
             }
         };
+        let mut built = self.parse_page_entries_with_permit(permit, entries);
+        built.failures.extend(skipped);
+        built
+    }
+
+    fn parse_page_entries_with_permit(
+        &self,
+        permit: &GraphTextWritePermit,
+        entries: Vec<PageEntry>,
+    ) -> PageCacheBuild {
         let entry_count = entries.len();
         let workers = page_cache_worker_count();
         // Small graphs (or a single core): serial — the parse is fast and thread
@@ -437,12 +453,12 @@ impl Graph {
             return Outcome::Unavailable;
         };
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Ok(entries) = self.page_build_entries(&permit) else {
+        let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
             return Outcome::Unavailable;
         };
         let mut sources = Vec::with_capacity(entries.len());
         let mut retained = Vec::new();
-        let mut failures = Vec::new();
+        let mut failures = skipped;
         let mut text_bytes = 0u64;
         for (i, entry) in entries.into_iter().enumerate() {
             if cancelled() {
@@ -576,8 +592,8 @@ impl Graph {
         // burst right after launch, competing with first scrolling/typing/the
         // first agenda query. Joiners wait for this same generation instead of
         // duplicating its parse.
-        let entries = match self.page_build_entries(&permit) {
-            Ok(entries) => entries,
+        let (entries, skipped) = match self.page_build_entries(&permit) {
+            Ok(inventory) => inventory,
             Err(failure) => {
                 let built = PageCacheBuild {
                     pages: Vec::new(),
@@ -590,6 +606,7 @@ impl Graph {
             }
         };
         let mut built = PageCacheBuild::with_capacity(entries.len());
+        built.failures.extend(skipped);
         let mut baselines: Vec<(PathBuf, ContentDigest, String)> =
             Vec::with_capacity(entries.len());
         for (i, e) in entries.into_iter().enumerate() {
@@ -675,7 +692,7 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn walk_entries_test(&self) -> Vec<PageEntry> {
         let permit = self.admit_retained_graph_text_writer().unwrap();
-        self.page_build_entries(&permit).unwrap()
+        self.page_build_entries(&permit).unwrap().0
     }
 
     #[cfg(test)]

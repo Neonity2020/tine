@@ -3241,6 +3241,35 @@
    "notes": "GH #385 (macOS, iCloud Drive graph): Journals showed 'No journal entries found' while All pages worked. Chain: the feed prepends an empty today placeholder; its activate_absent_editor(Journal) resolves through the configured walk of journals/+pages/, which (unlike the graph-wide inventory) refused any symlink, opened every non-page file (an unreadable .DS_Store, attachment, or refused iCloud download fails the open), and refused any two files on one inode. Since v0.6.94 loadFeed aborted the whole feed on one refused page and restartJournalFeed returned null, so the generic empty message showed and the retry loop repeated the failing call (5 activate_absent_editor failures in the reporter's diagnostic). Fix: the configured walk skips symlinks, hidden entries and non-page files before opening them (the save capture already skips symlinks since GH #267; write targets are opened no-follow); two page files on one inode are still refused. loadFeed leaves out a page whose activation failed and installs the rest; unsaved work and stale requests still defer the feed atomically. The same walk backs page rename, merge, PDF and journal migration, which are fixed too. The exact entry on the reporter's graph is not known; the test covers Emacs lock symlink, page symlink, unreadable .DS_Store and attachment, hidden hard link, hidden unparseable page name, and an iCloud placeholder. Not verified on macOS/iCloud."
   },
   {
+   "id": "REG-BLANK-GRAPH-ON-ONE-UNREADABLE-ENTRY-332",
+   "title": "One entry the page scan cannot read (FIFO, unreadable folder or page, oddly named file) no longer leaves the graph with zero pages, every page opening blank",
+   "family": "graph-open",
+   "sources": {
+    "issues": [
+     332
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "windows",
+    "linux",
+    "android",
+    "macos",
+    "ios"
+   ],
+   "layer": "rust-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model_tests_availability.rs",
+     "src-tauri/src/backend_command_parity.rs"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #332 (theaffman, Steve-21-bassman, dealingwith; Windows and Android, since after v0.6.5): graphs opened with every page blank. v0.6.90 replaced the tolerant list_md walk with the strict graph-wide inventory walk, which aborted on any entry it could not admit; the page cache was then installed with zero pages, list_pages returned [] and get_page returned 'absent', which the frontend renders as an empty new page (hence activate_absent_editor after every open in the reporters' diagnostics). The config (custom journals dir, dd-MM-yyyy) plays no part. Fix: the graph-wide READ walk skips an entry it cannot admit; an unreadable page file is recorded as a page index failure (source not complete), an unreadable folder or non-page entry is skipped without one. The configured walk (writes) and inventory limits stay fail-closed. Separately, list_sync_conflicts and list_vcs_marker_conflicts read every page file as sync commands on the main thread, freezing every command for 10-16 s at startup in the reporters' diagnostics; both are now async + spawn_blocking with a source guard. Test gh332_* reproduces FIFO, non-UTF-8 image name, unreadable folder, unreadable nested page and unreadable page: pre-fix list_pages is empty. Which entry each reporter has is not known. Not addressed: Windows FILE_ATTRIBUTE_REPARSE_POINT refusal of cloud-placeholder files (OneDrive etc.), unverified here and not indicated in the thread; the empty-looking UI does not yet name page-index failures."
+  },
+  {
    "id": "REG-CLOSE-DISCARD-DIAGNOSTIC-540",
    "title": "A close that discarded unsaved drafts is visible in the diagnostic report instead of reading as an ordinary clean exit",
    "family": "diagnostic-observability",
