@@ -3162,6 +3162,32 @@
    "notes": "The recorder writer accepts only fixed event names, catalogued IPC command names, enums, booleans, counts and durations; detailed debug strings never enter the report. Current/previous one-MiB segments, unclean-exit marker, private files and process lock are native-tested. Release tests pin line-level symbols, hidden maps copied outside dist, exact-SHA artifact naming and removal of maps from shipped assets."
   },
   {
+   "id": "REG-OLD-WEBKIT-ENGINE-FLOOR-572",
+   "title": "On a web engine older than Safari 15.4 Tine says so at startup and how to fix it, instead of opening half-working with a failed parser",
+   "family": "startup-platform",
+   "sources": {
+    "issues": [
+     572
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "macos",
+    "ios"
+   ],
+   "layer": "frontend-browser",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/engineCheck.test.ts",
+     "scripts/test-release-pipeline.mjs"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #572, jaemskyle: macOS Big Sur 11.7.8, 0.6.984 DMG. The system WKWebView was Safari-14-era: the lsdoc wasm failed to compile ('can't get 0th argument Type' -- the vendored module declares an externref parameter, the reference-types feature, Safari 15) and the frontend then threw on Array.prototype.at (Safari 15.4), so every page showed 'This page could not be displayed' and the block-renderer banner. Tine's declared floors were false: macOS had Tauri's default 10.13 and iOS was set to 14.0. Martin chose (2026-09-21) to require the Safari 15.4 engine with a clear message rather than support Safari 14: index.html runs an ES5 classic check (at, Object.hasOwn, structuredClone, and WebAssembly.validate of a one-type externref module) before the app module, renders the explanation and remedy (update Safari; iOS 15.4), and main.tsx stops and reveals the window on its flag. iOS minimumSystemVersion is 15.4. A source scan keeps post-15.4 built-ins out of src/. Verified in Chromium against the production build with Array.prototype.at deleted and with the reference-types probe failing: flag set, message shown, app not mounted; unmodified, the app mounts. Not verified on a real Safari 14 engine. Known limit, documented in the Guide: pdf.js needs Safari 17.4 (Promise.withResolvers, AbortSignal.any, class static blocks in the PdfViewer chunk only)."
+  },
+  {
    "id": "REG-CLOSE-DISCARD-DIAGNOSTIC-540",
    "title": "A close that discarded unsaved drafts is visible in the diagnostic report instead of reading as an ordinary clean exit",
    "family": "diagnostic-observability",

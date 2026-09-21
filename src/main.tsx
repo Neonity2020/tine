@@ -25,6 +25,13 @@ import { applyContentWidths } from "./contentWidth";
 import { installSystemInsetOwner } from "./systemInsets";
 import { installPlatformAttribute } from "./nativeChrome";
 
+// index.html's engine check has already told the user why Tine cannot run here
+// (GH #572); starting anyway would replace that message with a half-broken app.
+if ((window as { __tineUnsupportedEngine?: boolean }).__tineUnsupportedEngine) {
+  if (isTauri()) void getCurrentWindow().show().catch(() => {});
+  throw new Error("Tine: unsupported web engine");
+}
+
 installPlatformAttribute();
 installSystemInsetOwner();
 const published = isPublishedExport();

@@ -64,6 +64,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+
+- On a Mac whose web engine is older than Safari 15.4 (for example Big Sur
+  with Safari never updated), Tine now says so at startup and explains that
+  updating Safari fixes it, instead of opening with every page failing to
+  display. The iOS build now requires iOS 15.4 (GH #572).
+
 - A save conflict no longer ends up with a comparison that can never load. If
   Tine lost track of the conflict in the split second after it happened (for
   example because another page was deleted or renamed at that moment on

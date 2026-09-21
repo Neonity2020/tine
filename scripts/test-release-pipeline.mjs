@@ -458,7 +458,11 @@ assert.doesNotMatch(
 assert.equal(iosConfig.app.windows.length, 1, "iOS must retain its single-window contract");
 assert.equal(iosConfig.app.windows[0].label, "main");
 assert.equal(iosConfig.bundle.iOS.developmentTeam, "RQ5V4LK7N2");
-assert.equal(iosConfig.bundle.iOS.minimumSystemVersion, "14.0");
+// iOS WebKit is the OS's: below 15.4 the lsdoc wasm (reference types) and the
+// ES2022 frontend cannot run, so the store must not offer Tine there (GH #572).
+// The Swift package's lower `.iOS(.v14)` floor is compatible with this.
+assert.equal(iosConfig.bundle.iOS.minimumSystemVersion, "15.4");
+assert.equal(JSON.parse(fs.readFileSync(path.join(process.cwd(), "src-tauri/tauri.conf.json"), "utf8")).bundle.iOS.minimumSystemVersion, "15.4");
 assert.equal(iosConfig.bundle.resources, undefined, "the privacy manifest must not be nested under Tauri's assets folder");
 assert.match(iosInfoPlist, /<key>CFBundleDisplayName<\/key>\s*<string>TineOutline<\/string>/);
 assert.match(iosInfoPlist, /<key>ITSAppUsesNonExemptEncryption<\/key>\s*<false\/>/);
