@@ -62,7 +62,10 @@ fn an_empty_numbered_first_bullet_stays_a_list_item_and_the_page_keeps_saving() 
     // The reporter's first save: the numbered item exists but has no text yet.
     let first = graph
         .save_page(
-            &new_page(name, vec![block("b1", "logseq.order-list-type:: number", vec![])]),
+            &new_page(
+                name,
+                vec![block("b1", "logseq.order-list-type:: number", vec![])],
+            ),
             None,
         )
         .expect("the first save of a new page");
@@ -72,9 +75,13 @@ fn an_empty_numbered_first_bullet_stays_a_list_item_and_the_page_keeps_saving() 
         .find(|path| path.to_string_lossy().contains("Dosa"))
         .expect("the page file was created");
     let rel = format!("pages/{}", file.file_name().unwrap().to_string_lossy());
-    let loaded = graph.load_by_path(&rel).unwrap().expect("the new page loads");
+    let loaded = graph
+        .load_by_path(&rel)
+        .unwrap()
+        .expect("the new page loads");
     assert_eq!(
-        loaded.pre_block, None,
+        loaded.pre_block,
+        None,
         "an empty numbered item must not become page properties: {:?}",
         std::fs::read_to_string(&file).unwrap()
     );
@@ -100,7 +107,10 @@ fn an_empty_numbered_first_bullet_stays_a_list_item_and_the_page_keeps_saving() 
     let reread = graph.load_by_path(&rel).unwrap().unwrap();
     assert_eq!(reread.pre_block, None);
     assert_eq!(
-        reread.blocks.first().map(|b| (b.raw.as_str(), b.children.len())),
+        reread
+            .blocks
+            .first()
+            .map(|b| (b.raw.as_str(), b.children.len())),
         Some(("Dosa\nlogseq.order-list-type:: number", 1)),
         "the text and the child reached disk: {:?}",
         std::fs::read_to_string(&file).unwrap()
@@ -116,7 +126,10 @@ fn a_properties_only_first_bullet_of_page_properties_still_becomes_the_header() 
     let graph = Graph::open(&root);
     graph.warm_cache();
     graph
-        .save_page(&new_page("Book", vec![block("b1", "alias:: novel", vec![])]), None)
+        .save_page(
+            &new_page("Book", vec![block("b1", "alias:: novel", vec![])]),
+            None,
+        )
         .expect("save");
     assert_eq!(
         std::fs::read_to_string(root.join("pages/Book.md")).unwrap(),
