@@ -16,7 +16,7 @@ function runCheck(engine: { at?: boolean; hasOwn?: boolean; structuredClone?: bo
   const ArrayFake = { prototype: engine.at === false ? {} : { at() {} } };
   const ObjectFake = engine.hasOwn === false ? {} : { hasOwn() {} };
   const wasm = {
-    validate: (bytes: Uint8Array) =>
+    validate: (bytes: Uint8Array<ArrayBuffer>) =>
       engine.referenceTypes === false ? false : WebAssembly.validate(bytes),
   };
   new Function("window", "document", "navigator", "WebAssembly", "structuredClone", "Object", "Array", script)(
