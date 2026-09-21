@@ -20,7 +20,7 @@ mod tests {
         let sql = include_str!("query/sql.rs");
         let eval = include_str!("query/eval.rs");
         let refs = include_str!("refs.rs");
-        let projection = include_str!("direct_projection.rs");
+        let projection = crate::test_support::rust_module_production_source("direct_projection.rs");
         let document = include_str!("doc.rs");
         let quick_switcher = include_str!("../../../src/components/QuickSwitcher.tsx");
 

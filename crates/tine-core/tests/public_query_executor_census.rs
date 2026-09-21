@@ -269,7 +269,7 @@ fn a_walk_inside_a_cfg_test_region_is_not_counted() {
 #[test]
 fn the_cursor_owner_remains_shared() {
     let root = repo_root();
-    let direct = compiled_source(&root.join("crates/tine-core/src/direct_projection.rs"));
+    let direct = module_source(&root, "crates/tine-core/src/direct_projection.rs");
     assert!(direct.contains("query_cursor::drain_after"));
 }
 

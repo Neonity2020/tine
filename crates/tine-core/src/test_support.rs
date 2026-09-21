@@ -92,3 +92,12 @@ pub(crate) fn rust_module_production_files(module_root: &str) -> Vec<PathBuf> {
     files.insert(0, root);
     files
 }
+
+/// A split module's production files, read and joined (I-11).
+pub(crate) fn rust_module_production_source(module_root: &str) -> String {
+    rust_module_production_files(module_root)
+        .into_iter()
+        .map(|path| fs::read_to_string(path).expect("Rust module file is readable"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}

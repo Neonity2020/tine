@@ -1,7 +1,6 @@
 #[test]
 fn direct_query_producer_has_no_saved_edit_or_answer_cache_protocol() {
-    let source = include_str!("direct_projection.rs");
-    let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = crate::test_support::rust_module_production_source("direct_projection.rs");
     for forbidden in [
         "PhysicalProjectionQueryProgress",
         "PhysicalProjectionQueryTarget",
