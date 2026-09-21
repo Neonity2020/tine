@@ -1695,7 +1695,9 @@ mod tests {
         assert!(page.markdown.contains("experimental 32-bit Windows"));
         // GH #572: the macOS web-engine floor and its user remedy are documented.
         assert!(page.markdown.contains("Safari 15.4 or later"));
-        assert!(page.markdown.contains("updating Safari through Software Update"));
+        assert!(page
+            .markdown
+            .contains("updating Safari through Software Update"));
         assert!(page.markdown.contains("no public iOS app"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Workflows/Extend Tine]]"));

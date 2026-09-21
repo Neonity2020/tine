@@ -199,12 +199,25 @@ pub(crate) fn atomic_replace_expected_with_hooks(
     next: &[u8],
     after_retire: impl Fn() -> io::Result<()>,
 ) -> io::Result<AtomicReplaceOutcome> {
+    atomic_replace_expected_with_mover(path, expected, next, after_retire, move_file_noreplace)
+}
+
+/// [`atomic_replace_expected`] over an explicit no-replace mover, so tests can
+/// stand in for storage that refuses the flagged rename (GH #538).
+pub(crate) fn atomic_replace_expected_with_mover(
+    path: &Path,
+    expected: &[u8],
+    next: &[u8],
+    after_retire: impl Fn() -> io::Result<()>,
+    mover: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<AtomicReplaceOutcome> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let pid = std::process::id();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let stage = dir.join(format!(".{fname}.{pid}.{seq}.stage.tmp"));
     let tmp = dir.join(format!(".{fname}.{pid}.{seq}.publish.tmp"));
     let retired = dir.join(format!(".{fname}.{pid}.{seq}{RETIRED_SUFFIX}"));
 
@@ -212,14 +225,31 @@ pub(crate) fn atomic_replace_expected_with_hooks(
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
+            .open(&stage)?;
         file.write_all(next)?;
         barrier_sync_all(&file)?;
         Ok(())
     })();
     if let Err(error) = staged {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&stage);
         return Err(error);
+    }
+    // PROVE the no-replace move works here before vacating the live name
+    // (GH #538). Some Android shared storage refuses the flagged rename with
+    // EINVAL; discovering that only at PUBLISH, after the retire, used to
+    // strand the live file under its `.retired` name - and the undo uses the
+    // same refused primitive, so `config.edn` vanished and every later open
+    // failed. Moving our own staged temp costs one rename and leaves the live
+    // file untouched when the storage cannot do this.
+    if let Err(error) = mover(&stage, &tmp) {
+        let _ = fs::remove_file(&stage);
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "this storage refused an atomic no-replace rename in {fname:?}'s folder, \
+                 so {fname:?} was left unchanged: {error}"
+            ),
+        ));
     }
 
     // RETIRE: atomically capture whatever `path` currently holds. A no-replace
@@ -237,7 +267,7 @@ pub(crate) fn atomic_replace_expected_with_hooks(
     // A crash between here and the publish leaves the content in `retired`;
     // `restore_retired_files` puts it back on next open.
     if let Err(error) = after_retire() {
-        let _ = move_file_noreplace(&retired, path);
+        let _ = restore_vacated_name(&retired, path, &mover);
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
@@ -245,7 +275,7 @@ pub(crate) fn atomic_replace_expected_with_hooks(
     let found = match fs::read(&retired) {
         Ok(bytes) => bytes,
         Err(error) => {
-            let _ = move_file_noreplace(&retired, path);
+            let _ = restore_vacated_name(&retired, path, &mover);
             let _ = fs::remove_file(&tmp);
             return Err(error);
         }
@@ -255,26 +285,75 @@ pub(crate) fn atomic_replace_expected_with_hooks(
         // and publish nothing. If an even newer external CREATE took the name,
         // `retired` stays for the recovery sweep rather than deleting anyone's
         // data.
-        let _ = move_file_noreplace(&retired, path);
+        let _ = restore_vacated_name(&retired, path, &mover);
         let _ = fs::remove_file(&tmp);
         return Ok(AtomicReplaceOutcome::ExternalChanged);
     }
 
     // PUBLISH into the slot we vacated. No-replace: an AlreadyExists here means
     // an external CREATE won the window, and its bytes are not ours to replace.
-    if let Err(error) = move_file_noreplace(&tmp, path) {
+    if let Err(error) = mover(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         if error.kind() == io::ErrorKind::AlreadyExists {
             // Our retired bytes stay on disk for the sweep to triage.
             return Ok(AtomicReplaceOutcome::ExternalChanged);
         }
-        let _ = move_file_noreplace(&retired, path);
+        let _ = restore_vacated_name(&retired, path, &mover);
         return Err(error);
     }
 
     sync_dir(dir)?;
     let _ = fs::remove_file(&retired);
     Ok(AtomicReplaceOutcome::Published)
+}
+
+/// Put `retired` back under `target`, a name the caller itself vacated or
+/// found empty.
+///
+/// No-replace first, so a file that appeared at `target` meanwhile (a sync
+/// delivery, an external editor) is never clobbered. When the storage refuses
+/// the flagged rename itself (GH #538: Android shared storage answering
+/// `renameat2(RENAME_NOREPLACE)` with EINVAL) and `target` is still absent,
+/// fall back to a plain rename: otherwise the file stays stranded under its
+/// hidden `.retired` name and the graph cannot open again. The residual
+/// window - an external create between the existence check and the rename -
+/// is the same one every plain-rename save already has; losing the file
+/// outright is the worse outcome (in-scope scenario: crash or interrupted
+/// publish on flag-refusing storage).
+pub(crate) fn restore_vacated_name(
+    retired: &Path,
+    target: &Path,
+    mover: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match mover(retired, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+        Err(error) if no_replace_rename_is_refused(&error) && !target.exists() => {
+            fs::rename(retired, target)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// True when the storage refused the no-replace rename as an operation
+/// (unsupported flag), as opposed to a real I/O failure.
+pub(crate) fn no_replace_rename_is_refused(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+    ) || unix_rename_flag_refusal(error)
+}
+
+#[cfg(unix)]
+fn unix_rename_flag_refusal(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|errno| matches!(errno, libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP))
+}
+
+#[cfg(not(unix))]
+fn unix_rename_flag_refusal(_error: &io::Error) -> bool {
+    false
 }
 
 /// Atomic write: write to a temp file in the same directory, then rename. The

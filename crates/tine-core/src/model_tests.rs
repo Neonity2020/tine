@@ -11946,6 +11946,102 @@ fn a_crash_between_retire_and_publish_is_recovered_byte_identical() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Storage that refuses `renameat2(RENAME_NOREPLACE)` the way some Android
+/// shared storage does (GH #538): EINVAL for every flagged rename.
+fn flag_refusing_mover(_src: &Path, _dest: &Path) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(22))
+}
+
+#[test]
+fn gh538_a_refused_no_replace_rename_leaves_config_edn_in_place() {
+    // Before the fix the live file was retired first and the refused publish
+    // AND the refused undo left it stranded as `.config.edn.*.retired`.
+    let dir = scratch("gh538-refused-publish");
+    let path = dir.join("config.edn");
+    fs::write(&path, b"{:base 1}\n").unwrap();
+
+    let result = atomic_replace_expected_with_mover(
+        &path,
+        b"{:base 1}\n",
+        b"{:next 2}\n",
+        || Ok(()),
+        flag_refusing_mover,
+    );
+
+    let error = result.expect_err("the refusal must surface");
+    assert!(
+        error.to_string().contains("config.edn") && error.to_string().contains("unchanged"),
+        "the error must say the file was left alone: {error}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"{:base 1}\n",
+        "config.edn must stay put"
+    );
+    let leftovers: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "left {leftovers:?} behind");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn gh538_a_stranded_config_edn_is_restored_on_flag_refusing_storage() {
+    // A graph already hit by the old bug: config.edn missing, its bytes in a
+    // `.retired` sibling. The open-time recovery must bring it back rather
+    // than fail every open with a bare "Invalid argument".
+    let dir = scratch("gh538-stranded-restore");
+    fs::write(dir.join(".config.edn.4242.0.retired"), b"{:base 1}\n").unwrap();
+
+    let recovered = restore_retired_files_with(&dir, &[dir.clone()], flag_refusing_mover).unwrap();
+
+    assert_eq!(recovered, 1);
+    assert_eq!(fs::read(dir.join("config.edn")).unwrap(), b"{:base 1}\n");
+    assert!(!dir.join(".config.edn.4242.0.retired").exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn gh538_flag_refusing_recovery_never_overwrites_a_live_config_edn() {
+    // The plain-rename fallback applies only to an absent target; a present
+    // one still sends the retired copy to trash, never over the live file.
+    let dir = scratch("gh538-stranded-superseded");
+    fs::write(dir.join("config.edn"), b"current").unwrap();
+    fs::write(dir.join(".config.edn.4242.0.retired"), b"older").unwrap();
+
+    let recovered = restore_retired_files_with(&dir, &[dir.clone()], flag_refusing_mover).unwrap();
+
+    assert_eq!(recovered, 0);
+    assert_eq!(fs::read(dir.join("config.edn")).unwrap(), b"current");
+    let trashed =
+        typed_trash_dir(&dir, TrashEntryKind::Conflict).join(".config.edn.4242.0.retired");
+    assert_eq!(fs::read(trashed).unwrap(), b"older");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn gh538_a_real_io_error_during_recovery_is_named_not_bare() {
+    // Not a flag refusal: the recovery must still fail, but say what it was
+    // doing and to which file instead of a bare errno.
+    let dir = scratch("gh538-named-error");
+    fs::write(dir.join(".config.edn.4242.0.retired"), b"{:base 1}\n").unwrap();
+
+    let error = restore_retired_files_with(&dir, &[dir.clone()], |_: &Path, _: &Path| {
+        Err(io::Error::from_raw_os_error(5))
+    })
+    .unwrap_err();
+
+    let text = error.to_string();
+    assert!(text.contains("logseq/.config.edn.4242.0.retired"), "{text}");
+    assert!(
+        dir.join(".config.edn.4242.0.retired").exists(),
+        "nothing moved"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn recovery_keeps_a_superseded_retired_copy_instead_of_deleting_it() {
     // The publish completed (or an external writer recreated the file), so

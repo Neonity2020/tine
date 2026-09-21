@@ -69,6 +69,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   with Safari never updated), Tine now says so at startup and explains that
   updating Safari fixes it, instead of opening with every page failing to
   display. The iOS build now requires iOS 15.4 (GH #572).
+- On Android storage that refuses Tine's atomic "rename without overwriting",
+  a settings write could leave `logseq/config.edn` hidden under a `.retired`
+  name, after which the graph failed to open with "Invalid argument". Tine now
+  checks the rename works before touching `config.edn`, and a graph already
+  affected opens again with its settings restored (GH #538).
 
 - A save conflict no longer ends up with a comparison that can never load. If
   Tine lost track of the conflict in the split second after it happened (for

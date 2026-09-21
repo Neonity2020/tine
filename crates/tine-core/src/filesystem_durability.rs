@@ -17,11 +17,14 @@ use cap_std::fs::Dir;
 mod atomic_fs;
 
 pub(crate) use atomic_fs::{
-    atomic_replace_expected, atomic_write_new, barrier_sync_all, move_file_noreplace, sync_dir,
-    AtomicReplaceOutcome, RETIRED_SUFFIX,
+    atomic_replace_expected, atomic_write_new, barrier_sync_all, move_file_noreplace,
+    restore_vacated_name, sync_dir, AtomicReplaceOutcome, RETIRED_SUFFIX,
 };
 #[cfg(test)]
-pub(crate) use atomic_fs::{atomic_replace_expected_with_hooks, dir_fsync_is_unsupported};
+pub(crate) use atomic_fs::{
+    atomic_replace_expected_with_hooks, atomic_replace_expected_with_mover,
+    dir_fsync_is_unsupported,
+};
 pub use atomic_fs::{atomic_write, dir_fsync_error_is_unsupported, sync_dir_for_rename};
 
 /// Read–modify–write a small text file (config.edn, device settings) under a lock,

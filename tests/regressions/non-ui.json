@@ -3188,6 +3188,30 @@
    "notes": "GH #572, jaemskyle: macOS Big Sur 11.7.8, 0.6.984 DMG. The system WKWebView was Safari-14-era: the lsdoc wasm failed to compile ('can't get 0th argument Type' -- the vendored module declares an externref parameter, the reference-types feature, Safari 15) and the frontend then threw on Array.prototype.at (Safari 15.4), so every page showed 'This page could not be displayed' and the block-renderer banner. Tine's declared floors were false: macOS had Tauri's default 10.13 and iOS was set to 14.0. Martin chose (2026-09-21) to require the Safari 15.4 engine with a clear message rather than support Safari 14: index.html runs an ES5 classic check (at, Object.hasOwn, structuredClone, and WebAssembly.validate of a one-type externref module) before the app module, renders the explanation and remedy (update Safari; iOS 15.4), and main.tsx stops and reveals the window on its flag. iOS minimumSystemVersion is 15.4. A source scan keeps post-15.4 built-ins out of src/. Verified in Chromium against the production build with Array.prototype.at deleted and with the reference-types probe failing: flag set, message shown, app not mounted; unmodified, the app mounts. Not verified on a real Safari 14 engine. Known limit, documented in the Guide: pdf.js needs Safari 17.4 (Promise.withResolvers, AbortSignal.any, class static blocks in the PdfViewer chunk only)."
   },
   {
+   "id": "REG-CONFIG-STRANDED-ON-FLAG-REFUSING-STORAGE-538",
+   "title": "A settings write on storage that refuses atomic no-replace renames leaves config.edn in place, and a graph already hit by it opens again",
+   "family": "storage-durability",
+   "sources": {
+    "issues": [
+     538
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "rust-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model_tests.rs"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #538 (Android, 0.6.982): after a failed write, the graph never opened again with a bare 'unsafe graph layout: Invalid argument (os error 22)'. atomic_replace_expected (the config.edn writer) retired the live file with a plain rename, then published with renameat2(RENAME_NOREPLACE); on storage that answers the flag with EINVAL both the publish and the no-replace undo failed, the undo error was ignored, and config.edn stayed stranded under .config.edn.<pid>.<seq>.retired. The open-time restore used the same refused primitive, so every open failed. The Android flag refusal is recorded from Android CI run 32091898520; it is device-dependent and was not reproduced on the reporter's device. Fix: prove the no-replace move on the staged temp before retiring the live name (refusal leaves config.edn untouched, with a named error); restore a vacated name by plain rename only when the storage refuses the flag AND the target is absent; name the step and file on recovery errors. Tests gh538_* inject an EINVAL mover; 3 of 4 fail on the old logic (the fourth covers error wording). Not covered: Direct page saves on such storage still fail (named error), a separate decision."
+  },
+  {
    "id": "REG-CLOSE-DISCARD-DIAGNOSTIC-540",
    "title": "A close that discarded unsaved drafts is visible in the diagnostic report instead of reading as an ordinary clean exit",
    "family": "diagnostic-observability",

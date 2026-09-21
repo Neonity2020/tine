@@ -13,6 +13,16 @@ use super::*;
 ///
 /// Registered directories only - never a whole-graph walk.
 pub(crate) fn restore_retired_files(root: &Path, dirs: &[PathBuf]) -> io::Result<usize> {
+    restore_retired_files_with(root, dirs, move_file_noreplace)
+}
+
+/// [`restore_retired_files`] over an explicit no-replace mover (test seam for
+/// storage that refuses the flagged rename, GH #538).
+pub(crate) fn restore_retired_files_with(
+    root: &Path,
+    dirs: &[PathBuf],
+    mover: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<usize> {
     let mut recovered = 0usize;
     for dir in dirs {
         let entries = match fs::read_dir(dir) {
@@ -36,14 +46,29 @@ pub(crate) fn restore_retired_files(root: &Path, dirs: &[PathBuf]) -> io::Result
                 // recoverable instead of deleting it.
                 let trash = typed_trash_dir(root, TrashEntryKind::Conflict);
                 fs::create_dir_all(&trash)?;
-                move_file_noreplace(&retired, &trash.join(name))?;
+                restore_vacated_name(&retired, &trash.join(name), &mover).map_err(|error| {
+                    named_recovery_error("moving to recovery trash", name, error)
+                })?;
                 continue;
             }
-            move_file_noreplace(&retired, &target)?;
+            // `restore_vacated_name` falls back to a plain rename only when the
+            // storage refuses the no-replace flag and `target` is still absent:
+            // a stranded `config.edn` otherwise blocks every open (GH #538).
+            restore_vacated_name(&retired, &target, &mover)
+                .map_err(|error| named_recovery_error("restoring", name, error))?;
             recovered += 1;
         }
     }
     Ok(recovered)
+}
+
+/// Name the step and the (graph-relative, `logseq/`) file, so a refusal on the
+/// open path is not a bare errno (GH #538 showed only "Invalid argument").
+fn named_recovery_error(step: &str, name: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("recovering an interrupted settings write ({step} logseq/{name}) failed: {error}"),
+    )
 }
 
 /// `.config.edn.1234.7.retired` -> `config.edn`.
