@@ -66,14 +66,18 @@ impl Graph {
     }
 
     /// One-open coherent snapshot for a conflict authority decision. Unlike an
-    /// ordinary read, this also performs the hard-refusal admission checks that
-    /// must never mint override authority (portable alias and multiple links).
+    /// ordinary read, this also performs the hard-refusal admission check that
+    /// must never mint override authority: the portable alias. The link count
+    /// is no longer one of them — a hard-linked page is an ordinary page
+    /// (GH #571), and only page creation can name a true in-graph alias.
     pub(super) fn graph_text_read_optional_editor_conflict_snapshot(
         &self,
         permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<Option<(String, ContentDigest)>> {
-        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
+        // Parsed for its refusal, not its value: a non-portable target must not
+        // mint override authority.
+        GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -165,7 +169,8 @@ impl Graph {
         expected_identity: ContentDigest,
     ) -> io::Result<()> {
         let target = self.graph_text_target(permit, path, false)?;
-        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
+        // Parsed for its refusal, not its value (see above).
+        GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -174,18 +179,13 @@ impl Graph {
                 ),
             )
         })?;
-        self.validate_existing_graph_text_target_exact(
-            &target,
-            &graph_text_path,
-            Some(expected_identity),
-        )?;
+        self.validate_existing_graph_text_target_exact(&target, Some(expected_identity))?;
         Ok(())
     }
 
     pub(super) fn validate_existing_graph_text_target_exact(
         &self,
         target: &GraphTextTarget,
-        graph_text_path: &GraphTextPath,
         expected_identity: Option<ContentDigest>,
     ) -> io::Result<ContentDigest> {
         projection_optional_regular_metadata(target.parent(), &target.filename)?;

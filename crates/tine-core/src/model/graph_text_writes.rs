@@ -309,11 +309,9 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        if let Err(error) = self.validate_existing_graph_text_target_exact(
-            &target,
-            &graph_text_path,
-            Some(expected_identity),
-        ) {
+        if let Err(error) =
+            self.validate_existing_graph_text_target_exact(&target, Some(expected_identity))
+        {
             if editor_episode.is_some()
                 && (error.kind() == io::ErrorKind::NotFound
                     || error
@@ -365,11 +363,9 @@ impl Graph {
             // validation, but before the first live-name mutation.
             graph_text_write_before_mutation_hook()?;
             self.validate_graph_text_portable_aliases_path_local(permit, &graph_text_path, false)?;
-            if let Err(error) = self.validate_existing_graph_text_target_exact(
-                &target,
-                &graph_text_path,
-                Some(expected_identity),
-            ) {
+            if let Err(error) =
+                self.validate_existing_graph_text_target_exact(&target, Some(expected_identity))
+            {
                 if editor_episode.is_some()
                     && (error.kind() == io::ErrorKind::NotFound
                         || error
@@ -433,11 +429,9 @@ impl Graph {
             }
             published = true;
             journal_projection_after_publish_hook()?;
-            if let Err(error) = self.validate_existing_graph_text_target_exact(
-                &target,
-                &graph_text_path,
-                Some(staged_identity),
-            ) {
+            if let Err(error) =
+                self.validate_existing_graph_text_target_exact(&target, Some(staged_identity))
+            {
                 if editor_episode.is_some()
                     && (error.kind() == io::ErrorKind::NotFound
                         || error
@@ -706,7 +700,7 @@ impl Graph {
                 &source_graph_text,
                 false,
             )?;
-            self.validate_existing_graph_text_target_exact(&source, &source_graph_text, None)?;
+            self.validate_existing_graph_text_target_exact(&source, None)?;
             // Interim rule for the paths with no complete index (rename
             // transaction, recovery): the precise "is the other name a graph
             // page?" question needs the identity index, and building one per
