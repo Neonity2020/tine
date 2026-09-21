@@ -14,7 +14,7 @@ impl Graph {
         }
         // R6: a ready projection already holds the effective inventory; the
         // whole-graph parse below is the not-ready fallback.
-        if let Some((gen, entries)) = self.direct_projection_page_inventory(gen) {
+        if let Some((gen, entries)) = self.direct_projection_page_inventory() {
             *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
             return entries;
         }

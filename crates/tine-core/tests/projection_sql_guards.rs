@@ -62,6 +62,7 @@ fn projection_statement_sites_are_pinned() {
     let expected: BTreeMap<String, usize> = [
         // P3B unified the page/block plain-reference candidates at one statement site.
         ("crates/tine-core/src/direct_projection.rs", 3),
+        ("crates/tine-core/src/direct_projection/derived_reads.rs", 6),
         ("crates/tine-core/src/model/direct_query.rs", 3),
         ("crates/tine-core/src/query/export_results.rs", 5),
         ("crates/tine-core/src/query/friendly.rs", 4),

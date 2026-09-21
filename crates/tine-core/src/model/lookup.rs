@@ -150,6 +150,9 @@ impl Graph {
     /// icon appear in the result. On-demand (e.g. a `{{namespace}}` macro), not at
     /// index time.
     pub fn page_icons(&self, names: &[String]) -> std::collections::HashMap<String, String> {
+        if let Some(icons) = self.indexed_page_icons(names) {
+            return icons;
+        }
         let (mut icons_by_name, real_page_names) = self.with_pages(|pages| {
             let mut icons = std::collections::HashMap::new();
             let mut real = std::collections::HashSet::new();
@@ -522,6 +525,10 @@ impl Graph {
             .insert(abs.clone(), (revision.clone(), file_identity));
         let mut dto = page_dto_checked(&effective, &document)?;
         dto.read_only = read_only_org(&abs, &content);
+        self.session_page_ids.write().unwrap().insert(
+            abs.clone(),
+            SessionPageIds::capture(&revision, self.config.parse_config().digest(), &document),
+        );
         dto.rev = Some(revision);
         dto.path = self.rel_path(&abs);
         Ok(Some(dto))

@@ -43,6 +43,7 @@ mod budgets;
 mod config_writes;
 mod conflicts;
 mod derived_cache;
+mod derived_reads;
 mod direct_query;
 mod dto;
 mod editor_activation;

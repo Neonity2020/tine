@@ -4,6 +4,12 @@ use super::*;
 use crate::query::graph::QueryGraph;
 
 impl QueryGraph for Graph {
+    fn indexed_derived_pages(
+        &self,
+        selection: crate::direct_projection::derived_reads::DerivedSelection<'_>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        Graph::indexed_derived_pages(self, selection)
+    }
     fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
         Graph::with_pages(self, f)
     }

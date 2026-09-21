@@ -157,6 +157,9 @@ pub(super) struct PageBuildTestState {
     pub(super) joined_changed: std::sync::Condvar,
     pub(super) force_warm_failure: std::sync::atomic::AtomicBool,
     pub(super) drift_before_install: std::sync::atomic::AtomicBool,
+    /// GH #543: open this unchanged page once inside an index-backed derived
+    /// read, after its SQL answer and before its generation check.
+    pub(super) derived_read_open_once: std::sync::Mutex<Option<PathBuf>>,
     pub(super) enumerations: std::sync::atomic::AtomicUsize,
     pub(super) parses: std::sync::atomic::AtomicUsize,
     pub(super) installs: std::sync::atomic::AtomicUsize,

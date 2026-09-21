@@ -1280,16 +1280,7 @@ impl Graph {
     pub(super) fn direct_projection_page_aliases_with_owners(
         &self,
     ) -> Option<Vec<(String, String, String)>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let generation = self.wait_for_derived_read(&projection, generation)?;
-        let aliases = projection.page_aliases_with_owners(generation)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(aliases)
+        self.indexed_read(|projection, generation| projection.page_aliases_with_owners(generation))
     }
 
     pub(super) fn direct_projection_real_page_names(&self) -> Option<crate::query::RealPageNames> {
@@ -1355,16 +1346,7 @@ impl Graph {
     pub(super) fn direct_projection_block_ref_counts(
         &self,
     ) -> Option<std::collections::HashMap<String, usize>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let generation = self.wait_for_derived_read(&projection, generation)?;
-        let counts = projection.block_ref_counts(generation)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(counts)
+        self.indexed_read(|projection, generation| projection.block_ref_counts(generation))
     }
 
     pub(crate) fn direct_projection_block_referrer_candidate_pages(
@@ -1380,15 +1362,6 @@ impl Graph {
             .map(Arc::clone)?;
         let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
         self.direct_projection_pages_for_paths(generation, paths)
-    }
-
-    pub(super) fn direct_projection_ready(&self) -> bool {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|projection| projection.ready_at(generation))
     }
 
     #[cfg(test)]

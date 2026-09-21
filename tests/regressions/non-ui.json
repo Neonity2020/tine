@@ -5155,6 +5155,39 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit IT-04. Opening a page publishes it and moves the cache generation even when its bytes are unchanged (the publication re-lowers the page with this session's block ids, which the stored index may not carry). The cold page-reading pass installed only at its exact starting generation, so opening today's journal while it ran discarded the pass and the next reader parsed the whole graph again. Installation now uses the rule the warm check already uses: no structural move, and every page published this session has the revision and config the pass read. An edit after the pass read the page still discards it. The first test fails when installation requires the exact generation. Evidence: tine-agents/evidence/gh550-batch/gh543-derived-wait/cold-install-fail-before.log."
+},
+{
+ "id": "REG-WARM-REOPEN-RENDER-READS-INDEXED-543",
+ "title": "Page icons, block references, referrers, templates, calendar days and property facets answer from the index on reopen without parsing the graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::bl1_six_surfaces_answer_from_sql_after_warm_reopen",
+   "crates/tine-core/src/direct_projection_tests.rs::bl1_six_surfaces_wait_during_warm_without_parsing",
+   "crates/tine-core/src/direct_projection_tests.rs::bl1_six_surfaces_follow_a_page_opened_during_the_read",
+   "crates/tine-core/src/direct_projection_tests.rs::bl1_loaded_runtime_id_can_miss_sql_without_a_parsed_cache",
+   "crates/tine-core/src/direct_projection_tests.rs::bl1_sql_preview_runtime_ids_remain_locatable",
+   "crates/tine-core/src/direct_projection_tests.rs::derived_reads_follow_generation_moves_through_one_front_door"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit IT-01. Rendering a page link (icon), a block reference or embed (resolve/preview), a block's referrers, the template picker, the calendar and property facets each called the whole-graph parser, even with a current index, so a warm reopen that needed zero parses parsed every page and enqueued a full snapshot. They now answer from SQL (candidate blocks only, reconstructed per call, nothing retained), wait for the warm check instead of parsing before ready, and follow a generation move (a page opened during the read) by re-reading the index: Graph::indexed_read is the one front door, pinned by a source-count guard. Runtime block ids the index does not hold are located through session_page_ids and hydrate one page; load_by_path now records them. Duplicate claimants resolve in path order (the parser used read_dir order). Each surface's answer equals the parser oracle on a fixture with aliases, upper-case ref spelling, nested and child-only templates, empty/property-only/renamed journals. Fail-before: every surface parsed 8-9 pages; with a page opened mid-read, all six parsed the whole graph. Evidence: tine-agents/evidence/gh550-batch/bl1/."
 }
 ]
 }

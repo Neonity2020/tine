@@ -3968,6 +3968,7 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
     }
 }
 
+pub(crate) mod derived_reads;
 #[cfg(test)]
 #[path = "direct_projection_tests.rs"]
 mod tests;

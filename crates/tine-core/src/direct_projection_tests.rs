@@ -4105,6 +4105,52 @@ fn public_ir_query_on_warm_reopen_uses_sql_without_parsed_cache() {
 }
 
 #[test]
+fn bl1_loaded_runtime_id_can_miss_sql_without_a_parsed_cache() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("bl1-runtime-contract");
+    let database = scratch("bl1-runtime-contract-db").join("projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let mut page = graph.load_by_path("pages/one.md").unwrap().unwrap();
+        let baseline = page.rev.clone();
+        // A frontend-created runtime identity is persisted in the disposable
+        // projection, but not in Markdown as an id:: property.
+        let mut inserted = page.blocks[0].clone();
+        inserted.id = Uuid::new_v4().to_string();
+        inserted.raw = "TODO inserted first".into();
+        page.blocks.insert(0, inserted);
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let page = graph.load_by_path("pages/one.md").unwrap().unwrap();
+    let id = &page.blocks[1].id;
+    assert!(!graph.has_parsed_cache_test());
+    assert_eq!(graph.page_build_parses_test(), 0);
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(!projection.session_pages_test().contains("pages/one.md"));
+    assert_eq!(
+        projection.block_page_hint(graph.cache_generation(), id),
+        Some(None),
+        "the frontend holds a runtime id absent from the current SQL image"
+    );
+    let resolved = graph.resolve_block(id).expect("today's parser resolves it");
+    assert_eq!(resolved.blocks[0].raw, page.blocks[1].raw);
+    assert_eq!(graph.page_build_parses_test(), 0);
+    assert!(graph.on_demand_parses_test() <= 1);
+    release_projection(&graph);
+}
+
+#[test]
 fn warm_reopen_parses_nothing_and_answers_from_sql() {
     let _serial = serialize_projection_tests();
     let root = r6_graph("warm-reopen");
@@ -4185,6 +4231,304 @@ fn warm_reopen_parses_nothing_and_answers_from_sql() {
 
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
+const BL1_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+fn bl1_fixture(tag: &str) -> PathBuf {
+    let root = r6_graph(tag);
+    std::fs::write(
+        root.join("pages/target.md"),
+        "- target\n  status:: active\n  id:: local-id\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pages/one.md"), format!(
+        "icon:: 🌲\nalias:: forest\n\n- TODO target\n  id:: {BL1_ID}\n  status:: active\n  - child\n    id:: bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\n- parent template\n  template:: Parent\n  - child template\n    template:: Nested\n    id:: cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee\n- omitted parent\n  template:: Children\n  template-including-parent:: false\n  - inserted child\n    id:: dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee\n")).unwrap();
+    std::fs::write(
+        root.join("pages/two.md"),
+        format!(
+            "- ancestor\n  - exact (({BL1_ID}))\n- uppercase (({}))\n",
+            BL1_ID.to_uppercase()
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("journals/2026_09_07.md"), "").unwrap();
+    std::fs::write(root.join("journals/2026_09_08.md"), "-\n  status:: empty\n").unwrap();
+    std::fs::write(
+        root.join("journals/2026_09_09.md"),
+        "title:: Sep 10th, 2026\n\n- renamed content\n",
+    )
+    .unwrap();
+    root
+}
+
+fn bl1_answer(graph: &Graph, surface: usize) -> serde_json::Value {
+    match surface {
+        0 => serde_json::to_value(graph.page_icons(&[
+            "one".into(),
+            "forest".into(),
+            "missing".into(),
+        ]))
+        .unwrap(),
+        1 => {
+            let ids = vec![
+                BL1_ID.into(),
+                BL1_ID.into(),
+                BL1_ID.to_uppercase(),
+                "local-id".into(),
+                "missing".into(),
+            ];
+            // The parser's cross-page hinted HashMap order is unspecified;
+            // exercise truncation with duplicate inputs for one physical row.
+            let bounded = crate::query::resolve_blocks_bounded(graph, &ids[..3], 1, usize::MAX);
+            serde_json::json!([
+                graph.resolve_block(BL1_ID),
+                graph.resolve_blocks(&ids),
+                bounded,
+                graph.preview_block(BL1_ID, 8),
+                graph.preview_block_with_budget(BL1_ID, 1, 4096)
+            ])
+        }
+        2 => {
+            let result = graph.block_referrers_bounded(BL1_ID, 10, 10000);
+            serde_json::json!([*result.groups, result.total, result.exceeded])
+        }
+        3 => serde_json::json!([
+            graph.property_facets_bounded(100, 100000),
+            graph.autocomplete_property_facets_bounded(100, 100000)
+        ]),
+        4 => {
+            let mut templates = graph.templates();
+            templates.sort_by(|a, b| a.name.cmp(&b.name));
+            assert_eq!(templates.len(), 3);
+            serde_json::to_value(templates).unwrap()
+        }
+        5 => {
+            let mut days = graph.journal_content_days();
+            days.sort();
+            serde_json::to_value(days).unwrap()
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn bl1_six_surfaces_answer_from_sql_after_warm_reopen() {
+    let _serial = serialize_projection_tests();
+    let root = bl1_fixture("bl1-six-ready");
+    let database = scratch("bl1-six-ready-db").join("projection.sqlite");
+    let oracle = Graph::open(&root);
+    let expected = (0..6)
+        .map(|surface| bl1_answer(&oracle, surface))
+        .collect::<Vec<_>>();
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let mut violations = Vec::new();
+    for (surface, expected) in expected.iter().enumerate() {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let answer = bl1_answer(&graph, surface);
+        let evidence = (
+            surface,
+            answer == *expected,
+            graph.page_build_parses_test(),
+            graph.on_demand_parses_test(),
+            graph.has_parsed_cache_test(),
+        );
+        eprintln!(
+            "BL1 ready (surface, oracle_equal, whole_parses, on_demand, cache): {evidence:?}"
+        );
+        if evidence != (surface, true, 0, 0, false) {
+            violations.push(evidence);
+        }
+        release_projection(&graph);
+    }
+    assert!(violations.is_empty(), "{violations:?}");
+}
+
+/// Opening a page publishes it and moves the generation. A derived read that
+/// saw the move answers again from the index instead of parsing the graph.
+#[test]
+fn bl1_six_surfaces_follow_a_page_opened_during_the_read() {
+    let _serial = serialize_projection_tests();
+    let root = bl1_fixture("bl1-six-moved");
+    // A page no derived read touches, so opening it always publishes.
+    std::fs::write(root.join("pages/untouched.md"), "- plain\n").unwrap();
+    let database = scratch("bl1-six-moved-db").join("projection.sqlite");
+    let oracle = Graph::open(&root);
+    let expected = (0..6)
+        .map(|surface| bl1_answer(&oracle, surface))
+        .collect::<Vec<_>>();
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let mut violations = Vec::new();
+    for (surface, expected) in expected.iter().enumerate() {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        graph.open_page_during_next_derived_read_test(Some(root.join("pages/untouched.md")));
+        let generation = graph.cache_generation();
+        let answer = bl1_answer(&graph, surface);
+        let evidence = (
+            surface,
+            answer == *expected,
+            graph.page_build_parses_test(),
+            graph.has_parsed_cache_test(),
+        );
+        let moved = graph.cache_generation() != generation;
+        eprintln!(
+            "BL1 moved (surface, oracle_equal, whole_parses, cache): {evidence:?} moved={moved}"
+        );
+        if evidence != (surface, true, 0, false) || !moved {
+            violations.push(evidence);
+        }
+        graph.open_page_during_next_derived_read_test(None);
+        release_projection(&graph);
+    }
+    assert!(violations.is_empty(), "{violations:?}");
+}
+
+/// GH #543 (I-13): every index-backed derived read goes through
+/// `Graph::indexed_read`, which follows a generation move instead of falling
+/// back to the whole-graph parser. A reader calling `wait_for_derived_read`
+/// directly re-creates the fallback on every page open during a read. Imitate
+/// `direct_projection_page_aliases_with_owners` in `model/direct_query.rs`.
+#[test]
+fn derived_reads_follow_generation_moves_through_one_front_door() {
+    let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model");
+    let mut callers = Vec::new();
+    for entry in std::fs::read_dir(&model).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            let source = std::fs::read_to_string(&path).unwrap();
+            for (line, text) in source.lines().enumerate() {
+                if text.contains("self.wait_for_derived_read(") {
+                    callers.push(format!(
+                        "{}:{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        line + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        callers.len(),
+        1,
+        "only Graph::derived_reader (model/derived_reads.rs) may call wait_for_derived_read; use Graph::indexed_read: {callers:?}"
+    );
+    assert!(callers[0].starts_with("derived_reads.rs:"), "{callers:?}");
+}
+
+#[test]
+fn bl1_six_surfaces_wait_during_warm_without_parsing() {
+    let _serial = serialize_projection_tests();
+    let root = bl1_fixture("bl1-six-warming");
+    let database = scratch("bl1-six-warming-db").join("projection.sqlite");
+    let oracle = Graph::open(&root);
+    let expected = (0..6)
+        .map(|surface| bl1_answer(&oracle, surface))
+        .collect::<Vec<_>>();
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let reads = (0..6)
+        .map(|surface| {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || bl1_answer(&graph, surface))
+        })
+        .collect::<Vec<_>>();
+    std::thread::sleep(Duration::from_millis(600));
+    let premature = reads.iter().any(|read| read.is_finished());
+    let parses = graph.page_build_parses_test();
+    pause.release.wait();
+    warm.join().unwrap();
+    for (surface, read) in reads.into_iter().enumerate() {
+        assert_eq!(read.join().unwrap(), expected[surface], "surface {surface}");
+    }
+    assert!(!premature, "every surface must wait for warm validation");
+    assert_eq!(parses, 0);
+    assert_eq!(graph.page_build_parses_test(), 0);
+    assert_eq!(graph.on_demand_parses_test(), 0);
+    release_projection(&graph);
+}
+
+#[test]
+fn bl1_sql_preview_runtime_ids_remain_locatable() {
+    let _serial = serialize_projection_tests();
+    let root = bl1_fixture("bl1-preview-runtime");
+    let page_path = root.join("pages/one.md");
+    let source = std::fs::read_to_string(&page_path).unwrap();
+    std::fs::write(
+        &page_path,
+        source.replace("    id:: bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\n", ""),
+    )
+    .unwrap();
+    let database = scratch("bl1-preview-runtime-db").join("projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let mut page = graph.load_by_path("pages/one.md").unwrap().unwrap();
+        let baseline = page.rev.clone();
+        let mut inserted = page.blocks[0].clone();
+        inserted.id = Uuid::new_v4().to_string();
+        inserted.raw = "inserted before target".into();
+        inserted.children.clear();
+        page.blocks.insert(0, inserted);
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let preview = graph.preview_block(BL1_ID, 8).unwrap();
+    assert_eq!(graph.on_demand_parses_test(), 0);
+    let child = &preview.group.blocks[0].children[0];
+    assert!(!graph
+        .direct_projection_test()
+        .unwrap()
+        .session_pages_test()
+        .contains("pages/one.md"));
+    let resolved = graph.resolve_block(&child.id).unwrap();
+    assert_eq!(resolved.blocks[0].raw, child.raw);
+    assert_eq!(graph.page_build_parses_test(), 0);
+    assert_eq!(graph.on_demand_parses_test(), 1);
+    // Exact revision failure cannot resurrect the old runtime id or trigger a
+    // graph walk, even before a watcher has reported the changed file.
+    std::fs::write(root.join("pages/one.md"), "- externally replaced\n").unwrap();
+    assert!(graph.resolve_block(&child.id).is_none());
+    assert_eq!(graph.page_build_parses_test(), 0);
+    assert_eq!(graph.on_demand_parses_test(), 1);
+    release_projection(&graph);
 }
 
 #[test]

@@ -42,12 +42,14 @@ pub fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
 /// True if any block in the subtree has a non-empty line that isn't a `key::`
 /// property line — i.e. the page is more than an empty/placeholder bullet.
 pub(crate) fn doc_has_content(blocks: &[DocBlock]) -> bool {
-    blocks.iter().any(|b| {
-        b.raw
-            .lines()
-            .any(|l| !l.trim().is_empty() && crate::doc::parse_property_line(l).is_none())
-            || doc_has_content(&b.children)
-    })
+    blocks
+        .iter()
+        .any(|b| block_raw_has_content(&b.raw) || doc_has_content(&b.children))
+}
+
+pub(crate) fn block_raw_has_content(raw: &str) -> bool {
+    raw.lines()
+        .any(|line| !line.trim().is_empty() && crate::doc::parse_property_line(line).is_none())
 }
 
 /// Versioned namespace for file-mode runtime block locators. These UUIDs are

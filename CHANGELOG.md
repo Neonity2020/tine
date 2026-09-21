@@ -87,6 +87,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   not changed, is opened while it runs. Tine then read and parsed every page
   a second time before search could start. An edit made during the pass
   still restarts it (GH #543).
+- Reopening a large graph no longer parses every page when a page shows
+  a page icon, a block reference or embed, a block's references, a template,
+  the calendar, or property suggestions. Those now answer from the search
+  index, and wait for it while it is being checked. A page opened while one
+  of them is reading no longer sends it back to parsing the whole graph
+  (GH #543).
 - Advanced queries written the way Logseq's documentation and many
   `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
   or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or

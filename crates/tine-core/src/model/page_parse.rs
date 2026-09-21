@@ -14,6 +14,25 @@ pub(super) struct SessionPageIds {
 }
 
 impl SessionPageIds {
+    pub(super) fn from_projection(
+        revision: &str,
+        config: ContentDigest,
+        preorder: Vec<(String, usize)>,
+    ) -> Option<Self> {
+        let source = revision.rsplit(':').next()?;
+        (crate::direct_projection::projection_source_revision(source, config) == revision).then(
+            || Self {
+                revision: source.to_owned(),
+                config,
+                preorder,
+            },
+        )
+    }
+
+    pub(super) fn contains(&self, ids: &HashSet<String>) -> bool {
+        self.preorder.iter().any(|(id, _)| ids.contains(id))
+    }
+
     pub(super) fn capture(revision: &str, config: ContentDigest, doc: &Document) -> Self {
         let mut pending: Vec<_> = doc.roots.iter().rev().collect();
         let mut preorder = Vec::new();

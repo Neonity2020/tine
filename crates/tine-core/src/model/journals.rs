@@ -57,6 +57,9 @@ impl Graph {
     /// least one block with a non-empty, non-property line. Drives the calendar
     /// picker's empty/non-empty day marking. Served from the cache.
     pub fn journal_content_days(&self) -> Vec<i64> {
+        if let Some(days) = self.indexed_journal_content_days() {
+            return days;
+        }
         self.with_pages(|pages| {
             pages
                 .iter()

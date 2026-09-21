@@ -8,6 +8,12 @@ use crate::vocab::{PageEntry, PageKind, RefGroup, ReferenceCandidatePages, Refer
 
 #[allow(dead_code)]
 pub(crate) trait QueryGraph {
+    fn indexed_derived_pages(
+        &self,
+        _selection: crate::direct_projection::derived_reads::DerivedSelection<'_>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        None
+    }
     fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T;
     fn page_aliases(&self) -> Vec<(String, String)>;
     fn block_page_hint(&self, uuid: &str) -> Option<String>;
@@ -67,6 +73,12 @@ pub(crate) trait QueryGraph {
 // coercion during type inference. Forward the capability through `Arc` so the
 // established callers keep their signatures without cloning or allocation.
 impl<G: QueryGraph> QueryGraph for Arc<G> {
+    fn indexed_derived_pages(
+        &self,
+        selection: crate::direct_projection::derived_reads::DerivedSelection<'_>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        (**self).indexed_derived_pages(selection)
+    }
     fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
         (**self).with_pages(f)
     }

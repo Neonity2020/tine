@@ -31,6 +31,8 @@ fn write_census_corpus(root: &Path) {
         "type:: book\n\
          tags:: reading, fiction\n\n\
          - TODO alpha parent #reading [[Beta]]\n\
+         \x20 id:: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n\
+         \x20 template:: Census\n\
          \x20 SCHEDULED: <2026-09-20 Sun>\n\
          \t- alpha child\n\
          \t  prop:: value\n\
@@ -44,7 +46,7 @@ fn write_census_corpus(root: &Path) {
     .unwrap();
     std::fs::write(
         root.join("pages/Beta.md"),
-        "alias:: bee\n\n- beta block referencing [[Alpha Book]]\n- another #fiction alpha\n",
+        "alias:: bee\n\n- beta block referencing [[Alpha Book]] ((aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee))\n- another #fiction alpha\n",
     )
     .unwrap();
     std::fs::write(root.join("pages/Go.md"), "alias:: ox\n\n- short target\n").unwrap();
@@ -69,6 +71,12 @@ fn wait_ready(graph: &Graph) {
 }
 
 fn exercise_every_surface(graph: &Graph) {
+    graph.page_icons(&["Alpha Book".into(), "bee".into()]);
+    graph.resolve_blocks(&["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()]);
+    graph.preview_block("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", 8);
+    graph.block_referrers_bounded("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", 10, 10000);
+    graph.templates();
+    graph.journal_content_days();
     // Friendly search: names (default), content and both; block hits with
     // ancestors (breadcrumbs) and the trigram-driven candidate path.
     graph

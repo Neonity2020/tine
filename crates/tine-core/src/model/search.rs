@@ -351,12 +351,8 @@ impl Graph {
         max_values: usize,
         max_bytes: usize,
     ) -> (Vec<(String, Vec<String>)>, bool) {
-        if self.direct_projection_ready() {
-            if let Some(result) =
-                self.direct_projection_property_facets(false, max_values, max_bytes)
-            {
-                return result;
-            }
+        if let Some(result) = self.direct_projection_property_facets(false, max_values, max_bytes) {
+            return result;
         }
         self.direct_projection_note_fallback_read();
         crate::query::property_facets_bounded(self, max_values, max_bytes)
@@ -367,11 +363,8 @@ impl Graph {
         max_items: usize,
         max_bytes: usize,
     ) -> (Vec<(String, Vec<String>)>, bool) {
-        if self.direct_projection_ready() {
-            if let Some(result) = self.direct_projection_property_facets(true, max_items, max_bytes)
-            {
-                return result;
-            }
+        if let Some(result) = self.direct_projection_property_facets(true, max_items, max_bytes) {
+            return result;
         }
         self.direct_projection_note_fallback_read();
         crate::query::autocomplete_property_facets_bounded(self, max_items, max_bytes)

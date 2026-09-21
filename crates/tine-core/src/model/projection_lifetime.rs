@@ -370,17 +370,17 @@ impl Graph {
     /// walk's `PageEntry` shape. `pages.name` is the effective (title::-aware)
     /// name because the producer lowers the effective entry; kind comes from
     /// the row and a journal's sort key from its name.
-    pub(super) fn direct_projection_page_inventory(
+    pub(super) fn direct_projection_page_inventory(&self) -> Option<(u64, Vec<PageEntry>)> {
+        self.indexed_read(|projection, generation| {
+            self.direct_projection_page_inventory_at(projection, generation)
+        })
+    }
+
+    fn direct_projection_page_inventory_at(
         &self,
+        projection: &Arc<crate::direct_projection::DirectProjection>,
         generation: u64,
     ) -> Option<(u64, Vec<PageEntry>)> {
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let generation = self.wait_for_derived_read(&projection, generation)?;
         let rows = projection.page_inventory(generation)?;
         let mut entries = Vec::with_capacity(rows.len());
         for (name, rel_path, kind) in rows {
@@ -398,8 +398,7 @@ impl Graph {
             });
         }
         entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation)
-            .then_some((generation, entries))
+        Some((generation, entries))
     }
 
     /// R6: parse exactly the named pages for reference/fuzzy hydration when no
@@ -483,21 +482,15 @@ impl Graph {
         max_items: usize,
         max_bytes: usize,
     ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let result = projection.property_facets(
-            generation,
-            autocomplete,
-            &self.config.block_hidden_properties,
-            max_items,
-            max_bytes,
-        )?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+        self.indexed_read(|projection, generation| {
+            projection.property_facets(
+                generation,
+                autocomplete,
+                &self.config.block_hidden_properties,
+                max_items,
+                max_bytes,
+            )
+        })
     }
 
     /// The §6.2 registry row source when the Direct Files projection is READY
@@ -514,16 +507,7 @@ impl Graph {
         Vec<crate::query::registry::OwnerRow>,
         std::collections::HashMap<String, crate::query::registry::PageMeta>,
     )> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let generation = self.wait_for_derived_read(&projection, generation)?;
-        let result = projection.property_owner_rows(generation)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+        self.indexed_read(|projection, generation| projection.property_owner_rows(generation))
     }
 }
 

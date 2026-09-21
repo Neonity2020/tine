@@ -1553,9 +1553,11 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-21: GH #543 pins tine-storage v0.27.1 (fresh-build speedup:
     // cached statements and coordinate-resolved postings inside storage). The
     // production import and direct-call inventory is unchanged.
+    // 2026-09-21: BL1 adds read-only derived SQL snapshots and typed row
+    // validation. No storage write crossing, schema or dependency pin changes.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "d36012ef2ed70ac4260dca081237bbbb5723d870a0dba599b0ce4f7b2261213c",
+        "476a81b6398727206c611d8bb58b0e8a8fb0361abd1ceff0d9ba4e639833a3f8",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

@@ -78,6 +78,7 @@ use ir::{Anchor, Attr, CmpOp, Filter, Quant, Query, Rel, SortDir, Source, Value,
 
 use self::sort::{compare_sort_decorations, lexical_property_sort_text, SortDecor};
 use crate::date::{JournalDate, JournalFormat};
+use crate::direct_projection::derived_reads::DerivedSelection;
 use crate::doc::{property_key_norm, DocBlock, Document};
 #[cfg(test)]
 use crate::model::Graph;
@@ -521,6 +522,17 @@ thread_local! {
 /// Collect matching blocks from an exact candidate set, or from the complete
 /// already-parsed graph when no safe candidate set is available. The parser
 /// remains the semantic authority; this helper performs no disk I/O or parsing.
+fn with_candidate_pages<G: QueryGraph, T>(
+    graph: &G,
+    candidates: Option<Vec<(PageEntry, std::sync::Arc<Document>)>>,
+    f: impl FnOnce(&[(PageEntry, std::sync::Arc<Document>)]) -> T,
+) -> T {
+    match candidates {
+        Some(pages) => f(&pages),
+        None => graph.with_pages(f),
+    }
+}
+
 fn collect_bounded_candidates<G: QueryGraph>(
     graph: &G,
     candidate_pages: Option<Vec<(PageEntry, std::sync::Arc<Document>)>>,
@@ -532,8 +544,7 @@ fn collect_bounded_candidates<G: QueryGraph>(
 ) -> BoundedGroups {
     let ex = exclude.map(refs::normalize);
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
-    let groups = graph.with_pages(|all_pages| {
-        let pages = candidate_pages.as_deref().unwrap_or(all_pages);
+    let groups = with_candidate_pages(graph, candidate_pages, |pages| {
         // Pair each group with the referring page's journal `date_key` so the result
         // can be ordered like OG (the page cache itself is in arbitrary read_dir order).
         let mut groups: Vec<(Option<i64>, RefGroup)> = Vec::new();
@@ -1630,7 +1641,9 @@ pub fn block_referrers<G: QueryGraph>(graph: &G, uuid: &str) -> Vec<RefGroup> {
     }
     collect_bounded_candidates(
         graph,
-        graph.direct_projection_block_referrer_candidate_pages(u),
+        graph
+            .indexed_derived_pages(DerivedSelection::Referrers(u))
+            .or_else(|| graph.direct_projection_block_referrer_candidate_pages(u)),
         |b| b.projection().block_refs.iter().any(|r| r == u),
         |_, _| None,
         None,
@@ -1658,7 +1671,9 @@ pub fn block_referrers_bounded<G: QueryGraph>(
     }
     collect_bounded_candidates(
         graph,
-        graph.direct_projection_block_referrer_candidate_pages(u),
+        graph
+            .indexed_derived_pages(DerivedSelection::Referrers(u))
+            .or_else(|| graph.direct_projection_block_referrer_candidate_pages(u)),
         |b| b.projection().block_refs.iter().any(|r| r == u),
         |_, _| None,
         None,
@@ -3357,33 +3372,37 @@ pub fn search_cancellable<G: QueryGraph>(
 
 /// Find every `template:: <name>` block and the blocks an insertion produces.
 pub fn templates<G: QueryGraph>(graph: &G) -> Vec<TemplateDto> {
-    graph.with_pages(|pages| {
-        let mut out: Vec<TemplateDto> = Vec::new();
-        for (entry, doc) in pages {
-            walk(&doc.roots, &mut |b| {
-                let Some(name) = b.property("template") else {
-                    return;
-                };
-                if name.is_empty() {
-                    return;
-                }
-                let include_parent =
-                    b.property("template-including-parent").as_deref() != Some("false");
-                let blocks = if include_parent {
-                    vec![template_dto(b, true)]
-                } else {
-                    b.children.iter().map(|c| template_dto(c, false)).collect()
-                };
-                out.push(TemplateDto {
-                    name,
-                    blocks,
-                    page: entry.name.clone(),
-                    kind: entry.kind,
+    with_candidate_pages(
+        graph,
+        graph.indexed_derived_pages(DerivedSelection::Templates),
+        |pages| {
+            let mut out: Vec<TemplateDto> = Vec::new();
+            for (entry, doc) in pages {
+                walk(&doc.roots, &mut |b| {
+                    let Some(name) = b.property("template") else {
+                        return;
+                    };
+                    if name.is_empty() {
+                        return;
+                    }
+                    let include_parent =
+                        b.property("template-including-parent").as_deref() != Some("false");
+                    let blocks = if include_parent {
+                        vec![template_dto(b, true)]
+                    } else {
+                        b.children.iter().map(|c| template_dto(c, false)).collect()
+                    };
+                    out.push(TemplateDto {
+                        name,
+                        blocks,
+                        page: entry.name.clone(),
+                        kind: entry.kind,
+                    });
                 });
-            });
-        }
-        out
-    })
+            }
+            out
+        },
+    )
 }
 
 /// Convert a template block subtree to a DTO, dropping `id::` (so inserted
@@ -3508,11 +3527,16 @@ pub fn quick_switch(graph: &impl QueryGraph, query: &str, limit: usize) -> Vec<P
 /// Descendants are owned by the source page; explicit bounded consumers use
 /// `preview_block`.
 pub fn resolve_block<G: QueryGraph>(graph: &G, uuid: &str) -> Option<RefGroup> {
-    // Jump to the owning page via the uuid index, falling back to a full scan if
-    // the hint is missing or stale (so a lagging index can never give a wrong
-    // answer — just a slower one).
-    let hint = graph.block_page_hint(uuid);
-    graph.with_pages(|pages| {
+    // A ready index supplies only exact candidates. Runtime misses use captured
+    // pages or the session locator; only an unavailable index needs the legacy
+    // whole-graph fallback.
+    let ids = [uuid.to_owned()];
+    let candidates = graph.indexed_derived_pages(DerivedSelection::Resolve(&ids));
+    let hint = candidates
+        .is_none()
+        .then(|| graph.block_page_hint(uuid))
+        .flatten();
+    with_candidate_pages(graph, candidates, |pages| {
         let find_in = |entry: &PageEntry, doc: &Document| -> Option<RefGroup> {
             let mut found: Option<&DocBlock> = None;
             walk(&doc.roots, &mut |b| {
@@ -3593,8 +3617,13 @@ pub fn resolve_blocks_bounded<G: QueryGraph>(
     // uuid index); unhinted ids go straight to the whole-graph fallback.
     let mut by_page: HashMap<String, Vec<&str>> = HashMap::new();
     let mut unhinted: Vec<&str> = Vec::new();
+    let candidates = graph.indexed_derived_pages(DerivedSelection::Resolve(uuids));
     for &id in &distinct {
-        match graph.block_page_hint(id) {
+        match candidates
+            .is_none()
+            .then(|| graph.block_page_hint(id))
+            .flatten()
+        {
             Some(page) => by_page.entry(page).or_default().push(id),
             None => unhinted.push(id),
         }
@@ -3602,7 +3631,7 @@ pub fn resolve_blocks_bounded<G: QueryGraph>(
 
     let mut resolved: HashMap<&str, RefGroup> = HashMap::new();
     let mut resolved_budget = ConstructionBudget::new(max_rows, max_bytes);
-    graph.with_pages(|pages| {
+    with_candidate_pages(graph, candidates, |pages| {
         let mut page_by_name: HashMap<&str, (&PageEntry, &std::sync::Arc<Document>)> =
             HashMap::with_capacity(pages.len());
         for (entry, doc) in pages {
@@ -3724,8 +3753,13 @@ pub fn preview_block_with_budget<G: QueryGraph>(
 ) -> Option<BlockPreview> {
     let max_nodes = max_nodes.max(1);
     let max_bytes = max_bytes.max(1);
-    let hint = graph.block_page_hint(uuid);
-    graph.with_pages(|pages| {
+    let ids = [uuid.to_owned()];
+    let candidates = graph.indexed_derived_pages(DerivedSelection::Preview(&ids));
+    let hint = candidates
+        .is_none()
+        .then(|| graph.block_page_hint(uuid))
+        .flatten();
+    with_candidate_pages(graph, candidates, |pages| {
         let find_in = |entry: &PageEntry, doc: &Document| -> Option<BlockPreview> {
             let mut found: Option<&DocBlock> = None;
             walk(&doc.roots, &mut |block| {
