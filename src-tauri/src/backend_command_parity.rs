@@ -908,7 +908,7 @@ mod tests {
     /// finishes (GH #332 measured 10-16 s at startup on a large Windows graph).
     #[test]
     fn whole_graph_conflict_listings_are_async() {
-        let commands = include_str!("commands.rs");
+        let commands = crate::test_support::rust_module_production_source("commands.rs");
         for name in [
             "list_sync_conflicts",
             "list_vcs_marker_conflicts",
