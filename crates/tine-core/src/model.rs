@@ -366,6 +366,9 @@ pub struct Graph {
     /// revision, so it can check those pages against what it read instead of
     /// rereading the whole graph (GH #543).
     cache_structural_gen: std::sync::atomic::AtomicU64,
+    /// Pages counted by the running whole-graph check or read, for the
+    /// indexing progress bar only (GH #543).
+    indexing_progress: crate::indexing_progress::ProgressCounter,
     /// Raw watcher callbacks publish an O(1) admission barrier before their
     /// debounced reconciliation. The app registry admits only one Graph slot per
     /// canonical root, so this frontier is instance-local and cannot be cleared

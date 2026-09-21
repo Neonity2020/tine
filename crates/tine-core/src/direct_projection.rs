@@ -396,6 +396,9 @@ struct ProjectionShared {
     /// Before this marker, that race could trigger a redundant whole-graph
     /// reconstruction on the query thread.
     warms_in_flight: AtomicUsize,
+    /// Pages written by the running fresh build, for the indexing progress
+    /// bar only (GH #543).
+    build_progress: crate::indexing_progress::ProgressCounter,
     /// §5.9's failed-read injection: one read through the seam fails, exactly as
     /// a torn or truncated projection file, a disk error or a resource limit
     /// makes it fail. It exists because the obligation a failed read carries —
@@ -863,6 +866,7 @@ impl DirectProjection {
             registry_capture_attempts: AtomicU64::new(0),
             repairs_in_flight: AtomicUsize::new(0),
             warms_in_flight: AtomicUsize::new(0),
+            build_progress: Default::default(),
             #[cfg(test)]
             inject_read_failure: AtomicBool::new(false),
             #[cfg(test)]
@@ -1023,36 +1027,6 @@ impl DirectProjection {
             pending.warm_outcome = Some((pending.warm_attempt, WarmOutcome::Superseded));
         }
         self.shared.changed.notify_all();
-    }
-
-    /// Wait, at most `limit`, until no page delta is queued, so a warm whose
-    /// read already covers those publications can be offered to the queue
-    /// without reading the graph again (GH #543). False when deltas remain
-    /// (a turn that owes a full inventory keeps them) or the worker is gone
-    /// or failed.
-    pub(crate) fn wait_for_queued_deltas(&self, limit: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + limit;
-        let mut pending = self.shared.pending.lock().unwrap();
-        loop {
-            if !self.shared.worker_available.load(Ordering::Acquire)
-                || self.shared.worker_failed.load(Ordering::Acquire)
-            {
-                return false;
-            }
-            if pending.deltas.is_empty() {
-                return true;
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            pending = self
-                .shared
-                .changed
-                .wait_timeout(pending, deadline - now)
-                .unwrap()
-                .0;
-        }
     }
 
     /// R6 warm validation: hand the worker the walk inventory with exact
@@ -3170,7 +3144,12 @@ fn build_and_publish_fresh_projection(
         let config_digest = parse_config.digest();
         let mut applied = AppliedTurn::default();
         let mut text_bytes = 0u64;
+        let progress = shared.build_progress.begin(
+            crate::indexing_progress::IndexingPhase::Indexing,
+            pages.len(),
+        );
         for chunk in pages.chunks(BUILD_BATCH) {
+            progress.advance(chunk.len());
             if fresh_build_stopped(shared) {
                 return Err(FreshBuildError::Stopped);
             }
@@ -3992,3 +3971,5 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
 #[cfg(test)]
 #[path = "direct_projection_tests.rs"]
 mod tests;
+
+mod observers;

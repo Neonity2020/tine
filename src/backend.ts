@@ -130,6 +130,14 @@ export async function clipboardImageToPng(img: ClipboardImage): Promise<Uint8Arr
 
 /** One raw graph file, as returned by `graphSourceFiles` — the input to the
  *  in-app lsdoc↔mldoc diff panel. `text` is the file's bytes exactly as on disk. */
+/** Mirrors `tine_core::indexing_progress::IndexingProgress`. `total === 0`
+ *  means the pass is running but has not counted its pages yet. */
+export interface IndexingProgress {
+  phase: "checking" | "reading" | "indexing";
+  done: number;
+  total: number;
+}
+
 export interface GraphSourceFile {
   rel: string;
   text: string;
@@ -568,6 +576,9 @@ export interface Backend {
   getUnlinkedRefs(name: string): Promise<RefGroup[]>;
   /** True once the background whole-graph warm has built derived graph-open caches. */
   warmDone(): Promise<boolean>;
+  /** How far the graph-sized index work has got; null once search is answered
+   *  by a current index (GH #543). */
+  indexingProgress(): Promise<IndexingProgress | null>;
   /** Map of block uuid → number of blocks that reference it (the count badge). */
   getBlockRefCounts(): Promise<Record<string, number>>;
   /** Blocks that reference block `uuid`, grouped by page (the referrers panel). */
@@ -1484,6 +1495,9 @@ class TauriBackend implements Backend {
   }
   warmDone() {
     return this.call<boolean>("warm_done");
+  }
+  indexingProgress() {
+    return this.call<IndexingProgress | null>("indexing_progress");
   }
   getBlockRefCounts() {
     return this.call<Record<string, number>>("block_ref_counts", {});

@@ -429,6 +429,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- While a large graph is being indexed, the toolbar shows how far it has
+  got — checking, reading or building the search index, with a page count —
+  so a long first open no longer looks stuck. Tine stays usable meanwhile
+  (GH #543).
 - **A part of Tine that fails now says so, where it failed, with a Retry — instead
   of leaving the window blank.** Until now a single unreadable value anywhere in
   the interface tore down the whole render and showed nothing at all, with no

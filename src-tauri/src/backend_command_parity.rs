@@ -345,6 +345,7 @@ mod tests {
         ("graph.rs", "create_graph"),
         ("graph.rs", "default_graph_parent"),
         ("graph.rs", "finish_direct_cross_page_move"),
+        ("graph.rs", "indexing_progress"),
         ("graph.rs", "inspect_graph_access"),
         ("graph.rs", "load_graph"),
         ("graph.rs", "open_graph_window"),
@@ -698,7 +699,7 @@ mod tests {
         // whole packet exists to make unwritable.
         assert_eq!(
             (site_count, site_fingerprint),
-            (240, 13_237_046_910_067_947_179),
+            (241, 12_396_874_377_099_507_444),
             "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
              sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
              genuinely moved, changed family, appeared or disappeared. Diff these against \

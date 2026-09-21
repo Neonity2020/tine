@@ -449,6 +449,7 @@ impl Graph {
             effective_identity_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             cache_structural_gen: std::sync::atomic::AtomicU64::new(0),
+            indexing_progress: Default::default(),
             external_observation_epoch: std::sync::atomic::AtomicU64::new(0),
             external_reconciled_epoch: std::sync::atomic::AtomicU64::new(0),
             external_observation_instance: NEXT_EXTERNAL_OBSERVATION_INSTANCE

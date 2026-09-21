@@ -61,6 +61,42 @@ impl Graph {
             .map(|projection| projection.observe_commits(wake))
     }
 
+    /// What the graph-sized index work is doing, for the indexing progress bar
+    /// (GH #543). `None` once search is answered by a current index, or when
+    /// nothing graph-sized is running. Presentation only.
+    pub fn indexing_progress(&self) -> Option<crate::indexing_progress::IndexingProgress> {
+        use crate::direct_projection::ProjectionProgress;
+        use crate::indexing_progress::{IndexingPhase, IndexingProgress};
+        use crate::query::QueryReadinessReason as Reason;
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone);
+        let Some(projection) = projection else {
+            return self.indexing_progress.snapshot();
+        };
+        if let Some(build) = projection.build_progress() {
+            return Some(build);
+        }
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        if projection.ready_at(generation) {
+            return None;
+        }
+        if let Some(pass) = self.indexing_progress.snapshot() {
+            return Some(pass);
+        }
+        // Between passes: a queued snapshot or an announced warm is still
+        // graph-sized work, so keep the bar up rather than flicker it off.
+        match projection.progress_at(generation) {
+            ProjectionProgress::Working(Reason::Recovering | Reason::Indexing) => {
+                Some(IndexingProgress::unmeasured(IndexingPhase::Indexing))
+            }
+            _ => None,
+        }
+    }
+
     /// Test barrier for ordinary producer progression. Production queries read
     /// the current coherent image and never wait for a saved-edit generation.
     #[cfg(test)]

@@ -17,6 +17,7 @@ import { ContextMenu } from "./components/ContextMenu";
 import { Toasts, Lightbox } from "./components/Toasts";
 import { AudioOverlay } from "./components/AudioOverlay";
 import { CalendarJump } from "./components/CalendarJump";
+import { IndexingProgressBar } from "./components/IndexingProgressBar";
 import { RightSidebar } from "./components/RightSidebar";
 // Settings pulls in the plugin/theme catalogues, backup controls, and every
 // settings tab. Most launches never open it, so keep that work out of the
@@ -1596,6 +1597,7 @@ export function App(): JSX.Element {
             </Show>
           </Show>
           <div class="topbar-right">
+            <IndexingProgressBar />
             <CalendarJump triggerClass="topbar-optional-action" onOpenReady={(open) => { openCalendarJump = open; }} />
             <button class="icon-btn topbar-optional-action" title="Journals" data-pane-focus-neutral onClick={topbarActions.journals}>
               <svg viewBox="0 0 24 24" class="nav-icon">

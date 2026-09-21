@@ -5105,6 +5105,7 @@ fn empty_projection_shared() -> ProjectionShared {
         projection_health_checks: AtomicU64::new(0),
         repairs_in_flight: AtomicUsize::new(0),
         warms_in_flight: AtomicUsize::new(0),
+        build_progress: Default::default(),
         #[cfg(test)]
         capture_thread: Mutex::new(None),
         #[cfg(test)]
@@ -8519,4 +8520,80 @@ fn gh543_a_page_opened_during_the_warm_read_keeps_the_warm() {
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
+}
+
+/// GH #543 progress bar: each whole-graph pass reports how many pages it has
+/// finished, and the report ends once search is answered by a current index.
+#[test]
+fn gh543_indexing_progress_counts_each_whole_graph_pass() {
+    use crate::indexing_progress::{IndexingPhase, IndexingProgress};
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-indexing-progress");
+    for index in 0..80 {
+        std::fs::write(
+            root.join("pages").join(format!("bulk-{index:03}.md")),
+            format!("- TODO bulk-{index:03}\n"),
+        )
+        .unwrap();
+    }
+    let database = root.join("private/projection.sqlite");
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    assert_eq!(
+        graph.indexing_progress(),
+        None,
+        "a current index reports nothing"
+    );
+
+    // A fresh build counts the pages it has written.
+    let (pages, revisions, config) = parsed_snapshot(&graph);
+    let total = pages.len() as u64;
+    let projection = graph.direct_projection_test().unwrap();
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    *projection.shared.after_fresh_build_batch.lock().unwrap() = Some(Box::new({
+        let reached = Arc::clone(&reached);
+        let release = Arc::clone(&release);
+        move || {
+            reached.wait();
+            release.wait();
+        }
+    }));
+    projection.request_rebuild();
+    projection.enqueue_full(graph.cache_generation() + 1, pages, revisions, config, true);
+    reached.wait();
+    assert_eq!(
+        graph.indexing_progress(),
+        Some(IndexingProgress {
+            phase: IndexingPhase::Indexing,
+            done: 32,
+            total,
+        })
+    );
+    release.wait();
+    drop(projection);
+    release_projection(&graph);
+    drop(graph);
+    std::thread::sleep(Duration::from_millis(20));
+
+    // A warm reopen counts the pages it has checked.
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let checking = graph.indexing_progress().expect("the check is reported");
+    assert_eq!(checking.phase, IndexingPhase::Checking);
+    assert!(checking.total >= 80 && checking.done == checking.total);
+    pause.release.wait();
+    warm.join().unwrap();
+    wait_ready(&graph);
+    assert_eq!(graph.indexing_progress(), None);
+    release_projection(&graph);
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -463,10 +463,15 @@ impl Graph {
         let mut retained = Vec::new();
         let mut failures = skipped;
         let mut text_bytes = 0u64;
+        let progress = self.indexing_progress.begin(
+            crate::indexing_progress::IndexingPhase::Checking,
+            entries.len(),
+        );
         for (i, entry) in entries.into_iter().enumerate() {
             if cancelled() {
                 return Outcome::Cancelled;
             }
+            progress.advance(1);
             match self.graph_text_read_optional_text_with_identity(&permit, &entry.path) {
                 Ok(Some((content, _))) => {
                     let revision = content_rev(&content);
@@ -695,7 +700,12 @@ impl Graph {
         built.failures.extend(skipped);
         let mut baselines: Vec<(PathBuf, ContentDigest, String)> =
             Vec::with_capacity(entries.len());
+        let progress = self.indexing_progress.begin(
+            crate::indexing_progress::IndexingPhase::Reading,
+            entries.len(),
+        );
         for (i, e) in entries.into_iter().enumerate() {
+            progress.advance(1);
             if cancelled() {
                 self.finish_page_build(&flight, PageBuildOutcome::Cancelled);
                 return false;

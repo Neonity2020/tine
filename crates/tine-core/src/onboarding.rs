@@ -642,6 +642,22 @@ mod tests {
         );
     }
 
+    /// GH #543: the Guide tells a user opening a large graph that the toolbar
+    /// shows indexing progress and that Tine is usable meanwhile.
+    #[test]
+    fn search_guide_names_the_indexing_progress_bar() {
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.markdown.contains("Search reads the same index"))
+            .expect("the search Guide page is registered");
+        assert!(page
+            .markdown
+            .contains("the toolbar shows how far it has got"));
+        assert!(page
+            .markdown
+            .contains("the rest of Tine stays usable meanwhile"));
+    }
+
     #[test]
     fn files_reference_page_is_registered_linked_and_copyable() {
         let title = "Reference/Files, external edits, and backups";

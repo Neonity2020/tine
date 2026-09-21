@@ -25,6 +25,7 @@ pub mod durability_counters;
 pub mod graph_text_path;
 pub mod graph_text_scope;
 pub mod html_sanitize;
+pub mod indexing_progress;
 pub mod journal_feed;
 pub mod logbook;
 pub mod model;

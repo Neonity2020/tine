@@ -1095,6 +1095,23 @@ pub(crate) fn warm_done(
         .load(Ordering::Acquire))
 }
 
+/// How far the graph-sized index work has got, for the indexing progress bar
+/// (GH #543). `None` once search is answered by a current index. Polled by
+/// the frontend while it shows the bar; cheap (atomics and one short lock).
+#[tauri::command]
+pub(crate) fn indexing_progress(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<
+    Option<tine_core::indexing_progress::IndexingProgress>,
+    crate::command_error::CommandError,
+> {
+    Ok(slot_for_window(&state, window.label())
+        .map_err(crate::command_error::CommandError::from)?
+        .graph()
+        .indexing_progress())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
