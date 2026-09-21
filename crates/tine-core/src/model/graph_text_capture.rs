@@ -1351,7 +1351,6 @@ pub(super) fn validate_graph_text_admission_delta(
                 .copied();
             if let Some(resource) = resource {
                 if link_count.is_none()
-                    || link_count.copied() != Some(1)
                     || is_graph_text != Some(false)
                     || !index
                         .paths_by_file_resource
@@ -1402,9 +1401,12 @@ pub(super) fn validate_graph_text_admission_delta(
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing semantic reverse group")
             })?;
+        // The link count must agree with the record, not equal 1: a complete
+        // build admits a link outside graph-text scope, so a delta must too, or
+        // every external edit of an annexed graph discards the warm index
+        // (GH #571, GH #555). A second graph-text name is `resources.len() != 1`.
         if resource != Some(&record.file_resource_id)
             || link_count != Some(&record.link_count)
-            || record.link_count != 1
             || !portable.contains(&path)
             || resources.len() != 1
             || !resources.contains(relative)
@@ -1434,7 +1436,7 @@ pub(super) fn validate_graph_text_admission_delta(
         let resources = index.paths_by_file_resource.get(resource).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing resource reverse group")
         })?;
-        if link_count.copied() != Some(1)
+        if link_count.is_none()
             || resources.len() != 1
             || !resources.contains(relative)
             || is_graph_text != Some(false)

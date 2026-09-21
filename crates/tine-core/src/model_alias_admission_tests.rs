@@ -175,3 +175,110 @@ fn creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation() {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// GH #571, GH #555: the rename half. A rename MOVES a directory entry; the
+/// inode, and so every other name linked to it, keeps exactly the bytes it had.
+/// The divergence `MS-REF-GRAPH-TEXT-ALIAS` describes comes from temp + rename
+/// PUBLICATION giving one name a new inode, which a move never does, so the
+/// raw link-count refusal the move source kept after the save fix defended
+/// nothing and made every page on an annexed or deduplicated graph unrenamable.
+/// The referrer rewrites the rename also performs are ordinary publications,
+/// already allowed on a hard-linked file. Two GRAPH pages sharing one inode
+/// stay refused, by the rename's inventory, which can name the sibling.
+#[cfg(unix)]
+#[test]
+fn a_hard_linked_page_can_be_renamed() {
+    for placement in ["annex", "external", "in-graph"] {
+        let dir = scratch(&format!("rename-hardlink-{placement}"));
+        let target = dir.join("pages/Old.md");
+        fs::write(&target, "- body\n").unwrap();
+        fs::write(dir.join("pages/Referrer.md"), "- see [[Old]]\n").unwrap();
+        let outside =
+            (placement == "external").then(|| scratch(&format!("rename-hardlink-{placement}-out")));
+        let alias = match (placement, &outside) {
+            (_, Some(root)) => root.join("Old.md"),
+            ("annex", None) => {
+                let objects = dir.join(".git/annex/objects/f4/Old.md");
+                fs::create_dir_all(objects.parent().unwrap()).unwrap();
+                objects
+            }
+            _ => dir.join("pages/Twin.md"),
+        };
+        fs::hard_link(&target, &alias).unwrap();
+        // The referrer is linked too, so its rewrite is exercised on a
+        // multiply-linked file as well.
+        let referrer_link = dir.join(format!("referrer-link-{placement}"));
+        fs::hard_link(dir.join("pages/Referrer.md"), &referrer_link).unwrap();
+
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let renamed = graph.rename_page("Old", "New");
+        if placement == "in-graph" {
+            // Two GRAPH pages on one inode is the one case Martin kept refusing
+            // (2026-09-20). The rename's whole-graph inventory names both files,
+            // which is the precise check; nothing moves or is rewritten.
+            let error = renamed.expect_err("an in-graph twin is refused precisely");
+            assert!(error.to_string().contains("pages/Twin.md"), "{error}");
+            assert_eq!(fs::read_to_string(&target).unwrap(), "- body\n");
+            assert_eq!(
+                fs::read_to_string(dir.join("pages/Referrer.md")).unwrap(),
+                "- see [[Old]]\n"
+            );
+            let _ = fs::remove_dir_all(&dir);
+            continue;
+        }
+        renamed.unwrap_or_else(|error| panic!("{placement}: {error}"));
+
+        assert!(!target.exists(), "{placement}: the old name is gone");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/New.md")).unwrap(),
+            "- body\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Referrer.md")).unwrap(),
+            "- see [[New]]\n",
+            "{placement}: the referrer follows the rename"
+        );
+        assert_eq!(
+            fs::read_to_string(&alias).unwrap(),
+            "- body\n",
+            "{placement}: the other link keeps the bytes it had"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        if let Some(root) = outside {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}
+
+/// GH #571, GH #555: the external-edit half. On an annexed graph every page
+/// has a second link in `.git/annex/objects`, so the watcher's exact feed met
+/// a raw link count of 2 on every external edit (git pull, Syncthing, Logseq
+/// itself) and threw the warm identity index away; the next create or rename
+/// then paid a whole-graph rebuild. The exact feed must treat such a file like
+/// any other.
+#[cfg(unix)]
+#[test]
+fn an_external_edit_to_a_hard_linked_page_keeps_the_identity_index_warm() {
+    let dir = scratch("exact-feed-hardlink");
+    let target = dir.join("pages/Target.md");
+    fs::write(&target, "- before\n").unwrap();
+    let objects = dir.join(".git/annex/objects/f4/Target.md");
+    fs::create_dir_all(objects.parent().unwrap()).unwrap();
+    fs::hard_link(&target, &objects).unwrap();
+    let graph = Graph::open(&dir);
+    guarded_test_prime_identity(&graph);
+    let before = graph.guarded_graph_text_identity_report();
+
+    // An in-place external write keeps the inode, and with it the second link.
+    fs::write(&target, "- edited outside Tine\n").unwrap();
+    graph
+        .observe_graph_text_external_paths(std::iter::once(target.as_path()), false)
+        .unwrap();
+
+    let after = graph.guarded_graph_text_identity_report();
+    assert!(!after.invalidated, "{after:?}");
+    assert_eq!(after.complete_builds, before.complete_builds);
+    assert_eq!(after.exact_updates, before.exact_updates + 1);
+    let _ = fs::remove_dir_all(&dir);
+}

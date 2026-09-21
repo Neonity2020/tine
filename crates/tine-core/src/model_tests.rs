@@ -12169,22 +12169,27 @@ fn a_foreground_displacement_crash_is_restored_before_journal_replay() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A recovery artifact with a second link used to make the checked open refuse
+/// the whole graph. git-annex's assistant hard-links new files under
+/// `.git/annex/watchtmp`, so a crash on an annexed graph could leave exactly
+/// that (GH #555). Restoring is a MOVE: the inode keeps its bytes, and so does
+/// every other name linked to it, so the refusal defended no in-scope scenario
+/// and cost the user their graph.
 #[cfg(unix)]
 #[test]
-fn editor_recovery_sweep_refuses_a_multi_link_artifact() {
+fn editor_recovery_sweep_restores_a_multi_link_artifact() {
     let dir = scratch("editor-recovery-hardlink");
     let artifact = dir.join("pages").join(".Note.md.4242.1.editor-recovery");
     fs::write(&artifact, b"- linked bytes\n").unwrap();
     fs::hard_link(&artifact, dir.join("linked-copy")).unwrap();
 
-    let refused = match Graph::open_checked(&dir) {
-        Ok(_) => panic!("checked open accepted a multi-link W1 claimant"),
-        Err(error) => error,
-    };
+    let _graph = Graph::open_checked(&dir).expect("a multi-link artifact is restored");
 
-    assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused}");
-    assert!(!dir.join("pages/Note.md").exists());
-    assert_eq!(fs::read(&artifact).unwrap(), b"- linked bytes\n");
+    assert_eq!(
+        fs::read(dir.join("pages/Note.md")).unwrap(),
+        b"- linked bytes\n"
+    );
+    assert!(!artifact.exists());
     assert_eq!(
         fs::read(dir.join("linked-copy")).unwrap(),
         b"- linked bytes\n"

@@ -1,4 +1,4 @@
-//! Graph-text validation and error constructors: single-link and event-parent
+//! Graph-text validation and error constructors: event-parent
 //! checks, exact-feed path validation, bounded admission causes, the Direct
 //! save failure code, and the limit and alias errors.
 
@@ -33,22 +33,6 @@ pub(super) fn projection_file_link_count(_file: &fs::File) -> io::Result<u64> {
         io::ErrorKind::Unsupported,
         "file link-count proof is unavailable on this platform",
     ))
-}
-
-pub(super) fn validate_graph_text_single_link(file: &fs::File, relative: &str) -> io::Result<()> {
-    let link_count = projection_file_link_count(file)?;
-    if link_count != 1 {
-        return Err(DirectSaveError::into_io(
-            DirectSaveFailureCode::PrecheckResourceAlias,
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "graph text files alias one physical resource: {relative} has link count {link_count}"
-                ),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn validate_graph_text_event_parent(

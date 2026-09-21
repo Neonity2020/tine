@@ -602,7 +602,8 @@ impl Graph {
         projection_optional_regular_metadata(source.parent(), &source.filename)?;
         let source_file = open_projection_file_nofollow(source.parent(), &source.filename)?;
         let source_identity = canonical_projection_file_resource_id(&source_file)?;
-        validate_graph_text_single_link(&source_file, &self.rel_path(source_path))?;
+        // No link-count check: a move keeps the inode, so any other name linked
+        // to this artifact keeps exactly the bytes it had (GH #571, GH #555).
         drop(source_file);
 
         let destination = self.graph_text_target(permit, destination_path, true)?;
@@ -619,7 +620,6 @@ impl Graph {
                 "editor recovery artifact changed before reconciliation",
             ));
         }
-        validate_graph_text_single_link(&rebound, &self.rel_path(source_path))?;
         self.validate_graph_text_portable_aliases_path_local(
             permit,
             &destination_graph_text,
@@ -701,16 +701,12 @@ impl Graph {
                 false,
             )?;
             self.validate_existing_graph_text_target_exact(&source, None)?;
-            // Interim rule for the paths with no complete index (rename
-            // transaction, recovery): the precise "is the other name a graph
-            // page?" question needs the identity index, and building one per
-            // moved file is exactly the GH #406 rename cost. So these paths
-            // still refuse on the raw link count. That is why an annexed graph
-            // can save (GH #555) but cannot yet rename; tracked with the
-            // rename work rather than paid for here.
-            let source_file = open_projection_file_nofollow(source.parent(), &source.filename)?;
-            validate_graph_text_single_link(&source_file, source_graph_text.as_str())?;
-            drop(source_file);
+            // No link-count check on the move source. `MS-REF-GRAPH-TEXT-ALIAS`
+            // is the divergence temp + rename PUBLICATION causes by giving one
+            // name a new inode; a move keeps the inode, so every other name
+            // linked to it keeps exactly the bytes it had. The raw count this
+            // used to refuse on defended nothing and made every page of an
+            // annexed or deduplicated graph unrenamable (GH #571, GH #555).
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
                 &destination_graph_text,

@@ -4582,7 +4582,7 @@
   "scenario": null,
   "failBefore": "a_hard_link_outside_graph_text_scope_does_not_block_a_save on the pre-fix tree: 'annex: graph text files alias one physical resource: pages/Target.md has link count 2'. The refusal fired at save_page, not at load, so reading an annexed graph always worked and only editing was blocked."
  },
- "notes": "Every Direct save refused when the target file had more than one link. The rule (validate_graph_text_single_link) compared the raw link count to 1, which cannot distinguish the case it meant to catch - two GRAPH-TEXT paths on one inode, where temp+rename publication leaves the other page holding stale bytes - from links Tine has no interest in: git-annex annex.thin links every page into .git/annex/objects/..., which graph-text scope never descends into, and users hard-link or deduplicate pages outside the graph. Martin decided (2026-09-20) to allow hard links and keep the in-graph alias refusal. Implementation note: the precise check needs the complete identity index, and an ordinary resave must never build one (GH #267 keeps saves target-local, O(1) not O(graph)), so the refusal now lives on page creation, where the index is already in hand (validate_graph_text_resource_alias), and the rename transaction's move source plus editor recovery keep the raw link count as an interim rule. Accepted consequence, asserted in an_in_graph_alias_no_longer_blocks_a_resave: if two graph pages really do share an inode, editing one leaves the other with its old bytes rather than refusing. Remaining gap: an annexed graph can save but still cannot rename, tracked with the rename work (GH #406, GH #535)."
+ "notes": "Every Direct save refused when the target file had more than one link. The rule (validate_graph_text_single_link) compared the raw link count to 1, which cannot distinguish the case it meant to catch - two GRAPH-TEXT paths on one inode, where temp+rename publication leaves the other page holding stale bytes - from links Tine has no interest in: git-annex annex.thin links every page into .git/annex/objects/..., which graph-text scope never descends into, and users hard-link or deduplicate pages outside the graph. Martin decided (2026-09-20) to allow hard links and keep the in-graph alias refusal. Implementation note: the precise check needs the complete identity index, and an ordinary resave must never build one (GH #267 keeps saves target-local, O(1) not O(graph)), so the refusal now lives on page creation, where the index is already in hand (validate_graph_text_resource_alias), and the rename transaction's move source plus editor recovery keep the raw link count as an interim rule. Accepted consequence, asserted in an_in_graph_alias_no_longer_blocks_a_resave: if two graph pages really do share an inode, editing one leaves the other with its old bytes rather than refusing. Remaining gap closed by REG-GRAPH-TEXT-HARDLINK-RENAME-571: rename, editor recovery and the exact watcher feed."
 },
 {
  "id": "REG-PDF-EXPORT-MOBILE-560",
@@ -4743,6 +4743,35 @@
   "failBefore": "proven"
  },
  "notes": "Every ProjectionSemanticRefusal (merge markers, a dropped preamble, a page-header property moved into the outline, an Org file that cannot round-trip) reached the frontend as `reason code: unknown`: retried at 100/300 ms, then a transient 'after 3 tries' toast, then a page that silently never saved while each further edit repeated the cycle (GH #546 screenshot; DanTremonti's GH #540 report; the remaining gap after GH #535). The refusal is a verdict on the draft's content, so direct_save_failure_code now maps that marker type to `refused.data_preservation` (no retry) in one arm covering every producer, and the frontend shows one sticky, deduplicated message per page with a Review unsaved action (the close-path recovery panel: Copy draft, Open page), dismissed when the page saves or leaves the working set. Fail-before: the core tests return `unknown`; the store test sees 6 save attempts instead of 4 without the frontend policy change. The firewall itself is unchanged."
+},
+{
+ "id": "REG-GRAPH-TEXT-HARDLINK-RENAME-571",
+ "title": "A page that is also hard-linked elsewhere (git-annex, deduplication) can be renamed, restored after a crash, and edited externally without discarding the warm index",
+ "family": "direct-save",
+ "sources": {
+  "issues": [
+   571,
+   555
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "linux",
+  "macos",
+  "windows"
+ ],
+ "layer": "rust-core-storage",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_alias_admission_tests.rs::a_hard_linked_page_can_be_renamed",
+   "crates/tine-core/src/model_alias_admission_tests.rs::an_external_edit_to_a_hard_linked_page_keeps_the_identity_index_warm",
+   "crates/tine-core/src/model_tests.rs::editor_recovery_sweep_restores_a_multi_link_artifact"
+  ],
+  "scenario": null,
+  "failBefore": "On the pre-fix tree: a_hard_linked_page_can_be_renamed failed 'annex: graph text files alias one physical resource: pages/Old.md has link count 2'; an_external_edit_to_a_hard_linked_page_keeps_the_identity_index_warm reported invalidated: true, exact_updates: 0; the recovery test's predecessor pinned that checked open REFUSED the graph."
+ },
+ "notes": "After the save fix, three paths still refused on a raw link count. (1) The rename transaction's move source and editor recovery: a move keeps the inode, so no name can diverge, and the MS-REF-GRAPH-TEXT-ALIAS divergence comes only from temp+rename publication, so the check defended nothing; the referrer rewrites are ordinary publications, already allowed. (2) The checked-open recovery sweep refused the WHOLE graph over a recovery artifact with a second link, which git-annex's assistant produces under .git/annex/watchtmp. (3) The exact watcher delta required link count 1 while a complete build admits any, so every external edit of an annexed graph discarded the warm identity index and the next create or rename paid a whole-graph rebuild. All three now accept a link outside graph-text scope. Two GRAPH pages on one inode stay refused where the sibling can be named (Martin, 2026-09-20): the rename inventory refuses with both paths and changes nothing (asserted in the rename test), and an exact delta with resources.len() != 1 falls back to a rebuild. Windows/Google Drive (GH #571) is covered structurally: the Windows link count comes from GetFileInformationByHandle and no path now refuses on it; not run on Windows."
 }
 ]
 }
