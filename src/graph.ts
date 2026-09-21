@@ -200,6 +200,12 @@ export async function loadGraphPath(
     clearRecent();
   }
   if (switching || !hadGraph) resetLeftSidebarSections();
+  // Title format BEFORE the meta/epoch change that wakes the Journals surface:
+  // otherwise today's template lookup runs under the default "MMM do, yyyy"
+  // title, misses a custom-format journal Syncthing already delivered, and
+  // saves the template over it with no baseline (a spurious save conflict on
+  // every launch, GH #550). applyConfigDerivedState below re-applies it.
+  setJournalTitleFormat(meta.journal_page_title_format);
   setGraphMeta(meta ?? null);
   // Recovery is part of graph activation: no page becomes interactive before
   // its app-private retained drafts have been restored into the conflict queue.
@@ -551,6 +557,10 @@ function journalTemplateOwnerIsCurrent(owner: JournalTemplateOwner): boolean {
     && localDayKey() === owner.day;
 }
 
+function blockTreeHasText(block: BlockDto): boolean {
+  return block.raw.trim() !== "" || block.children.some(blockTreeHasText);
+}
+
 async function materializeJournalTemplate(
   owner: JournalTemplateOwner,
   canWrite: () => boolean,
@@ -558,7 +568,10 @@ async function materializeJournalTemplate(
   try {
     const existing = await backend().getPage(owner.title, "journal");
     if (!journalTemplateOwnerIsCurrent(owner)) return "stale";
-    if (existing && existing.blocks.some((b) => b.raw.trim() !== "")) return "ready";
+    // Any text anywhere in the tree is the user's: the usual template shape
+    // leaves an empty parent, and checking only top-level blocks re-applied the
+    // template over text typed into its children (GH #550).
+    if (existing && existing.blocks.some(blockTreeHasText)) return "ready";
     const tmpl = (await backend().listTemplates()).find((t) => t.name === owner.template);
     if (!journalTemplateOwnerIsCurrent(owner)) return "stale";
     if (!tmpl) return "ready";
@@ -832,6 +845,9 @@ export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | n
 export function applyGraphConfigChange(meta: GraphMeta): void {
   const previous = graphMeta();
   if (previous && previous.root !== meta.root) return; // a different graph's window
+  // Same ordering rule as graph bind (GH #550): the format lands before
+  // anything observing the meta or epoch change computes a journal title.
+  setJournalTitleFormat(meta.journal_page_title_format);
   setGraphMeta(meta);
   // A journal-title or format change re-dates and re-routes what is already on
   // screen, so in-flight results from before it must not land afterwards.

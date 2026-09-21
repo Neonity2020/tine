@@ -85,6 +85,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   with an unusual name). Tine now skips that item and shows the rest. Opening a
   large graph also no longer freezes the app for several seconds while it
   checks for conflict copies (GH #332).
+- The default journal template could be applied again over text typed into a
+  nested block of today's journal, replacing it. Text anywhere in the journal
+  now counts, so the template never overwrites it (GH #550).
+- With a custom journal title format, opening a graph no longer tries to write
+  the journal template over today's journal delivered by a sync app, which
+  caused a hidden save conflict on every launch (GH #550).
 
 - A save conflict no longer ends up with a comparison that can never load. If
   Tine lost track of the conflict in the split second after it happened (for

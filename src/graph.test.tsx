@@ -168,7 +168,7 @@ async function loadHarness(
     localDayKey: (date = new Date()) =>
       date.getFullYear() * 10_000 + (date.getMonth() + 1) * 100 + date.getDate(),
     localDayRolloverDelay: vi.fn(() => 1),
-    setJournalTitleFormat: vi.fn(),
+    setJournalTitleFormat: vi.fn(() => { events.push("set-title-format"); }),
   }));
   vi.doMock("./editor/templateVars", () => ({ applyTemplateVars, prepareTemplateVars }));
   vi.doMock("./warmCache", () => ({ waitForWarmCache: vi.fn(async () => warm) }));
@@ -475,9 +475,13 @@ describe("default journal template graph bind", () => {
     await loadGraphPath(META.root);
     await ensureJournalTemplateForDay(new Date());
 
+    // GH #550: the journal title format is set before the epoch bump that
+    // wakes the Journals surface (and re-applied by the config-derived state).
     expect(events).toEqual([
       `activate-pdf:${META.root}`,
+      "set-title-format",
       "bump-epoch",
+      "set-title-format",
       "save-template",
     ]);
   });
@@ -531,6 +535,31 @@ describe("default journal template graph bind", () => {
     await ensureJournalTemplateForDay(new Date());
 
     expect(api.listTemplates).not.toHaveBeenCalled();
+    expect(api.savePage).not.toHaveBeenCalled();
+  });
+
+  it("GH #550: never overwrites text typed into a child block of an empty-parent journal", async () => {
+    // The usual Logseq template shape leaves an empty parent with children;
+    // typing into a child must count as content, or the next launch/focus
+    // re-applies the template over it.
+    const existing: PageDto = {
+      name: "Jul 10th, 2026",
+      kind: "journal",
+      title: "Jul 10th, 2026",
+      pre_block: null,
+      blocks: [{
+        id: "parent",
+        raw: "",
+        collapsed: false,
+        children: [{ id: "child", raw: "user typed this", collapsed: false, children: [] }],
+      }],
+      rev: "child-content-rev",
+    };
+    const { loadGraphPath, ensureJournalTemplateForDay, api } = await loadHarness(existing);
+
+    await loadGraphPath(META.root);
+    await ensureJournalTemplateForDay(new Date());
+
     expect(api.savePage).not.toHaveBeenCalled();
   });
 
@@ -669,11 +698,12 @@ describe("PDF graph ownership", () => {
 
     await harness.loadGraphPath(META.root, { forceRefresh: true });
 
-    expect(harness.events.slice(0, 5)).toEqual([
+    expect(harness.events.slice(0, 6)).toEqual([
       "drain-pdf",
       "retire-pdf",
       "load-refresh",
       `activate-pdf:${META.root}`,
+      "set-title-format",
       "bump-epoch",
     ]);
     expect(harness.activatePdfOwnership).toHaveBeenCalledTimes(2);

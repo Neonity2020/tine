@@ -3270,6 +3270,62 @@
    "notes": "GH #332 (theaffman, Steve-21-bassman, dealingwith; Windows and Android, since after v0.6.5): graphs opened with every page blank. v0.6.90 replaced the tolerant list_md walk with the strict graph-wide inventory walk, which aborted on any entry it could not admit; the page cache was then installed with zero pages, list_pages returned [] and get_page returned 'absent', which the frontend renders as an empty new page (hence activate_absent_editor after every open in the reporters' diagnostics). The config (custom journals dir, dd-MM-yyyy) plays no part. Fix: the graph-wide READ walk skips an entry it cannot admit; an unreadable page file is recorded as a page index failure (source not complete), an unreadable folder or non-page entry is skipped without one. The configured walk (writes) and inventory limits stay fail-closed. Separately, list_sync_conflicts and list_vcs_marker_conflicts read every page file as sync commands on the main thread, freezing every command for 10-16 s at startup in the reporters' diagnostics; both are now async + spawn_blocking with a source guard. Test gh332_* reproduces FIFO, non-UTF-8 image name, unreadable folder, unreadable nested page and unreadable page: pre-fix list_pages is empty. Which entry each reporter has is not known. Not addressed: Windows FILE_ATTRIBUTE_REPARSE_POINT refusal of cloud-placeholder files (OneDrive etc.), unverified here and not indicated in the thread; the empty-looking UI does not yet name page-index failures."
   },
   {
+   "id": "REG-JOURNAL-TEMPLATE-OVERWRITES-CHILD-TEXT-550",
+   "title": "The default journal template is never re-applied over text the user typed into a child block of today's journal",
+   "family": "journal-template",
+   "sources": {
+    "issues": [
+     550
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "windows",
+    "linux",
+    "android",
+    "macos",
+    "ios"
+   ],
+   "layer": "frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/graph.test.tsx"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "Found while tracing GH #550 (not the reporter's symptom). materializeJournalTemplate treated today's journal as empty when every TOP-LEVEL block was blank. The usual template shape leaves an empty parent with children, so text typed into a child was overwritten by the template on the next launch, focus, visibility or watcher refresh. The check now looks at the whole block tree. Reproduced by the #550 investigation with a backend probe; frontend test fails before, passes after."
+  },
+  {
+   "id": "REG-JOURNAL-TEMPLATE-STARTUP-CONFLICT-CUSTOM-TITLE-550",
+   "title": "With a custom journal title format, opening a graph no longer saves the journal template over an already-delivered today's journal (a spurious save conflict on every launch)",
+   "family": "journal-template",
+   "sources": {
+    "issues": [
+     550
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "windows",
+    "linux",
+    "android",
+    "macos",
+    "ios"
+   ],
+   "layer": "frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/graph.test.tsx"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #550 diagnostics showed save_page failing with direct.save conflict.save_baseline_present about 15 s after every launch with no edit. Graph bind bumped the epoch (waking the Journals surface) before applyConfigDerivedState set the graph's journal title format, so the template lookup used the default 'MMM do, yyyy' title, found no page for a custom-format graph, and saved the template with no base revision; the backend's date fallback mapped it onto today's real file delivered by Syncthing, hence the conflict (or a silent create when the file was absent). The error was swallowed, so no data was lost. The title format is now set before setGraphMeta/bumpGraphEpoch at bind and on live config change. The reporter's config lines were not confirmed. The 40 s open itself is not addressed here."
+  },
+  {
    "id": "REG-CLOSE-DISCARD-DIAGNOSTIC-540",
    "title": "A close that discarded unsaved drafts is visible in the diagnostic report instead of reading as an ordinary clean exit",
    "family": "diagnostic-observability",
