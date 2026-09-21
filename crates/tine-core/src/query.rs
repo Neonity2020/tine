@@ -29,6 +29,8 @@ mod oracle_gate1;
 #[path = "query/oracle_walk_tests.rs"]
 mod oracle_walk;
 pub use execution_error::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
+mod advanced_patterns;
+use advanced_patterns::{scan_groups, where_groups};
 pub mod ir;
 pub mod macro_text;
 pub(crate) mod og;
@@ -2771,7 +2773,7 @@ fn advanced_pred(
     let inputs = resolve_inputs(query_src, current_page, today);
     let mut ran = Vec::new();
     let mut ignored = Vec::new();
-    let groups = where_groups(query_src);
+    let groups = advanced_patterns::flatten_single_branch_groups(where_groups(query_src));
     let (lowered_page_properties, consumed_patterns) = lower_page_property_patterns(&groups);
     let (lowered_current_pages, current_page_patterns) =
         lower_current_page_patterns(&groups, &inputs);
@@ -2779,6 +2781,18 @@ fn advanced_pred(
         .into_iter()
         .chain(current_page_patterns)
         .collect::<std::collections::HashSet<_>>();
+    let taken = consumed_patterns
+        .iter()
+        .copied()
+        .chain(lowered_current_pages.keys().copied())
+        .chain(lowered_page_properties.keys().copied())
+        .collect::<std::collections::HashSet<_>>();
+    let (lowered_attributes, attribute_patterns) = advanced_patterns::lower_attribute_patterns(
+        &groups,
+        &taken,
+        advanced_patterns::advanced_find_var(query_src).as_deref(),
+        &inputs,
+    );
     let preds: Vec<Filter> = groups
         .iter()
         .enumerate()
@@ -2791,12 +2805,21 @@ fn advanced_pred(
                 ran.push("page-property".into());
                 return Some(pred.clone());
             }
-            if consumed_patterns.contains(&index) {
+            if let Some((pred, label)) = lowered_attributes.get(&index) {
+                ran.push((*label).into());
+                return Some(pred.clone());
+            }
+            if consumed_patterns.contains(&index) || attribute_patterns.contains(&index) {
                 return None;
             }
             parse_adv_group(group, &inputs, today, &mut ran, &mut ignored, 0)
         })
         .collect();
+    // GH #542: a `:result-transform` is a Clojure function (ADR 0042 keeps
+    // scripting out). It reorders or reshapes the answer, so say it did not run.
+    if query_src.contains(":result-transform") {
+        ignored.push("result-transform".into());
+    }
     if ignored.iter().any(|item| item == "query-nesting-too-deep") {
         return (None, Vec::new(), ignored);
     }
@@ -2951,75 +2974,6 @@ fn lower_page_property_patterns(
     (lowered, consumed)
 }
 
-/// Collect balanced `(...)`/`[...]` groups at the top level of `s` (string-aware),
-/// stopping at the first top-level *closing* bracket (so scanning after `:where`
-/// halts at the find-vector's `]` rather than swallowing `:inputs`).
-fn scan_groups(s: &str) -> Vec<String> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    let mut out = Vec::new();
-    while i < b.len() {
-        let c = b[i] as char;
-        if c == ')' || c == ']' || c == '}' {
-            break;
-        }
-        // EDN/DataScript line comment (`; …` to end of line) — skip it so example
-        // clauses written inside a `;;` hint are NOT parsed as real groups.
-        if c == ';' {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '(' || c == '[' {
-            let start = i;
-            let mut depth = 0;
-            let mut in_str = false;
-            while i < b.len() {
-                let ch = b[i] as char;
-                if in_str {
-                    if ch == '\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if ch == '"' {
-                        in_str = false;
-                    }
-                } else if ch == ';' {
-                    // Comment inside a group body (between clauses) — skip to EOL.
-                    while i < b.len() && b[i] != b'\n' {
-                        i += 1;
-                    }
-                    continue;
-                } else if ch == '"' {
-                    in_str = true;
-                } else if ch == '(' || ch == '[' || ch == '{' {
-                    depth += 1;
-                } else if ch == ')' || ch == ']' || ch == '}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        i += 1;
-                        break;
-                    }
-                }
-                i += 1;
-            }
-            out.push(s[start..i.min(s.len())].to_string());
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
-/// The clause groups in the `:where` section.
-fn where_groups(src: &str) -> Vec<String> {
-    match src.find(":where") {
-        Some(idx) => scan_groups(&src[idx + ":where".len()..]),
-        None => Vec::new(),
-    }
-}
-
 /// Map one `:where` group to a `Pred` (or None → ignored). Recurses for and/or/not.
 fn parse_adv_group(
     group: &str,
@@ -3046,14 +3000,30 @@ fn parse_adv_group(
         .to_ascii_lowercase();
     match head.as_str() {
         "and" | "or" | "not" => {
+            let ignored_before = ignored.len();
             let kids: Vec<Filter> = scan_groups(inner)
                 .iter()
                 .filter_map(|g| parse_adv_group(g, inputs, today, ran, ignored, depth + 1))
                 .collect();
+            // GH #542: dropping a clause Tine does not understand only ever
+            // WIDENS a conjunction. Under `not` it narrows the answer, and an
+            // `or` missing a branch drops blocks the query returns; neither is
+            // a superset with a notice. Such a group is dropped whole instead,
+            // which widens the enclosing conjunction like any other ignored
+            // clause.
+            if head != "and" && ignored.len() > ignored_before {
+                ignored.push(head.clone());
+                return None;
+            }
             if kids.is_empty() {
                 None
             } else if head == "not" {
-                Some(Filter::not(kids.into_iter().next().expect("one")))
+                // `(not A B)` excludes blocks matching A AND B.
+                Some(Filter::not(if kids.len() == 1 {
+                    kids.into_iter().next().expect("one")
+                } else {
+                    Filter::and(kids)
+                }))
             } else if head == "or" {
                 Some(Filter::or(kids))
             } else {

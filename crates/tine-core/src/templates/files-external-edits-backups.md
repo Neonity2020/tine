@@ -24,7 +24,7 @@ icon:: 🗄️
 	- `logseq/config.edn` is live too. A change made in Logseq, a text editor, or delivered by a sync provider updates favorites, shortcuts, macros, the home page, journal formats, hidden properties, and other shared settings during the session; reopening the graph is not required. Tine reloads only when the file's bytes actually changed.
 	- Running two Tine windows on the same graph — or on a graph nested inside an open one — is refused, so that conflict cannot happen locally. For file sync between devices, run one app at a time on the graph where you can, and let conflict copies (below) catch the rest.
 - ## Snapshots — automatic backups
-	- Each time Tine opens your graph it snapshots eligible Markdown/Org files across the graph, plus `logseq/config.edn` and asset `.edn` sidecars, to a local folder **outside** the graph. Syncthing never syncs it. Binary assets are not copied.
+	- Each time Tine opens your graph it snapshots eligible Markdown/Org files across the graph once opening has settled (the search index is ready and the app has been quiet for a few seconds), so the copy does not compete with your first page, plus `logseq/config.edn` and asset `.edn` sidecars, to a local folder **outside** the graph. Syncthing never syncs it. Binary assets are not copied.
 	- Settings → **Backups & recovery** → **Snapshots to keep** (default 12) controls how many survive; the oldest beyond the count are pruned.
 	- 1. Pick a snapshot and choose **Restore**, then confirm.
 	- 2. What you should see: Tine snapshots your current state first, restores backed-up graph text to its original paths, restores config and sidecars, and reloads the graph — a mistaken restore is itself reversible.

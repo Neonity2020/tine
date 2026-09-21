@@ -2181,6 +2181,32 @@
    "notes": "OG source at 6e7afa8eb040686ff057156ee877193b581dd369 resolves the typed :current-page keyword positionally through current-page-fn and lowercases the page name before query execution. Tine now retains typed AdvancedInput::Date values while binding that one keyword as AdvancedInput::Page, then conservatively lowers only the exact standard [?p :block/name ?current-page] identity joined to one [?b :block/refs ?p] or [?b :block/page ?p] relationship. Ambiguous and unrelated patterns remain visibly unsupported; this does not claim full DataScript joins. Contract-doc delta: none; this is a bounded compatibility extension within the existing partial advanced-query contract."
   },
   {
+   "id": "REG-ADVANCED-ATTRIBUTE-PATTERNS-542",
+   "title": "Advanced queries written with block attribute patterns (:block/marker, :block/scheduled, the block's journal page) return the blocks Logseq returns, and never a narrowed answer from a partly understood not/or",
+   "family": "query-compatibility",
+   "sources": {
+    "issues": [
+     542
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model_tests_advanced_queries.rs::gh542_reporter_advanced_queries_answer_like_logseq",
+     "crates/tine-core/src/model_tests_advanced_queries.rs::gh542_a_partly_understood_not_or_or_is_not_narrowed",
+     "crates/tine-core/src/query_tests.rs::gh542_attribute_patterns_lower_only_block_local_meaning",
+     "crates/tine-core/src/onboarding.rs::gh542_guide_advanced_query_example_runs_whole"
+    ],
+    "failBefore": "proven"
+   },
+   "notes": "GH #542 (bgzo, macOS 0.6.982). The advanced lowerer understood only rule heads such as (task ?b ...) and refused every DataScript attribute pattern, so [?b :block/marker \"TODO\"] -- also Tine's own screenshot fixture -- rendered as unsupported. Worse, a not/or containing a clause it did not understand ran as the part it did: (not [?b :block/scheduled ?d]) was dropped and the OVERDUE query returned scheduled tasks, and a partly understood not can hide blocks the query keeps. Fix (query/advanced_patterns.rs): patterns on the :find variable's marker/priority/scheduled/deadline and on its page's journal?/journal-day lower to typed filters, alone, as literals, or as a value variable narrowed by contains?/=/not=/</<=/>/>= against a literal or an :inputs date; (not [pattern]) whose variable is local to the not; single-branch or/or-join and nested and are opened. A value variable used anywhere else (a join) is not lowered. A not/or that loses any child is dropped whole, so a partial answer is only ever a disclosed superset; (not A B) now means not(A and B) rather than not(A). :result-transform is reported as not run. Fail-before: both model tests fail on the old code (first query unsupported; partial not narrowed). Out of scope: rendering config.edn :default-queries on the Journals page (not implemented in Tine at all; product decision), running :result-transform functions (ADR 0042), and the reporter's NEXT query as written, which pulls ?b while every clause binds ?h and is refused by Logseq too. Contract-doc delta: none; a bounded extension of the documented partial advanced-query subset (BACKLOG 'Advanced Datalog queries')."
+  },
+  {
    "id": "REG-GRAPH-HOME-CONFIG-OWNER-269",
    "title": "The graph home page round-trips through Logseq-compatible config.edn without replacing other default-home keys",
    "family": "config-compatibility",

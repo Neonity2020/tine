@@ -15895,3 +15895,6 @@ mod availability;
 
 #[path = "model_tests_journal_lookup.rs"]
 mod journal_lookup;
+
+#[path = "model_tests_advanced_queries.rs"]
+mod advanced_queries;

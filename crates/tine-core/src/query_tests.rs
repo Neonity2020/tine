@@ -2973,3 +2973,41 @@ fn result_families_stop_constructing_at_row_and_byte_budgets() {
     assert!(facets.iter().map(|(_, values)| values.len()).sum::<usize>() <= 2);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// GH #542: an attribute pattern lowers only when it is a filter on the
+/// returned block alone.
+#[test]
+fn gh542_attribute_patterns_lower_only_block_local_meaning() {
+    let lower = |src: &str| advanced_pred(src, None, TODAY);
+
+    // A flipped comparison is the same bound.
+    let (a, _, ignored_a) =
+        lower("[:find (pull ?b [*]) :where [?b :block/scheduled ?d] [(<= ?d 20260630)]]");
+    let (b, _, ignored_b) =
+        lower("[:find (pull ?b [*]) :where [?b :block/scheduled ?d] [(>= 20260630 ?d)]]");
+    assert!(ignored_a.is_empty() && ignored_b.is_empty());
+    assert_eq!(a.unwrap().filter, b.unwrap().filter);
+
+    // A value variable shared by two patterns is a join (scheduled == deadline):
+    // neither pattern may lower to "has a schedule".
+    let (_, ran, ignored) =
+        lower("[:find (pull ?b [*]) :where [?b :block/scheduled ?d] [?b :block/deadline ?d]]");
+    assert!(ran.is_empty(), "{ran:?}");
+    assert_eq!(ignored, vec!["pattern", "pattern"]);
+
+    // A `not` correlated with an outer binding is not "no deadline".
+    let (_, ran, ignored) = lower(
+        "[:find (pull ?b [*]) :where (task ?b #{\"TODO\"}) [?b :block/scheduled ?d] (not [?b :block/deadline ?d])]",
+    );
+    assert_eq!(ran, vec!["task"]);
+    assert!(ignored.contains(&"not".to_string()), "{ignored:?}");
+
+    // A literal of the wrong type never matches in Logseq; it is not guessed.
+    let (lowered, _, ignored) = lower("[:find (pull ?b [*]) :where [?b :block/marker 3]]");
+    assert!(lowered.is_none());
+    assert_eq!(ignored, vec!["pattern"]);
+
+    // The pulled variable must be the one the clauses constrain.
+    let (lowered, _, _) = lower("[:find (pull ?x [*]) :where [?b :block/marker \"TODO\"]]");
+    assert!(lowered.is_none());
+}

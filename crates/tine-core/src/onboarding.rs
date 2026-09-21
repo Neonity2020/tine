@@ -655,6 +655,7 @@ mod tests {
         assert!(page.markdown.contains("logseq/.tine-trash"));
         assert!(page.markdown.contains("Watch for external edits"));
         assert!(page.markdown.contains("Snapshots to keep"));
+        assert!(page.markdown.contains("once opening has settled"));
         assert!(page.markdown.contains("Verify synchronized graph"));
         assert!(page.markdown.contains("`logseq/config.edn` is live too"));
         assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
@@ -969,6 +970,35 @@ mod tests {
     /// runs them through `read_scoped_display_settings` — the one reader every
     /// query block goes through — so the sentence is checked against the
     /// behaviour it promises, and a change to either one has to change both.
+    /// GH #542: the Guide's advanced-query example is one Tine runs whole.
+    #[test]
+    fn gh542_guide_advanced_query_example_runs_whole() {
+        let workflow = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Workflows/Find and revisit")
+            .expect("the find-and-revisit workflow is registered");
+        let start = workflow
+            .markdown
+            .find("`[:find ")
+            .expect("the Guide shows an advanced query");
+        let example = &workflow.markdown[start + 1..];
+        let example = &example[..example.find('`').expect("closed code span")];
+        let today = crate::date::JournalDate::today();
+        let (query, _) = crate::query::parse_query_source(example, today);
+        let result = crate::query::resolve_for_execution(
+            &query,
+            &crate::query::ir::ExecutionContext::default(),
+            today,
+        );
+        assert!(result.report().supported, "{example}");
+        assert!(
+            result.report().ignored.is_empty(),
+            "{:?}",
+            result.report().ignored
+        );
+        assert!(workflow.markdown.contains("never fewer"));
+    }
+
     #[test]
     fn q3_guide_scoped_display_example_roundtrips() {
         use crate::query::ir::{Field, FriendlyPageMatchScope, ViewKind};

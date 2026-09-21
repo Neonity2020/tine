@@ -65,6 +65,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Advanced queries written the way Logseq's documentation and many
+  `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
+  or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or
+  `>=`, the block's journal page and journal day, and
+  `(not [?b :block/scheduled ?d])`. Before, these were refused as
+  unsupported, and a `not` or `or` Tine only partly understood ran as the part
+  it understood, so an "overdue" query could list scheduled tasks. Such a
+  `not`/`or` is now left out whole, so a partial answer can only be wider than
+  the query, and says so (GH #542).
+
 - Opening a graph no longer rebuilds its search index from scratch on every
   launch. The Journals view reads its first days before the index has been
   checked, and those reads were given index positions that collided with the
