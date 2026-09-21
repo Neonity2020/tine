@@ -65,6 +65,7 @@
     "anonymize-graph": "node scripts/anonymize-graph.mjs",
     "test:anonymize-graph": "node --test scripts/anonymize-graph.test.mjs",
     "test:search-scaling-fixture": "node --test scripts/generate-search-scaling-fixture.test.mjs",
+    "test:realistic-graph": "node --test scripts/generate-realistic-graph.test.mjs",
     "test:script-identifiers": "node scripts/check-script-identifiers.mjs",
     "test:e2e-harness": "node --test scripts/e2e-file-poll.test.mjs scripts/e2e-capabilities.test.mjs scripts/e2e-process-group.test.mjs scripts/e2e-machine-probe.test.mjs scripts/e2e-main-window.test.mjs scripts/check-issue-receipts.test.mjs scripts/playwright-wrapper.test.mjs",
     "test:e2e-provenance": "node scripts/test-e2e-provenance.mjs",
