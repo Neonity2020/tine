@@ -13,6 +13,7 @@ icon:: 🗄️
 	- You never press Save: edits are written automatically to the same file the page came from, about half a second after a pause, and byte-identical rewrites are skipped.
 	- Writes are atomic and format-preserving — tabs vs spaces, comments, and compact EDN survive round-trips.
 	- A page **rename** is transactional: the file move and every `[[reference]]` / `#tag` rewrite commit together, re-checked just before writing, or roll back.
+	- Tine saves pending edits before a rename. A page whose edits cannot be saved stops the rename only if the rename would change that page, or its unsaved text mentions the old name; the message names it. Other pages keep their unsaved edits through the rename.
 	- An Org file is rewritten only when Tine can reproduce it byte-for-byte; one it cannot round-trip opens **read-only** so the graph cannot be corrupted.
 - ## External edits
 	- Tine notices changes made outside it — Logseq, Syncthing, or another editor. Settings (**t s**) → **Files** → **Watch for external edits**: **Live (inotify)** (default, no idle wakeups) or **Poll (3s)** for filesystems where the OS watcher misses edits (some network mounts). Saved per device.

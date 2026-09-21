@@ -3,9 +3,10 @@
 
 import { backend } from "./backend";
 import { graphBindingRuntime } from "./graphBindingRuntime";
-import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
+import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, conflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
-import { resetStore, flushAll } from "./store";
+import { resetStore, flushAll, doc, pageByName, forgetPage, invalidateUndoForPage, reloadPageIfStillSafe } from "./store";
+import { dirtyPages, graphBinding, renameFlushFailureMessage, savingPages } from "./persistence";
 import { clearAssetBlobCache } from "./assetCache";
 import { resetTabsToJournals, openPage, restoreSession, flushSession, route, sameRoute, type PageTarget } from "./router";
 import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
@@ -15,7 +16,7 @@ import { waitForWarmCache } from "./warmCache";
 import { CUSTOM_CSS_STYLE_ID, ensureLsShimStyle } from "./lsShim";
 import { ensureThemeStyle } from "./themeGallery";
 import { isMobile, platformKind } from "./platform";
-import type { BlockDto, GraphMeta } from "./types";
+import type { BlockDto, GraphMeta, RenameTouchedPage } from "./types";
 import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
@@ -369,48 +370,143 @@ async function loadAliases(): Promise<void> {
   await Promise.all([refreshAliases(), refreshPageIdentities()]);
 }
 
-/** Refresh frontend state after a successful page rename. The backend rename
- *  rewrites `[[refs]]` across many files through the self-write guard, which
- *  SUPPRESSES the watcher reload — so every in-memory page (the renamed page, the
- *  journals feed, satellite/sidebar pages) is potentially stale, and a stale save
- *  of one would silently revert the rename's rewrite on disk. Reset the store
- *  (cancels pending/in-flight saves + clears the shared `byId`) and bump the graph
- *  epoch (drops the block-resolve cache and forces the open view + Linked
- *  References to refetch from the now-correct backend). Aliases may have moved with
- *  the renamed file, so refresh those too. Caller must have run flushAll() first
- *  (so resetStore discards nothing unsaved) and then navigate to the new name. */
-export function refreshAfterRename(from: string, to: string, exactTarget?: PageTarget): void {
+/** What a rename may proceed with after trying to save every pending edit. */
+export type RenamePreparation =
+  | { ok: true; unsavedPaths: string[] }
+  | { ok: false; message: string };
+
+/** Save every pending edit before a rename, and decide what a failure means.
+ *
+ *  The rename reads referring pages from disk to rewrite their `[[refs]]`, so
+ *  every edit that CAN be saved is saved first. A page that cannot be saved
+ *  used to block every rename in the graph, because the old refresh reset the
+ *  whole working set; it now blocks only when it matters (GH #535):
+ *  - it is the page being renamed, or one of its namespace children; or
+ *  - its unsaved text mentions the old name, so the rename would miss a
+ *    reference that exists only in memory.
+ *  Anything else is handed to the backend as `unsavedPaths`, which refuses to
+ *  rewrite those files, and keeps its unsaved edits through the rename. */
+export async function prepareRename(from: string): Promise<RenamePreparation> {
+  if (await flushAll()) return { ok: true, unsavedPaths: [] };
+  const renamed = pageIdentityKey(from);
+  const mention = from.trim().toLowerCase().normalize("NFC");
+  const stuck = [...new Set([...dirtyPages(), ...savingPages(), ...conflicts()])];
+  const unsavedPaths: string[] = [];
+  for (const name of stuck) {
+    const key = pageIdentityKey(name);
+    if (key === renamed || key.startsWith(`${renamed}/`)) {
+      return {
+        ok: false,
+        message: `Couldn't rename: “${name}” has changes Tine could not save. Save or discard them, then rename again. Your pending edits are still here.`,
+      };
+    }
+    if (mention && unsavedPageText(name).toLowerCase().normalize("NFC").includes(mention)) {
+      return {
+        ok: false,
+        message: `Couldn't rename: “${name}” has changes Tine could not save, and they mention “${from}”, so the rename could not update them. Save or discard those changes, then rename again. Your pending edits are still here.`,
+      };
+    }
+    const path = pageByName(name)?.path;
+    if (path) unsavedPaths.push(path);
+  }
+  return { ok: true, unsavedPaths };
+}
+
+/** Everything a page holds in memory: its header and every block. */
+function unsavedPageText(name: string): string {
+  const page = pageByName(name);
+  if (!page) return "";
+  const parts = [page.preBlock ?? ""];
+  const visit = (id: string) => {
+    const node = doc.byId[id];
+    if (!node) return;
+    parts.push(node.raw);
+    node.children.forEach(visit);
+  };
+  page.roots.forEach(visit);
+  return parts.join("\n");
+}
+
+/** Refresh frontend state after a successful page rename.
+ *
+ *  The backend rewrites `[[refs]]` through the self-write guard, which
+ *  SUPPRESSES the watcher reload, so each page it touched is stale in memory
+ *  and a stale save could revert the rewrite. Only those pages are refreshed
+ *  (GH #535); every other open page, unsaved edits included, is kept:
+ *  - a moved page is dropped under its old name (the caller opens the new one);
+ *  - a rewritten page is reloaded from disk when it is still clean. One edited
+ *    while the rename ran keeps its edit, and its save meets the rewrite as an
+ *    ordinary reviewable conflict.
+ *  Undo history for touched pages is dropped: replaying it would restore the
+ *  pre-rename text. The graph epoch is bumped so views, Linked References and
+ *  the block-resolve cache refetch; aliases may have moved with the file.
+ *
+ *  `touched === null` (a merge, which does not report what it touched) keeps
+ *  the old full reset; its caller must have saved every page first.
+ *  Returns once the rewritten pages have been reloaded. */
+export async function refreshAfterRename(
+  from: string,
+  to: string,
+  exactTarget: PageTarget | undefined,
+  touched: readonly RenameTouchedPage[] | null,
+): Promise<void> {
   if (exactTarget) {
     removePageTargetAcrossPanes(exactTarget);
     renamePageInNavigation(exactTarget, { name: to, pageKind: exactTarget.pageKind });
   } else {
     renamePageInNavigation(from, to);
   }
-  resetStore();
+  const reloads: RenameTouchedPage[] = [];
+  if (touched === null) {
+    resetStore();
+  } else {
+    for (const page of touched) {
+      const loaded = pageByName(page.name);
+      if (!loaded || loaded.kind !== page.kind || (loaded.path ?? "") !== page.path) continue;
+      if (page.renamedTo !== null) {
+        forgetPage(page.name);
+      } else {
+        invalidateUndoForPage(page.name);
+        reloads.push(page);
+      }
+    }
+  }
   resetNavigationIndex();
   bumpGraphEpoch();
   void Promise.all([refreshAliases(), refreshPageIdentities()]);
+  const binding = graphBinding();
+  await Promise.all(reloads.map(async (page) => {
+    const dto = await backend().getPageByPath(page.path);
+    if (dto && binding === graphBinding()) await reloadPageIfStillSafe(page.name, dto, binding);
+  }));
 }
+
+export type RenameResult =
+  | { status: "renamed"; touched: RenameTouchedPage[] }
+  | { status: "merged" | "cancelled" };
 
 export async function renameOrMergePage(
   from: string,
   to: string,
-  sourcePath?: string,
-): Promise<"renamed" | "merged" | "cancelled"> {
+  sourcePath: string | undefined,
+  unsavedPaths: readonly string[],
+): Promise<RenameResult> {
   const destination = await backend().getPage(to, "page");
   let exactSourcePath = sourcePath;
   if (!exactSourcePath) exactSourcePath = (await backend().getPage(from, "page"))?.path;
   if (destination?.path && destination.path !== exactSourcePath) {
+    // A merge still resets the whole working set, so it needs every page saved.
+    if (unsavedPaths.length) throw new Error(renameFlushFailureMessage());
     if (!globalThis.confirm(`Page “${to}” already exists. Merge “${from}” into it?`)) {
-      return "cancelled";
+      return { status: "cancelled" };
     }
     if (!exactSourcePath) {
       throw new Error(`Couldn't identify the source file for “${from}”.`);
     }
     await backend().mergePages(exactSourcePath, destination.path, { from, to });
-    return "merged";
+    return { status: "merged" };
   }
-  const outcome = await backend().renamePage(from, to, exactSourcePath);
+  const outcome = await backend().renamePage(from, to, exactSourcePath, [...unsavedPaths]);
   const skipped = outcome?.skippedConflictedReferrers ?? [];
   if (skipped.length) {
     // These files are mid-merge, so the rename deliberately left their refs
@@ -424,7 +520,7 @@ export async function renameOrMergePage(
       { sticky: true },
     );
   }
-  return "renamed";
+  return { status: "renamed", touched: outcome?.touched ?? [] };
 }
 
 export type JournalTemplateEnsureResult = "ready" | "deferred" | "stale";

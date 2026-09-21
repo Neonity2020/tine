@@ -186,6 +186,23 @@ pub struct SyncConflict {
 pub struct RenameOutcome {
     /// Paths of quarantined referrers left byte-identical, old refs intact.
     pub skipped_conflicted_referrers: Vec<String>,
+    /// Every page whose file the rename moved or rewrote. The frontend reloads
+    /// exactly these and keeps every other open page, unsaved edits included
+    /// (GH #535).
+    pub touched: Vec<RenameTouchedPage>,
+}
+
+/// One page a rename moved or rewrote.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameTouchedPage {
+    /// The page's name before the rename.
+    pub name: String,
+    pub kind: PageKind,
+    /// Graph-root-relative path of the file before the rename.
+    pub path: String,
+    /// Set when the page itself moved: its name after the rename.
+    pub renamed_to: Option<String>,
 }
 
 /// A page whose ON-DISK bytes carry unresolved VCS merge-conflict markers

@@ -1,4 +1,3 @@
-import { renameFlushFailureMessage } from "../persistence";
 import { For, Show, Switch, Match, createEffect, createSignal, onCleanup, type JSX } from "solid-js";
 import {
   contextMenu,
@@ -22,7 +21,7 @@ import {
 } from "../ui";
 import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, openInNewTab, pageTargetMatchesLoaded, type PageTarget } from "../router";
 import { activePaneRoutes, removePageTargetAcrossPanes } from "../panes";
-import { refreshAfterRename, renameOrMergePage } from "../graph";
+import { prepareRename, refreshAfterRename, renameOrMergePage } from "../graph";
 import { backend } from "../backend";
 import { isMobilePlatform } from "../nativeChrome";
 import { carryDay } from "../carry";
@@ -42,7 +41,6 @@ import {
   setSelectionHeading,
   setCollapsedDeep,
   dtoSubtreeMarkdown,
-  flushAll,
   flushPage,
   isDirty,
   deletePage,
@@ -1124,21 +1122,27 @@ function RenamePage(props: {
     props.close(false);
     if (!next || next === from) return;
     try {
-      // Persist ALL unsaved edits first — the rename reads every referencing page
-      // from disk to rewrite its `[[refs]]`, so a dirty edit on ANY page would be
-      // read stale and lost.
-      if (!(await flushAll())) {
-        pushToast(renameFlushFailureMessage(), "error", { sticky: true });
+      // Save every pending edit first: the rename reads referring pages from
+      // disk to rewrite their `[[refs]]`. An edit that cannot be saved blocks
+      // the rename only if the rename would touch it (GH #535).
+      const prepared = await prepareRename(from);
+      if (!prepared.ok) {
+        pushToast(prepared.message, "error", { sticky: true });
         return;
       }
-      const outcome = await renameOrMergePage(from, next, props.path);
-      if (outcome === "cancelled") return;
-      // Backend rewrote refs across pages via the self-write guard (no watcher
-      // reload) → in-memory pages are stale; reset + reload so a stale save can't
-      // revert the rename.
-      refreshAfterRename(from, next, { name: from, pageKind: kind, ...(props.path ? { path: props.path } : {}) });
+      const result = await renameOrMergePage(from, next, props.path, prepared.unsavedPaths);
+      if (result.status === "cancelled") return;
+      // The backend rewrote refs through the self-write guard (no watcher
+      // reload): refresh the pages it touched so a stale save can't revert the
+      // rename.
+      void refreshAfterRename(
+        from,
+        next,
+        { name: from, pageKind: kind, ...(props.path ? { path: props.path } : {}) },
+        result.status === "renamed" ? result.touched : null,
+      );
       openPage(next, kind);
-      pushToast(outcome === "merged" ? `Merged into “${next}”` : `Renamed to “${next}”`, "success");
+      pushToast(result.status === "merged" ? `Merged into “${next}”` : `Renamed to “${next}”`, "success");
     } catch (e) {
       pushToast(`Rename failed: ${String(e)}`, "error");
     }

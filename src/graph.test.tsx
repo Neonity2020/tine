@@ -128,6 +128,7 @@ async function loadHarness(
     refreshJournalConflicts: vi.fn(async () => {}),
     refreshSyncConflicts: vi.fn(async () => {}),
     restoreLiveSaveConflicts: vi.fn(),
+    conflicts: vi.fn(() => []),
     clearRecent: vi.fn(),
     resetLeftSidebarSections: vi.fn(),
     graphTransitioning: () => false,
@@ -298,7 +299,7 @@ describe("page rename collisions", () => {
     const confirm = vi.fn(() => true);
     vi.spyOn(globalThis, "confirm").mockImplementation(confirm);
 
-    await expect(harness.renameOrMergePage("B", "A", "pages/B.md")).resolves.toBe("merged");
+    await expect(harness.renameOrMergePage("B", "A", "pages/B.md", [])).resolves.toEqual({ status: "merged" });
 
     expect(confirm).toHaveBeenCalledWith("Page “A” already exists. Merge “B” into it?");
     expect(harness.api.mergePages).toHaveBeenCalledWith(
@@ -321,7 +322,7 @@ describe("page rename collisions", () => {
     const harness = await loadHarness(destination);
     vi.spyOn(globalThis, "confirm").mockReturnValue(false);
 
-    await expect(harness.renameOrMergePage("B", "A", "pages/B.md")).resolves.toBe("cancelled");
+    await expect(harness.renameOrMergePage("B", "A", "pages/B.md", [])).resolves.toEqual({ status: "cancelled" });
     expect(harness.api.mergePages).not.toHaveBeenCalled();
     expect(harness.api.renamePage).not.toHaveBeenCalled();
   });
@@ -329,8 +330,25 @@ describe("page rename collisions", () => {
   it("keeps the ordinary rename path when the destination has no file", async () => {
     const harness = await loadHarness(null);
 
-    await expect(harness.renameOrMergePage("B", "C", "pages/B.md")).resolves.toBe("renamed");
-    expect(harness.api.renamePage).toHaveBeenCalledWith("B", "C", "pages/B.md");
+    await expect(harness.renameOrMergePage("B", "C", "pages/B.md", ["pages/Other.md"])).resolves.toMatchObject({ status: "renamed" });
+    expect(harness.api.renamePage).toHaveBeenCalledWith("B", "C", "pages/B.md", ["pages/Other.md"]);
+    expect(harness.api.mergePages).not.toHaveBeenCalled();
+  });
+
+  it("refuses a merge while any page is unsaved, because a merge still reloads every page (GH #535)", async () => {
+    const destination: PageDto = {
+      name: "A",
+      kind: "page",
+      title: "A",
+      pre_block: null,
+      blocks: [],
+      path: "pages/A.md",
+    };
+    const harness = await loadHarness(destination);
+    const confirm = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+
+    await expect(harness.renameOrMergePage("B", "A", "pages/B.md", ["pages/Other.md"])).rejects.toThrow("Couldn't");
+    expect(confirm).not.toHaveBeenCalled();
     expect(harness.api.mergePages).not.toHaveBeenCalled();
   });
 });

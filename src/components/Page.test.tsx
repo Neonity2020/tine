@@ -29,8 +29,9 @@ import { journalTitle } from "../journal";
 import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
+import { refreshAfterRename } from "../graph";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, registerLiveSaveConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, conflicts, closeContextMenu, contextMenu, graphEpoch, markConflict, registerLiveSaveConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 
 beforeAll(async () => {
@@ -1438,7 +1439,7 @@ describe("page actions entry point", () => {
     vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue([]);
     vi.spyOn(backend(), "getUnlinkedRefs").mockResolvedValue([]);
-    const rename = vi.spyOn(backend(), "renamePage").mockResolvedValue({ skippedConflictedReferrers: [] });
+    const rename = vi.spyOn(backend(), "renamePage").mockResolvedValue({ skippedConflictedReferrers: [], touched: [] });
     mainPaneRouter.openFile(dto.path!, dto.name, "page", { inPlace: true });
 
     const { root, dispose } = mount(() => <PageView />);
@@ -1460,7 +1461,7 @@ describe("page actions entry point", () => {
       blurred.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
       await flushMicrotasks();
       expect(rename).toHaveBeenCalledTimes(1);
-      expect(rename).toHaveBeenLastCalledWith("Rename me", "Blurred name", dto.path);
+      expect(rename).toHaveBeenLastCalledWith("Rename me", "Blurred name", dto.path, []);
 
       rename.mockClear();
       const entered = await begin("Entered name");
@@ -1480,40 +1481,52 @@ describe("page actions entry point", () => {
     }
   });
 
-  it.each(["save refusal", "other page conflict", "missing conflict review", "many conflicts"])("names the actual blocker when title rename cannot flush: %s (GH #535)", async (blocker) => {
+  // GH #535: a page whose save is refused — the same refusal on EVERY attempt,
+  // as the reporter's was — blocks a rename only when the rename would touch
+  // it. The old guard needed every page in the graph saved, so one stuck page
+  // refused every rename for the rest of the session.
+  it.each([
+    "unrelated page refused on every save",
+    "unrelated conflict",
+    "stuck page mentions the old name",
+    "renamed page itself stuck",
+  ])("a stuck page blocks a title rename only when the rename would touch it: %s (GH #535)", async (blocker) => {
     const dto: PageDto = {
       name: "Rename me", kind: "page", title: "Rename me", pre_block: null,
       path: "pages/Rename me.md",
-      blocks: [{ id: "rename-root", raw: "Unsaved body", collapsed: false, children: [] }],
+      blocks: [{ id: "rename-root", raw: "Body", collapsed: false, children: [] }],
     };
+    const otherDraft = blocker === "stuck page mentions the old name" ? "see [[rename me]] later" : "Other draft";
     setDoc({
-      byId: { "rename-root": node("rename-root", "Unsaved body", dto.name) },
-      pages: [{ ...page(dto.name, "page", ["rename-root"]), path: dto.path }],
+      byId: {
+        "rename-root": node("rename-root", "Body", dto.name),
+        "other-root": node("other-root", otherDraft, "Other page"),
+      },
+      pages: [
+        { ...page(dto.name, "page", ["rename-root"]), path: dto.path },
+        { ...page("Other page", "page", ["other-root"]), path: "pages/Other page.md" },
+      ],
       feed: [], loaded: true,
     });
     vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue([]);
     vi.spyOn(backend(), "getUnlinkedRefs").mockResolvedValue([]);
     const save = vi.spyOn(backend(), "savePage").mockRejectedValue({
-      kind: "direct-save-failure", reasonCode: "identity.name_taken",
-      message: "Another file owns this page name",
+      kind: "save-conflict", reasonCode: "conflict.pinned_owner", epoch: null,
+      message: "save refused",
     });
-    const rename = vi.spyOn(backend(), "renamePage");
+    const rename = vi.spyOn(backend(), "renamePage").mockResolvedValue({
+      skippedConflictedReferrers: [],
+      touched: [{ name: dto.name, kind: "page", path: dto.path!, renamedTo: "Renamed" }],
+    });
     const warning = vi.spyOn(globalThis, "alert").mockImplementation(() => {});
     mainPaneRouter.openFile(dto.path!, dto.name, "page", { inPlace: true });
     const { root, dispose } = mount(() => <PageView />);
     try {
       await flushMicrotasks(); await flushMicrotasks();
-      if (blocker === "save refusal") addDirty(dto.name);
-      else if (blocker === "missing conflict review") {
-        save.mockRejectedValue({ kind: "save-conflict", reasonCode: "conflict.pinned_owner", epoch: null });
-        addDirty(dto.name);
-      } else if (blocker === "many conflicts") {
-        for (const name of ["First", "Second", "Third", "Fourth"]) markConflict(name);
-      } else {
-        await registerLiveSaveConflict({ ...dto, name: "Other page", path: "pages/Other page.md" }, null, 1);
-        markConflict("Other page");
-      }
+      if (blocker === "renamed page itself stuck") addDirty(dto.name);
+      else if (blocker === "unrelated conflict") markConflict("Other page");
+      else addDirty("Other page");
       root.querySelector<HTMLElement>(".page-title")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
       await tick();
       const input = root.querySelector<HTMLInputElement>(".page-title-input")!;
@@ -1521,29 +1534,66 @@ describe("page actions entry point", () => {
       input.dispatchEvent(new InputEvent("input", { bubbles: true }));
       input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
       for (let i = 0; i < 10; i++) await flushMicrotasks();
-      expect(rename).not.toHaveBeenCalled();
-      expect(doc.byId["rename-root"].raw).toBe("Unsaved body");
-      if (blocker === "save refusal") {
-        expect(save).toHaveBeenCalled();
-        expect(isDirty(dto.name)).toBe(true);
-        expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
-        expect(warning.mock.calls[0][0]).not.toContain("conflict");
-      } else if (blocker === "missing conflict review") {
-        expect(save).toHaveBeenCalled();
-        expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
-        expect(warning.mock.calls[0][0]).toContain("no conflict review");
-        expect(warning.mock.calls[0][0]).not.toContain("Open that page");
-      } else if (blocker === "many conflicts") {
-        expect(warning.mock.calls[0][0]).toContain("and 1 more");
-        expect(warning.mock.calls[0][0]).not.toContain("Fourth");
+
+      if (blocker === "renamed page itself stuck") {
+        expect(rename).not.toHaveBeenCalled();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining("“Rename me”"));
+        expect(doc.byId["rename-root"].raw).toBe("Body");
+      } else if (blocker === "stuck page mentions the old name") {
+        expect(rename).not.toHaveBeenCalled();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining("“Other page”"));
+        expect(warning.mock.calls[0][0]).toContain("mention “Rename me”");
       } else {
-        expect(save).not.toHaveBeenCalled();
-        expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Other page” has an unresolved save conflict'));
+        if (blocker === "unrelated page refused on every save") {
+          // Every attempt was refused and nothing was mocked to succeed later,
+          // so the page is still stuck while the rename goes ahead.
+          expect(save).toHaveBeenCalled();
+          expect(isDirty("Other page") || conflicts().includes("Other page")).toBe(true);
+        }
+        expect(warning).not.toHaveBeenCalled();
+        expect(rename).toHaveBeenCalledWith("Rename me", "Renamed", dto.path, ["pages/Other page.md"]);
+        // The stuck page's unsaved text survives the rename's refresh.
+        expect(doc.byId["other-root"]?.raw).toBe("Other draft");
+        expect(pageByName("Other page")).toBeTruthy();
+        // The moved page is dropped under its old name.
+        expect(pageByName(dto.name)).toBeUndefined();
       }
     } finally {
-      for (const name of ["Other page", dto.name, "First", "Second", "Third", "Fourth"]) clearConflict(name);
+      for (const name of ["Other page", dto.name]) clearConflict(name);
       dispose();
     }
+  });
+
+  it("refreshes only the pages a rename rewrote, and keeps unsaved edits (GH #535)", async () => {
+    const dtoFor = (name: string, raw: string): PageDto => ({
+      name, kind: "page", title: name, pre_block: null, path: `pages/${name}.md`, rev: `rev-${raw}`,
+      blocks: [{ id: `${name}-root`, raw, collapsed: false, children: [] }],
+    });
+    setDoc({
+      byId: {
+        "Clean-root": node("Clean-root", "see [[Old]]", "Clean"),
+        "Edited-root": node("Edited-root", "see [[Old]] and typing", "Edited"),
+        "Untouched-root": node("Untouched-root", "unsaved elsewhere", "Untouched"),
+      },
+      pages: ["Clean", "Edited", "Untouched"].map((name) => ({ ...page(name, "page", [`${name}-root`]), path: `pages/${name}.md` })),
+      feed: [], loaded: true,
+    });
+    addDirty("Edited");
+    addDirty("Untouched");
+    const read = vi.spyOn(backend(), "getPageByPath").mockImplementation(async (path) =>
+      path === "pages/Clean.md" ? dtoFor("Clean", "see [[New]]")
+        : path === "pages/Edited.md" ? dtoFor("Edited", "see [[New]]")
+        : null);
+
+    await refreshAfterRename("Old", "New", undefined, [
+      { name: "Clean", kind: "page", path: "pages/Clean.md", renamedTo: null },
+      { name: "Edited", kind: "page", path: "pages/Edited.md", renamedTo: null },
+    ]);
+
+    expect(read).not.toHaveBeenCalledWith("pages/Untouched.md");
+    expect(doc.byId[pageByName("Clean")!.roots[0]].raw).toBe("see [[New]]");
+    expect(doc.byId["Edited-root"].raw).toBe("see [[Old]] and typing");
+    expect(doc.byId["Untouched-root"].raw).toBe("unsaved elsewhere");
   });
 
   it("keeps a path-bearing title owner through sidebar, new-tab, and menu gestures", async () => {

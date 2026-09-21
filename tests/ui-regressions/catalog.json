@@ -11364,7 +11364,7 @@
     },
     {
       "id": "UI-PAGE-RENAME-FLUSH-DIAGNOSTIC-535",
-      "title": "A refused page rename names pending or conflicted pages without inventing a conflict",
+      "title": "One page that cannot save no longer blocks every rename in the graph",
       "family": "page-rename",
       "sources": {
         "issues": [
@@ -11379,12 +11379,17 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/Page.test.tsx"
+          "src/components/Page.test.tsx::a stuck page blocks a title rename only when the rename would touch it: %s (GH #535)",
+          "src/components/Page.test.tsx::refreshes only the pages a rename rewrote, and keeps unsaved edits (GH #535)",
+          "src/graph.test.tsx::refuses a merge while any page is unsaved, because a merge still reloads every page (GH #535)",
+          "crates/tine-core/src/model_rename_refresh_tests.rs::a_rename_reports_every_page_it_moved_or_rewrote_and_nothing_else",
+          "crates/tine-core/src/model_rename_refresh_tests.rs::a_rename_refuses_to_rewrite_a_file_with_unsaved_edits_and_changes_nothing",
+          "crates/tine-core/src/model_rename_refresh_tests.rs::a_rename_retires_only_the_moved_editor_and_a_stale_referrer_conflicts_reviewably"
         ],
         "scenario": "page-rename.actual-flush-blocker-preserves-drafts",
         "failBefore": "proven"
       },
-      "notes": "Partial GH #535: actual title DOM submission through real persistence with a typed non-conflict save failure and an unrelated conflict. Rename remains refused and pending body edits remain intact; message names the actual pending/conflicted page, caps listed names at three, and never directs the user to absent conflict review UI. Windows native save refusal and reporter-specific root cause remain unverified. Context-menu caller uses the identical read-only diagnostic; ContextMenu render suite passes."
+      "notes": "GH #535. A rename required every page in the graph to save first (flushAll's verdict is graph-wide) because the post-rename refresh reset the whole working set and the backend burned every editor activation; so one page whose save was refused - the reporter's refusal is unexplained and the test replays it on EVERY attempt - blocked every rename for the session. The rename now reports the pages it moved or rewrote (RenameOutcome.touched); the frontend forgets moved pages under their old names, reloads clean rewritten pages, and keeps every other page including unsaved edits; the backend retires only moved pages' activations and revokes conflict authority only for touched paths, so a referrer edited during the rename conflicts reviewably. A stuck page still blocks, and is named, when it is the renamed page or a namespace child, or when its unsaved text mentions the old name (the rename could not update a reference that exists only in memory); otherwise its path is passed as unsavedPaths and the backend refuses to rewrite it. Merge still resets everything, so it still needs every page saved. Fail-before: under the old all-pages rule the unrelated-page cases refuse the rename; under the old full reset the stuck page's draft is lost. The earlier attempt a9cac72c (reverted in ab42a9ed) only changed the message: its test mocked the next save to succeed. Not addressed: a page that meets an epoch-less save refusal is itself still stuck without a review banner; Windows native behaviour and the reporter's root cause remain unverified."
     },
     {
       "id": "UI-EMBED-INPUT-OWNERSHIP-20260913",

@@ -39,6 +39,24 @@ impl Graph {
         new: &str,
         expected_path: Option<&str>,
     ) -> io::Result<RenameOutcome> {
+        self.rename_page_guarded(old, new, expected_path, &[])
+    }
+
+    /// `rename_page_reporting`, refusing to move or rewrite any file in
+    /// `unsaved_paths` (graph-root-relative).
+    ///
+    /// The frontend passes the pages whose edits it could not save. A rename
+    /// no longer needs every page in the graph saved first, only the ones it
+    /// touches, and it cannot know which those are until the transaction has
+    /// read the graph; rewriting a file under an unsaved edit would turn that
+    /// edit into a conflict against bytes the user never saw (GH #535).
+    pub fn rename_page_guarded(
+        &self,
+        old: &str,
+        new: &str,
+        expected_path: Option<&str>,
+        unsaved_paths: &[String],
+    ) -> io::Result<RenameOutcome> {
         let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let old = old.trim();
@@ -47,7 +65,6 @@ impl Graph {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty name"));
         }
         if old.is_empty() || crate::refs::same_page(old, new) {
-            self.finish_successful_rename_editor_lifecycle();
             return Ok(RenameOutcome::default()); // nothing to do (case-only rename is intentionally a no-op)
         }
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
@@ -417,8 +434,20 @@ impl Graph {
             }
         }
         if edits.is_empty() {
-            self.finish_successful_rename_editor_lifecycle();
             return Ok(RenameOutcome::default()); // page doesn't exist / nothing references it
+        }
+        if let Some(blocked) = edits
+            .iter()
+            .find(|edit| unsaved_paths.contains(&self.rel_path(&edit.src)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "“{}” has changes Tine could not save, and this rename would rewrite it. \
+                     Save or discard those changes, then rename again.",
+                    blocked.src_entry.name
+                ),
+            ));
         }
 
         // Phase 1 — lock every touched path (src + move dst), sorted + deduped
@@ -666,9 +695,30 @@ impl Graph {
             });
         }
         self.direct_projection_publish_page_set(projection_generation, page_set);
-        self.finish_successful_rename_editor_lifecycle();
+        let touched = edits
+            .iter()
+            .map(|edit| RenameTouchedPage {
+                name: edit.src_entry.name.clone(),
+                kind: edit.src_entry.kind,
+                path: self.rel_path(&edit.src),
+                renamed_to: (edit.is_move && edit.dst != edit.src)
+                    .then(|| {
+                        rename_map
+                            .get(&crate::refs::normalize(&edit.src_entry.name))
+                            .cloned()
+                    })
+                    .flatten(),
+            })
+            .collect();
+        self.finish_successful_rename_editor_lifecycle(
+            &edits
+                .iter()
+                .map(|edit| (&edit.src, &edit.dst, edit.is_move && edit.dst != edit.src))
+                .collect::<Vec<_>>(),
+        );
         Ok(RenameOutcome {
             skipped_conflicted_referrers,
+            touched,
         })
     }
 
@@ -685,16 +735,29 @@ impl Graph {
         )
     }
 
-    /// An ordinary rename resets the frontend's entire working set because the
-    /// transaction can rewrite references in every open page.  The Graph itself
-    /// remains bound, so its activation registry would otherwise outlive those
-    /// destroyed editor instances and a later `Reuse` could inherit a dead
-    /// editor's authority.  Burn the whole graph-wide editor generation only
-    /// after a successful rename; an error leaves the still-mounted editors and
-    /// their conflict banners intact.
-    fn finish_successful_rename_editor_lifecycle(&self) {
-        self.editor_activations.lock().unwrap().live.clear();
-        self.revoke_all_conflict_authority();
+    /// The frontend reloads only the pages a rename touched (GH #535), so only
+    /// those lose their editor state here. A MOVED page's editor is destroyed
+    /// with its old name, so its activation is retired and a later `Reuse` on
+    /// that path cannot inherit it. A page rewritten in place keeps its editor:
+    /// a clean one is reloaded by the frontend, which replaces the activation
+    /// itself, and one edited during the rename must still save against its own
+    /// activation, where the rewrite surfaces as an ordinary reviewable
+    /// conflict. Conflict authority observed before the rewrite is revoked for
+    /// every touched path. Untouched pages keep everything. An error leaves the
+    /// still-mounted editors and their conflict banners intact.
+    fn finish_successful_rename_editor_lifecycle(&self, touched: &[(&PathBuf, &PathBuf, bool)]) {
+        {
+            let mut activations = self.editor_activations.lock().unwrap();
+            for (src, _, moved) in touched {
+                if *moved {
+                    activations.live.remove(*src);
+                }
+            }
+        }
+        for (src, dst, _) in touched {
+            self.revoke_conflict_authority(src);
+            self.revoke_conflict_authority(dst);
+        }
     }
 
     /// Delete a page/journal file. Rather than unlinking, the file is moved to a

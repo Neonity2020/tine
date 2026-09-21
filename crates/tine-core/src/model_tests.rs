@@ -10008,6 +10008,8 @@ mod alias_admission;
 
 #[path = "model_rename_cost_tests.rs"]
 mod rename_cost;
+#[path = "model_rename_refresh_tests.rs"]
+mod rename_refresh;
 
 /// GH #366's literal reporter page name. Unicode itself must not make an
 /// otherwise ordinary Direct Files creation ambiguous; the neighboring test
@@ -14683,17 +14685,19 @@ fn gh254_token_cannot_cross_path_rename_or_successful_save() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// Rename resets the frontend's whole working set: reference rewrites can
-/// make every mounted page stale, not only the page whose file moved.  The
-/// backend Graph remains the same object, so it must explicitly burn every
-/// activation after success rather than relying on Graph destruction.
+/// A rename's frontend refresh reloads only the pages it touched (GH #535), so
+/// the backend retires only the MOVED page's activation: that editor dies with
+/// the old name, and a later `Reuse` on the path must not inherit it. A
+/// reference-rewritten page keeps its editor (see
+/// `rename_refresh::a_rename_retires_only_the_moved_editor_and_a_stale_referrer_conflicts_reviewably`).
+/// A failed rename retires nothing.
 #[test]
-fn gh254_successful_rename_burns_all_editor_activations_but_failure_does_not() {
+fn gh254_successful_rename_retires_the_moved_editor_but_failure_does_not() {
     let root = scratch("gh254-inc3-rename-activation-lifecycle");
     let note_path = root.join("pages/Note.md");
     let other_path = root.join("pages/Other.md");
     fs::write(&note_path, "- [[Other]]\n").unwrap();
-    fs::write(&other_path, "- other\n").unwrap();
+    fs::write(&other_path, "- [[Note]]\n").unwrap();
     let graph = Graph::open(&root);
     graph.warm_cache();
 
@@ -14720,16 +14724,16 @@ fn gh254_successful_rename_burns_all_editor_activations_but_failure_does_not() {
         !graph.retire_editor_activation("pages/Note.md", note.activation),
         "the moved page's destroyed editor must be retired"
     );
-    assert!(
-        !graph.retire_editor_activation("pages/Other.md", other.activation),
-        "a reference-rewritten satellite editor must be retired too"
-    );
     let reopened = graph
-        .activate_editor("pages/Other.md", ActivationIntent::Reuse, None)
+        .activate_editor("pages/Note.md", ActivationIntent::Reuse, None)
         .unwrap();
     assert_ne!(
-        reopened.activation, other.activation,
-        "Reuse after the reset must mint for the new editor instance"
+        reopened.activation, note.activation,
+        "Reuse on the moved path must mint for a new editor instance"
+    );
+    assert!(
+        graph.retire_editor_activation("pages/Other.md", other.activation),
+        "a reference-rewritten page's editor survives; the frontend replaces it"
     );
     let _ = fs::remove_dir_all(root);
 }

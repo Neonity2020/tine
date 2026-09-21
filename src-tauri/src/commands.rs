@@ -648,6 +648,7 @@ pub(crate) async fn rename_page(
     old: String,
     new: String,
     expected_path: Option<String>,
+    unsaved_paths: Option<Vec<String>>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::model::RenameOutcome, CommandError> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -655,7 +656,12 @@ pub(crate) async fn rename_page(
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         slot.graph()
-            .rename_page_reporting(&old, &new, expected_path.as_deref())
+            .rename_page_guarded(
+                &old,
+                &new,
+                expected_path.as_deref(),
+                unsaved_paths.as_deref().unwrap_or_default(),
+            )
             .map_err(CommandError::from)
     })
     .await

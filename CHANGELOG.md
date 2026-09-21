@@ -47,6 +47,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- One page that cannot be saved no longer blocks every rename in the graph.
+  A rename used to need every open page saved first, so a single page whose
+  save kept being refused made every rename fail until you deleted and
+  recreated that page. Now such a page stops a rename only if the rename would
+  change it, or its unsaved text mentions the old name, and the message names
+  it. After a rename Tine reloads only the pages the rename changed, so
+  unsaved edits on every other page are kept (GH #535).
 - Renaming a page that many other pages link to is much faster in a large
   graph. Every file the rename rewrote re-listed the whole pages folder to
   check for names that differ only in case or accents, so the cost grew with

@@ -1114,7 +1114,7 @@ export function mockBackend(): Backend {
     },
     async renamePage(): Promise<RenameOutcome> {
       // no-op in mock; nothing is ever quarantined here
-      return { skippedConflictedReferrers: [] };
+      return { skippedConflictedReferrers: [], touched: [] };
     },
     async publishHtml(): Promise<[string, number]> {
       return ["/mock/graph/publish", all.length];

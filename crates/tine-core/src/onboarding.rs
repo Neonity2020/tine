@@ -656,6 +656,14 @@ mod tests {
         assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("Retry saving"));
+        // GH #535: one page that cannot save no longer blocks every rename. The
+        // Guide says when it still does, or a refused rename reads as arbitrary.
+        assert!(page
+            .markdown
+            .contains("stops the rename only if the rename would change that page"));
+        assert!(page
+            .markdown
+            .contains("Other pages keep their unsaved edits through the rename"));
         // Query export: the whole-page consequence and the size limit must be
         // in the Guide, because the dialog's one checkbox is all the UI says.
         assert!(page.markdown.contains("published-queries/<name>/"));

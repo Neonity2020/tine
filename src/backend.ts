@@ -573,7 +573,9 @@ export interface Backend {
   getBlockReferrers(uuid: string): Promise<RefGroup[]>;
   deletePage(name: string, kind: "journal" | "page", expectedPath?: string): Promise<void>;
   /** Rename a page and update all [[refs]]/#tags across the graph. */
-  renamePage(old: string, next: string, expectedPath?: string): Promise<RenameOutcome>;
+  /** `unsavedPaths`: pages whose edits could not be saved. The rename refuses
+   *  to move or rewrite any of them (GH #535). */
+  renamePage(old: string, next: string, expectedPath?: string, unsavedPaths?: string[]): Promise<RenameOutcome>;
   publishHtml(): Promise<[string, number]>;
   /** Plan a query export: the pages that own the query's results, plus the
    *  fingerprint the confirm step echoes back. Writes nothing. */
@@ -1489,8 +1491,8 @@ class TauriBackend implements Backend {
   deletePage(name: string, kind: "journal" | "page", expectedPath?: string) {
     return this.call<void>("delete_page", { name, kind, expectedPath });
   }
-  renamePage(old: string, next: string, expectedPath?: string) {
-    return this.call<RenameOutcome>("rename_page", { old, new: next, expectedPath });
+  renamePage(old: string, next: string, expectedPath?: string, unsavedPaths?: string[]) {
+    return this.call<RenameOutcome>("rename_page", { old, new: next, expectedPath, unsavedPaths });
   }
   publishHtml() {
     return this.call<[string, number]>("publish_html");
