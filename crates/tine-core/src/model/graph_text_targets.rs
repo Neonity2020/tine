@@ -94,7 +94,6 @@ impl Graph {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
-        validate_graph_text_single_link(&file, graph_text_path.as_str())?;
         #[cfg(test)]
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let identity = canonical_projection_file_resource_id(&file)?;
@@ -198,7 +197,6 @@ impl Graph {
                 "graph text target changed at the local identity validation boundary",
             ));
         }
-        validate_graph_text_single_link(&file, graph_text_path.as_str())?;
         Ok(identity)
     }
 
@@ -361,6 +359,49 @@ impl Graph {
         Ok(())
     }
 
+    /// Refuse only the alias Tine can actually name: another GRAPH-TEXT path
+    /// already holding this exact physical resource.
+    ///
+    /// **Threat scenario** (the refusal-table rule): two graph paths on one
+    /// inode. Every publication here is temp + no-clobber rename, so a save
+    /// through one name installs a NEW inode at that name and the other page
+    /// silently keeps the old bytes while Tine reports the save as done —
+    /// honest in-graph divergence the user never asked for, reachable through
+    /// an ordinary sync-delivered or user-made duplicate.
+    ///
+    /// A link whose other name is NOT a graph-text path is deliberately not
+    /// this function's business (GH #571, GH #555): git-annex's `annex.thin`
+    /// mode links every page into `.git/annex/objects/...`, which graph-text
+    /// scope never descends into. The old rule refused on the raw link count
+    /// and so could not tell those two cases apart, which made Tine unusable
+    /// on an annexed graph.
+    pub(super) fn validate_graph_text_resource_alias(
+        index: &CompleteGraphTextAdmissionIndex,
+        target_relative: &str,
+        identity: ContentDigest,
+    ) -> io::Result<()> {
+        let Some(sibling) = index
+            .paths_by_file_resource
+            .get(&identity)
+            .and_then(|members| {
+                members
+                    .iter()
+                    .find(|member| member.as_str() != target_relative)
+            })
+        else {
+            return Ok(());
+        };
+        Err(DirectSaveError::into_io(
+            DirectSaveFailureCode::PrecheckResourceAlias,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "graph text files alias one physical resource: {sibling} and {target_relative}"
+                ),
+            ),
+        ))
+    }
+
     /// Apply strict current graph-scope collision policy to editor/name-only
     /// mutation. Portable aliases remain readable, but an editor mutation
     /// cannot choose one without authenticated exact logical authority.
@@ -398,26 +439,7 @@ impl Graph {
             ));
         }
         if let Some(identity) = target_identity {
-            if let Some(sibling) = index
-                .paths_by_file_resource
-                .get(&identity)
-                .and_then(|members| {
-                    members
-                        .iter()
-                        .find(|member| member.as_str() != target_relative)
-                })
-            {
-                return Err(DirectSaveError::into_io(
-                    DirectSaveFailureCode::PrecheckResourceAlias,
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "graph text files alias one physical resource: {} and {target_relative}",
-                            sibling
-                        ),
-                    ),
-                ));
-            }
+            Self::validate_graph_text_resource_alias(&index, &target_relative, identity)?;
         }
         Ok(index)
     }

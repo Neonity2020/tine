@@ -4554,6 +4554,35 @@
   "failBefore": "Structural, not same-platform. The reporter's screenshot carries the exact producer text of canonical_graph_root (src-tauri/src/state.rs): \"couldn't resolve graph path: Z:\\\\tine\\\\tine-demo\\\\tine-demo: O volume nao contem um sistema de arquivos reconhecido ... (os error 1005)\" = ERROR_UNRECOGNIZED_VOLUME from GetFinalPathNameByHandle, which is what std::fs::canonicalize calls on Windows. No Linux filesystem refuses that call, so the fallback arm is proven directly by unit test rather than by reproducing the refusal; an end-to-end Cryptomator/VeraCrypt confirmation on Windows is still outstanding."
  },
  "notes": "Creating or opening a graph inside a Cryptomator (or VeraCrypt) vault on Windows failed with 'Couldn't create the graph. (couldn't resolve graph path ... os error 1005)', after the graph folders had already been created - so it read as a half-made graph rather than an unsupported call. Dokany/WinFsp-backed volumes are allowed not to implement GetFinalPathNameByHandle. Two sites depended on it: canonical_graph_root (the command-layer root key, which produced the reported message) and open_projection_root_nofollow (crates/tine-core/src/model/projection_fs.rs), whose failure is swallowed with .ok() - so even had the first succeeded, the graph would have opened with no projection root and every Direct save would have failed. Both now call tine_core::directory_identity::canonical_existing_path, which prefers the filesystem's canonical answer and falls back to an absolute spelling of a path that exists. Canonicalization was never the safety boundary on this path: the graph tree is opened no-follow through cap_std, which is what refuses symlinks and reparse points, and that is unchanged. One accepted consequence: on a volume that cannot canonicalize, two different spellings of one root (differing case, or a symlinked ancestor) are two different root keys rather than one."
+},
+{
+ "id": "REG-GRAPH-TEXT-HARDLINK-SAVE-571",
+ "title": "A page that is also hard-linked elsewhere (git-annex, deduplication) saves instead of failing precheck.resource_alias",
+ "family": "direct-save",
+ "sources": {
+  "issues": [
+   571,
+   555
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "linux",
+  "macos",
+  "windows"
+ ],
+ "layer": "rust-core-storage",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests.rs::a_hard_link_outside_graph_text_scope_does_not_block_a_save",
+   "crates/tine-core/src/model_tests.rs::an_in_graph_alias_no_longer_blocks_a_resave",
+   "crates/tine-core/src/model_tests.rs::existing_save_local_proofs_cover_hardlinks_and_index_uncertainty"
+  ],
+  "scenario": null,
+  "failBefore": "a_hard_link_outside_graph_text_scope_does_not_block_a_save on the pre-fix tree: 'annex: graph text files alias one physical resource: pages/Target.md has link count 2'. The refusal fired at save_page, not at load, so reading an annexed graph always worked and only editing was blocked."
+ },
+ "notes": "Every Direct save refused when the target file had more than one link. The rule (validate_graph_text_single_link) compared the raw link count to 1, which cannot distinguish the case it meant to catch - two GRAPH-TEXT paths on one inode, where temp+rename publication leaves the other page holding stale bytes - from links Tine has no interest in: git-annex annex.thin links every page into .git/annex/objects/..., which graph-text scope never descends into, and users hard-link or deduplicate pages outside the graph. Martin decided (2026-09-20) to allow hard links and keep the in-graph alias refusal. Implementation note: the precise check needs the complete identity index, and an ordinary resave must never build one (GH #267 keeps saves target-local, O(1) not O(graph)), so the refusal now lives on page creation, where the index is already in hand (validate_graph_text_resource_alias), and the rename transaction's move source plus editor recovery keep the raw link count as an interim rule. Accepted consequence, asserted in an_in_graph_alias_no_longer_blocks_a_resave: if two graph pages really do share an inode, editing one leaves the other with its old bytes rather than refusing. Remaining gap: an annexed graph can save but still cannot rename, tracked with the rename work (GH #406, GH #535)."
 }
 ]
 }

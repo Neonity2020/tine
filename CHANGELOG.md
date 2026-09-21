@@ -47,6 +47,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- Saving a page no longer fails when the file is also hard-linked somewhere else. Graphs managed by git-annex (`annex.thin` mode links every page into `.git/annex/objects/`) or by a deduplicating tool refused every save with a physical-resource alias error, so the graph could be read but never edited. Tine now refuses only the case it can actually name - two pages inside the graph sharing one file - and only where it already knows the whole graph, which is page creation (GH #571, GH #555).
 - A graph inside a Cryptomator or VeraCrypt vault (and any other user-space
   volume) can be created and opened again. Windows asks the volume driver to
   resolve a path to its final name, and these drivers are allowed to answer

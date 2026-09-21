@@ -182,12 +182,22 @@ impl Graph {
         validation: GraphTextPublicationValidation,
     ) -> io::Result<()> {
         if !create_new {
-            if validation == GraphTextPublicationValidation::CompleteIndex {
-                let _ = self.guarded_graph_text_identity_index()?;
-            }
             let expected_identity = self
                 .graph_text_optional_file_identity(permit, path)?
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            // There is deliberately NO alias check here. Naming the other graph
+            // page that holds this inode requires the complete identity index,
+            // and an existing save must never build it (GH #267) — that is what
+            // keeps a save O(1) rather than O(graph). The raw link count that
+            // used to stand in for the check on this path could not tell a
+            // graph sibling from git-annex's `.git/annex/objects` link, so it
+            // refused every save on an annexed or deduplicated graph (GH #571,
+            // GH #555). Martin, 2026-09-21: allow it here. The precise refusal
+            // stays on page creation, where the index is already in hand, and
+            // the non-index move paths keep the blanket rule for now.
+            // `existing_save_local_proofs_cover_hardlinks_and_index_uncertainty`
+            // pins both halves of this: the save is allowed, and it builds no
+            // complete generation.
             return self.graph_text_atomic_replace_bound(
                 permit,
                 path,
@@ -325,7 +335,6 @@ impl Graph {
         let staged_identity = match (|| {
             let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
             let identity = canonical_projection_file_resource_id(&staged_file)?;
-            validate_graph_text_single_link(&staged_file, graph_text_path.as_str())?;
             Ok::<_, io::Error>(identity)
         })() {
             Ok(identity) => identity,
@@ -387,7 +396,6 @@ impl Graph {
                     "graph text target changed before durable retirement",
                 ));
             }
-            validate_graph_text_single_link(&live_file, graph_text_path.as_str())?;
             drop(live_file);
             rename_noreplace(&target.filename, &recovery, &live_bytes)?;
             retired = true;
@@ -395,7 +403,6 @@ impl Graph {
             let (retired_file, retired_bytes) =
                 open_and_read_projection_regular(target.parent(), &recovery)?;
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
-            validate_graph_text_single_link(&retired_file, graph_text_path.as_str())?;
             drop(retired_file);
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
@@ -416,7 +423,6 @@ impl Graph {
                     "staged editor identity changed before publication",
                 ));
             }
-            validate_graph_text_single_link(&staged_file, graph_text_path.as_str())?;
             drop(staged_file);
 
             if let Err(error) = rename_noreplace(&temp, &target.filename, bytes) {
@@ -471,7 +477,6 @@ impl Graph {
                                 "displaced target identity changed before restore",
                             ));
                         }
-                        validate_graph_text_single_link(&recovery_file, graph_text_path.as_str())?;
                         let recovery_bytes = read_projection_regular(target.parent(), &recovery)?;
                         move_graph_text_exact_no_replace(
                             target.parent(),
@@ -702,6 +707,16 @@ impl Graph {
                 false,
             )?;
             self.validate_existing_graph_text_target_exact(&source, &source_graph_text, None)?;
+            // Interim rule for the paths with no complete index (rename
+            // transaction, recovery): the precise "is the other name a graph
+            // page?" question needs the identity index, and building one per
+            // moved file is exactly the GH #406 rename cost. So these paths
+            // still refuse on the raw link count. That is why an annexed graph
+            // can save (GH #555) but cannot yet rename; tracked with the
+            // rename work rather than paid for here.
+            let source_file = open_projection_file_nofollow(source.parent(), &source.filename)?;
+            validate_graph_text_single_link(&source_file, source_graph_text.as_str())?;
+            drop(source_file);
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
                 &destination_graph_text,

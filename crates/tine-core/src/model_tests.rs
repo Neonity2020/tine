@@ -1613,13 +1613,15 @@ fn foreign_destination_before_restore_keeps_retired_original_recoverable() {
 
 // Restored after `a5cf7c11 refactor: remove legacy managed sync model path`
 // deleted it wholesale. Its second half called `migrate_sync_identities`,
-// which that refactor legitimately removed — but the link-count parity
-// above it is not legacy and is still load-bearing: the Direct creation
-// census refuses `file.link_count != 1`, and on Windows that count comes
-// from `GetFileInformationByHandle` on a handle opened BEFORE the hard link
-// existed. If a held handle reported a stale 1, the hard-link refusal would
-// be defeated on Windows only. The v1 half is dropped; the platform
-// assertion is not.
+// which that refactor legitimately removed — but the link-count parity above
+// it is not legacy and is still load-bearing. Since GH #571 the raw count no
+// longer refuses an ordinary save; it remains the interim refusal on the two
+// paths that have no complete identity index (the rename transaction's move
+// source and editor recovery), and on Windows that count comes from
+// `GetFileInformationByHandle` on a handle opened BEFORE the hard link
+// existed. If a held handle reported a stale 1, those refusals would be
+// defeated on Windows only. The v1 half is dropped; the platform assertion
+// is not.
 #[cfg(windows)]
 #[test]
 fn projection_windows_held_handle_link_count_tracks_one_and_two_links() {
@@ -1634,8 +1636,8 @@ fn projection_windows_held_handle_link_count_tracks_one_and_two_links() {
     assert_eq!(
         projection_file_link_count(&file).unwrap(),
         2,
-        "a held handle must observe the new link, or the creation census \
-             cannot refuse a hard-linked graph text file on Windows"
+        "a held handle must observe the new link, or the rename and recovery \
+             move paths cannot refuse a hard-linked graph text file on Windows"
     );
     assert_eq!(fs::read(&target).unwrap(), b"- retained\n");
     assert_eq!(fs::read(&alias).unwrap(), b"- retained\n");
@@ -5981,16 +5983,16 @@ fn resource_epoch_uses_local_existing_proofs_and_cached_creation_proof() {
     graph_a
         .observe_graph_text_external_paths(std::iter::once(alias.as_path()), false)
         .unwrap();
+    guarded_test_resave(&graph_b, &mut page_b, "allowed").unwrap();
     assert_eq!(
-        guarded_test_resave(&graph_b, &mut page_b, "refused")
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::AlreadyExists
+        fs::read_to_string(&primary).unwrap(),
+        "- allowed\n",
+        "a second link to the target no longer refuses the save (GH #571)"
     );
     assert_eq!(
         graph_b.guarded_graph_text_identity_stats().0,
         1,
-        "link-count refusal must not rebuild a sibling's complete index"
+        "observing a new link must not rebuild a sibling's complete index"
     );
     let _ = fs::remove_dir_all(&dir);
 
@@ -6116,18 +6118,22 @@ fn existing_save_local_proofs_cover_hardlinks_and_index_uncertainty() {
         .observe_graph_text_external_paths(std::iter::once(alias.as_path()), false)
         .unwrap();
     assert!(graph.guarded_graph_text_identity_stats().2);
-    assert_eq!(
-        guarded_test_resave(&graph, &mut page, "hardlink refused")
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::AlreadyExists
-    );
+    guarded_test_resave(&graph, &mut page, "hardlink allowed").unwrap();
     assert_eq!(
         fs::read_to_string(&primary).unwrap(),
-        "- after delete\n",
-        "link-count refusal must not write the target"
+        "- hardlink allowed\n",
+        "a linked target saves through the ordinary local proofs (GH #571)"
     );
-    assert_eq!(graph.guarded_graph_text_identity_stats().0, 0);
+    assert_eq!(
+        fs::read_to_string(&alias).unwrap(),
+        "- after delete\n",
+        "publication is temp + rename, so the other link keeps its own bytes"
+    );
+    assert_eq!(
+        graph.guarded_graph_text_identity_stats().0,
+        0,
+        "allowing the link must not build the complete generation either"
+    );
 
     fs::remove_file(&alias).unwrap();
     graph
@@ -10015,6 +10021,96 @@ fn unrelated_creation_does_not_mutate_existing_hardlinks() {
     assert_eq!(fs::read(&incumbent).unwrap(), b"- incumbent\n");
     assert_eq!(fs::read(&alias).unwrap(), b"- incumbent\n");
     assert!(target.exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// GH #571 and GH #555. A second link to a page is only Tine's business when
+/// the other name is itself a graph-text path. git-annex in `annex.thin` mode
+/// links every page to `.git/annex/objects/...`, which graph-text scope never
+/// descends into, and a user may keep a link to a page outside the graph
+/// entirely. Refusing on the raw link count made every save on such a graph
+/// fail with `precheck.resource_alias`, which is the whole of #571 and the
+/// reason Tine was unusable on an annexed graph (#555).
+#[cfg(unix)]
+#[test]
+fn a_hard_link_outside_graph_text_scope_does_not_block_a_save() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for placement in ["annex", "external"] {
+        let dir = scratch(&format!("save-hardlink-{placement}"));
+        let target = dir.join("pages/Target.md");
+        fs::write(&target, "- before\n").unwrap();
+        let outside =
+            (placement == "external").then(|| scratch(&format!("save-hardlink-{placement}-out")));
+        let alias = match &outside {
+            Some(root) => root.join("Target.md"),
+            None => {
+                let objects = dir.join(".git/annex/objects/f4/Target.md");
+                fs::create_dir_all(objects.parent().unwrap()).unwrap();
+                objects
+            }
+        };
+        fs::hard_link(&target, &alias).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().nlink(), 2, "{placement}");
+
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        page.blocks[0].raw = "after".to_owned();
+
+        graph
+            .save_page(&page, page.rev.as_deref())
+            .unwrap_or_else(|error| panic!("{placement}: {error}"));
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "- after\n");
+        // Publication is temp + rename, so the out-of-scope name keeps the
+        // bytes it had. That is what every editor writing this way does; it is
+        // not something Tine can or should prevent by refusing to save.
+        assert_eq!(fs::read_to_string(&alias).unwrap(), "- before\n");
+        let _ = fs::remove_dir_all(&dir);
+        if let Some(root) = outside {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}
+
+/// GH #571, and the half of the old rule Martin dropped on 2026-09-21: two
+/// GRAPH-TEXT paths on one inode no longer block an ordinary resave. Naming
+/// the sibling requires the complete identity index, and an existing save must
+/// never build one (GH #267) — that is what keeps a save O(1) rather than
+/// O(graph) — so the only local stand-in was the raw link count, which cannot
+/// tell a graph sibling from git-annex's `.git/annex/objects` link and so made
+/// annexed graphs unsaveable. The precise refusal still fires where the index
+/// is already in hand: the `precheck.resource_alias` arm of
+/// `validate_current_graph_text_collision_strict`, on page creation.
+///
+/// The accepted consequence is asserted here rather than left implicit:
+/// publication is temp + no-clobber rename, so the other page keeps the bytes
+/// it had instead of following the edit.
+#[cfg(unix)]
+#[test]
+fn an_in_graph_alias_no_longer_blocks_a_resave() {
+    let dir = scratch("save-in-graph-alias");
+    let target = dir.join("pages/Target.md");
+    let alias = dir.join("pages/Alias.md");
+    fs::write(&target, "- before\n").unwrap();
+    fs::hard_link(&target, &alias).unwrap();
+
+    let graph = Graph::open(&dir);
+    graph.warm_cache();
+    let mut page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+    page.blocks[0].raw = "after".to_owned();
+
+    graph
+        .save_page(&page, page.rev.as_deref())
+        .expect("an in-graph alias no longer refuses the save");
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "- after\n");
+    assert_eq!(
+        fs::read_to_string(&alias).unwrap(),
+        "- before\n",
+        "temp + rename publishes a new inode, so the alias keeps its bytes"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
