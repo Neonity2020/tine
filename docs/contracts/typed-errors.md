@@ -294,7 +294,7 @@ Exemplar to imitate: `android_media::call`.
 
 ### `Prose` census
 
-The syntactic census is 47 production sites (35 in `commands.rs`, 12 in
+The syntactic census is 46 production sites (34 in `commands.rs`, 12 in
 `state.rs`; test modules excluded). `CommandError::prose` is an identity
 adapter when a phase-B helper already returns `CommandError`, so those retained
 E2 call sites do not erase the typed variant. The rows below have no typed

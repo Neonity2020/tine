@@ -4761,8 +4761,8 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/model_tests.rs::gh490_a_conflict_whose_authority_was_revoked_is_still_captured_and_reviewable",
-   "crates/tine-core/src/model_tests.rs::gh490_a_restored_captureless_capsule_is_reviewed_against_the_disk"
+   "crates/tine-core/src/model_live_conflict_authority_tests.rs::gh490_a_conflict_whose_authority_was_revoked_is_still_captured_and_reviewable",
+   "crates/tine-core/src/model_live_conflict_authority_tests.rs::gh490_a_restored_captureless_capsule_is_reviewed_against_the_disk"
   ],
   "scenario": null,
   "failBefore": "proven"
