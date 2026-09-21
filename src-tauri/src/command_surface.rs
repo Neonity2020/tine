@@ -72,6 +72,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "guide_pages",
     "import_asset",
     "import_native_capture",
+    "indexing_progress",
     "inspect_graph_access",
     "install_plugin",
     "journal_content_days",
