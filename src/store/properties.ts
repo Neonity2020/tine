@@ -6,6 +6,7 @@ import { facetsOf } from "../render/facets";
 import { graphBinding } from "../persistence";
 import { PROP_LINE, isBuiltinHidden, isPageHeaderPropertiesOnly, isPropertiesOnly, joinProps, markdownRawWithProperty, orgPreBlockWithProperty, orgRawWithProperty, readPropertyValue, splitPagePreamble, splitProps, upsertPropertyLine } from "../editor/properties";
 import { produce } from "solid-js/store";
+import { pushToast } from "../ui";
 import { pushUndo, withUndoUnit } from "./undo";
 
 let selectedIdsImpl: (() => string[]) | null = null;
@@ -198,6 +199,62 @@ export function finishPageHeaderEdit(id: string): void {
       delete s.byId[id];
     })
   );
+}
+
+/** The one wording for "this page header is not valid properties yet", shared by
+ * the projection that refuses to serialize it and the editor-exit check that
+ * tells the user. Two copies of a rule drift; the copy that loses its rationale
+ * is where the next bug lands. */
+export const PAGE_HEADER_INVALID_TOAST =
+  "Page-header properties must contain only valid key:: value lines before they can be saved.";
+
+/** Adopt the page header that a COMPLETED save folded into the file's preamble.
+ *
+ * `projectPageDto` folds a flagless properties-only first bullet into
+ * `pre_block` (GH #198). That rewrites the file, but the store keeps holding
+ * those properties as an ordinary first root with an empty `preBlock`, so from
+ * that moment the store and the file disagree about where the page header
+ * lives. The next keystroke that leaves the bullet transiently NOT
+ * properties-only then proposes `pre_block: null` plus a property-bearing
+ * outline block — exactly what the data-preservation firewall refuses
+ * (GH #163). That refusal carries no typed code, so it reaches the user as
+ * `reason code: unknown`, is classified retryable, and after three tries
+ * becomes a red toast while the block is still being edited (GH #546).
+ *
+ * Marking the root as the page header hands the page to the header path, which
+ * folds it exactly and defers while it is invalid instead of contradicting the
+ * file. Compare-and-swap on the exact folded text: the save was in flight, so
+ * the user may have typed since, and a later edit must not be adopted silently.
+ */
+export function adoptFoldedPageHeader(pageName: string, folded: string): void {
+  const page = pageByName(pageName);
+  if (!page || page.preBlock) return;
+  const first = doc.byId[page.roots[0]];
+  if (!first || first.originatedFromPageHeader || first.children.length > 0) return;
+  if (first.raw.replace(/\n+$/, "") !== folded) return;
+  setDoc(
+    produce((s) => {
+      const node = s.byId[first.id];
+      if (node) node.originatedFromPageHeader = true;
+    })
+  );
+}
+
+/** Tell the user their page header is not valid properties — when the editor
+ * CLOSES, which is the moment they finished writing it (GH #546).
+ *
+ * Autosave deliberately says nothing: it fires shortly after a typing pause, so
+ * a half-written header is the ordinary state of an unfinished edit. The edit
+ * is never lost — the projection refuses to serialize an invalid header, the
+ * page stays dirty, and it saves as soon as the properties are valid again. */
+export function reportInvalidPageHeaderOnExit(id: string): void {
+  const node = doc.byId[id];
+  if (!node?.originatedFromPageHeader) return;
+  // An empty draft deletes the header, and `finishPageHeaderEdit` has already
+  // removed it — nothing to complain about.
+  if (node.raw === "") return;
+  if (node.children.length === 0 && isPageHeaderPropertiesOnly(node.raw.replace(/\n+$/, ""))) return;
+  pushToast(PAGE_HEADER_INVALID_TOAST, "error");
 }
 
 /** Turn ordinary text before the first Markdown bullet into a real first block

@@ -1932,8 +1932,8 @@
      "crates/tine-core/src/model.rs::same_path_same_length_retitle_after_reconciliation_refuses_creation",
      "crates/tine-core/src/model.rs::missing_target_creation_refuses_an_externally_retitled_owner",
      "crates/tine-core/src/model.rs::creation_refuses_historical_arbitrary_and_explicit_semantic_owners",
-     "crates/tine-core/src/model.rs::unrelated_creation_does_not_mutate_existing_hardlinks",
-     "crates/tine-core/src/model.rs::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
+     "crates/tine-core/src/model_alias_admission_tests.rs::unrelated_creation_does_not_mutate_existing_hardlinks",
+     "crates/tine-core/src/model_alias_admission_tests.rs::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
      "crates/tine-core/src/model.rs::creation_refuses_symlink_parent_and_leaf_without_touching_outside_bytes",
      "crates/tine-core/src/model.rs::external_exact_target_creator_wins_without_byte_change",
      "crates/tine-core/src/model.rs::external_portable_alias_creator_wins_before_creation_publication",
@@ -3026,7 +3026,7 @@
      "crates/tine-core/src/model.rs::tests::windows_direct_publication_receipt_requires_revision_and_file_identity",
      "src-tauri/src/watcher.rs::tests::atomic_page_save_temp_events_stay_incremental",
      "crates/tine-core/src/model.rs::tests::direct_creation_round_trips_a_chinese_page_name",
-     "crates/tine-core/src/model.rs::tests::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
+     "crates/tine-core/src/model_alias_admission_tests.rs::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
      "crates/tine-core/src/model.rs::tests::external_semantic_owner_creator_wins_before_creation_publication"
     ],
     "scenario": "direct.windows-exact-event-and-self-publication-create-reconcile-create",
@@ -4634,6 +4634,31 @@
   "failBefore": "Not a behaviour fix: the export was already correct, and the Rust test characterises it rather than failing before. The defect was the report - Settings showed 'Exported 0 pages to <dir>' with no reason, which reads as a broken button. The message change itself is not pinned by a test; the core behaviour it describes is."
  },
  "notes": "Reported as an Android failure, but it is neither Android-specific nor a fault. Publication is the public-page capability: only pages carrying public:: true are exported unless :publishing/all-pages-public? is set, matching Logseq (publish.rs, all_pages_public defaults to false). A graph with no public page therefore exports zero pages and writes the bare index/pages templates the reporter saw. The report was diagnosed by elimination: the UI renders 'Exported N pages' only when publishHtml RESOLVES, so a successful zero excludes both unready-projection paths, which raise errors instead - verified by running them, giving ProjectionUnavailable with no projection attached and NotReady(Busy) with a projection attached but not yet built. The Guide already documents the public:: rule (templates/research-document.md, templates/files-external-edits-backups.md); the gap was in-app, so the zero case now names the rule."
+},
+{
+ "id": "REG-PAGE-HEADER-MIDEDIT-SAVE-546",
+ "title": "Editing page properties does not raise a save-failure toast while they are still being typed",
+ "family": "direct-files",
+ "sources": {
+  "issues": [
+   546
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend-and-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/store.test.ts::reconciles the store with the page header the save just wrote to disk",
+   "crates/tine-core/tests/gh546_page_header_mid_edit.rs::a_mid_edit_page_header_bullet_is_refused_with_the_untyped_unknown_code"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #546. Page-header properties authored as the flagless properties-only first bullet are folded into pre_block by the frontend projection (GH #198). That fold rewrites the file but was never reconciled into the store, so from that save on the store held the header as an ordinary root with an empty preBlock while the file held it as a preamble. The next keystroke leaving the bullet transiently not properties-only then proposed pre_block:null plus a property-bearing outline block - exactly what the GH #163 data-preservation firewall refuses. That refusal is built by projection_semantic_refusal, which carries no typed DirectSaveError, so direct_save_failure_code falls through to its Unknown default; 'unknown' is absent from the frontend's non-retryable denylist, so the save was retried at 100 ms and 300 ms and the third failure pushed the reporter's red toast, verbatim, while the block was still being edited. A successful save now marks the folded root as the page header (compare-and-swap on the exact folded text), which hands the page to the header path: it folds byte-identically and defers while invalid instead of contradicting the file. Separately, autosave no longer reports an invalid header at all - it fires shortly after a typing pause, so a half-written header is the ordinary state of an unfinished edit - and the validation message moved to where the header editor closes, which is the reporter's stated expectation. Deferring is safe only because the store now knows what the file holds: on a page whose file has no preamble the same shape still saves as outline, so an unconditional defer would have made such a page never save."
 }
 ]
 }

@@ -20,6 +20,7 @@ icon:: 🔗
   - Machine-managed properties stay out of the form: `id::` and `collapsed::` are never listed, and the `tine.` keys behind Sheets and saved searches are edited from those surfaces instead.
   - Each property is written in the form its own file uses. A Markdown page gets `key:: value`; an Org page gets a `#+key: value` file directive, and an Org block its `:PROPERTIES:` drawer — the shapes Logseq itself reads back.
   - A key does not have to be plain ASCII. `klíč:: hodnota` is an ordinary property: it can be added, changed, and removed again like any other.
+  - Properties you type directly at the top of a page are checked when you finish editing that header, not while you are still writing it — a half-written `key:: value` line simply waits, and the page saves itself as soon as the header is valid properties again.
   - A read-only page — a bundled Guide page, or one Tine cannot safely rewrite — offers no property editing at all, rather than a form whose writes would be dropped.
 - ## Block references and embeds
   - Type `((` while editing: the popup full-text-searches blocks, and choosing one inserts a durable `((reference))` — whitespace-separated words are required anywhere in the block, in any order, while punctuation such as `OR`, `-`, and `/` stays literal. Tine first writes a stable `id::` on the source block, so the reference survives renames, reloads, and restarts.

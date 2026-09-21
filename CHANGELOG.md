@@ -47,6 +47,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- Editing a page's properties no longer raises a save-failure toast while you
+  are still typing them. Page properties written as the first bullet of a page
+  are saved into the file's own header, but Tine kept treating them as an
+  ordinary bullet afterwards, so a half-written `key:: value` line proposed a
+  change the save path is required to refuse — surfacing mid-edit as
+  "Couldn't save … after 3 tries — (reason code: unknown)". Tine now follows
+  those properties into the file, and an invalid page header is reported when
+  you finish editing it instead of on every autosave; the page saves by itself
+  as soon as the properties are valid again (GH #546).
 - "Export to PDF…" is no longer offered on Android and iOS, where it could not work: a mobile WebView cannot print, so the option silently did nothing. Choosing it from the command palette or a shortcut now says PDF export needs the desktop app instead of opening a dialog that leads nowhere (GH #560).
 - "Export graph to HTML" now says why it exported nothing when a graph has no public pages, instead of reporting "Exported 0 pages" with no explanation. Only pages marked `public:: true` are exported, as in Logseq (GH #560).
 - Saving a page no longer fails when the file is also hard-linked somewhere else. Graphs managed by git-annex (`annex.thin` mode links every page into `.git/annex/objects/`) or by a deduplicating tool refused every save with a physical-resource alias error, so the graph could be read but never edited. Tine now refuses only the case it can actually name - two pages inside the graph sharing one file - and only where it already knows the whole graph, which is page creation (GH #571, GH #555).

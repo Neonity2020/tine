@@ -17,6 +17,7 @@ const DECLARED_STORE_SURFACE = [
   "setProspectiveTarget",
   "pageByName",
   "pageInstanceGeneration",
+  "adoptFoldedPageHeader",
   "pageToDto",
   "setEditorActivation",
   "sweepReplaceable",

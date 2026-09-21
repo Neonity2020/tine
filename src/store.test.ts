@@ -3698,3 +3698,56 @@ describe("a watcher reload re-checks safety at the moment it applies", () => {
     expect(pageByName("Stale")).toBeUndefined();
   });
 });
+
+describe("GH #546 — page-header properties saved while the user is still typing", () => {
+  it("reconciles the store with the page header the save just wrote to disk", async () => {
+    // Page-header properties authored as the flagless properties-only first
+    // bullet: the projection folds them into pre_block (GH #198), so the file
+    // ends up carrying a preamble the STORE does not know about. That
+    // divergence is the root cause of the reporter's toast — from here on the
+    // store proposes pre_block=null, and the first keystroke that leaves the
+    // bullet transiently not properties-only ships the header property as
+    // outline content, which the disk firewall must refuse (GH #163).
+    load([blk("alias:: book")]);
+    markDirty("Test");
+    const saved: PageDto[] = [];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
+      saved.push(dto);
+      return { revision: "gh546-rev" };
+    });
+    try {
+      await flushPage("Test");
+    } finally {
+      saveSpy.mockRestore();
+    }
+
+    // Preconditions, asserted separately from the property below: the fold
+    // really did happen, so disk now carries the header as a preamble.
+    expect(saved).toHaveLength(1);
+    expect(saved[0].pre_block).toBe("alias:: book");
+    expect(saved[0].blocks).toEqual([]);
+
+    // One keystroke into a second property, whose `::` is not typed yet.
+    setRaw(doc.pages[0].roots[0], "alias:: book\ntag");
+
+    // The property this test exists to protect. The Rust data-preservation
+    // firewall refuses a DTO that empties `pre_block` while presenting a
+    // page-header property as outline content (GH #163), and that refusal
+    // reaches the user as `reason code: unknown`, is classified retryable, and
+    // after three tries becomes a red toast mid-edit. The store must therefore
+    // never propose that shape once the header is on disk as a preamble.
+    const dto = pageToDto("Test");
+    const strandsHeaderInOutline =
+      dto !== null
+      && !(dto.pre_block ?? "")
+      && JSON.stringify(dto.blocks).includes("alias:: book");
+    expect(strandsHeaderInOutline).toBe(false);
+
+    // And the edit is not stranded by deferring it: as soon as the properties
+    // are valid again the page serializes normally, header and all. Without
+    // this the bug could be "fixed" by never saving the page again.
+    setRaw(doc.pages[0].roots[0], "alias:: book\ntag:: x");
+    expect(pageToDto("Test")?.pre_block).toBe("alias:: book\ntag:: x");
+    expect(pageToDto("Test")?.blocks).toEqual([]);
+  });
+});

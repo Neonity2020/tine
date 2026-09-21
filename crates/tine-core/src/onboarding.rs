@@ -1022,6 +1022,12 @@ mod tests {
         assert!(reference.markdown.contains("`both`"));
         assert!(reference.markdown.contains("`tine.page-match-scope`"));
         assert!(reference.markdown.contains("`tine.page-display:: 1`"));
+        // When a half-written page header is reported is a user-visible rule,
+        // not an implementation detail: the reader has to know the unfinished
+        // line is waiting rather than failing (GH #546).
+        assert!(reference
+            .markdown
+            .contains("checked when you finish editing that header"));
     }
 
     #[test]

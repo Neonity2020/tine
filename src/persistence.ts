@@ -9,6 +9,14 @@
 // than at module scope, so the store↔persistence import cycle resolves cleanly.
 // `persistence.storeSurface.test.ts` pins that import list: it is the coupling
 // this split exists to bound, so it may not grow unnoticed.
+//
+// The list grew once more for `adoptFoldedPageHeader` (GH #546). A save is the
+// only event that knows which bytes actually became the file, and the page
+// header the projection folded out of the first bullet exists only in those
+// bytes. Until the store is told, it keeps proposing a page shape that
+// contradicts the file it just wrote, and the disk firewall refuses the next
+// save mid-edit. So this is still "WHEN and HOW an edit reaches disk" telling
+// the tree what reached it — not persistence reaching into the doc tree.
 
 import {
   doc,
@@ -18,6 +26,7 @@ import {
   setProspectiveTarget,
   pageByName,
   pageInstanceGeneration,
+  adoptFoldedPageHeader,
   pageToDto,
   setEditorActivation,
   sweepReplaceable,
@@ -943,6 +952,11 @@ async function doSave(
       baseRev.set(name, rev);
       if (baseline === null) bumpPageInventoryRev();
     }
+    // These bytes are now the file. If they carry a page header the projection
+    // folded out of the first bullet, the store must stop presenting it as an
+    // ordinary root, or its next proposal contradicts the file it just wrote
+    // and the disk firewall refuses the save mid-edit (GH #546).
+    if (dto.pre_block) adoptFoldedPageHeader(name, dto.pre_block);
     // The favorites arrangement lives in an ordinary page, so editing it in
     // Tine's own editor is how a keyboard user reorders favorites. The sidebar
     // has to follow that edit, and this is the one place every in-app page save

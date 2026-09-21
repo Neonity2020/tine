@@ -8,7 +8,7 @@ import { graphBindingRuntime } from "../graphBindingRuntime";
 import { graphEpoch, graphMeta, graphTransitioning, pushToast } from "../ui";
 import { isPageHeaderPropertiesOnly, markdownRawWithProperty, orgRawWithProperty, parsePageHeaderPropertyLine } from "../editor/properties";
 import { produce, unwrap } from "solid-js/store";
-import { rawWithInheritedOrderListType } from "./properties";
+import { PAGE_HEADER_INVALID_TOAST, rawWithInheritedOrderListType } from "./properties";
 import { trimBlockTrailingSpace } from "../editor/format";
 
 
@@ -66,7 +66,7 @@ function projectPageDto(
     const canonicalRaw = first.raw.replace(/\n+$/, "");
     if (first.children.length > 0 || (first.raw !== "" && !isPageHeaderPropertiesOnly(canonicalRaw))) {
       if (reportInvalidHeader) {
-        pushToast("Page-header properties must contain only valid key:: value lines before they can be saved.", "error");
+        pushToast(PAGE_HEADER_INVALID_TOAST, "error");
       }
       return null;
     }

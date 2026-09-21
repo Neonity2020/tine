@@ -570,7 +570,26 @@ fn portable_case_nfc_and_file_identity_aliases_are_readable_but_non_writable() {
         );
         std::fs::remove_dir_all(&root).ok();
     }
+}
 
+/// Two GRAPH-TEXT paths on one inode stay readable, and since GH #571 an
+/// ordinary resave through one of them is allowed rather than refused.
+///
+/// This used to be the tail of the portable-alias test above, asserting
+/// `AlreadyExists`. Martin's 2026-09-20 policy dropped that refusal for the
+/// resave path: naming the sibling needs the complete identity index, an
+/// ordinary save must never build one (GH #267, which is what keeps a save
+/// O(1) rather than O(graph)), and the only target-local stand-in was the raw
+/// link count — which cannot tell a graph sibling from git-annex's
+/// `.git/annex/objects` link, and so made annexed graphs unsaveable (GH #555).
+/// The precise refusal still fires where the index is already in hand, on page
+/// creation.
+///
+/// The accepted consequence is asserted, not left implicit: publication is
+/// temp + no-clobber rename, so the save installs a NEW inode at the saved
+/// name and the sibling keeps the bytes it had.
+#[test]
+fn same_inode_graph_text_aliases_stay_readable_and_save() {
     let root =
         std::env::temp_dir().join(format!("tine-graph-text-hardlink-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -581,24 +600,25 @@ fn portable_case_nfc_and_file_identity_aliases_are_readable_but_non_writable() {
     std::fs::hard_link(root.join("external/One.md"), root.join("external/Two.md")).unwrap();
     let graph = Graph::open(&root);
     assert_eq!(graph.list_pages().len(), 2);
-    for path in ["external/One.md", "external/Two.md"] {
-        let mut page = graph
-            .load_by_path(path)
-            .unwrap()
-            .expect("same-inode aliases stay readable for recovery");
-        assert_eq!(page.blocks[0].raw, "shared inode");
-        page.blocks[0].raw = "must not publish".into();
-        assert_eq!(
-            graph
-                .save_page(&page, page.rev.as_deref())
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
-    }
+
+    let mut page = graph
+        .load_by_path("external/One.md")
+        .unwrap()
+        .expect("same-inode aliases stay readable");
+    assert_eq!(page.blocks[0].raw, "shared inode");
+    page.blocks[0].raw = "edited through One".into();
+    graph
+        .save_page(&page, page.rev.as_deref())
+        .expect("an in-graph alias no longer refuses an ordinary resave (GH #571)");
+
     assert_eq!(
         std::fs::read_to_string(root.join("external/One.md")).unwrap(),
-        "- shared inode\n"
+        "- edited through One\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("external/Two.md")).unwrap(),
+        "- shared inode\n",
+        "temp + rename publishes a new inode, so the sibling keeps its bytes"
     );
     std::fs::remove_dir_all(&root).ok();
 }

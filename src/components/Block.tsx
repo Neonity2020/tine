@@ -53,6 +53,7 @@ import {
   nextVisibleOrExtend,
   beginPageHeaderEdit,
   finishPageHeaderEdit,
+  reportInvalidPageHeaderOnExit,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
   replaceTemplateTriggerWithOutline,
@@ -3649,6 +3650,10 @@ export function Editor(props: { id: string }): JSX.Element {
     const calcExit = isCalc();
     commit(calcExit ? ref.value : normalizePlanning(ref.value, pageFmt()), calcExit ? { calc: true } : undefined);
     finishPageHeaderEdit(props.id);
+    // The editor is closing, so the user has finished writing these properties:
+    // this is the moment to say they are not valid, not every autosave while
+    // they were still typing them (GH #546).
+    reportInvalidPageHeaderOnExit(props.id);
     // Only clear if no other block grabbed editing focus.
     if (editingId() === props.id) endEdit("blur");
   };
