@@ -41,6 +41,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- Live exports now have shareable page and block links. With one pane and one
+  tab, the browser address follows navigation; the page and block menus provide
+  explicit copy actions, and opening a link restores its page or block in the
+  read-only exported app (GH #182).
 - Tine's desktop binary now has a documented command-line interface: `--help`
   and `--version`; explicit `open` and `capture` commands; create-only static
   and live graph exports with graph-relative output and an explicit `--replace`;

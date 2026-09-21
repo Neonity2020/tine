@@ -667,6 +667,9 @@ mod tests {
         assert!(page.markdown.contains("Query export size limit"));
         assert!(page.markdown.contains("Copy complete recovery data"));
         assert!(page.markdown.contains("Try opening again"));
+        assert!(page.markdown.contains("Copy page link"));
+        assert!(page.markdown.contains("Copy block link"));
+        assert!(page.markdown.contains("one pane with one tab"));
 
         let index = GUIDE_TEMPLATES
             .iter()

@@ -1,6 +1,6 @@
 import { Match, Show, Suspense, Switch, createEffect, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
-import { isPublishedExport } from "./publishedBackend";
+import { isPublishedExport, loadPublishedSnapshot } from "./publishedBackend";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
 import { QuickSwitcher } from "./components/QuickSwitcher";
@@ -47,7 +47,7 @@ import { applyObservedAssetChanges } from "./assetRefresh";
 import { favoritesPageChanged } from "./favoritesStore";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
-import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type PdfRoute, type QueryRoute } from "./router";
+import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type PdfRoute, type QueryRoute, type Route } from "./router";
 import {
   theme,
   toggleTheme,
@@ -176,6 +176,11 @@ import { hlsPageName } from "./pdf";
 import { createStartupRecoveryController } from "./startupRecovery";
 import { writeClipboardTextResilient } from "./clipboard";
 import { FailureBoundary } from "./components/FailureBoundary";
+import {
+  openPublishedPermalink,
+  publishedPermalinkForWorkspace,
+  replacePublishedPermalink,
+} from "./publishedPermalink";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -859,6 +864,46 @@ export async function installMobileExternalLinkHandler(): Promise<() => void> {
 }
 
 export function App(): JSX.Element {
+  const published = isPublishedExport();
+  const initialPublishedHash = published ? window.location.hash : "";
+  const [publishedPermalinkReady, setPublishedPermalinkReady] = createSignal(!published);
+  let initialPublishedPermalinkHandled = false;
+  let revealedPublishedBlock: { route: Route; block: string } | null = null;
+
+  const syncPublishedPermalink = () => {
+    if (!published || !publishedPermalinkReady()) return;
+    const paneIds = layoutPaneIds();
+    const router = paneRouter(paneIds[0] ?? focusedPaneId());
+    const current = router.route();
+    if (revealedPublishedBlock && revealedPublishedBlock.route !== current) {
+      revealedPublishedBlock = null;
+    }
+    const target = publishedPermalinkForWorkspace(
+      paneIds.length,
+      router.tabs().length,
+      current,
+      revealedPublishedBlock?.block,
+    );
+    if (target !== undefined) replacePublishedPermalink(target);
+  };
+
+  const applyPublishedHash = async (hash: string) => {
+    const result = openPublishedPermalink(
+      await loadPublishedSnapshot(),
+      hash,
+      paneRouter(focusedPaneId()),
+    );
+    revealedPublishedBlock = result.status === "opened" && result.target.kind === "block"
+      ? { route: result.route, block: result.target.block }
+      : null;
+    if (result.status === "invalid") {
+      pushToast("This published link isn't valid.", "error");
+    } else if (result.status === "missing") {
+      pushToast("This published link no longer exists in this export.", "error");
+    }
+    return result.status;
+  };
+
   let openCalendarJump = () => {};
   const topbarActions = {
     calendar: () => openCalendarJump(),
@@ -876,7 +921,27 @@ export function App(): JSX.Element {
     pickGraph: switchGraph,
     copyText: writeClipboardTextResilient,
     notify: (message, kind) => pushToast(message, kind, kind === "error" ? { sticky: true } : undefined),
-    completeFirstLoad: () => setFirstLoadDone(true),
+    completeFirstLoad: () => {
+      if (!published || initialPublishedPermalinkHandled) {
+        setFirstLoadDone(true);
+        return;
+      }
+      initialPublishedPermalinkHandled = true;
+      void applyPublishedHash(initialPublishedHash).finally(() => {
+        setPublishedPermalinkReady(true);
+        setFirstLoadDone(true);
+      });
+    },
+  });
+  createEffect(syncPublishedPermalink);
+  onMount(() => {
+    if (!published) return;
+    const onHashChange = () => {
+      if (!publishedPermalinkReady()) return;
+      void applyPublishedHash(window.location.hash).finally(syncPublishedPermalink);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    onCleanup(() => window.removeEventListener("hashchange", onHashChange));
   });
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.

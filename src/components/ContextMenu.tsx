@@ -80,6 +80,8 @@ import { copyBlockOutline, writeClipboardText } from "../clipboard";
 import type { PageKind } from "../types";
 import { registerTransientLayer } from "../transientLayers";
 import { beginPageDeleteTrace } from "../pageDeleteTrace";
+import { isPublishedExport } from "../publishedBackend";
+import { publishedPermalinkUrl } from "../publishedPermalink";
 
 // Copy a block reference/embed — but only after the block's id:: is durably on
 // disk. ensureBlockId returns null if the save couldn't land (conflict/error), in
@@ -977,6 +979,16 @@ function PageMenu(props: {
     { id: "open-new-tab", label: "Open in new tab", run: () => openPageTargetInNewTab(target()) },
     { id: "favorite-toggle", label: fav() ? "Remove from favorites" : "Add to favorites", run: () => toggleFavorite(props.name, props.pageKind) },
     { id: "copy-page-ref", label: "Copy page ref", run: () => { void writeClipboardText(`[[${props.name}]]`); pushToast("Copied page ref", "success"); } },
+    ...(isPublishedExport()
+      ? [{
+          id: "copy-page-link",
+          label: "Copy page link",
+          run: () => {
+            void writeClipboardText(publishedPermalinkUrl({ kind: "page", page: props.name }));
+            pushToast("Copied page link", "success");
+          },
+        }]
+      : []),
     {
       id: "copy-export",
       label: "Copy / export as…",
@@ -1189,6 +1201,16 @@ function blockActions(id: string, x: number, y: number): { label: string; run: (
       { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
       { label: "Zoom into block", run: () => zoomInto(id) },
       { label: "Open in new tab", run: () => openBlockInNewTab(id) },
+      ...(isPublishedExport()
+        ? [{
+            label: "Copy block link",
+            run: () => {
+              const ref = persistentBlockRef(id);
+              void writeClipboardText(publishedPermalinkUrl({ kind: "block", block: ref.uuid }));
+              pushToast("Copied block link", "success");
+            },
+          }]
+        : []),
       { label: "Copy block", run: () => { const text = blockSubtreeMarkdown(id, 0, true, copyStripCollapsed()); void copyBlockOutline("copy", text, buildClipboardPayload([id])); pushToast("Copied block", "success"); } },
       {
         label: "Copy / export as…",
