@@ -282,6 +282,13 @@ never publishes an inventory this process has not compared to disk.
 `pages.position` is reconciled from the captured order or the delta's retained,
 appended or removed position. In-scope scenario: an external edit between two
 sessions, followed by a save of a different page before the warm completes.
+Until this session's order is seeded from an inventory, a delta carries no
+position (GH #550): a page the image already holds at the same source revision
+is dropped, a changed one is applied in place and keeps its stored position,
+and a page the image does not hold waits for the warm's fresh build instead of
+being given a guessed position. Launch reads such as the Journals feed publish
+exactly these deltas; counting their positions from 0 collided with the stored
+ones and rebuilt the whole projection on every launch.
 
 **One parse config, or a re-lowering.** Six graph-config facts decide those
 derived rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,

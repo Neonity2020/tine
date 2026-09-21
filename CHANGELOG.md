@@ -65,6 +65,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Opening a graph no longer rebuilds its search index from scratch on every
+  launch. The Journals view reads its first days before the index has been
+  checked, and those reads were given index positions that collided with the
+  ones already stored, so the index was thrown away and rebuilt each time,
+  a large, repeated write on every open (a ~40-second open was reported on an
+  Android phone). Pages read at launch now keep
+  their stored place, and unchanged ones are not re-indexed at all (GH #550).
+
 - On a Mac whose web engine is older than Safari 15.4 (for example Big Sur
   with Safari never updated), Tine now says so at startup and explains that
   updating Safari fixes it, instead of opening with every page failing to

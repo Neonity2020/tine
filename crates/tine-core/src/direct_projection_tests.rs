@@ -3096,6 +3096,18 @@ fn coalesced_edits_keep_first_insertion_page_order_and_readds_append() {
         _ => panic!("replacement expected"),
     };
     let mut pending = PendingProjection::default();
+    // Before an inventory seeds the order, a delta carries no position:
+    // storage keeps a stored page's own (GH #550).
+    pending.record_delta(1, replacement("unseeded"));
+    assert!(matches!(
+        &pending.deltas["pages/unseeded.md"].1,
+        PageDelta::Replace {
+            page_position: None,
+            ..
+        }
+    ));
+    pending.deltas.clear();
+    pending.seed_page_order(std::iter::empty::<&str>());
     pending.record_delta(1, replacement("z-first"));
     pending.record_delta(2, replacement("a-second"));
     pending.record_delta(3, replacement("z-first"));
@@ -8248,4 +8260,167 @@ fn a_migrated_legacy_highlight_page_leaves_search() {
         projection.debug_state_test()
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// GH #550: the Journals feed loads its first pages before the warm has
+/// validated the reopened projection. Those reads must not turn a clean reopen
+/// into a full rebuild -- on a phone that rebuild was the whole 40 s open,
+/// repeated on every launch.
+#[test]
+fn gh550_journal_feed_before_the_warm_keeps_a_clean_reopen_clean() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh550-feed-first");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    for (day, text) in [
+        // A future-dated journal: stored first, but never in today's feed.
+        // The feed's cold session therefore numbers its pages from 0 while
+        // the image holds that future day at position 0.
+        ("2027_01_04", "- planned\n"),
+        ("2026_09_19", "- TODO older\n"),
+        ("2026_09_20", "- yesterday\n  - child\n"),
+        ("2026_09_21", "- today [[one]]\n"),
+    ] {
+        std::fs::write(root.join(format!("journals/{day}.md")), text).unwrap();
+    }
+    std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
+    std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
+    // Enough ordinary pages that the image stores the journals at positions
+    // the feed's cold session would not guess.
+    for page in 0..12 {
+        std::fs::write(root.join(format!("pages/aa-{page:02}.md")), "- filler\n").unwrap();
+    }
+    let database = scratch("gh550-feed-first-db").join("projection.sqlite");
+
+    reset_lowerings(&root);
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert_eq!(lowerings(), 18, "the first open lowers every page");
+        release_projection(&graph);
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
+    reset_lowerings(&root);
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        // Exactly what the app does: the feed loads its window first.
+        let cutoff = crate::date::JournalDate {
+            year: 2026,
+            month: 9,
+            day: 21,
+        };
+        let feed = graph.feed_journals_desc_through(cutoff);
+        assert_eq!(
+            feed.len(),
+            3,
+            "the feed sees every journal through the cutoff"
+        );
+        for entry in &feed {
+            graph.load_page(entry).expect("the feed loads its journal");
+        }
+        // ...and one ordinary page. The cold session numbers these four
+        // reads 0..=3, and the image cannot hold all four at exactly those
+        // positions (it has a fourth journal and walks each folder whole), so
+        // at least one number is already taken by a page this change does not
+        // touch: the `UNIQUE constraint failed: pages.position` of GH #550.
+        let two = graph
+            .entry_for_path(&root.join("pages/two.md"))
+            .expect("the page has an entry");
+        graph.load_page(&two).expect("an ordinary page loads");
+        // Let the worker take the feed's deltas before the warm, as it does
+        // on a slow phone, so this does not depend on who wins the race.
+        assert!(
+            graph.direct_projection_test().unwrap().wait_drained_test(),
+            "the feed's deltas must not fail against the reopened image"
+        );
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert_eq!(
+            lowerings(),
+            0,
+            "feed reads before the warm must not re-lower an unchanged graph"
+        );
+        assert_eq!(
+            signature(
+                &graph
+                    .run_query_bounded("(task TODO)", 100, 1_000_000)
+                    .expect("the ready projection answers the public bounded route")
+                    .groups
+            ),
+            signature(
+                &crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000).groups
+            )
+        );
+        release_projection(&graph);
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
+/// GH #550 siblings: a launch read of a page that changed since the image was
+/// written applies in place, and one of a page the image has never seen is
+/// left to the warm's fresh build. Neither may fail the projection, and both
+/// must answer queries from the current bytes.
+#[test]
+fn gh550_launch_reads_of_changed_and_new_pages_settle_without_failing() {
+    let _serial = serialize_projection_tests();
+    for (case, edit, expected_lowerings) in [
+        ("changed", "journals/2026_09_20.md", 1),
+        ("new", "journals/2026_09_21.md", 4),
+    ] {
+        let root = scratch(&format!("gh550-launch-{case}"));
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("journals/2026_09_19.md"), "- older\n").unwrap();
+        std::fs::write(root.join("journals/2026_09_20.md"), "- yesterday\n").unwrap();
+        std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
+        let database = scratch(&format!("gh550-launch-{case}-db")).join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+            release_projection(&graph);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        // Another device delivers this between launches.
+        std::fs::write(root.join(edit), "- TODO delivered by sync\n").unwrap();
+
+        reset_lowerings(&root);
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            let entry = graph
+                .entry_for_path(&root.join(edit))
+                .expect("the delivered journal has an entry");
+            graph.load_page(&entry).expect("the feed loads it");
+            assert!(
+                graph.direct_projection_test().unwrap().wait_drained_test(),
+                "{case}: a launch read must not fail the projection"
+            );
+            graph.warm_cache();
+            wait_ready(&graph);
+            assert_eq!(lowerings(), expected_lowerings, "{case}");
+            let projected = graph
+                .run_query_bounded("(task TODO)", 100, 1_000_000)
+                .expect("the ready projection answers the public bounded route")
+                .groups;
+            assert_eq!(
+                signature(&projected),
+                signature(
+                    &crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000).groups
+                ),
+                "{case}"
+            );
+            assert_eq!(projected.len(), 2, "{case}: the delivered TODO is indexed");
+            release_projection(&graph);
+        }
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
 }

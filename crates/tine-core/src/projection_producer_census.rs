@@ -1547,9 +1547,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-20: final compact-projection delivery pins tine-storage v0.27.0.
     // The production import and direct-call inventory is unchanged, so the
     // digest below holds.
+    // 2026-09-21: GH #550 settles pre-seed launch deltas against the reopened
+    // image with two read-only `database.source_delta` calls in
+    // `settle_unseeded_deltas`. No write crossing or dependency pin changed.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "9e53e9b52a57fb8df5174cc77fed32859109168ed79e554a3bd451eac91aba53",
+        "d36012ef2ed70ac4260dca081237bbbb5723d870a0dba599b0ce4f7b2261213c",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

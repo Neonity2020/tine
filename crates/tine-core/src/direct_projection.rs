@@ -205,6 +205,13 @@ struct PendingProjection {
     stop: bool,
     page_order: BTreeMap<String, u64>,
     next_page_order: u64,
+    /// Whether this session's `page_order` has been seeded from a complete
+    /// inventory (a full snapshot or a warm walk). Before that the queue does
+    /// not know where a reopened image keeps its pages, so it hands out no
+    /// positions at all: counting from 0 collided with the positions the
+    /// image already stores (`UNIQUE constraint failed: pages.position`), and
+    /// that failure rebuilt the whole projection on every launch (GH #550).
+    order_seeded: bool,
     /// R6 warm validation queued for the worker.
     warm: Option<PendingWarm>,
     /// R6: the worker's verdict on the last warm validation.
@@ -223,6 +230,11 @@ impl PendingProjection {
     fn record_delta(&mut self, generation: u64, mut delta: PageDelta) {
         let key = delta.entry().rel_path.clone();
         match &mut delta {
+            PageDelta::Replace { .. } if !self.order_seeded => {
+                // No position: storage keeps a stored page's own, and the
+                // worker refuses to place a page the image does not hold
+                // (`settle_unseeded_deltas`).
+            }
             PageDelta::Replace { page_position, .. } => {
                 let position = if let Some(position) = self.page_order.get(&key) {
                     *position
@@ -252,6 +264,7 @@ impl PendingProjection {
             // after existing pages. Re-number both owners together below.
             inventory.sort_by_key(|path| self.page_order.get(*path).copied().unwrap_or(u64::MAX));
         }
+        self.order_seeded = true;
         self.next_page_order = inventory.len() as u64;
         self.page_order = inventory
             .into_iter()
@@ -2197,6 +2210,26 @@ impl DirectProjection {
         ProjectionProgress::Stale
     }
 
+    /// Wait until the worker has drained its queue and finished its turn, and
+    /// report whether that turn failed.
+    #[cfg(test)]
+    pub(crate) fn wait_drained_test(&self) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            {
+                let pending = self.shared.pending.lock().unwrap();
+                if !pending.has_work() && !self.shared.worker_busy.load(Ordering::Acquire) {
+                    return !self.shared.worker_failed.load(Ordering::Acquire);
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "projection worker did not drain"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Test diagnostic: the queue and readiness state in one line, for a
     /// convergence failure that would otherwise be a bare timeout.
     #[cfg(test)]
@@ -2753,13 +2786,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 if requires_full_rebuild {
                     return Err(ProjectionRefusal::AwaitingFullInventory);
                 }
-                apply_deltas(
-                    writer_slot
-                        .as_mut()
-                        .ok_or(ProjectionRefusal::AwaitingFullInventory)?,
-                    deltas,
-                )
-                .map_err(ProjectionRefusal::Failed)?
+                let database = writer_slot
+                    .as_mut()
+                    .ok_or(ProjectionRefusal::AwaitingFullInventory)?;
+                let deltas = settle_unseeded_deltas(database, deltas)
+                    .map_err(ProjectionRefusal::Failed)?
+                    .ok_or(ProjectionRefusal::AwaitingFullInventory)?;
+                apply_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?
             };
 
             let (revision, registry_after) = {
@@ -3334,6 +3367,67 @@ fn validate_warm(
         return Ok(WarmOutcome::Clean);
     }
     Ok(WarmOutcome::FreshBuildRequired)
+}
+
+/// GH #550: settle the deltas a session published before it had seeded its
+/// page order (they carry no position). Launch reads -- the Journals feed
+/// loading its first days -- publish every page they read, and they arrive
+/// before the warm has validated the reopened image.
+///
+/// - A page the image already holds at this exact source revision is
+///   dropped: re-lowering it writes rows identical to the ones stored.
+/// - A changed page the image holds is applied without a position, so it
+///   keeps its stored one.
+/// - A page the image does not hold cannot be placed without the session's
+///   inventory. `None` asks for that inventory instead of inventing a
+///   position; the page set differs from the image, so the warm would have
+///   required a fresh build anyway.
+fn settle_unseeded_deltas(
+    database: &PhysicalGraphProjectionDatabase,
+    mut deltas: BTreeMap<String, (u64, PageDelta)>,
+) -> Result<Option<BTreeMap<String, (u64, PageDelta)>>, String> {
+    let unseeded = deltas
+        .values()
+        .filter_map(|(_, delta)| match delta {
+            PageDelta::Replace {
+                entry,
+                revision,
+                parse_config,
+                page_position: None,
+                ..
+            } => Some(PhysicalGraphProjectionSourceRevision {
+                path: entry.rel_path.clone(),
+                revision: projection_source_revision(revision, parse_config.digest()),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if unseeded.is_empty() {
+        return Ok(Some(deltas));
+    }
+    // Against an empty inventory every stored page reads as a deletion: that
+    // is the set of paths the image holds.
+    let stored = database
+        .source_delta(&[])
+        .map_err(|error| error.to_string())?
+        .deletions
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let changed = database
+        .source_delta(&unseeded)
+        .map_err(|error| error.to_string())?
+        .replacements
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    for source in unseeded {
+        if !stored.contains(&source.path) {
+            return Ok(None);
+        }
+        if !changed.contains(&source.path) {
+            deltas.remove(&source.path);
+        }
+    }
+    Ok(Some(deltas))
 }
 
 fn apply_deltas(

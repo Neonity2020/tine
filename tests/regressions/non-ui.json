@@ -3212,6 +3212,34 @@
    "notes": "GH #538 (Android, 0.6.982): after a failed write, the graph never opened again with a bare 'unsafe graph layout: Invalid argument (os error 22)'. atomic_replace_expected (the config.edn writer) retired the live file with a plain rename, then published with renameat2(RENAME_NOREPLACE); on storage that answers the flag with EINVAL both the publish and the no-replace undo failed, the undo error was ignored, and config.edn stayed stranded under .config.edn.<pid>.<seq>.retired. The open-time restore used the same refused primitive, so every open failed. The Android flag refusal is recorded from Android CI run 32091898520; it is device-dependent and was not reproduced on the reporter's device. Fix: prove the no-replace move on the staged temp before retiring the live name (refusal leaves config.edn untouched, with a named error); restore a vacated name by plain rename only when the storage refuses the flag AND the target is absent; name the step and file on recovery errors. Tests gh538_* inject an EINVAL mover; 3 of 4 fail on the old logic (the fourth covers error wording). Not covered: Direct page saves on such storage still fail (named error), a separate decision."
   },
   {
+   "id": "REG-PROJECTION-REBUILT-EVERY-LAUNCH-550",
+   "title": "Reopening a graph whose search index is current does not rebuild the index because the Journals feed read pages before the warm",
+   "family": "direct-files-performance",
+   "sources": {
+    "issues": [
+     550
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android",
+    "linux",
+    "windows",
+    "macos",
+    "ios"
+   ],
+   "layer": "rust-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/direct_projection_tests.rs"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #550 (Android, 764 pages, ~40 s open on every launch). The Journals feed loads its first days before the warm has validated the reopened projection; each load_page published a Replace delta, and the cold queue numbered those pages 0,1,2,... while the image already stored other pages at those positions. The delta turn failed with 'UNIQUE constraint failed: pages.position', the projection went stale, and the warm rebuilt all of it -- every launch. Where the positions happened to line up, the feed pages were still re-lowered for nothing. Fix: before an inventory seeds the session's page order a delta carries no position; the worker drops pre-seed deltas whose page the image holds at the same source revision, applies changed ones in place (storage keeps their stored position), and hands a page the image does not hold to the warm's fresh build. Tests: gh550_journal_feed_before_the_warm_keeps_a_clean_reopen_clean fails deterministically on the old code (projection failure on drain; 3 needless re-lowerings when positions line up); gh550_launch_reads_of_changed_and_new_pages_settle_without_failing covers the changed/new siblings. Real corpus (logseq-anonymized with journals renamed to dates ending yesterday, feed's 3 days loaded before the warm): old code 'projection is stale' + 1,078 lowerings on each relaunch, fixed 0. Not measured on the reporter's phone."
+  },
+  {
    "id": "REG-JOURNALS-FEED-BLANK-ON-NON-PAGE-ENTRY-385",
    "title": "A non-page entry in journals/ or pages/ (symlink, unreadable sidecar, hidden hard link) no longer blanks the Journals view or refuses today's journal and renames",
    "family": "journals-feed",
