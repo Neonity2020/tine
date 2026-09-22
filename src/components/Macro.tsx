@@ -1,5 +1,5 @@
 import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
-import { backend, QueryPrintRefusedError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
+import { backend, OperationCancelledError, QueryPrintRefusedError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
 import { isPublishedExport } from "../publishedBackend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
@@ -619,7 +619,12 @@ export function QueryMacro(props: {
         }
         next = { ...next, view: rebased };
       } catch (error) {
-        setPrintError(errorText(error));
+        // The block or graph changed while its reading was fetched: the
+        // reading no longer describes it, so the edit must not be rebased on
+        // it (GH #543, audit R5-04).
+        setPrintError(error instanceof OperationCancelledError
+          ? "The query text changed. Wait for it to refresh, then try this edit again."
+          : errorText(error));
         return false;
       }
     }

@@ -39,17 +39,15 @@ export function createReferenceFetcher(options: {
     disposed = true;
   });
   return async <T>(name: string, load: () => Promise<T[]>): Promise<T[]> => {
+    const current = () => !disposed && options.currentName() === name;
     options.setLoadError(null);
     try {
-      return await runQueryWhenCurrent(
-        load,
-        () => !disposed && options.currentName() === name,
-        options.setIndexPending,
-      );
+      return await runQueryWhenCurrent(load, current, options.setIndexPending);
     } catch (error) {
       // A superseded read is not a failure the user should see; the resource
-      // for the new page is already running.
-      if (error instanceof OperationCancelledError) return [];
+      // for the new page is already running, and the panel's error state is
+      // its to set (GH #543, audit R5-04).
+      if (error instanceof OperationCancelledError || !current()) return [];
       options.setLoadError(classifyReferenceLoadError(error));
       return [];
     }

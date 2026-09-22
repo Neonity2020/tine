@@ -101,6 +101,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - The progress bar now also shows a whole-graph page read when the search
   index is already ready, for example while finding unused assets (GH #543).
 
+- Moving to another page while the index is still being built no longer shows
+  the new page's linked references as failed because of the previous page's
+  read (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).

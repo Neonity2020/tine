@@ -60,15 +60,28 @@ export function runQueryWhenCurrent<T>(
   // issue a read of its own before this one has even started. Readiness policy
   // is still `runQueryWhenReady`'s alone: it owns every retry after the first
   // refusal, and nothing here is mode-specific.
-  return load().catch((error) => {
-    if (!(error instanceof QueryNotReadyError) || !isCurrent()) throw error;
-    onPending(error);
-    return runQueryWhenReady(load, {
-      signal: new AbortController().signal,
-      isCurrent,
-      onPending,
-    });
-  });
+  //
+  // The eager attempt settles under the same ownership rule as every retry: a
+  // caller that is no longer current gets cancellation, whatever the attempt
+  // returned. Rethrowing its own refusal let a superseded references read mark
+  // the replacement panel failed (GH #543, audit R5-04), and a late success
+  // could feed a stale reading to a caller that no longer asked for it.
+  return load().then(
+    (value) => {
+      if (!isCurrent()) throw new OperationCancelledError();
+      return value;
+    },
+    (error) => {
+      if (!isCurrent()) throw new OperationCancelledError();
+      if (!(error instanceof QueryNotReadyError)) throw error;
+      onPending(error);
+      return runQueryWhenReady(load, {
+        signal: new AbortController().signal,
+        isCurrent,
+        onPending,
+      });
+    },
+  );
 }
 
 /** Retry typed readiness only. The native producer must report a failed rebuild

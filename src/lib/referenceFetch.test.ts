@@ -20,6 +20,35 @@ function harness(currentName: () => string) {
 }
 
 describe("createReferenceFetcher", () => {
+  // GH #543, audit R5-04: the eager first attempt of a read the pane has
+  // routed away from settles after the new page's read answered. Its
+  // readiness refusal must not mark the new panel failed.
+  it("a superseded first read cannot mark the new panel failed", async () => {
+    let showing = "Old";
+    const { fetcher, dispose, errors } = harness(() => showing);
+    let rejectOld!: (reason: unknown) => void;
+    const old = fetcher("Old", () => new Promise<string[]>((_resolve, reject) => { rejectOld = reject; }));
+    showing = "New";
+    expect(await fetcher("New", async () => ["current reference"])).toEqual(["current reference"]);
+    rejectOld(new QueryNotReadyError("indexing"));
+    expect(await old).toEqual([]);
+    dispose();
+    expect(errors.at(-1)).toBeNull();
+  });
+
+  it("a superseded first read's real failure does not mark the new panel failed either", async () => {
+    let showing = "Old";
+    const { fetcher, dispose, errors } = harness(() => showing);
+    let rejectOld!: (reason: unknown) => void;
+    const old = fetcher("Old", () => new Promise<string[]>((_resolve, reject) => { rejectOld = reject; }));
+    showing = "New";
+    expect(await fetcher("New", async () => ["current reference"])).toEqual(["current reference"]);
+    rejectOld(new Error("backend exploded"));
+    expect(await old).toEqual([]);
+    dispose();
+    expect(errors.at(-1)).toBeNull();
+  });
+
   it("waits out an indexing projection instead of surfacing an error", async () => {
     const { fetcher, dispose, errors, pending } = harness(() => "Target");
     let attempts = 0;

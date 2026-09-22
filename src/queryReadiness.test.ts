@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { classifyNativeCallError, OperationCancelledError, QueryNotReadyError, QueryUnavailableError } from "./backend";
-import { runQueryWhenReady } from "./queryReadiness";
+import { runQueryWhenCurrent, runQueryWhenReady } from "./queryReadiness";
 import { resetSharedQueryResultsForTests, sharedQueryResult } from "./queryResultCache";
 
 afterEach(() => { vi.useRealTimers(); resetSharedQueryResultsForTests(); });
@@ -50,6 +50,36 @@ describe("searchIndexPendingMessage", () => {
 });
 
 describe("owned query readiness", () => {
+  // GH #543, audit R5-04: the eager first attempt settles under the same
+  // ownership rule as every retry. A caller no longer current gets
+  // cancellation whatever the attempt returned.
+  it("settles a superseded eager attempt as cancellation, whatever it returned", async () => {
+    for (const settle of [
+      (resolve: (v: string) => void) => resolve("stale reading"),
+      (_resolve: unknown, reject: (e: unknown) => void) => reject(new QueryNotReadyError("indexing")),
+      (_resolve: unknown, reject: (e: unknown) => void) => reject(new Error("real failure")),
+    ]) {
+      let current = true;
+      const pending: unknown[] = [];
+      let finish!: () => void;
+      const run = runQueryWhenCurrent(
+        () => new Promise<string>((resolve, reject) => { finish = () => settle(resolve, reject); }),
+        () => current,
+        (error) => pending.push(error),
+      );
+      current = false;
+      finish();
+      await expect(run).rejects.toBeInstanceOf(OperationCancelledError);
+      expect(pending).toEqual([]);
+    }
+  });
+
+  it("returns a current eager attempt's answer and rethrows its real failure", async () => {
+    await expect(runQueryWhenCurrent(async () => "answer", () => true)).resolves.toBe("answer");
+    const failure = new Error("real failure");
+    await expect(runQueryWhenCurrent(async () => { throw failure; }, () => true)).rejects.toBe(failure);
+  });
+
   it("backs off pending attempts and returns the actual answer", async () => {
     vi.useFakeTimers();
     const current = owner();

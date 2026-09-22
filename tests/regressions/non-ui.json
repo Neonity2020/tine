@@ -5843,6 +5843,32 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 5, R5-03 (a sibling of R4-P2). Graph::indexing_progress returned None for a ready index before it checked the running core pass, so an asset listing's whole-graph parse showed as idle. Fix: the running pass is consulted first. The poller in src/indexingProgress.ts has no other ready-means-idle exit. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log and tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-03.log."
+},
+{
+ "id": "REG-A-SUPERSEDED-REFERENCES-READ-CANNOT-FAIL-THE-NEW-PANEL-543",
+ "title": "Moving to another page while references are still indexing never shows the new page's references as failed because of the old page's read",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/lib/referenceFetch.test.ts::a superseded first read cannot mark the new panel failed",
+   "src/lib/referenceFetch.test.ts::a superseded first read's real failure does not mark the new panel failed either",
+   "src/queryReadiness.test.ts::settles a superseded eager attempt as cancellation, whatever it returned"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 5, R5-04 (I-20). runQueryWhenCurrent's eager first attempt rethrew its own refusal after its caller had stopped being current, and createReferenceFetcher wrote that refusal to the shared panel error. Fix (shape, at the shared seam): the eager attempt settles like every retry, so a caller that is no longer current gets OperationCancelledError whether the attempt succeeded or failed; the reference fetcher also gates its error write on the current page. The sibling callers (LinkedReferences filter context, QueryBuilder, Macro) already gate on their own revision, except the query-block save rebase in Macro.tsx, which used to rebase on a stale reading and now stops with the query-changed message. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log and tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-04.log (3 tests)."
 }
 ]
 }
