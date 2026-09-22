@@ -175,7 +175,7 @@ impl Graph {
                     // memoized whole-graph result and can invalidate an
                     // inventory read that was in flight.
                     let disk_rev = content_rev(content);
-                    let parse_config = self.config.parse_config().digest();
+                    let parse_config = self.config().parse_config().digest();
                     // `disk_revs` records a revision only once the parsed cache
                     // is built; the session record is written by every
                     // publication, warm or cold, so it is the one that answers
@@ -256,7 +256,7 @@ impl Graph {
                     .get(path)
                     .is_some_and(|ids| {
                         ids.revision == disk_rev
-                            && ids.config == self.config.parse_config().digest()
+                            && ids.config == self.config().parse_config().digest()
                     })
             {
                 return Ok(None);

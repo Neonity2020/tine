@@ -134,7 +134,7 @@ impl Graph {
                 if let Some((revision, preorder)) = row.session_ids {
                     if let Some(ids) = SessionPageIds::from_projection(
                         &revision,
-                        self.config.parse_config().digest(),
+                        self.config().parse_config().digest(),
                         preorder,
                     ) {
                         self.session_page_ids
@@ -186,7 +186,7 @@ impl Graph {
                 if let Some(cached) = cached {
                     pages.extend(cached.iter().cloned());
                 } else {
-                    let config = self.config.parse_config().digest();
+                    let config = self.config().parse_config().digest();
                     let sources = self
                         .session_page_ids
                         .read()

@@ -1453,6 +1453,19 @@ fn refresh_changed_configs(
             continue;
         }
         let before = slot.graph_meta();
+        // A change to settings only is taken in by this graph; reopening it
+        // would restart indexing for an edit to, say, favorites (GH #543).
+        match slot.take_in_config() {
+            tine_core::config::ConfigReach::Unchanged => continue,
+            tine_core::config::ConfigReach::Settings => {
+                let after = slot.graph_meta();
+                if after != before {
+                    let _ = app.emit_to(label, "graph-config-changed", after);
+                }
+                continue;
+            }
+            tine_core::config::ConfigReach::Graph => {}
+        }
         drop(slot);
         match refresh_graph_for_label(&state, app, label, RefreshLaneWait::TryOnce) {
             Ok(RefreshOutcome::Deferred) => {

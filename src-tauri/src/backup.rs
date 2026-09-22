@@ -131,13 +131,13 @@ impl BackupSource {
             assets: g.assets_path(),
             cfg: g.root.join("logseq").join("config.edn"),
             root: g.root.clone(),
-            journals_dir: g.config.journals_dir.clone(),
-            pages_dir: g.config.pages_dir.clone(),
+            journals_dir: g.config().journals_dir.clone(),
+            pages_dir: g.config().pages_dir.clone(),
             graph_text_scope: g.graph_text_scope(),
             graph_text_policy: SnapshotGraphTextPolicy {
                 version: GRAPH_TEXT_SCOPE_VERSION,
-                hidden: g.config.hidden.clone(),
-                hidden_parse_failed_closed: g.config.hidden_parse_failed_closed,
+                hidden: g.config().hidden.clone(),
+                hidden_parse_failed_closed: g.config().hidden_parse_failed_closed,
             },
         }
     }

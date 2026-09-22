@@ -5382,14 +5382,17 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "src-tauri/src/backend_command_parity.rs::presentation_settings_do_not_reopen_the_graph",
-   "src-tauri/src/state.rs::a_presentation_setting_keeps_the_graph_and_its_index",
+   "src-tauri/src/backend_command_parity.rs::settings_commands_leave_reopening_to_the_config_reach",
+   "src-tauri/src/state.rs::a_settings_change_keeps_the_graph_and_its_index",
+   "crates/tine-core/src/config.rs::a_change_reaches_the_graph_only_through_a_graph_field",
+   "crates/tine-core/src/config.rs::a_settings_field_is_not_copied_at_open_or_into_the_index",
+   "crates/tine-core/src/config.rs::a_setting_written_through_the_graph_is_the_one_it_reads",
    "src/instanceReplacement.test.ts::keeps the binding for a presentation-only setting (GH #543)"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "GH #543 indexing audit IT-06. set_timetracking_enabled, set_show_brackets, set_doc_mode_enter_for_new_block, set_logical_outdenting and set_guide_announced wrote config and then ran refresh_graph, which retires the projection worker, reopens the Graph and starts a new launch check; on a first launch, dismissing the Guide toast discarded the whole cold index build. The frontend also rebound (aborting print, closing unsaved recovery). tine-core reads none of these five, so they now write config and update the slot's GraphMeta in place (GraphSlot::apply_presentation_setting). preferred_format, journal title format, default home and restore_backup still refresh because the core reads them. Evidence: tine-agents/evidence/gh550-batch/it06-presentation-settings-fail-before.log."
+ "notes": "GH #543 indexing audit IT-06. set_timetracking_enabled, set_show_brackets, set_doc_mode_enter_for_new_block, set_logical_outdenting and set_guide_announced wrote config and then ran refresh_graph, which retires the projection worker, reopens the Graph and starts a new launch check; on a first launch, dismissing the Guide toast discarded the whole cold index build. The frontend also rebound (aborting print, closing unsaved recovery). tine-core reads none of these five, so they now write config and update the slot's GraphMeta in place (GraphSlot::apply_presentation_setting). preferred_format, journal title format, default home and restore_backup still refreshed. R2-P1 (round 2): the per-command choice is gone. Config::reach classifies every Config field (an exhaustive destructure, so a new field does not compile unclassified) as settings (read when used, swapped in place through Graph::config()) or graph (only a new Graph takes it in). Every settings command goes through GraphSlot::apply_config_write, Graph::write_config takes the change in, and the watcher does the same for an outside config.edn edit; only set_journal_title_format (a graph field, plus title-named journal migration) and restore_backup still reopen. default_home was the launch-time trigger: the device-local home migration calls set_default_home while the graph opens. The same change fixes exports and the CLI reading favorites and workflow as the graph opened. Evidence: tine-agents/evidence/gh550-batch/it06-presentation-settings-fail-before.log, tine-agents/evidence/gh550-batch/r2p1-fail-before.log."
 },
 {
  "id": "REG-FAILED-READ-DURING-REBUILD-QUEUES-NO-SECOND-BUILD-543",

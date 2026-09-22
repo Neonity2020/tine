@@ -31,8 +31,9 @@ impl Graph {
         path: &GraphTextPath,
     ) -> Result<GraphTextKind, UnsafeGraphTextPath> {
         let path_components = path.as_str().split('/').collect::<Vec<_>>();
-        let page_root = configured_root_components(&self.config.pages_dir);
-        let journal_root = configured_root_components(&self.config.journals_dir);
+        let config = self.config();
+        let page_root = configured_root_components(&config.pages_dir);
+        let journal_root = configured_root_components(&config.journals_dir);
         let Some(page_root) = page_root else {
             return Err(UnsafeGraphTextPath(path.as_str().to_owned()));
         };

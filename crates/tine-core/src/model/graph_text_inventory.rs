@@ -436,13 +436,13 @@ impl Graph {
     /// inventory.  Nested roots are discovered through their outer root, then
     /// classified by their exact graph-relative path below; equal roots have no
     /// unambiguous owner and fail before any file is parsed or mutated.
-    pub(super) fn configured_text_inventory_roots(
+    pub(super) fn configured_text_inventory_roots<'c>(
         &self,
+        config: &'c Config,
         permit: &GraphTextWritePermit,
-    ) -> io::Result<Vec<(&str, usize)>> {
-        let page_root = configured_root_components(&self.config.pages_dir).ok_or_else(bad_path)?;
-        let journal_root =
-            configured_root_components(&self.config.journals_dir).ok_or_else(bad_path)?;
+    ) -> io::Result<Vec<(&'c str, usize)>> {
+        let page_root = configured_root_components(&config.pages_dir).ok_or_else(bad_path)?;
+        let journal_root = configured_root_components(&config.journals_dir).ok_or_else(bad_path)?;
         if page_root == journal_root {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -451,8 +451,8 @@ impl Graph {
         }
 
         let configured = [
-            (&self.config.pages_dir, page_root),
-            (&self.config.journals_dir, journal_root),
+            (&config.pages_dir, page_root),
+            (&config.journals_dir, journal_root),
         ];
         let mut resources = std::collections::BTreeMap::new();
         for (root, _) in configured.iter() {
@@ -523,7 +523,7 @@ impl Graph {
         {
             return Err(bad_path());
         }
-        let decoded = decode_page_name(stem, self.config.file_name_format);
+        let decoded = decode_page_name(stem, self.config().file_name_format);
         let (name, kind, date_key) = match self.journal_format.parse(&decoded) {
             Some(date) => (
                 self.journal_format.title(date),
@@ -706,7 +706,7 @@ impl Graph {
         let (dir, stem) = match kind {
             PageKind::Page => (
                 self.pages_path(),
-                Some(encode_page_name(name, self.config.file_name_format)),
+                Some(encode_page_name(name, self.config().file_name_format)),
             ),
             PageKind::Journal => (
                 self.journals_path(),
@@ -748,7 +748,7 @@ impl Graph {
                         .join(format!("{stem}.{}", preferred.ext()))
                 })),
             PageKind::Page => {
-                let encoded = encode_page_name(name, self.config.file_name_format);
+                let encoded = encode_page_name(name, self.config().file_name_format);
                 let primary = self
                     .pages_path()
                     .join(format!("{encoded}.{}", preferred.ext()));

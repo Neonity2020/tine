@@ -282,7 +282,7 @@ impl Graph {
                 ),
             ));
         }
-        let enc = encode_page_name(name, self.config.file_name_format);
+        let enc = encode_page_name(name, self.config().file_name_format);
         for target in configured_text_variant_paths(&dir, &enc) {
             if self.graph_text_exists(&write, &target)? {
                 return Err(DirectSaveError::into_io(
@@ -392,7 +392,7 @@ impl Graph {
                 // place rather than creating a second file in the other extension;
                 // a brand-new page is created in the graph's preferred format.
                 // Cheap `exists()` probes (the common hit needs one), no dir scan.
-                let enc = encode_page_name(name, self.config.file_name_format);
+                let enc = encode_page_name(name, self.config().file_name_format);
                 let dir = self.pages_path();
                 let primary = dir.join(format!("{enc}.{}", pref.ext()));
                 if primary.exists() {
@@ -426,7 +426,7 @@ impl Graph {
         }
         let path = self.pages_path().join(format!(
             "{}.md",
-            encode_page_name(name, self.config.file_name_format)
+            encode_page_name(name, self.config().file_name_format)
         ));
         let filename_name = self
             .graph_entry_for_relative_path(&self.rel_path(&path))?
@@ -470,7 +470,7 @@ impl Graph {
         guide_twin_race_hook(&path)?;
         let alt = self.pages_path().join(format!(
             "{}.org",
-            encode_page_name(name, self.config.file_name_format)
+            encode_page_name(name, self.config().file_name_format)
         ));
         if self.graph_text_exists(&write, &alt)? {
             // An Org twin appeared during publication. Withdraw only the exact

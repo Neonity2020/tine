@@ -86,7 +86,7 @@ impl Graph {
         revision: &str,
         doc: &mut Document,
     ) -> bool {
-        let config = self.config.parse_config().digest();
+        let config = self.config().parse_config().digest();
         self.session_page_ids
             .read()
             .unwrap()

@@ -67,40 +67,65 @@ impl Graph {
         *self.recent_config_write.write().unwrap() = config_file_description(&self.root);
     }
 
+    /// The configuration as last taken in.
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config.read().unwrap())
+    }
+
+    /// Change this instance's configuration before anyone else holds it
+    /// (exports and the CLI override single settings for one run).
+    pub fn config_mut(&mut self) -> &mut Config {
+        Arc::make_mut(self.config.get_mut().unwrap())
+    }
+
+    /// Re-read `config.edn` and take in a change that reaches only settings.
+    /// [`ConfigReach::Graph`] leaves this instance as it is: the caller opens
+    /// a new `Graph`, which is the only way that change is taken in.
+    pub fn take_in_config(&self) -> crate::config::ConfigReach {
+        let bytes = fs::read(reconciliation_scan_config_path_at_open(&self.root)).ok();
+        let new = bytes
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(Config::parse)
+            .unwrap_or_default();
+        let mut current = self.config.write().unwrap();
+        let reach = current.reach(&new);
+        if reach == crate::config::ConfigReach::Settings {
+            *current = Arc::new(new);
+        }
+        reach
+    }
+
     pub fn meta(&self) -> GraphMeta {
+        let config = self.config();
         GraphMeta {
             root: self.root.display().to_string(),
-            journals_dir: self.config.journals_dir.clone(),
-            pages_dir: self.config.pages_dir.clone(),
-            preferred_workflow: match self.config.preferred_workflow {
+            journals_dir: config.journals_dir.clone(),
+            pages_dir: config.pages_dir.clone(),
+            preferred_workflow: match config.preferred_workflow {
                 crate::config::Workflow::Todo => "todo".into(),
                 crate::config::Workflow::Now => "now".into(),
             },
-            shortcuts: self.config.shortcuts.clone(),
-            start_of_week: self.config.start_of_week,
-            linked_references_collapsed_threshold: self
-                .config
-                .linked_references_collapsed_threshold,
-            block_hidden_properties: self.config.block_hidden_properties.clone(),
-            default_journal_template: self.config.default_journal_template.clone(),
-            default_home: self.config.default_home.clone(),
-            favorites: self.config.favorites.clone(),
-            favorites_page: self.config.favorites_page.clone(),
+            shortcuts: config.shortcuts.clone(),
+            start_of_week: config.start_of_week,
+            linked_references_collapsed_threshold: config.linked_references_collapsed_threshold,
+            block_hidden_properties: config.block_hidden_properties.clone(),
+            default_journal_template: config.default_journal_template.clone(),
+            default_home: config.default_home.clone(),
+            favorites: config.favorites.clone(),
+            favorites_page: config.favorites_page.clone(),
             journal_page_title_format: self.journal_format.title_format().to_string(),
             journal_file_name_format: self.journal_format.file_format().to_string(),
-            preferred_format: self.config.preferred_format.ext().to_string(),
-            macros: self.config.macros.clone(),
-            enable_timetracking: self.config.enable_timetracking,
-            show_brackets: self.config.show_brackets,
-            doc_mode_enter_for_new_block: self.config.doc_mode_enter_for_new_block,
-            logical_outdenting: self.config.logical_outdenting,
-            logbook_with_second_support: self.config.logbook.with_second_support,
-            logbook_enabled_in_timestamped_blocks: self
-                .config
-                .logbook
-                .enabled_in_timestamped_blocks,
-            logbook_enabled_in_all_blocks: self.config.logbook.enabled_in_all_blocks,
-            guide_announced: self.config.guide_announced,
+            preferred_format: config.preferred_format.ext().to_string(),
+            macros: config.macros.clone(),
+            enable_timetracking: config.enable_timetracking,
+            show_brackets: config.show_brackets,
+            doc_mode_enter_for_new_block: config.doc_mode_enter_for_new_block,
+            logical_outdenting: config.logical_outdenting,
+            logbook_with_second_support: config.logbook.with_second_support,
+            logbook_enabled_in_timestamped_blocks: config.logbook.enabled_in_timestamped_blocks,
+            logbook_enabled_in_all_blocks: config.logbook.enabled_in_all_blocks,
+            guide_announced: config.guide_announced,
         }
     }
 
@@ -119,11 +144,11 @@ impl Graph {
     }
 
     pub fn journals_path(&self) -> PathBuf {
-        self.root.join(&self.config.journals_dir)
+        self.root.join(&self.config().journals_dir)
     }
 
     pub fn pages_path(&self) -> PathBuf {
-        self.root.join(&self.config.pages_dir)
+        self.root.join(&self.config().pages_dir)
     }
 
     /// Graph-root-relative, forward-slashed path for an absolute file path inside
@@ -181,7 +206,8 @@ impl Graph {
             return None;
         }
         let parts = rel.split('/').collect::<Vec<_>>();
-        let configured_root = [&self.config.journals_dir, &self.config.pages_dir]
+        let config = self.config();
+        let configured_root = [&config.journals_dir, &config.pages_dir]
             .into_iter()
             .filter_map(|configured| {
                 let components = configured.split('/').collect::<Vec<_>>();
@@ -230,7 +256,7 @@ impl Graph {
             return Err(bad_path());
         }
         let components = relative_path.split('/').collect::<Vec<_>>();
-        let configured_root_len = [&self.config.journals_dir, &self.config.pages_dir]
+        let configured_root_len = [&self.config().journals_dir, &self.config().pages_dir]
             .into_iter()
             .filter_map(|configured_root| {
                 let root_components = configured_root.split('/').collect::<Vec<_>>();
@@ -496,6 +522,6 @@ impl Graph {
     /// The format (`Md`/`Org`) new pages and journals are created in, from
     /// `config.edn`'s `:preferred-format`. Existing files keep their own format.
     pub fn preferred_format(&self) -> Format {
-        self.config.preferred_format
+        self.config().preferred_format
     }
 }

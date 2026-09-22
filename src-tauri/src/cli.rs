@@ -207,7 +207,7 @@ fn export(format: ExportFormat) -> CliResult<()> {
     match format {
         ExportFormat::Static(args) => {
             let (mut graph, _projection) = open_graph(&args.graph)?;
-            graph.config.all_pages_public |= args.all_pages;
+            graph.config_mut().all_pages_public |= args.all_pages;
             let output = publication_output(&args.output, args.replace)?;
             let outcome = publish_graph_to(&graph, output)
                 .map_err(|error| format!("static export failed: {error}"))?;
@@ -216,7 +216,7 @@ fn export(format: ExportFormat) -> CliResult<()> {
         }
         ExportFormat::Live(args) => {
             let (mut graph, _projection) = open_graph(&args.export.graph)?;
-            graph.config.all_pages_public |= args.export.all_pages;
+            graph.config_mut().all_pages_public |= args.export.all_pages;
             let output = publication_output(&args.export.output, args.export.replace)?;
             let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
             let bundle = embedded_app_bundle(&context);
@@ -339,7 +339,7 @@ fn doctor(path: &Path) -> CliResult<()> {
     terminal_stdout(format_args!("Pages and journals: {}", pages.len()));
     terminal_stdout(format_args!(
         "Default home: {}",
-        graph.config.default_home.as_deref().unwrap_or("(none)")
+        graph.config().default_home.as_deref().unwrap_or("(none)")
     ));
     if failures.is_empty() && duplicates.is_empty() {
         terminal_stdout(format_args!(

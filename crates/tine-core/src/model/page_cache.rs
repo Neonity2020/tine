@@ -643,7 +643,7 @@ impl Graph {
                 text_bytes as f64 / (1024.0 * 1024.0),
             )
         });
-        let parse_config = Arc::new(self.config.parse_config());
+        let parse_config = Arc::new(self.config().parse_config());
         // A stale image is repaired page by page at most this many times
         // before the complete rebuild takes over: each repair re-validates,
         // and a graph still changing underneath it gets the rebuild.
@@ -1123,7 +1123,7 @@ impl Graph {
             evict_entry.path.clone(),
             SessionPageIds::capture(
                 &projection_revision,
-                self.config.parse_config().digest(),
+                self.config().parse_config().digest(),
                 &evict_doc,
             ),
         );
@@ -1240,7 +1240,7 @@ impl Graph {
                     evict_entry.clone(),
                     Arc::clone(&evict_doc),
                     projection_revision.clone(),
-                    Arc::new(self.config.parse_config()),
+                    Arc::new(self.config().parse_config()),
                 );
                 true
             });

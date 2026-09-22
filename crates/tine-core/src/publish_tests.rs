@@ -2160,7 +2160,7 @@ fn publish_runs_repeated_query_macros_once_per_authored_use() {
         .map(|(entry, document)| (entry.clone(), document.as_ref().clone()))
         .collect();
     let mut snapshot = PublicationGraphSnapshot::new(captured).unwrap();
-    snapshot.graph.config = graph.config.clone();
+    *snapshot.graph.config_mut() = (*graph.config()).clone();
     let reader = CapturedWalkReader {
         graph: &snapshot.graph,
         runs: std::cell::Cell::new(0),
@@ -3175,7 +3175,7 @@ fn graph_publication_ships_the_app_with_a_real_page_as_home() {
     fs::write(dir.join("pages/Private.md"), "- private\n").unwrap();
 
     let mut graph = Graph::open(&dir);
-    graph.config.default_home = Some("Other".to_string());
+    graph.config_mut().default_home = Some("Other".to_string());
     let _projection = prepare_publication_graph(&graph);
     let outcome =
         publish_graph_app(&graph, fake_app_bundle(), "Tine Guide", "Welcome to Tine").unwrap();

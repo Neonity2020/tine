@@ -3494,8 +3494,9 @@ pub(crate) fn publish_graph_documents_inner(
     )?;
     write_publish_stage_file(&stage, "app.js", APP_JS.as_bytes())?;
     write_publish_stage_file(&stage, "enhance.js", ENHANCE_JS.as_bytes())?;
-    let all_public = graph.config.all_pages_public;
-    let favorites: HashSet<&str> = graph.config.favorites.iter().map(|s| s.as_str()).collect();
+    let config = graph.config();
+    let all_public = config.all_pages_public;
+    let favorites: HashSet<&str> = config.favorites.iter().map(|s| s.as_str()).collect();
 
     let snapshot_pages = pages
         .into_iter()
@@ -3578,8 +3579,10 @@ pub(crate) fn publish_graph_documents_inner(
     // exactly those presentation settings — never scope-affecting settings
     // like `:hidden` or `:publishing/all-pages-public?`, which the publish
     // projection resolves from the source graph above.
-    snapshot.graph.config.preferred_workflow = graph.config.preferred_workflow;
-    snapshot.graph.config.block_hidden_properties = graph.config.block_hidden_properties.clone();
+    let config = graph.config();
+    let snapshot_config = snapshot.graph.config_mut();
+    snapshot_config.preferred_workflow = config.preferred_workflow;
+    snapshot_config.block_hidden_properties = config.block_hidden_properties.clone();
 
     // ONE source of truth: a unique, nonempty name→slug map for the exported set.
     // Every filename, cross-page link, block-ref target, and search-index entry is
@@ -3815,7 +3818,8 @@ pub(crate) fn publish_graph_documents_inner(
                         ((*name).to_string(), None)
                     }
                     app_export::AppHome::Auto => {
-                        let configured = graph.config.default_home.as_deref();
+                        let config = graph.config();
+                        let configured = config.default_home.as_deref();
                         let selected = configured
                             .and_then(|requested| {
                                 let wanted = crate::refs::page_key(requested);

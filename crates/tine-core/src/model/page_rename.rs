@@ -158,7 +158,7 @@ impl Graph {
             };
             // Keep the page's own physical extension on rename (an .markdown page
             // stays .markdown; an .org page stays .org).
-            let encoded_new = encode_page_name(&new_name, self.config.file_name_format);
+            let encoded_new = encode_page_name(&new_name, self.config().file_name_format);
             let entry_extension = text_extension_from_path(&entry.path).ok_or_else(bad_path)?;
             let new_path = self
                 .pages_path()
@@ -307,7 +307,7 @@ impl Graph {
                 &content,
                 &rename_map,
                 is_org,
-                self.config.file_name_format,
+                self.config().file_name_format,
             );
             inline_reservation.resize(
                 usize_to_u64(inline.capacity())?,

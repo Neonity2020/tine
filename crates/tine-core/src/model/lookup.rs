@@ -126,7 +126,7 @@ impl Graph {
     fn is_file_named_page(&self, name: &str, path: &Path) -> bool {
         path.parent() == Some(self.pages_path().as_path())
             && path.file_stem().and_then(|stem| stem.to_str())
-                == Some(encode_page_name(name, self.config.file_name_format).as_str())
+                == Some(encode_page_name(name, self.config().file_name_format).as_str())
     }
 
     /// GH #543 (IT-05): open a named page from the file named for it, without
@@ -140,7 +140,7 @@ impl Graph {
     /// such a file over any that claims the name through `title::`. Anything
     /// else returns `None`, and the caller falls back to the page list.
     fn load_page_by_file_name(&self, name: &str) -> io::Result<Option<PageDto>> {
-        let stem = encode_page_name(name, self.config.file_name_format);
+        let stem = encode_page_name(name, self.config().file_name_format);
         if stem.is_empty() {
             return Ok(None);
         }
@@ -599,7 +599,7 @@ impl Graph {
         dto.read_only = read_only_org(&abs, &content);
         self.session_page_ids.write().unwrap().insert(
             abs.clone(),
-            SessionPageIds::capture(&revision, self.config.parse_config().digest(), &document),
+            SessionPageIds::capture(&revision, self.config().parse_config().digest(), &document),
         );
         dto.rev = Some(revision);
         dto.path = self.rel_path(&abs);

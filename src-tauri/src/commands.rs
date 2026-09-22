@@ -5,8 +5,8 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, display_read, owned_graph_context, refresh_graph,
-    slot_for_bound_window, slot_for_context, with_config_graph, with_filesystem_graph,
-    with_trash_graph, AppState, GraphContext,
+    slot_for_bound_window, slot_for_context, with_filesystem_graph, with_trash_graph, AppState,
+    GraphContext,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -1327,9 +1327,7 @@ pub(crate) fn set_favorites(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_favorites(&names).map_err(CommandError::from)
-    })
+    slot_for_context(&state)?.apply_config_write(|g| g.set_favorites(&names))
 }
 
 #[tauri::command]
@@ -1337,9 +1335,7 @@ pub(crate) fn set_favorites_page(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_favorites_page(&name).map_err(CommandError::from)
-    })
+    slot_for_context(&state)?.apply_config_write(|g| g.set_favorites_page(&name))
 }
 
 #[tauri::command]
@@ -1347,13 +1343,8 @@ pub(crate) fn set_default_home(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |graph| {
-        graph
-            .set_default_home_page(name.as_deref())
-            .map_err(CommandError::from)
-    })?;
-    refresh_graph(&state)?;
-    Ok(())
+    slot_for_context(&state)?
+        .apply_config_write(|graph| graph.set_default_home_page(name.as_deref()))
 }
 
 #[tauri::command]
@@ -1361,10 +1352,7 @@ pub(crate) fn set_preferred_workflow(
     workflow: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_preferred_workflow(&workflow)
-            .map_err(CommandError::from)
-    })
+    slot_for_context(&state)?.apply_config_write(|g| g.set_preferred_workflow(&workflow))
 }
 
 #[tauri::command]
@@ -1372,10 +1360,7 @@ pub(crate) fn set_timetracking_enabled(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_presentation_setting(
-        |g| g.set_timetracking_enabled(enabled),
-        |meta| meta.enable_timetracking = enabled,
-    )
+    slot_for_context(&state)?.apply_config_write(|g| g.set_timetracking_enabled(enabled))
 }
 
 #[tauri::command]
@@ -1383,10 +1368,7 @@ pub(crate) fn set_show_brackets(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_presentation_setting(
-        |g| g.set_show_brackets(enabled),
-        |meta| meta.show_brackets = enabled,
-    )
+    slot_for_context(&state)?.apply_config_write(|g| g.set_show_brackets(enabled))
 }
 
 #[tauri::command]
@@ -1394,10 +1376,7 @@ pub(crate) fn set_doc_mode_enter_for_new_block(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_presentation_setting(
-        |g| g.set_doc_mode_enter_for_new_block(enabled),
-        |meta| meta.doc_mode_enter_for_new_block = enabled,
-    )
+    slot_for_context(&state)?.apply_config_write(|g| g.set_doc_mode_enter_for_new_block(enabled))
 }
 
 #[tauri::command]
@@ -1405,10 +1384,7 @@ pub(crate) fn set_logical_outdenting(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_presentation_setting(
-        |g| g.set_logical_outdenting(enabled),
-        |meta| meta.logical_outdenting = enabled,
-    )
+    slot_for_context(&state)?.apply_config_write(|g| g.set_logical_outdenting(enabled))
 }
 
 #[tauri::command]
@@ -1416,10 +1392,7 @@ pub(crate) fn set_guide_announced(
     announced: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_presentation_setting(
-        |g| g.set_guide_announced(announced),
-        |meta| meta.guide_announced = announced,
-    )
+    slot_for_context(&state)?.apply_config_write(|g| g.set_guide_announced(announced))
 }
 
 #[tauri::command]
@@ -1427,17 +1400,13 @@ pub(crate) fn set_default_journal_template(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_default_journal_template(name.as_deref())
-            .map_err(CommandError::from)
-    })
+    slot_for_context(&state)?
+        .apply_config_write(|g| g.set_default_journal_template(name.as_deref()))
 }
 
 #[tauri::command]
 pub(crate) fn set_start_of_week(n: u32, state: GraphContext<'_>) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_start_of_week(n).map_err(CommandError::from)
-    })
+    slot_for_context(&state)?.apply_config_write(|g| g.set_start_of_week(n))
 }
 
 /// Set the graph's `:preferred-format` for new pages/journals ("md" or "org").
@@ -1451,11 +1420,7 @@ pub(crate) fn set_preferred_format(
     } else {
         tine_core::model::Format::Md
     };
-    with_config_graph(&state, |g| {
-        g.set_preferred_format(fmt).map_err(CommandError::from)
-    })?;
-    refresh_graph(&state)?; // so new pages/journals use the new extension immediately
-    Ok(())
+    slot_for_context(&state)?.apply_config_write(|g| g.set_preferred_format(fmt))
 }
 
 /// Set the graph's `:journal/page-title-format` (journal display-title format,
@@ -1465,10 +1430,7 @@ pub(crate) fn set_journal_title_format(
     format: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_journal_page_title_format(&format)
-            .map_err(CommandError::from)
-    })?;
+    slot_for_context(&state)?.apply_config_write(|g| g.set_journal_page_title_format(&format))?;
     refresh_graph(&state)?; // pick up the new format + migrate any title-named journals
     Ok(())
 }

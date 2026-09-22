@@ -155,6 +155,83 @@ pub struct LogbookSettings {
     pub enabled_in_all_blocks: bool,
 }
 
+/// How far a change to `config.edn` reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigReach {
+    Unchanged,
+    /// Only settings that are read when used: the graph takes the new
+    /// configuration in place and keeps its pages and its index.
+    Settings,
+    /// A setting the graph was opened, parsed or indexed with: only a new
+    /// `Graph` can take it in.
+    Graph,
+}
+
+/// The one classification of every `Config` field. The destructure in
+/// `reach` names every field, so a new field does not compile until it is
+/// listed here. A `settings` field must be one nothing copies at open or
+/// into the index (`config_reach_tests` checks the places that do).
+macro_rules! config_reach {
+    (graph: [$($g:ident),* $(,)?], settings: [$($s:ident),* $(,)?] $(,)?) => {
+        impl Config {
+            /// The fields a [`ConfigReach::Settings`] change may move.
+            pub const SETTINGS_FIELDS: &'static [&'static str] = &[$(stringify!($s)),*];
+
+            /// How far the change from `self` to `new` reaches.
+            pub fn reach(&self, new: &Config) -> ConfigReach {
+                let Config { $($g,)* $($s,)* } = self;
+                if false $(|| *$g != new.$g)* {
+                    return ConfigReach::Graph;
+                }
+                if false $(|| *$s != new.$s)* {
+                    return ConfigReach::Settings;
+                }
+                ConfigReach::Unchanged
+            }
+        }
+    };
+}
+
+config_reach! {
+    graph: [
+        // Where graph text lives and which of it is admitted.
+        journals_dir,
+        pages_dir,
+        hidden,
+        hidden_parse_failed_closed,
+        file_name_format,
+        // Parser inputs (`ParseConfig`): every parsed page depends on them.
+        block_hidden_properties,
+        separated_by_commas,
+        ignored_page_references_keywords,
+        journal_file_name_format,
+        journal_page_title_format,
+        // Decide which pages exist.
+        property_pages_enabled,
+        property_pages_excludelist,
+    ],
+    settings: [
+        preferred_workflow,
+        shortcuts,
+        all_pages_public,
+        start_of_week,
+        linked_references_collapsed_threshold,
+        default_journal_template,
+        default_home,
+        favorites,
+        // Excluded from references when a query runs, not when it is indexed.
+        favorites_page,
+        preferred_format,
+        macros,
+        enable_timetracking,
+        show_brackets,
+        doc_mode_enter_for_new_block,
+        logical_outdenting,
+        logbook,
+        guide_announced,
+    ],
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -1307,6 +1384,85 @@ impl Config {
 }
 
 #[cfg(test)]
+mod config_reach_tests {
+    use super::*;
+
+    #[test]
+    fn a_change_reaches_the_graph_only_through_a_graph_field() {
+        let base = Config::parse("{}");
+        assert_eq!(base.reach(&base.clone()), ConfigReach::Unchanged);
+        let home = Config::parse(r#"{:default-home {:page "Start"}}"#);
+        assert_eq!(base.reach(&home), ConfigReach::Settings);
+        let favorites = Config::parse(r#"{:favorites ["A"] :tine/favorites-page "F"}"#);
+        assert_eq!(base.reach(&favorites), ConfigReach::Settings);
+        let hidden = Config::parse(r#"{:hidden ["drafts"] :default-home {:page "Start"}}"#);
+        assert_eq!(base.reach(&hidden), ConfigReach::Graph);
+        let title = Config::parse(r#"{:journal/page-title-format "yyyy-MM-dd"}"#);
+        assert_eq!(base.reach(&title), ConfigReach::Graph);
+    }
+
+    /// Exports and the CLI read settings from the graph: one written through
+    /// the graph is the one they read, without reopening it. Favorites and the
+    /// workflow were read as the graph opened until the next launch.
+    #[test]
+    fn a_setting_written_through_the_graph_is_the_one_it_reads() {
+        let dir = std::env::temp_dir().join(format!("tine-config-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        std::fs::write(dir.join("logseq/config.edn"), "{}\n").unwrap();
+        let graph = crate::model::Graph::open(&dir);
+        graph.set_favorites(&["A".to_owned()]).unwrap();
+        graph.set_default_home_page(Some("Home")).unwrap();
+        graph.set_journal_page_title_format("yyyy-MM-dd").unwrap();
+        let config = graph.config();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(config.favorites, vec!["A".to_owned()]);
+        assert_eq!(config.default_home.as_deref(), Some("Home"));
+        // Reaches the graph: this instance keeps the format it parsed with.
+        assert_eq!(config.journal_page_title_format, None);
+    }
+
+    /// A `settings` field is taken in place, so nothing may copy it where a
+    /// swap cannot reach: into what the graph derives when it opens, or into
+    /// the parser input every indexed page is stored under. If this fails,
+    /// the field belongs in `graph:` in `config_reach!` (GH #543, R2-P1).
+    #[test]
+    fn a_settings_field_is_not_copied_at_open_or_into_the_index() {
+        let sources = [
+            ("model/open_graph.rs", include_str!("model/open_graph.rs")),
+            (
+                "model/projection_lifetime.rs",
+                include_str!("model/projection_lifetime.rs"),
+            ),
+            ("config.rs parse_config", {
+                let source = include_str!("config.rs");
+                let start = source.find("pub fn parse_config(&self)").unwrap();
+                &source[start..start + source[start..].find("\n    }\n").unwrap()]
+            }),
+        ];
+        let mut copied = Vec::new();
+        for field in Config::SETTINGS_FIELDS {
+            for (name, source) in sources {
+                if [
+                    format!("config.{field}"),
+                    format!("config().{field}"),
+                    format!("self.{field}"),
+                ]
+                .iter()
+                .any(|read| source.contains(read.as_str()))
+                {
+                    copied.push(format!("{name}: {field}"));
+                }
+            }
+        }
+        assert!(
+            copied.is_empty(),
+            "settings fields copied where a swap cannot reach: {copied:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod parse_config_tests {
     use super::*;
 
@@ -1625,7 +1781,7 @@ mod tests {
         std::fs::write(dir.join("logseq").join("config.edn"), original).unwrap();
 
         let g = crate::model::Graph::open(&dir);
-        assert_eq!(g.config.favorites_page, None);
+        assert_eq!(g.config().favorites_page, None);
         g.set_favorites_page("Favorites").unwrap();
 
         let written = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
@@ -1716,7 +1872,7 @@ mod tests {
         assert!(written.contains(";; keep me"), "{written}");
         assert!(written.contains(":start-of-week 2"), "{written}");
         assert_eq!(
-            Graph::open(&dir).config.default_home.as_deref(),
+            Graph::open(&dir).config().default_home.as_deref(),
             Some("New \"Home\"")
         );
 
@@ -1724,7 +1880,7 @@ mod tests {
         let cleared = fs::read_to_string(&path).unwrap();
         assert!(!cleared.contains(":page \"New"), "{cleared}");
         assert!(cleared.contains(":sidebar [\"Contents\"]"), "{cleared}");
-        assert_eq!(Graph::open(&dir).config.default_home, None);
+        assert_eq!(Graph::open(&dir).config().default_home, None);
 
         fs::write(&path, "{:start-of-week 2}\n").unwrap();
         Graph::open(&dir)
@@ -1866,9 +2022,9 @@ mod tests {
             "not written: {after}"
         );
         assert!(after.contains(":start-of-week 0"), "other keys preserved");
-        assert!(!Graph::open(&dir).config.enable_timetracking);
+        assert!(!Graph::open(&dir).config().enable_timetracking);
         Graph::open(&dir).set_timetracking_enabled(true).unwrap();
-        assert!(Graph::open(&dir).config.enable_timetracking);
+        assert!(Graph::open(&dir).config().enable_timetracking);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1899,7 +2055,7 @@ mod tests {
             after.contains(";; preserve this comment"),
             "comments preserved"
         );
-        assert!(!Graph::open(&dir).config.show_brackets);
+        assert!(!Graph::open(&dir).config().show_brackets);
         let _ = fs::remove_dir_all(&dir);
     }
 

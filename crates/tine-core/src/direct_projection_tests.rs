@@ -519,7 +519,7 @@ fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
     };
     assert!(job.query_revision > initial_revision);
     assert_eq!(job.query_revision, job.snapshot.query_revision().unwrap());
-    assert_eq!(job.config.digest(), graph.config.parse_config().digest());
+    assert_eq!(job.config.digest(), graph.config().parse_config().digest());
     assert!(job.registry.is_none());
     let acquired_revision = job.query_revision;
     assert_eq!(
@@ -3834,7 +3834,7 @@ fn parsed_snapshot(graph: &Graph) -> (PageSnapshot, PageRevisions, Arc<ParseConf
     (
         Arc::new(pages),
         Arc::new(revisions),
-        Arc::new(graph.config.parse_config()),
+        Arc::new(graph.config().parse_config()),
     )
 }
 
@@ -4627,7 +4627,7 @@ fn query_registry_snapshot_preserves_old_reads_without_publishing_over_new_edits
     let QueryJobOpen::Job(mut old_job) = projection.open_query_job(old_generation) else {
         panic!("initial snapshot must be ready");
     };
-    let config = graph.config.parse_config();
+    let config = graph.config().parse_config();
     let old = old_job.read_registry(&config).unwrap();
     assert!(!old.rows().is_empty());
     let legacy = graph.property_registry();
@@ -4678,7 +4678,7 @@ fn query_registry_live_text_edits_reuse_cache_and_property_edits_patch_it() {
     graph.warm_cache();
     wait_ready(&graph);
     let projection = graph.direct_projection_test().unwrap();
-    let config = graph.config.parse_config();
+    let config = graph.config().parse_config();
     let read = || {
         let QueryJobOpen::Job(mut job) = projection.open_query_job(graph.cache_generation()) else {
             panic!("ready query snapshot");
@@ -4765,7 +4765,7 @@ fn query_registry_snapshot_rejects_orphaned_property_owners() {
         panic!("the schema still opens before corrupt ownership is inspected");
     };
     assert!(matches!(
-        job.read_registry(&graph.config.parse_config()),
+        job.read_registry(&graph.config().parse_config()),
         Err(QueryExecutionError::Unavailable(
             QueryUnavailableReason::InvalidSnapshot
         ))
@@ -4890,7 +4890,7 @@ fn task_query_skips_registry_capture_after_many_dirty_property_keys() {
         panic!("the ready projection admits a registry-free job");
     };
     assert!(matches!(
-        registry_free.read_registry(&graph.config.parse_config()),
+        registry_free.read_registry(&graph.config().parse_config()),
         Err(crate::query::QueryExecutionError::Unavailable(
             crate::query::QueryUnavailableReason::InvalidSnapshot
         ))
@@ -5013,7 +5013,7 @@ fn publication_sources_are_compared_inside_the_owned_main_snapshot() {
             (entry, revision)
         })
         .collect::<Vec<_>>();
-    let config = graph.config.parse_config();
+    let config = graph.config().parse_config();
     let projection = graph.direct_projection_test().unwrap();
     let QueryJobOpen::Job(mut old) =
         projection.open_current_query_job(RegistrySensitivity::Insensitive)
@@ -6746,7 +6746,7 @@ fn a_warm_does_not_take_a_later_attempts_verdict() {
     graph.warm_cache();
     wait_ready(&graph);
     let projection = graph.direct_projection_test().unwrap();
-    let config = Arc::new(graph.config.parse_config());
+    let config = Arc::new(graph.config().parse_config());
 
     // Attempt A announces a warm and is descheduled before reading its verdict.
     let (sources, bytes) = warm_sources(&graph);
@@ -6922,7 +6922,7 @@ fn a_page_the_walk_could_not_read_keeps_the_rows_it_already_had() {
         .map(|(entry, _)| entry)
         .collect::<Vec<_>>();
     assert_eq!(retained.len(), 1, "fixture did not contain the page");
-    let config = Arc::new(graph.config.parse_config());
+    let config = Arc::new(graph.config().parse_config());
     let generation = graph.cache_generation();
     let order = walk_order(&sources, &retained);
     let attempt = require_warm(projection.enqueue_warm(
@@ -6971,7 +6971,7 @@ fn a_page_the_walk_could_not_read_keeps_its_place_for_later_updates() {
     let retained = vec![all[0].0.clone()];
     let later = all.last().unwrap().0.clone();
     let sources = all.into_iter().skip(1).collect::<Vec<_>>();
-    let config = Arc::new(graph.config.parse_config());
+    let config = Arc::new(graph.config().parse_config());
     let attempt = require_warm(projection.enqueue_warm(
         graph.cache_generation(),
         sources,

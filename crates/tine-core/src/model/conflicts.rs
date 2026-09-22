@@ -114,7 +114,7 @@ impl Graph {
                         .parse(base_stem)
                         .map(|d| self.journal_format.title(d))
                         .unwrap_or_else(|| base_stem.to_string()),
-                    PageKind::Page => decode_page_name(base_stem, self.config.file_name_format),
+                    PageKind::Page => decode_page_name(base_stem, self.config().file_name_format),
                 };
                 let tag = stem[base_stem.len()..]
                     .trim_matches(|c: char| c == '.' || c == ' ' || c == '(' || c == ')')
@@ -184,7 +184,7 @@ impl Graph {
                         .parse(stem)
                         .map(|d| self.journal_format.title(d))
                         .unwrap_or_else(|| stem.to_string()),
-                    PageKind::Page => decode_page_name(stem, self.config.file_name_format),
+                    PageKind::Page => decode_page_name(stem, self.config().file_name_format),
                 };
                 out.push(VcsMarkerConflict {
                     path: self.rel_path(&p),

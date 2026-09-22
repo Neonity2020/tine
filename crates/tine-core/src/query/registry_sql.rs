@@ -829,7 +829,7 @@ mod tests {
     fn direct_wrapper_and_shared_full_reader_return_the_same_registry() {
         let _serial = SERIAL.lock().unwrap();
         let (root, database, graph) = projection_fixture("direct-parity");
-        let config = graph.config.parse_config();
+        let config = graph.config().parse_config();
         let projection = graph.direct_projection_test().unwrap();
         let QueryJobOpen::Job(mut job) = projection.open_query_job(graph.cache_generation()) else {
             panic!("ready fixture must admit a Direct query job");
@@ -846,7 +846,7 @@ mod tests {
     fn affected_patch_matches_full_rebuild_across_values_counts_and_declarations() {
         let _serial = SERIAL.lock().unwrap();
         let (root, database, graph) = projection_fixture("patch-parity");
-        let config = graph.config.parse_config();
+        let config = graph.config().parse_config();
         let base = build_base(&database, &config).with_generation(37);
         assert!(base.row("score").unwrap().declared.is_none());
         let unchanged = base.row("unchanged").unwrap().clone();
@@ -922,7 +922,7 @@ mod tests {
     fn affected_patch_does_not_decode_unrelated_property_rows() {
         let _serial = SERIAL.lock().unwrap();
         let (root, database, graph) = projection_fixture("bounded-rows");
-        let config = graph.config.parse_config();
+        let config = graph.config().parse_config();
         let base = build_base(&database, &config);
         drop(graph);
 
@@ -967,7 +967,7 @@ mod tests {
     fn empty_patch_is_statement_free_but_still_honors_digest_and_cancellation() {
         let _serial = SERIAL.lock().unwrap();
         let (root, database, graph) = projection_fixture("empty");
-        let config = graph.config.parse_config();
+        let config = graph.config().parse_config();
         let base = build_base(&database, &config);
         drop(graph);
 
@@ -1004,7 +1004,7 @@ mod tests {
 
     fn assert_patch_rejects_damage(tag: &str, damage: &str) {
         let (root, database, graph) = projection_fixture(tag);
-        let config = graph.config.parse_config();
+        let config = graph.config().parse_config();
         let base = build_base(&database, &config);
         drop(graph);
         let connection = rusqlite::Connection::open(&database).unwrap();

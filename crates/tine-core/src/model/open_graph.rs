@@ -45,8 +45,8 @@ impl Graph {
         approved_assets: Option<&Path>,
     ) -> io::Result<Graph> {
         let mut graph = Self::open(root);
-        validate_graph_dir(&graph.root, &graph.config.journals_dir, "journals")?;
-        validate_graph_dir(&graph.root, &graph.config.pages_dir, "pages")?;
+        validate_graph_dir(&graph.root, &graph.config().journals_dir, "journals")?;
+        validate_graph_dir(&graph.root, &graph.config().pages_dir, "pages")?;
         validate_graph_dir(&graph.root, "logseq", "logseq")?;
         validate_graph_dir(&graph.root, "publish", "publish")?;
         // `.tine-sync` (left behind by the removed Managed Storage mode) is not
@@ -429,7 +429,7 @@ impl Graph {
             projection_root,
             interrupted_publication_claimants: RwLock::new(std::collections::BTreeSet::new()),
             root,
-            config,
+            config: RwLock::new(Arc::new(config)),
             graph_text_scope,
             reconciliation_scan_open_config_description: config_bytes
                 .as_deref()

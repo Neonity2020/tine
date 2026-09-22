@@ -70,6 +70,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Changing the home page or the format for new pages, or an outside edit to
+  a setting in `config.edn`, reopened the graph and restarted indexing. On
+  the first launch after upgrading, moving a home page set on this device
+  into `config.edn` did this too. Settings now apply in place (GH #543).
+- Exports used the favorites and workflow the graph had when it opened,
+  ignoring changes made since.
 - Saving or deleting a page while Tine was still reading the graph at launch
   made it throw that work away and read the whole graph again. Only the
   changed page is read again now (GH #543).

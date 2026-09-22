@@ -105,8 +105,8 @@ impl QueryGraph for Graph {
         Graph::cache_generation(self)
     }
 
-    fn config(&self) -> &Config {
-        &self.config
+    fn config(&self) -> Arc<Config> {
+        Graph::config(self)
     }
 
     #[cfg(test)]

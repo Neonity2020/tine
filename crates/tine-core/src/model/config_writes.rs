@@ -40,6 +40,9 @@ impl Graph {
     ) -> io::Result<()> {
         crate::filesystem_durability::atomic_update(path, &CONFIG_LOCK, edit)?;
         self.note_config_write();
+        // A setting is read when it is used, so it applies now; a change that
+        // reaches the graph waits for the caller to open a new one.
+        self.take_in_config();
         Ok(())
     }
 

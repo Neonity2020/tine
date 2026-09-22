@@ -305,7 +305,11 @@ pub struct Graph {
     /// approved an external assets symlink/junction it is that exact resolved
     /// directory. No other graph path may use this capability.
     assets_root: PathBuf,
-    pub config: Config,
+    /// The graph's `config.edn` as last taken in. A change whose
+    /// [`Config::reach`] is `Settings` replaces it in place; a change that
+    /// reaches the graph replaces the whole `Graph`. Read it with
+    /// [`Graph::config`].
+    config: RwLock<Arc<Config>>,
     /// Sole versioned eligibility policy for normal graph text discovery and
     /// exact existing-file access. It grants no creation/projection authority.
     graph_text_scope: GraphTextScope,

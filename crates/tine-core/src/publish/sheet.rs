@@ -965,7 +965,7 @@ fn render_sheet_table(
     out: &mut String,
 ) {
     let user_hidden: &[String] = match emit.ctx.graph {
-        Some(graph) => &graph.config.block_hidden_properties,
+        Some(graph) => &graph.config().block_hidden_properties,
         None => &[],
     };
     let columns = sheet_columns(cfg, rows, query_backed, user_hidden);
@@ -1362,7 +1362,7 @@ pub(super) fn render_children_sheet(
             let workflow = emit
                 .ctx
                 .graph
-                .map(|g| g.config.preferred_workflow)
+                .map(|g| g.config().preferred_workflow)
                 .unwrap_or(crate::Workflow::Now);
             render_sheet_board(cfg, &rows, emit, workflow, false, counter, index, out);
         }
@@ -1413,7 +1413,7 @@ pub(super) fn render_query_sheet(
                 cfg,
                 &rows,
                 emit,
-                graph.config.preferred_workflow,
+                graph.config().preferred_workflow,
                 true,
                 &mut counter,
                 &mut sink,

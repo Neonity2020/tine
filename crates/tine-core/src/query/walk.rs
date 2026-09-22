@@ -216,7 +216,7 @@ impl QueryPageSource for GraphQueryPages<'_> {
     }
 
     fn parse_config(&self) -> crate::config::ParseConfig {
-        self.0.config.parse_config()
+        self.0.config().parse_config()
     }
 
     fn registry(&self) -> std::sync::Arc<crate::query::registry::Registry> {

@@ -1109,7 +1109,7 @@ export function mockBackend(): Backend {
       return collect((b) => blockRefIds(b.raw).includes(uuid));
     },
     async setDefaultHome(): Promise<void> {
-      notifyGraphRebound();
+      // Taken in place: the real backend keeps the Graph (GH #543).
     },
     async deletePage(): Promise<void> {
       // no-op in mock
@@ -1420,13 +1420,13 @@ export function mockBackend(): Backend {
     async setLogicalOutdenting(): Promise<void> {
       // Presentation-only: the real backend keeps the Graph (GH #543).
     },
-    // These settings reach `refresh_graph` in the real backend, which installs a
+    async setPreferredFormat(): Promise<void> {
+      // Taken in place: the real backend keeps the Graph (GH #543).
+    },
+    // This setting reaches `refresh_graph` in the real backend, which installs a
     // FRESH Graph with an empty editor-activation registry. Not a no-op even
     // here: a mock that silently omits a contract lets every test that uses it
     // prove the wrong thing. (GH #254 increment 3, round 15.)
-    async setPreferredFormat(): Promise<void> {
-      notifyGraphRebound();
-    },
     async setJournalTitleFormat(): Promise<void> {
       notifyGraphRebound();
     },

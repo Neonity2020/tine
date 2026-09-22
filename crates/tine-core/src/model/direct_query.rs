@@ -476,7 +476,7 @@ impl Graph {
                 request,
                 crate::direct_projection::RegistrySensitivity::Required,
                 |job| {
-                    if !job.publication_sources_match(sources, &self.config.parse_config())? {
+                    if !job.publication_sources_match(sources, &self.config().parse_config())? {
                         return Ok(Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             "The graph is still updating. Try publishing again shortly.",
@@ -1074,7 +1074,7 @@ impl Graph {
             return self.parse_pages_on_demand_with_revisions(generation, sources);
         };
         let revisions = self.disk_revs.read().unwrap();
-        let config_digest = self.config.parse_config().digest();
+        let config_digest = self.config().parse_config().digest();
         let mut pages = Vec::with_capacity(sources.len());
         for (relative, projected_revision) in sources {
             let path = self.root.join(&relative);
@@ -1190,8 +1190,8 @@ impl Graph {
                         target,
                     );
                     let format = crate::date::JournalFormat::new(
-                        self.config.journal_file_name_format.as_deref(),
-                        self.config.journal_page_title_format.as_deref(),
+                        self.config().journal_file_name_format.as_deref(),
+                        self.config().journal_page_title_format.as_deref(),
                     );
                     if let Some(target_day) = format.parse(target) {
                         let rows = crate::query::projection_sql::run(
@@ -1322,7 +1322,7 @@ impl Graph {
             self_page,
             kind,
             mode,
-            &self.config,
+            &self.config(),
         )?;
         let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
         Some((pages, candidates.blocks, candidates.page_owners))

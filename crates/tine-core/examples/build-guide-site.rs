@@ -88,7 +88,7 @@ fn main() {
     create_demo_graph(&tmp).expect("scaffold demo graph");
 
     let mut graph = Graph::open(&tmp);
-    graph.config.all_pages_public = true;
+    graph.config_mut().all_pages_public = true;
     let projection_dir = tempfile::tempdir().expect("create derived-state directory");
     graph
         .attach_direct_projection(projection_dir.path().join("direct.sqlite"))

@@ -97,7 +97,7 @@ impl GraphSlot {
     /// Settings use the short-lived filesystem capability, enforced in
     /// `tine-core` by `Graph::ensure_config_write_target`, without graph-text
     /// authority.
-    pub(crate) fn with_config_graph<T>(
+    fn with_config_graph<T>(
         &self,
         f: impl FnOnce(&Graph) -> Result<T, CommandError>,
     ) -> Result<T, CommandError> {
@@ -127,19 +127,31 @@ impl GraphSlot {
         self.graph_meta.read().unwrap().clone()
     }
 
-    /// Persist a presentation-only setting and update the meta the frontend
-    /// reads, keeping this `Graph` and its index. Only for settings nothing in
-    /// the core reads: `refresh_graph` retires the projection worker, reopens
-    /// the graph and starts the launch check again, which on a first launch
-    /// threw away the whole index build for a toggle (GH #543, IT-06).
-    pub(crate) fn apply_presentation_setting(
+    /// Write `config.edn`, then take the change in as far as it reaches. The
+    /// one way a command writes configuration: whether the graph must be
+    /// reopened is [`tine_core::config::Config::reach`]'s answer, never the
+    /// command's. Reopening retires the index worker and starts the launch
+    /// check again, which on a first launch threw away the whole index build
+    /// for a toggle (GH #543, IT-06 and R2-P1).
+    pub(crate) fn apply_config_write(
         &self,
         write: impl FnOnce(&Graph) -> std::io::Result<()>,
-        update: impl FnOnce(&mut tine_core::model::GraphMeta),
     ) -> Result<(), CommandError> {
         self.with_config_graph(|graph| write(graph).map_err(CommandError::from))?;
-        update(&mut self.graph_meta.write().unwrap());
+        // The core took the change in as far as it reaches (`write_config`).
+        *self.graph_meta.write().unwrap() = self.graph.meta();
         Ok(())
+    }
+
+    /// Take in `config.edn` as far as the change reaches settings, and give
+    /// the frontend the new meta. A change that reaches the graph leaves this
+    /// slot as it is; only a new `Graph` can take it in.
+    pub(crate) fn take_in_config(&self) -> tine_core::config::ConfigReach {
+        let reach = self.graph.take_in_config();
+        if reach == tine_core::config::ConfigReach::Settings {
+            *self.graph_meta.write().unwrap() = self.graph.meta();
+        }
+        reach
     }
 
     /// Re-open the graph object for the same window/root without revoking the
@@ -466,7 +478,9 @@ pub(crate) fn display_read<T>(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Err(CommandError::prose("stale-graph-binding"))
+    Err(CommandError::graph(
+        "the graph was replaced and its replacement was not bound in time",
+    ))
 }
 
 /// Resolve the only graph capability granted to the capture WebView: a bounded
@@ -503,14 +517,6 @@ pub(crate) fn with_filesystem_graph<T>(
     f: impl FnOnce(&Graph) -> Result<T, CommandError>,
 ) -> Result<T, CommandError> {
     slot_for_context(ctx)?.with_filesystem_graph(f)
-}
-
-/// Run a `logseq/config.edn` write. See [`GraphSlot::with_config_graph`].
-pub(crate) fn with_config_graph<T>(
-    ctx: &GraphContext<'_>,
-    f: impl FnOnce(&Graph) -> Result<T, CommandError>,
-) -> Result<T, CommandError> {
-    slot_for_context(ctx)?.with_config_graph(f)
 }
 
 /// Run a recoverable-trash write under either authority. See
@@ -595,7 +601,7 @@ pub(crate) fn refresh_graph_for_label(
         .unwrap()
         .swap_refreshed(&label, &old, Arc::clone(&replacement))
     {
-        return Err(CommandError::prose(
+        return Err(CommandError::graph(
             "graph changed while its configuration refresh was running",
         ));
     }
@@ -755,7 +761,7 @@ mod tests {
         "activate_absent_editor",
         "activate_editor",
         "apply_journal_filename_migrations",
-        "apply_presentation_setting",
+        "apply_config_write",
         "begin_direct_cross_page_move",
         "capture_live_save_conflict",
         "copy_guide_into_bound_graph",
@@ -955,13 +961,15 @@ mod tests {
         }
     }
 
-    /// GH #543 (indexing audit IT-06): a presentation-only setting keeps the
-    /// Graph, its index and its launch check. Toggling one used to refresh the
+    /// GH #543 (indexing audit IT-06, R2-P1): a change to settings keeps the
+    /// Graph, its index and its launch check. Changing one used to refresh the
     /// graph: the projection worker was retired and the graph reopened, and on
-    /// a first launch -- when dismissing the Guide toast is most likely -- the
-    /// whole index build restarted from nothing.
+    /// a first launch -- when dismissing the Guide toast is most likely, and
+    /// when a device-local home page is migrated into config.edn -- the whole
+    /// index build restarted from nothing.
     #[test]
-    fn a_presentation_setting_keeps_the_graph_and_its_index() {
+    fn a_settings_change_keeps_the_graph_and_its_index() {
+        use tine_core::config::ConfigReach;
         let root = std::env::temp_dir().join(format!(
             "tine-presentation-setting-{}-{:?}",
             std::process::id(),
@@ -989,25 +997,48 @@ mod tests {
         assert!(answered > 0, "the fixture has a referring block");
         assert!(!slot.graph_meta().show_brackets || !slot.graph_meta().guide_announced);
 
-        slot.apply_presentation_setting(
-            |graph| graph.set_show_brackets(true),
-            |meta| meta.show_brackets = true,
-        )
-        .unwrap();
-        slot.apply_presentation_setting(
-            |graph| graph.set_guide_announced(true),
-            |meta| meta.guide_announced = true,
-        )
-        .unwrap();
+        slot.apply_config_write(|graph| graph.set_show_brackets(true))
+            .unwrap();
+        slot.apply_config_write(|graph| graph.set_guide_announced(true))
+            .unwrap();
+        slot.apply_config_write(|graph| graph.set_default_home_page(Some("Alpha")))
+            .unwrap();
+        slot.apply_config_write(|graph| graph.set_preferred_format(tine_core::model::Format::Org))
+            .unwrap();
 
         assert!(
             Arc::ptr_eq(&before, &slot.graph()),
             "the graph was replaced"
         );
-        assert!(slot.graph_meta().show_brackets && slot.graph_meta().guide_announced);
-        // Persisted: the next open reads both.
+        let meta = slot.graph_meta();
+        assert!(meta.show_brackets && meta.guide_announced);
+        assert_eq!(meta.default_home.as_deref(), Some("Alpha"));
+        assert_eq!(meta.preferred_format, "org");
+        // The core reads what it was given, not what it was opened with.
+        assert_eq!(slot.graph().config().default_home.as_deref(), Some("Alpha"));
+        // Persisted: the next open reads them.
         let reopened = Graph::open(&root).meta();
         assert!(reopened.show_brackets && reopened.guide_announced);
+        assert_eq!(reopened.default_home.as_deref(), Some("Alpha"));
+
+        // An outside edit (another instance, Logseq, Syncthing) to a setting
+        // is taken in the same way when the watcher sees it.
+        Graph::open(&root).set_show_brackets(false).unwrap();
+        assert_eq!(slot.take_in_config(), ConfigReach::Settings);
+        assert!(
+            Arc::ptr_eq(&before, &slot.graph()),
+            "the graph was replaced"
+        );
+        assert!(!slot.graph_meta().show_brackets);
+        // One that reaches the graph is not: the watcher opens a new Graph.
+        Graph::open(&root)
+            .set_journal_page_title_format("yyyy-MM-dd")
+            .unwrap();
+        assert_eq!(slot.take_in_config(), ConfigReach::Graph);
+        assert_ne!(
+            slot.graph().config().journal_page_title_format.as_deref(),
+            Some("yyyy-MM-dd")
+        );
         // The index was never detached: the same query answers at once, with
         // no second launch check (a refresh would need one before answering).
         assert_eq!(alpha_ref_count(&before).ok(), Some(answered));

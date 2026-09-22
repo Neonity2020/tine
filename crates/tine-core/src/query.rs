@@ -1177,6 +1177,7 @@ fn collect_reference_occurrences_in<G: QueryGraph>(
         refs::ReferenceSourceExclusions::new(self_page, graph.config().favorites_page.as_deref());
     let mut accumulator = BoundedReferenceGroups::new(max_rows, max_bytes);
     let pages = candidate_pages.pages.as_slice();
+    let config = graph.config();
     let mut sources = pages.iter().collect::<Vec<_>>();
     sources.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
     for (entry, doc) in sources {
@@ -1194,11 +1195,11 @@ fn collect_reference_occurrences_in<G: QueryGraph>(
             .and_then(|pre| page_property_block(entry, pre))
         {
             if accumulator.closed() {
-                if block_has_reference(&block, names_norm, kind, graph.config()) {
+                if block_has_reference(&block, names_norm, kind, &config) {
                     accumulator.deny();
                 }
             } else if let Some(hit) =
-                block_reference_evidence(&block, canonical, names_norm, kind, graph.config())
+                block_reference_evidence(&block, canonical, names_norm, kind, &config)
             {
                 // The page-property DTO is the estimate's own input here, so it
                 // is built before admission on this one row (unchanged).
@@ -1226,10 +1227,9 @@ fn collect_reference_occurrences_in<G: QueryGraph>(
                     return None;
                 }
                 if construction_closed.get() {
-                    block_has_reference(block, names_norm, kind, graph.config()).then_some(None)
+                    block_has_reference(block, names_norm, kind, &config).then_some(None)
                 } else {
-                    block_reference_evidence(block, canonical, names_norm, kind, graph.config())
-                        .map(Some)
+                    block_reference_evidence(block, canonical, names_norm, kind, &config).map(Some)
                 }
             },
             &mut |block, ancestors, hit| {
@@ -1767,6 +1767,7 @@ pub fn reference_diagnostics<G: QueryGraph>(graph: &G, target: &str) -> Referenc
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let excluded_page = refs::page_key(&self_page);
+    let config = graph.config();
     let mut traces = graph.with_pages(|pages| {
         let mut traces = Vec::new();
         for (entry, document) in pages {
@@ -1777,7 +1778,7 @@ pub fn reference_diagnostics<G: QueryGraph>(graph: &G, target: &str) -> Referenc
                     block.is_org,
                     &canonical,
                     &names_norm,
-                    graph.config(),
+                    &config,
                 );
                 let raw_lower = block.raw.to_lowercase();
                 let textual_candidate = names_norm.iter().any(|name| raw_lower.contains(name));

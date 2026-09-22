@@ -20,7 +20,7 @@ impl Graph {
                     self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
                     snapshot,
                     revisions,
-                    Arc::new(self.config.parse_config()),
+                    Arc::new(self.config().parse_config()),
                     self.page_index_failures.read().unwrap().is_empty(),
                 );
             }
@@ -199,7 +199,7 @@ impl Graph {
                 generation,
                 pages,
                 revisions,
-                Arc::new(self.config.parse_config()),
+                Arc::new(self.config().parse_config()),
                 source_complete,
             );
         }
@@ -218,7 +218,7 @@ impl Graph {
                 entry,
                 document,
                 revision,
-                Arc::new(self.config.parse_config()),
+                Arc::new(self.config().parse_config()),
             );
         }
     }
@@ -246,7 +246,11 @@ impl Graph {
             }
         }
         if let Some(projection) = self.direct_projection.get() {
-            projection.enqueue_page_set(generation, changes, Arc::new(self.config.parse_config()));
+            projection.enqueue_page_set(
+                generation,
+                changes,
+                Arc::new(self.config().parse_config()),
+            );
         }
     }
 
@@ -398,7 +402,7 @@ impl Graph {
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
         let permit = self.admit_retained_graph_text_writer().ok()?;
         let mut pages = Vec::with_capacity(sources.len());
-        let config_digest = self.config.parse_config().digest();
+        let config_digest = self.config().parse_config().digest();
         for (relative, projected_revision) in sources {
             let absolute = self.root.join(&relative);
             let entry = self.graph_inventory_entry(&absolute).ok()??;
@@ -448,7 +452,7 @@ impl Graph {
             projection.property_facets(
                 generation,
                 autocomplete,
-                &self.config.block_hidden_properties,
+                &self.config().block_hidden_properties,
                 max_items,
                 max_bytes,
             )

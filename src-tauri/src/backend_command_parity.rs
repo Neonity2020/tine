@@ -1007,31 +1007,29 @@ mod tests {
         );
     }
 
-    /// GH #543 (indexing audit IT-06): a presentation-only setting must not
-    /// reopen the graph. `refresh_graph` retires the index worker and restarts
-    /// the launch check, and on a first launch that discarded the whole index
-    /// build for a toggle. Nothing in tine-core reads these settings; they go
-    /// through `GraphSlot::apply_presentation_setting`. A setting the core does
-    /// read (a new page's extension, the journal title format, the published
-    /// home page) still refreshes.
+    /// GH #543 (indexing audit IT-06, R2-P1): a settings command does not
+    /// decide to reopen the graph; `Config::reach` does, inside
+    /// `GraphSlot::apply_config_write`. `refresh_graph` retires the index
+    /// worker and restarts the launch check, so a settings command that calls
+    /// it by hand restarts indexing for a toggle. The one exception reopens
+    /// for more than configuration: a new journal title format migrates
+    /// title-named journal files.
     #[test]
-    fn presentation_settings_do_not_reopen_the_graph() {
+    fn settings_commands_leave_reopening_to_the_config_reach() {
         let reopening = commands_that_reopen_the_graph();
-        let offenders: Vec<&str> = [
-            "set_timetracking_enabled",
-            "set_show_brackets",
-            "set_doc_mode_enter_for_new_block",
-            "set_logical_outdenting",
-            "set_guide_announced",
-        ]
-        .into_iter()
-        .filter(|command| reopening.contains(*command))
-        .collect();
-        assert!(
-            offenders.is_empty(),
-            "these presentation settings reach refresh_graph, which restarts \
-             indexing for a toggle; use GraphSlot::apply_presentation_setting \
-             (see set_show_brackets in commands.rs): {offenders:?}"
+        let mut settings_that_reopen = BTreeSet::new();
+        for (_, source) in crate::test_support::rust_module_sources() {
+            for (name, body) in tauri_command_bodies(&source) {
+                if body.contains("apply_config_write(") && reopening.contains(&name) {
+                    settings_that_reopen.insert(name);
+                }
+            }
+        }
+        assert_eq!(
+            settings_that_reopen,
+            BTreeSet::from(["set_journal_title_format".to_owned()]),
+            "a settings command calls refresh_graph itself; let apply_config_write \
+             take the change in (see set_show_brackets in commands.rs)"
         );
     }
 

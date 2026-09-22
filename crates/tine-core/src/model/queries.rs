@@ -12,7 +12,7 @@ impl Graph {
     /// ([`Graph::query_property_registry_current`]) and has no other.
     #[cfg(test)]
     pub(crate) fn property_registry(&self) -> Arc<crate::query::registry::Registry> {
-        let config = self.config.parse_config();
+        let config = self.config().parse_config();
         let (rows, pages) = self
             .direct_projection_property_owner_rows()
             .unwrap_or_else(|| crate::query::property_owner_rows(self));
@@ -178,7 +178,7 @@ impl Graph {
         use std::sync::atomic::Ordering;
         let generation = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
-        let config_digest = self.config.parse_config().digest();
+        let config_digest = self.config().parse_config().digest();
         {
             let mut g = self.derived_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {

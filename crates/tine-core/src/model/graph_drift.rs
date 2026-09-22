@@ -112,7 +112,7 @@ impl Graph {
             });
         }
         let removed = self.cache_structural_gen.removed_since(structural)?;
-        let config = self.config.parse_config().digest();
+        let config = self.config().parse_config().digest();
         let changed = self
             .session_page_ids
             .read()

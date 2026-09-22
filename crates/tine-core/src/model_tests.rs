@@ -1247,8 +1247,8 @@ fn last_graph_text_content_budget_peak() -> u64 {
 fn publisher_p1_graph_text_classifier_uses_longest_component_root_and_preserves_exact_path() {
     let dir = scratch("graph-text-classifier-longest-root");
     let mut graph = Graph::open(&dir);
-    graph.config.pages_dir = "graph/text".to_owned();
-    graph.config.journals_dir = "graph/text/daily".to_owned();
+    graph.config_mut().pages_dir = "graph/text".to_owned();
+    graph.config_mut().journals_dir = "graph/text/daily".to_owned();
 
     let nested = GraphTextPath::parse("graph/text/daily/2026/07/naïve.md").unwrap();
     assert_eq!(
@@ -1269,8 +1269,8 @@ fn publisher_p1_graph_text_classifier_uses_longest_component_root_and_preserves_
 fn publisher_p1_graph_text_classifier_rejects_boundary_misses_outside_paths_and_equal_roots() {
     let dir = scratch("graph-text-classifier-rejections");
     let mut graph = Graph::open(&dir);
-    graph.config.pages_dir = "pages".to_owned();
-    graph.config.journals_dir = "pages-journal".to_owned();
+    graph.config_mut().pages_dir = "pages".to_owned();
+    graph.config_mut().journals_dir = "pages-journal".to_owned();
     for path in ["pages-old/file.md", "outside/file.md"] {
         assert!(
             graph
@@ -1284,14 +1284,14 @@ fn publisher_p1_graph_text_classifier_rejects_boundary_misses_outside_paths_and_
         Ok(GraphTextKind::Journal)
     );
 
-    graph.config.journals_dir = "pages".to_owned();
+    graph.config_mut().journals_dir = "pages".to_owned();
     assert!(graph
         .classify_graph_text_path(&GraphTextPath::parse("pages/a.md").unwrap())
         .is_err());
 
     for malformed_pages_root in ["bad*", "COM¹"] {
-        graph.config.pages_dir = malformed_pages_root.to_owned();
-        graph.config.journals_dir = "journals".to_owned();
+        graph.config_mut().pages_dir = malformed_pages_root.to_owned();
+        graph.config_mut().journals_dir = "journals".to_owned();
         assert!(graph
             .classify_graph_text_path(&GraphTextPath::parse("journals/2026/07/24.md").unwrap())
             .is_err());
@@ -9046,8 +9046,8 @@ impl crate::query::graph::QueryGraph for ExhaustiveReferenceCandidateGraph<'_> {
         self.0.cache_generation()
     }
 
-    fn config(&self) -> &Config {
-        &self.0.config
+    fn config(&self) -> Arc<Config> {
+        self.0.config()
     }
 
     fn direct_projection_test(&self) -> Option<Arc<crate::direct_projection::DirectProjection>> {
@@ -15511,7 +15511,7 @@ fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
         0,
         "under the default formats the title parses as nothing, so it is an ordinary page"
     );
-    let before_digest = before.config.parse_config().digest();
+    let before_digest = before.config().parse_config().digest();
     // Reopening attaches a projection at the same database; the old worker
     // must have released its writer lease first, or under load the new one
     // cannot open it and never converges.
@@ -15524,7 +15524,7 @@ fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
     )
     .unwrap();
     let after = ready_graph(&dir);
-    let after_digest = after.config.parse_config().digest();
+    let after_digest = after.config().parse_config().digest();
     assert_ne!(
         before_digest, after_digest,
         "the title format is one of the six projected-fact inputs (§5.8)"
@@ -15555,7 +15555,7 @@ fn every_implemented_row_source_builds_the_same_registry() {
         .attach_direct_projection(dir.join(".registry-sources/projection.sqlite"))
         .unwrap();
     graph.warm_cache();
-    let config = graph.config.parse_config();
+    let config = graph.config().parse_config();
 
     let (document_rows, document_pages) = crate::query::property_owner_rows(&graph);
     let from_documents = crate::query::registry::build_registry(
@@ -15636,7 +15636,7 @@ fn registry_row_sources_agree_on_a_real_graph() {
         .attach_direct_projection(projection_dir.join("projection.sqlite"))
         .unwrap();
     graph.warm_cache();
-    let config = graph.config.parse_config();
+    let config = graph.config().parse_config();
 
     let (document_rows, document_pages) = crate::query::property_owner_rows(&graph);
     let document_row_count = document_rows.len();
@@ -15690,7 +15690,7 @@ fn the_registry_build_is_measured_and_bounded() {
     }
     let graph = Graph::open(&dir);
     graph.warm_cache();
-    let config = graph.config.parse_config();
+    let config = graph.config().parse_config();
 
     let mut micros = Vec::new();
     for _ in 0..20 {
@@ -15737,7 +15737,7 @@ fn registry_build_timing_on_a_real_graph() {
     };
     let graph = Graph::open(std::path::Path::new(&root));
     graph.warm_cache();
-    let config = graph.config.parse_config();
+    let config = graph.config().parse_config();
 
     let mut micros = Vec::new();
     let mut rows_seen = 0usize;
