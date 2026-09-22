@@ -22,6 +22,7 @@ impl Graph {
                     revisions,
                     Arc::new(self.config().parse_config()),
                     self.page_index_failures.read().unwrap().is_empty(),
+                    self.unreadable_pages(),
                 );
             }
         });
@@ -227,14 +228,34 @@ impl Graph {
         if !force && projection.ready_at(generation) {
             return FullOfferOutcome::AlreadyCurrent;
         }
+        let retained = if source_complete {
+            Vec::new()
+        } else {
+            self.unreadable_pages()
+        };
         projection.enqueue_full(
             generation,
             pages,
             revisions,
             Arc::new(self.config().parse_config()),
             source_complete,
+            retained,
         );
         FullOfferOutcome::Queued
+    }
+
+    /// The pages the installed parsed cache could not read or parse that
+    /// still exist. The index keeps their stored rows; a failed page that is
+    /// gone is not listed, so its rows go.
+    fn unreadable_pages(&self) -> Vec<PageEntry> {
+        self.page_index_failures
+            .read()
+            .unwrap()
+            .iter()
+            .map(|rel_path| self.root.join(rel_path))
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .filter_map(|path| self.entry_for_path(&path))
+            .collect()
     }
 
     /// Offer the installed parsed cache to the index as the warm's payload,

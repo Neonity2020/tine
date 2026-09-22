@@ -633,6 +633,7 @@ fn same_config_inventory_preserves_jobs_but_changed_config_cancels_them() {
         Arc::clone(&revisions),
         Arc::clone(&config),
         true,
+        Vec::new(),
     );
     wait_generation(generation + 1);
     let ordinary_cancelled = job.is_cancelled();
@@ -650,7 +651,14 @@ fn same_config_inventory_preserves_jobs_but_changed_config_cancels_them() {
     changed
         .hidden_properties
         .push("target-config-sentinel".into());
-    projection.enqueue_full(generation + 2, pages, revisions, Arc::new(changed), true);
+    projection.enqueue_full(
+        generation + 2,
+        pages,
+        revisions,
+        Arc::new(changed),
+        true,
+        Vec::new(),
+    );
     let started = Instant::now();
     while !job.is_cancelled() && started.elapsed() < Duration::from_secs(3) {
         std::thread::sleep(Duration::from_millis(1));
@@ -3402,6 +3410,7 @@ fn ordinary_graph_edits_never_run_whole_image_health_checks() {
         revisions,
         config,
         true,
+        Vec::new(),
     );
     wait_ready(&other_graph);
     assert_eq!(
@@ -3432,7 +3441,14 @@ fn ordinary_graph_edits_never_run_whole_image_health_checks() {
     }
 
     let (pages, revisions, config) = parsed_snapshot(&graph);
-    projection.enqueue_full(graph.cache_generation(), pages, revisions, config, true);
+    projection.enqueue_full(
+        graph.cache_generation(),
+        pages,
+        revisions,
+        config,
+        true,
+        Vec::new(),
+    );
     wait_ready(&graph);
     assert_eq!(
         projection.projection_health_checks_test(),
@@ -7024,7 +7040,7 @@ fn a_page_the_walk_could_not_read_keeps_its_place_for_later_updates() {
 }
 
 #[test]
-fn an_incomplete_stale_snapshot_keeps_the_old_coherent_image_until_reconstruction_succeeds() {
+fn an_incomplete_stale_snapshot_keeps_the_unreadable_pages_rows_and_updates_the_rest() {
     let _serial = serialize_projection_tests();
     let root = r6_graph("incomplete-stale-snapshot");
     let unreadable_path = root.join("pages/unreadable.md");
@@ -7050,32 +7066,24 @@ fn an_incomplete_stale_snapshot_keeps_the_old_coherent_image_until_reconstructio
     std::fs::write(root.join("pages/one.md"), "- TODO readable replacement\n").unwrap();
     std::fs::write(&unreadable_path, [0xff, 0xfe, 0xfd]).unwrap();
 
-    // A real Graph open captures an incomplete parsed snapshot: the healthy
-    // older SQL image stays serviceable, but readiness is withheld until the
-    // unreadable page can join a complete source inventory.
+    // A real Graph open cannot read one page and finds another changed. The
+    // unreadable page keeps its stored rows, the changed one is brought
+    // current, and the index is ready: withholding readiness until the page
+    // became readable left search down for the session (design v4 §0.1).
     let graph = Graph::open(&root);
     graph.attach_direct_projection(database.clone()).unwrap();
+    let reported = reported_projection_failures_test();
     graph.warm_cache();
     let projection = graph.direct_projection_test().unwrap();
-    let reported = reported_projection_failures_test();
-    let started = Instant::now();
-    loop {
-        let pending = projection.shared.pending.lock().unwrap();
-        if !pending.has_work() && !projection.shared.worker_busy.load(Ordering::Acquire) {
-            break;
-        }
-        drop(pending);
-        assert!(started.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_ready(&graph);
     assert!(!projection.worker_failed());
     assert_eq!(reported_projection_failures_test(), reported);
     assert!(projection_contains(
         &database,
         "retained unreadable sentinel"
     ));
-    assert!(projection_contains(&database, "TODO one"));
-    assert!(!projection_contains(&database, "readable replacement"));
+    assert!(!projection_contains(&database, "TODO one"));
+    assert!(projection_contains(&database, "readable replacement"));
 
     // Restoring and loading the failed page reconciles the parsed cache through
     // the normal Graph path. Its subsequent save may race that full capture;
@@ -7135,6 +7143,7 @@ fn an_unreadable_page_with_no_old_rows_does_not_fail_the_readable_graph() {
         Arc::new(revisions),
         config,
         false,
+        Vec::new(),
     );
     wait_ready(&graph);
     assert!(projection.worker_available() && !projection.worker_failed());
@@ -7192,7 +7201,7 @@ fn a_full_snapshot_older_than_the_queue_does_not_roll_it_back() {
     assert!(saved_generation > stale_generation);
 
     // The delayed snapshot arrives, naming the generation it was built for.
-    projection.enqueue_full(stale_generation, pages, revisions, config, true);
+    projection.enqueue_full(stale_generation, pages, revisions, config, true, Vec::new());
     // Read the queue OUT of the lock: a panic while holding it wedges the
     // worker on the poisoned mutex and the failure shows up as a hang.
     let latest = projection.shared.pending.lock().unwrap().latest_generation;
@@ -7310,7 +7319,7 @@ fn a_rebuild_does_not_discard_a_save_newer_than_its_snapshot() {
     // A reset repair whose snapshot predates that save. The payload is
     // refused, and the rebuild obligation must go with it rather than latch.
     projection.request_rebuild();
-    projection.enqueue_full(stale_generation, pages, revisions, config, true);
+    projection.enqueue_full(stale_generation, pages, revisions, config, true, Vec::new());
     assert!(
         !projection.shared.pending.lock().unwrap().rebuild,
         "the refused payload left the rebuild latched with nothing to ride in on: {}",
@@ -7500,7 +7509,14 @@ fn cancellation_before_publication_keeps_the_old_image_and_discards_the_stage() 
         }
     }));
     projection.request_rebuild();
-    projection.enqueue_full(graph.cache_generation() + 1, pages, revisions, config, true);
+    projection.enqueue_full(
+        graph.cache_generation() + 1,
+        pages,
+        revisions,
+        config,
+        true,
+        Vec::new(),
+    );
     reached.wait();
     let closing = Arc::clone(&projection);
     let closed =
@@ -7625,7 +7641,14 @@ fn cancellation_between_fresh_build_batches_discards_the_partial_stage() {
         }
     }));
     projection.request_rebuild();
-    projection.enqueue_full(graph.cache_generation() + 1, pages, revisions, config, true);
+    projection.enqueue_full(
+        graph.cache_generation() + 1,
+        pages,
+        revisions,
+        config,
+        true,
+        Vec::new(),
+    );
     reached.wait();
     let closing = Arc::clone(&projection);
     let closed =
@@ -7677,7 +7700,14 @@ fn edit_delete_and_rename_during_staged_build_reconcile_after_publication() {
         }
     }));
     projection.request_rebuild();
-    projection.enqueue_full(graph.cache_generation(), pages, revisions, config, true);
+    projection.enqueue_full(
+        graph.cache_generation(),
+        pages,
+        revisions,
+        config,
+        true,
+        Vec::new(),
+    );
     reached.wait();
 
     let one = graph
@@ -7735,7 +7765,14 @@ fn cancellation_after_publication_keeps_the_installed_complete_image() {
         }
     }));
     projection.request_rebuild();
-    projection.enqueue_full(graph.cache_generation() + 1, pages, revisions, config, true);
+    projection.enqueue_full(
+        graph.cache_generation() + 1,
+        pages,
+        revisions,
+        config,
+        true,
+        Vec::new(),
+    );
     reached.wait();
     let closing = Arc::clone(&projection);
     let closed =
@@ -7799,7 +7836,7 @@ fn held_alias_reader_is_drained_before_fresh_publication() {
         .lock()
         .unwrap() = Some(Box::new(move || after_tx.send(()).unwrap()));
     projection.request_rebuild();
-    projection.enqueue_full(generation, pages, revisions, config, true);
+    projection.enqueue_full(generation, pages, revisions, config, true, Vec::new());
     before_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(
         after_rx.recv_timeout(Duration::from_millis(100)).is_err(),
@@ -7858,7 +7895,7 @@ fn delayed_shared_reader_rechecks_readiness_before_opening_a_connection() {
         }
     }));
     projection.request_rebuild();
-    projection.enqueue_full(generation, pages, revisions, config, true);
+    projection.enqueue_full(generation, pages, revisions, config, true, Vec::new());
     publication_reached.wait();
 
     release.wait();
@@ -7898,7 +7935,14 @@ fn failures_on_either_side_of_publication_preserve_the_boundary_image() {
             *projection.shared.before_fresh_publication.lock().unwrap() = Some(injected);
         }
         projection.request_rebuild();
-        projection.enqueue_full(graph.cache_generation() + 1, pages, revisions, config, true);
+        projection.enqueue_full(
+            graph.cache_generation() + 1,
+            pages,
+            revisions,
+            config,
+            true,
+            Vec::new(),
+        );
         let started = Instant::now();
         while !projection.worker_failed() && started.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(1));
@@ -9637,7 +9681,14 @@ fn gh543_indexing_progress_counts_each_whole_graph_pass() {
         }
     }));
     projection.request_rebuild();
-    projection.enqueue_full(graph.cache_generation() + 1, pages, revisions, config, true);
+    projection.enqueue_full(
+        graph.cache_generation() + 1,
+        pages,
+        revisions,
+        config,
+        true,
+        Vec::new(),
+    );
     reached.wait();
     assert_eq!(
         graph.indexing_progress(),
@@ -10047,7 +10098,14 @@ fn the_same_full_snapshot_offered_twice_is_taken_once() {
     projection.reset_projection_health_checks_test();
 
     let (_, revisions, config) = parsed_snapshot(&graph);
-    projection.enqueue_full(graph.cache_generation(), snapshot, revisions, config, true);
+    projection.enqueue_full(
+        graph.cache_generation(),
+        snapshot,
+        revisions,
+        config,
+        true,
+        Vec::new(),
+    );
     assert!(
         projection.ready_at(graph.cache_generation()),
         "a repeated offer must not reopen a not-ready window"

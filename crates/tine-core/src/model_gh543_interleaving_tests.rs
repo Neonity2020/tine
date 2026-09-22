@@ -678,3 +678,57 @@ fn gh543_a_cold_open_reads_each_page_at_most_twice() {
     open(PAGES, "a reopen over a clean index");
     let _ = fs::remove_dir_all(root);
 }
+
+/// GH #543 (design v4 §0.1): one page that cannot be read left the index
+/// unready for the whole session once any other page had changed while the
+/// app was closed. The launch validation cannot vouch for an image with an
+/// unread page and a changed one, so it asks for a full parse; that parse is
+/// missing the unreadable page, and the healthy image refused it rather than
+/// delete the page. Nothing else ever produced a complete snapshot, so every
+/// query and search stayed unavailable. The index now brings the pages it
+/// read current and keeps the unreadable page's stored rows.
+#[test]
+fn gh543_an_unreadable_page_does_not_keep_the_index_down() {
+    let root = scratch("gh543-unreadable-keeps-rows");
+    fs::write(page_path(&root, "p0"), "- kept marmot\n").unwrap();
+    fs::write(page_path(&root, "p1"), "- old wombat\n").unwrap();
+    fs::write(page_path(&root, "p2"), "- steady ibis\n").unwrap();
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(10))
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    // While the app was closed: one page became unreadable, another changed.
+    fs::write(page_path(&root, "p0"), [0xff, 0xfe]).unwrap();
+    fs::write(page_path(&root, "p1"), "- new quokka\n").unwrap();
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    let ready = graph.wait_for_direct_projection_for_test(Duration::from_secs(10));
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        ready.is_ok(),
+        "one unreadable page kept the index unready: {}",
+        projection.debug_state_test()
+    );
+    let hits = |term: &str| graph.search(term, 20).unwrap().len();
+    assert_eq!(
+        hits("marmot"),
+        1,
+        "the unreadable page lost its stored rows"
+    );
+    assert_eq!(
+        hits("quokka"),
+        1,
+        "the changed page was not brought current"
+    );
+    assert_eq!(hits("wombat"), 0, "the changed page kept its old rows");
+    assert_eq!(hits("ibis"), 1);
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+}

@@ -132,6 +132,10 @@ struct PendingFull {
     /// parsed. A partial cache may still be useful to the app, but it must not
     /// replace a healthy complete projection and silently erase retained rows.
     source_complete: bool,
+    /// Pages that exist but could not be read or parsed for this snapshot.
+    /// Over a healthy image they keep their stored rows (see
+    /// `apply_incomplete_full`).
+    retained: Vec<PageEntry>,
 }
 
 /// R6 warm validation: the walk inventory with each page's exact content
@@ -1240,6 +1244,7 @@ impl DirectProjection {
         revisions: PageRevisions,
         parse_config: Arc<ParseConfig>,
         source_complete: bool,
+        retained: Vec<PageEntry>,
     ) {
         let mut pending = self.shared.pending.lock().unwrap();
         // A snapshot older than the queue is not a supersession, it is a
@@ -1315,6 +1320,7 @@ impl DirectProjection {
             revisions,
             parse_config,
             source_complete,
+            retained,
         });
         pending.deltas.clear();
         pending.latest_generation = generation;
@@ -2995,11 +3001,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     )
                     .map_err(ProjectionRefusal::Failed)?
                 } else if !full.source_complete && existing_image_healthy {
-                    // A transiently unreadable page is absent from this parsed
-                    // cache. Replacing a healthy complete image would turn
-                    // that absence into a deletion. Keep the old coherent
-                    // image and wait for a complete readable capture instead.
-                    return Err(ProjectionRefusal::AwaitingFullInventory);
+                    apply_incomplete_full(
+                        writer_slot.as_mut().expect("healthy writer"),
+                        &shared,
+                        &full,
+                        deltas,
+                    )
+                    .map_err(ProjectionRefusal::Failed)?
                 } else {
                     let (database, applied) = build_and_publish_fresh_projection(
                         &shared,
@@ -3485,6 +3493,7 @@ fn build_and_publish_fresh_projection(
             revisions,
             parse_config,
             source_complete: _,
+            retained: _,
         } = full;
         let config_digest = parse_config.digest();
         let mut applied = AppliedTurn::default();
@@ -3746,17 +3755,92 @@ fn validate_warm(
     }
     let walk = warm.sources.len() + warm.retained.len();
     let changed = source_delta.replacements.len() + source_delta.deletions.len();
-    // An incomplete walk (a page it could not read) is never repaired: the
-    // repaired image would mix fresh pages with a page whose current bytes
-    // nobody has seen, so the old coherent image stays until a complete
-    // reconstruction succeeds.
-    if !warm.retained.is_empty() || changed * WARM_REPAIR_MAX_SHARE_DIVISOR > walk {
+    // A page the walk could not read keeps its stored rows through the
+    // repair, as it does through a clean validation and a full snapshot
+    // (`apply_incomplete_full`): asking for a full parse instead gains
+    // nothing, because that parse cannot read the page either.
+    if changed * WARM_REPAIR_MAX_SHARE_DIVISOR > walk {
         return Ok(WarmOutcome::FreshBuildRequired);
     }
     Ok(WarmOutcome::Changed {
         replacements: source_delta.replacements,
         deletions: source_delta.deletions,
     })
+}
+
+/// A parsed snapshot that is missing pages it could not read or parse,
+/// offered over a healthy image. Replacing the image would turn each such
+/// absence into a deletion, and refusing it left the index unready for the
+/// session: nothing else produces a complete snapshot while the page stays
+/// unreadable, and a page that recovers without changing produces no event
+/// at all (GH #543). So bring every page the snapshot did read current, and
+/// keep the stored rows, and the stored revision, of every page in
+/// `retained`, exactly as the warm validation does for a page it cannot
+/// read. A retained page that later changes arrives as an ordinary update.
+/// In-scope scenarios: a transient disk error, a sharing violation while
+/// another process holds the file, and a page whose parse fails.
+fn apply_incomplete_full(
+    database: &mut PhysicalGraphProjectionDatabase,
+    shared: &ProjectionShared,
+    full: &PendingFull,
+    mut deltas: BTreeMap<String, (u64, PageDelta)>,
+) -> Result<AppliedTurn, String> {
+    let config_digest = full.parse_config.digest();
+    let mut sources = Vec::with_capacity(full.pages.len());
+    let mut documents = HashMap::with_capacity(full.pages.len());
+    for (entry, document) in full.pages.iter() {
+        let revision = full
+            .revisions
+            .get(&entry.path)
+            .ok_or_else(|| format!("snapshot has no revision for {}", entry.rel_path))?;
+        sources.push(PhysicalGraphProjectionSourceRevision {
+            path: entry.rel_path.clone(),
+            revision: projection_source_revision(revision, config_digest),
+        });
+        documents.insert(entry.rel_path.as_str(), (entry, document, revision));
+    }
+    let mut source_delta = database
+        .source_delta(&sources)
+        .map_err(|error| error.to_string())?;
+    let retained = full
+        .retained
+        .iter()
+        .map(|entry| entry.rel_path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    source_delta
+        .deletions
+        .retain(|path| !retained.contains(path.as_str()));
+    let replacements = source_delta
+        .replacements
+        .iter()
+        .map(|path| {
+            let (entry, document, revision) = documents
+                .get(path.as_str())
+                .ok_or_else(|| format!("snapshot has no page {path}"))?;
+            Ok(((*entry).clone(), Arc::clone(document), (*revision).clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    projection_diag(|| {
+        format!(
+            "incomplete full: keeping {} unreadable page(s)",
+            full.retained.len()
+        )
+    });
+    let order = apply_warm_repair(
+        database,
+        shared,
+        WarmRepair {
+            replacements,
+            deletions: source_delta.deletions,
+        },
+        &full.parse_config,
+    )?;
+    {
+        let mut pending = shared.pending.lock().unwrap();
+        pending.reseed_after_repair(&order);
+        pending.place_taken(&mut deltas);
+    }
+    apply_deltas(database, deltas)
 }
 
 /// Apply a `WarmRepair` in one transaction and reconcile every stored page's

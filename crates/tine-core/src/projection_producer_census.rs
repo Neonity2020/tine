@@ -1569,9 +1569,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // snapshot, `holds_source_revision`, so a page open skips a delta the
     // ready image already holds. No storage write crossing, schema or
     // dependency pin changes.
+    // 2026-09-22: GH #543 (design v4 §0.1) `apply_incomplete_full` keeps an
+    // unreadable page's rows under a full snapshot: one more read-only
+    // `source_delta` call; its write goes through the existing
+    // `apply_warm_repair`. No new storage import, write kind, schema or
+    // dependency pin.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "370bc2340b0d36e17affebb75345bad772433d1d45c70b9a5ad06b4f6210af87",
+        "1c3ff2a049a52015ee850cafeaf883a7e878f5ce808305eab7f577e24ad76979",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
