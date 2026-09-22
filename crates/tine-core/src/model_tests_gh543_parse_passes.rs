@@ -3,6 +3,159 @@
 
 use super::*;
 
+/// GH #543 (audit R3-07): a watcher failure recorded while a complete
+/// capture was running is newer than that capture; installing the capture
+/// must not erase it and declare the index ready.
+#[test]
+fn a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure() {
+    let dir = scratch("audit543-r3-fast-failure");
+    fs::write(dir.join("pages/Good.md"), "- good\n").unwrap();
+    let failed = dir.join("pages/Failed.md");
+    fs::write(&failed, "- old readable content\n").unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    let permit = graph.admit_retained_graph_text_writer().unwrap();
+    let flight = PageBuildFlight::new(graph.cache_generation(), graph.cache_structural_gen.load());
+    let built = graph.load_all_pages_with_permit(&permit);
+    fs::write(&failed, [0xff, 0xfe, 0xfd]).unwrap();
+    assert!(graph.sync_file_checked(&failed).is_err());
+    let before = graph.page_index_failures();
+    let installed = graph.install_reconciled(&flight, &permit, built);
+    let after = graph.page_index_failures();
+    let ready = graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .is_ok();
+    graph.detach_direct_projection(Duration::from_secs(5));
+    eprintln!("R3 watcher failure: before={before:?} after={after:?} installed={installed:?} ready={ready}");
+    assert_eq!(
+        after, before,
+        "the old complete capture erased a newer known unreadable path"
+    );
+}
+
+/// GH #543 (audit R3-01): a page deleted and recreated while the cold pass
+/// ran is re-read on its own; the rest of the pass is kept.
+#[test]
+fn a_page_deleted_and_recreated_during_a_pass_keeps_the_pass() {
+    let dir = scratch("audit543-r3-delete-recreate");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    let pause = Arc::new(PageBuildTestPause::new());
+    *graph.page_build_test.cold_read_done.lock().unwrap() = Some(Arc::clone(&pause));
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache_cancellable(|| false))
+    };
+    pause.reached.wait();
+    let path = dir.join("pages/p0.md");
+    fs::remove_file(&path).unwrap();
+    graph.sync_deleted_file(&path).unwrap();
+    fs::write(&path, "- recreated\n").unwrap();
+    graph.sync_file(&path);
+    pause.release.wait();
+    let completed = warmer.join().unwrap();
+    let first = graph.page_build_parses_test();
+    let listed = graph.list_pages().len();
+    let total = graph.page_build_parses_test();
+    graph.detach_direct_projection(Duration::from_secs(5));
+    eprintln!(
+        "R3 delete/recreate: completed={completed} first={first} total={total} listed={listed}"
+    );
+    assert!(
+        completed,
+        "a named delete/recreate discarded the completed cold pass"
+    );
+    assert_eq!(first, total, "the next listing reparsed the whole graph");
+}
+
+/// GH #543 (audit R3-02): a page opened before the cold pass and edited
+/// externally afterwards is not stale forever: the pass's own read is newer
+/// than the session publication.
+#[test]
+fn a_page_edited_after_an_earlier_open_keeps_the_pass() {
+    let dir = scratch("audit543-r3-open-external-edit");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    let pause = Arc::new(PageBuildTestPause::new());
+    *graph.page_build_test.cold_read_done.lock().unwrap() = Some(Arc::clone(&pause));
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache_cancellable(|| false))
+    };
+    pause.reached.wait();
+    let path = dir.join("pages/p0.md");
+    let entry = graph.entry_for_path(&path).unwrap();
+    graph.load_page(&entry).unwrap();
+    // The watcher has not delivered this edit yet. The warm's own baseline
+    // check sees it, and must retain that exact newer parse.
+    fs::write(&path, "- external edit after page open\n").unwrap();
+    pause.release.wait();
+    let completed = warmer.join().unwrap();
+    let first = graph.page_build_parses_test();
+    let listed = graph.list_pages().len();
+    let total = graph.page_build_parses_test();
+    graph.detach_direct_projection(Duration::from_secs(5));
+    eprintln!(
+        "R3 open/external edit: completed={completed} first={first} total={total} listed={listed}"
+    );
+    assert!(
+        completed,
+        "an obsolete session revision rejected newer disk bytes"
+    );
+    assert_eq!(first, total, "the next listing reparsed the whole graph");
+}
+
+/// GH #543 (audit R3-03): more named changes than any bounded log would
+/// retain still stay named, so the pass is kept rather than treated as
+/// unexplained drift.
+#[test]
+fn many_named_deletes_during_a_pass_keep_the_pass() {
+    let dir = scratch("audit543-r3-many-deletes");
+    for index in 0..1030 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    let pause = Arc::new(PageBuildTestPause::new());
+    *graph.page_build_test.cold_read_done.lock().unwrap() = Some(Arc::clone(&pause));
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache_cancellable(|| false))
+    };
+    pause.reached.wait();
+    for index in 0..1025 {
+        let path = dir.join(format!("pages/p{index}.md"));
+        fs::remove_file(&path).unwrap();
+        graph.sync_deleted_file(&path).unwrap();
+    }
+    pause.release.wait();
+    let completed = warmer.join().unwrap();
+    let first = graph.page_build_parses_test();
+    let listed = graph.list_pages().len();
+    let total = graph.page_build_parses_test();
+    graph.detach_direct_projection(Duration::from_secs(5));
+    eprintln!("R3 many deletes: completed={completed} first={first} total={total} listed={listed}");
+    assert!(
+        completed,
+        "retention dropped named changes needed by the active pass"
+    );
+    assert_eq!(first, total, "the next listing reparsed every survivor");
+}
+
 /// An edit saved after the cold parse read every page must cost one page
 /// parse, not the whole graph again (GH #543, indexing audit R2-02).
 #[test]

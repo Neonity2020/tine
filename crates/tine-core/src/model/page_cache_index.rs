@@ -64,6 +64,9 @@ pub(super) enum DirectCreationEvidence {
 pub(super) struct PageCacheBuild {
     pub(super) pages: Vec<ParsedPage>,
     pub(super) failures: Vec<String>,
+    /// Pages read again after the pass's first read, with the structural
+    /// sequence noted before that later read (see `PassReadAt`).
+    pub(super) reread: std::collections::HashMap<PathBuf, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,8 +115,9 @@ impl From<PageCacheInstallOutcome> for PageBuildOutcome {
 
 pub(super) struct PageBuildFlight {
     pub(super) expected_generation: u64,
-    /// `cache_structural_gen` at the claim: with the parsed revisions, it
-    /// tells a harmless generation move from real drift at installation.
+    /// `cache_structural_gen` at the claim, before anything was read: with
+    /// the parsed revisions, it tells a harmless generation move from real
+    /// drift at installation.
     pub(super) expected_structural: u64,
     outcome: std::sync::Mutex<Option<PageBuildOutcome>>,
     completed: std::sync::Condvar,
@@ -203,12 +207,14 @@ impl PageCacheBuild {
         Self {
             pages: Vec::with_capacity(capacity),
             failures: Vec::new(),
+            reread: std::collections::HashMap::new(),
         }
     }
 
     pub(super) fn append(&mut self, mut other: Self) {
         self.pages.append(&mut other.pages);
         self.failures.append(&mut other.failures);
+        self.reread.extend(other.reread);
     }
 
     pub(super) fn collect(&mut self, parsed: PageParseResult) -> bool {

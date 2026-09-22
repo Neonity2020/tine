@@ -67,8 +67,8 @@ impl Graph {
             Ok(inventory) => inventory,
             Err(failure) => {
                 return PageCacheBuild {
-                    pages: Vec::new(),
                     failures: vec![failure],
+                    ..PageCacheBuild::with_capacity(0)
                 };
             }
         };
@@ -241,8 +241,11 @@ impl Graph {
         built
             .failures
             .retain(|failure| !paths.contains(&self.root.join(failure)));
+        // Noted before reading: an event after it is one this read missed.
+        let read_at = self.cache_structural_gen.load();
         let mut baselines = Vec::with_capacity(paths.len());
         for path in paths {
+            built.reread.insert(path.clone(), read_at);
             let Ok(Some(entry)) = self.graph_text_entry_for_path(path) else {
                 continue;
             };
@@ -293,6 +296,7 @@ impl Graph {
         let PageCacheBuild {
             pages: built,
             mut failures,
+            reread,
         } = built;
         failures.sort();
         failures.dedup();
@@ -311,17 +315,23 @@ impl Graph {
         // parsed. A cache that another publisher already supplied is likewise
         // never overwritten.
         let mut guard = self.cache.write().unwrap();
-        let Some(drift) = self.drift_since(
-            &guard,
-            flight.expected_generation,
-            flight.expected_structural,
-            |path| revs.get(path).map(String::as_str),
-        ) else {
+        let read_at = graph_drift::PassReadAt {
+            generation: flight.expected_generation,
+            structural: flight.expected_structural,
+            reread: &reread,
+        };
+        let Some(drift) =
+            self.drift_since(&guard, &read_at, |path| revs.get(path).map(String::as_str))
+        else {
             return Ok(PageCacheInstallOutcome::GenerationDrift);
         };
+        // A page that became unreadable after it was read is read again, so
+        // its failure is recorded rather than overwritten by the older, clean
+        // capture (audit R3-07).
         let stale = drift
             .changed
             .into_iter()
+            .chain(drift.reread)
             .chain(
                 drift
                     .removed
@@ -339,7 +349,14 @@ impl Graph {
                     (entry, document, revision)
                 })
                 .collect();
-            return Err((PageCacheBuild { pages, failures }, stale));
+            return Err((
+                PageCacheBuild {
+                    pages,
+                    failures,
+                    reread,
+                },
+                stale,
+            ));
         }
         let expected_generation = drift.generation;
         let source_complete = failures.is_empty();
@@ -660,7 +677,12 @@ impl Graph {
                     .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
                     .collect::<std::collections::HashMap<_, _>>();
                 let cache = self.cache.read().unwrap();
-                self.drift_since(&cache, read_at, structural, |path| read.get(path).copied())
+                let read_at = graph_drift::PassReadAt {
+                    generation: read_at,
+                    structural,
+                    reread: &std::collections::HashMap::new(),
+                };
+                self.drift_since(&cache, &read_at, |path| read.get(path).copied())
             };
             let Some(drift) = drift else {
                 return abandoned();
@@ -866,8 +888,8 @@ impl Graph {
             Ok(inventory) => inventory,
             Err(failure) => {
                 let built = PageCacheBuild {
-                    pages: Vec::new(),
                     failures: vec![failure],
+                    ..PageCacheBuild::with_capacity(0)
                 };
                 let outcome =
                     PageBuildOutcome::from(self.install_reconciled(&flight, &permit, built));
@@ -1119,7 +1141,7 @@ impl Graph {
         let projection = self.direct_projection.get();
         let mut guard = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
-        self.session_page_ids.write().unwrap().insert(
+        self.publish_session_page_ids(
             evict_entry.path.clone(),
             SessionPageIds::capture(
                 &projection_revision,

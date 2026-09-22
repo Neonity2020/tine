@@ -90,7 +90,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   ignoring changes made since.
 - Saving or deleting a page while Tine was still reading the graph at launch
   made it throw that work away and read the whole graph again. Only the
-  changed page is read again now (GH #543).
+  changed page is read again now, also when a page was deleted and recreated,
+  was opened before the reading started, or when many pages changed at once
+  (GH #543).
+- A page file that became unreadable while the graph was being indexed could
+  be forgotten, with the index reporting itself complete without it
+  (GH #543).
+- After a setting reloaded the graph, the indexing started before the reload
+  could mark the reloaded graph as finished before its own indexing began, so
+  alias and reference counts could show incomplete values (GH #543).
 - When the graph's pages could not be read, the unused-assets list offered
   every asset for trashing, including media still in use. It now reports the
   error instead.

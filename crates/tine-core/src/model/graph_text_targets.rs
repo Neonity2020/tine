@@ -809,6 +809,8 @@ impl Graph {
             failures.sort();
             failures.dedup();
         }
+        self.cache_structural_gen
+            .record(graph_drift::StructuralChange::Reread(path.to_path_buf()));
         let generation = self
             .cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release)
@@ -859,6 +861,8 @@ impl Graph {
         }
         let mut failures = failures_guard.clone();
         failures.retain(|failure| failure != &entry.rel_path);
+        self.cache_structural_gen
+            .record(graph_drift::StructuralChange::Reread(entry.path.clone()));
         let generation = self
             .cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release)

@@ -597,7 +597,7 @@ impl Graph {
             .insert(abs.clone(), (revision.clone(), file_identity));
         let mut dto = page_dto_checked(&effective, &document)?;
         dto.read_only = read_only_org(&abs, &content);
-        self.session_page_ids.write().unwrap().insert(
+        self.publish_session_page_ids(
             abs.clone(),
             SessionPageIds::capture(&revision, self.config().parse_config().digest(), &document),
         );

@@ -11,6 +11,9 @@ pub(super) struct SessionPageIds {
     pub(super) revision: String,
     pub(super) config: ContentDigest,
     preorder: Vec<(String, usize)>,
+    /// Event sequence of this publication (see `StructuralGeneration`); 0 for
+    /// ids restored from the stored index, which record no new read.
+    pub(super) published: u64,
 }
 
 impl SessionPageIds {
@@ -25,6 +28,7 @@ impl SessionPageIds {
                 revision: source.to_owned(),
                 config,
                 preorder,
+                published: 0,
             },
         )
     }
@@ -44,6 +48,7 @@ impl SessionPageIds {
             revision: revision.to_owned(),
             config,
             preorder,
+            published: 0,
         }
     }
 
