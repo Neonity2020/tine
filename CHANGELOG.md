@@ -78,6 +78,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - While one page file could not be read (for example a file still arriving
   from a sync service), every page listing re-read and parsed the whole graph.
   Only the unreadable file is re-checked now (GH #543).
+- The indexing bar showed only the indexing done at launch. If Tine later had
+  to rebuild the search index in the same session (for example after finding
+  it damaged), that rebuild ran with no indication. It now shows too
+  (GH #543).
 - Changing a display-only setting (bracket display, time tracking, logical
   outdenting, document-mode Enter) or dismissing the Guide notice reloaded the
   whole graph. On a first launch that restarted indexing from the beginning,
