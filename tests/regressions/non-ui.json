@@ -5502,12 +5502,14 @@
    "src-tauri/src/state.rs::a_display_read_on_a_retired_graph_is_answered_by_its_replacement",
    "src-tauri/src/state.rs::a_failed_refresh_leaves_the_bound_graph_serving",
    "src-tauri/src/state.rs::a_refresh_does_not_swap_over_a_window_that_moved_on",
-   "src-tauri/src/state.rs::graphs_are_retired_only_where_they_are_replaced"
+   "src-tauri/src/state.rs::graphs_are_retired_only_where_they_are_replaced",
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_a_block_resolve_on_a_retired_graph_parses_nothing",
+   "src-tauri/src/state.rs::a_read_takes_its_graph_through_display_read_or_is_listed"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "Audit finding IT-09 (Martin chose option A, 2026-09-22). A derived read waiting on indexing when the app replaced its graph (switch, or a refresh from preferred format / default home / journal title format / restore backup) saw the projection stop, fell back to with_pages and parsed the whole retired graph: 5 of 5 fixture pages, graph-sized at 10k, competing with the replacement's cold index. Graph::retire (set on bind revocation, remove and refresh) makes display reads (commands list_pages, page_aliases, page_icons, block_ref_counts, list_templates, journal_content_days, backlink_filter_context, via state::display_read) stop waiting and skip the parse; the skipped answer is never memoized (page list, find-entry index, derived memo), and the command retries on the window's current graph. Reads that act on their answer (export, orphan assets, creation) are not display reads and keep the full answer. Fail-before: display read returned Some after retirement; memo test listed 0 of 5 pages. Evidence: tine-agents/evidence/gh550-batch/it09-*. Round-2 audit R2-03 (unreleased regression of this fix): a refresh retired the old graph before reopening the root, so a failed reopen left the window bound to a retired graph that answered no display read (probe: display=None). Refresh is now prepare (fallible, touches nothing) then commit (infallible, the only refresh retire), and the swap is compare-and-swap so a window that moved on keeps its graph. A source guard pins retire() to bind, remove and commit."
+ "notes": "Audit finding IT-09 (Martin chose option A, 2026-09-22). A derived read waiting on indexing when the app replaced its graph (switch, or a refresh from preferred format / default home / journal title format / restore backup) saw the projection stop, fell back to with_pages and parsed the whole retired graph: 5 of 5 fixture pages, graph-sized at 10k, competing with the replacement's cold index. Graph::retire (set on bind revocation, remove and refresh) makes display reads (commands list_pages, page_aliases, page_icons, block_ref_counts, list_templates, journal_content_days, backlink_filter_context, via state::display_read) stop waiting and skip the parse; the skipped answer is never memoized (page list, find-entry index, derived memo), and the command retries on the window's current graph. Reads that act on their answer (export, orphan assets, creation) are not display reads and keep the full answer. Fail-before: display read returned Some after retirement; memo test listed 0 of 5 pages. Evidence: tine-agents/evidence/gh550-batch/it09-*. Round-2 audit R2-03 (unreleased regression of this fix): a refresh retired the old graph before reopening the root, so a failed reopen left the window bound to a retired graph that answered no display read (probe: display=None). Refresh is now prepare (fallible, touches nothing) then commit (infallible, the only refresh retire), and the swap is compare-and-swap so a window that moved on keeps its graph. A source guard pins retire() to bind, remove and commit. Round-2 audit R2-01: only 7 of the display commands were routed through display_read, so resolve_blocks and the other reads (backlinks, queries, search, page loads, conflict lists; 27 commands) still parsed a retired graph (probe: 5 of 5 pages). They now use display_read, and a source guard lists every function that takes a window's graph directly: a new one fails until it is routed through display_read or listed as a write, export or acting read. Fail-before: the resolve test without display_read parsed 5 pages; evidence tine-agents/evidence/gh550-batch/r201/."
 },
 {
  "id": "REG-INDEX-READS-ANSWER-WHILE-A-JOINED-BUILD-RUNS-543",
@@ -5536,6 +5538,32 @@
   "failBefore": "proven"
  },
  "notes": "Audit finding R2-04. A warm that found the snapshot already captured (an orphan-asset listing got there first) joined the running SQL build and waited for it inside `if let Some(p) = self.direct_projection.lock().unwrap().as_ref().map(Arc::clone) { p.wait_until_ready_at(..) }`. The lock in that condition stays held for the whole block, in edition 2024 as in 2021, so indexing_progress and every other projection read blocked until the build finished. Fix (shape): the field is now a ProjectionSlot whose only reads return a released clone, so no caller can hold the slot lock across a wait. Guard: CI denies clippy::significant_drop_in_scrutinee on the whole workspace (the same class at 20 sites, all converted, including test hooks that ran while their own lock was held). Fail-before at aa851886: the progress read did not return while the build was paused. Evidence: tine-agents/evidence/gh550-batch/r204-fail-before.log, indexing-audit-r2/."
+},
+{
+ "id": "REG-ORPHAN-ASSETS-UNREADABLE-GRAPH-ERRORS",
+ "title": "The unused-assets list reports an error instead of listing in-use media when the graph's pages cannot be read",
+ "family": "direct-files-data-safety",
+ "sources": {
+  "issues": [],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests.rs::orphan_assets_is_an_error_when_the_pages_cannot_be_read"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Found while fixing GH #543 R2-01 (Graph::with_pages answers an empty page set when graph-text admission fails). orphan_assets scanned that empty set for references, so every asset, in use or not, was offered for trashing. It now uses Graph::try_with_pages, which returns the admission error. Fail-before: a symlinked graph root (no retained no-follow capability) listed used.png as an orphan. Evidence: tine-agents/evidence/gh550-batch/r201/orphan-fail-before.log."
 }
 ]
 }

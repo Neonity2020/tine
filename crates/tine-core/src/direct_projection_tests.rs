@@ -9868,6 +9868,56 @@ fn gh543_a_display_read_cut_short_leaves_no_memo_behind() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Resolving block references is a display read like any listing: a refresh
+/// that retires its graph mid-read leaves it parsing nothing (GH #543, R2-01).
+#[test]
+fn gh543_a_block_resolve_on_a_retired_graph_parses_nothing() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-retired-resolve");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let reader = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || {
+            graph.display_read(|| {
+                crate::query::resolve_blocks_bounded(
+                    &graph,
+                    &["11111111-1111-4111-8111-111111111111".into()],
+                    100,
+                    1_000_000,
+                )
+            })
+        })
+    };
+    std::thread::sleep(Duration::from_millis(350));
+    graph.retire();
+    let answer = reader.join().unwrap();
+    let parses = graph.page_build_parses_test();
+    pause.release.wait();
+    warmer.join().unwrap();
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+    assert!(
+        answer.is_none(),
+        "a read cut short by retirement reported an answer"
+    );
+    assert_eq!(parses, 0, "a block resolve parsed its retired graph");
+}
+
 /// A warm that finds the snapshot already captured (here by an orphan-asset
 /// listing) joins the running SQL build and waits for it. The indexing
 /// progress bar and every other projection read must still answer meanwhile.

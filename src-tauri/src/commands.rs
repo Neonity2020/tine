@@ -289,8 +289,9 @@ pub(crate) async fn referenced_page_names(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().referenced_page_names_versioned(known_digest))
+        display_read(&state, &label, binding_generation, |graph| {
+            Ok(graph.referenced_page_names_versioned(known_digest))
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -316,28 +317,29 @@ pub(crate) async fn journal_feed_page(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        let as_of_day = JournalDate::today().ordinal_key();
-        {
-            let graph = slot.graph();
-            let entries = graph.feed_journals_desc_through(JournalDate::from_ordinal(as_of_day));
-            let selection = collect_journal_feed_page(
-                entries
-                    .into_iter()
-                    .filter(|entry| journal_feed_candidate_in_window(entry, as_of_day, before_day)),
-                limit,
-                // A journal deleted from disk between selection and load is
-                // skipped, but its day still advances the cursor.
-                |entry| graph.load_page(entry),
-            )
-            .map_err(CommandError::prose)?;
-            Ok(JournalFeedPage {
-                pages: selection.pages,
-                next_before_day: selection.next_before_day,
-                done: selection.done,
-                as_of_day,
-            })
-        }
+        display_read(&state, &label, binding_generation, |graph| {
+            let as_of_day = JournalDate::today().ordinal_key();
+            {
+                let entries =
+                    graph.feed_journals_desc_through(JournalDate::from_ordinal(as_of_day));
+                let selection = collect_journal_feed_page(
+                    entries.into_iter().filter(|entry| {
+                        journal_feed_candidate_in_window(entry, as_of_day, before_day)
+                    }),
+                    limit,
+                    // A journal deleted from disk between selection and load is
+                    // skipped, but its day still advances the cursor.
+                    |entry| graph.load_page(entry),
+                )
+                .map_err(CommandError::prose)?;
+                Ok(JournalFeedPage {
+                    pages: selection.pages,
+                    next_before_day: selection.next_before_day,
+                    done: selection.done,
+                    as_of_day,
+                })
+            }
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -352,10 +354,9 @@ pub(crate) async fn get_page(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.graph()
-            .load_named(&name, kind)
-            .map_err(CommandError::from)
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.load_named(&name, kind).map_err(CommandError::from)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -524,12 +525,13 @@ pub(crate) async fn get_backlinks(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        bounded_groups_or_error(slot.graph().backlinks_bounded_indexed(
-            &name,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        )?)
+        display_read(&state, &label, binding_generation, |graph| {
+            bounded_groups_or_error(graph.backlinks_bounded_indexed(
+                &name,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )?)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -568,12 +570,13 @@ pub(crate) async fn get_unlinked_refs(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        bounded_groups_or_error(slot.graph().unlinked_refs_bounded_indexed(
-            &name,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        )?)
+        display_read(&state, &label, binding_generation, |graph| {
+            bounded_groups_or_error(graph.unlinked_refs_bounded_indexed(
+                &name,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )?)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -608,12 +611,13 @@ pub(crate) async fn block_referrers(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        bounded_groups_or_error(slot.graph().block_referrers_bounded(
-            &uuid,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+        display_read(&state, &label, binding_generation, |graph| {
+            bounded_groups_or_error(graph.block_referrers_bounded(
+                &uuid,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            ))
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -814,12 +818,13 @@ pub(crate) async fn run_query(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        bounded_groups_or_error(slot.graph().run_query_bounded(
-            &query,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        )?)
+        display_read(&state, &label, binding_generation, |graph| {
+            bounded_groups_or_error(graph.run_query_bounded(
+                &query,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )?)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -938,29 +943,30 @@ pub(crate) async fn run_graph_search(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     let execution = tauri::async_runtime::spawn_blocking(move || -> Result<_, CommandError> {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        (match lane.as_deref() {
-            Some(lane) => slot.graph().run_graph_search_latest_displayed_for(
-                lane,
-                &source,
-                page_limit,
-                block_limit,
-                scope,
-                explain,
-                display,
-                consumer,
-            ),
-            None => slot.graph().run_graph_search_displayed_for(
-                &source,
-                page_limit,
-                block_limit,
-                scope,
-                explain,
-                display,
-                consumer,
-            ),
-        })
-        .map_err(CommandError::from)
+        display_read(&state, &label, binding_generation, |graph| {
+            (match lane.as_deref() {
+                Some(lane) => graph.run_graph_search_latest_displayed_for(
+                    lane,
+                    &source,
+                    page_limit,
+                    block_limit,
+                    scope.clone(),
+                    explain,
+                    display.clone(),
+                    consumer,
+                ),
+                None => graph.run_graph_search_displayed_for(
+                    &source,
+                    page_limit,
+                    block_limit,
+                    scope.clone(),
+                    explain,
+                    display.clone(),
+                    consumer,
+                ),
+            })
+            .map_err(CommandError::from)
+        })?
     })
     .await
     .map_err(CommandError::worker)??;
@@ -978,20 +984,21 @@ pub(crate) async fn run_advanced_query(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        let (result, exceeded, total) = slot.graph().run_advanced_query_bounded_cached(
-            &query,
-            current_page.as_deref(),
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        )?;
-        if exceeded {
-            Err(CommandError::prose(format!(
-                "result-too-large: {total} advanced-query matches; narrow the query"
-            )))
-        } else {
-            Ok(result)
-        }
+        display_read(&state, &label, binding_generation, |graph| {
+            let (result, exceeded, total) = graph.run_advanced_query_bounded_cached(
+                &query,
+                current_page.as_deref(),
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )?;
+            if exceeded {
+                Err(CommandError::prose(format!(
+                    "result-too-large: {total} advanced-query matches; narrow the query"
+                )))
+            } else {
+                Ok(result)
+            }
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1082,9 +1089,9 @@ fn query_result_or_error(
 /// Fetch the registry snapshot the parse reads for its `UnknownIdent`
 /// suggestions, through whichever storage mode this slot is bound to.
 fn query_registry_snapshot(
-    slot: &crate::state::GraphSlot,
+    graph: &tine_core::Graph,
 ) -> Result<tine_core::query::ir::RegistrySnapshot, CommandError> {
-    Ok(slot.graph().query_registry_snapshot_ready()?)
+    Ok(graph.query_registry_snapshot_ready()?)
 }
 
 /// SPEC §7.1 `query_parse`: text → `{query, view}`, with the §4.1 precedence
@@ -1101,26 +1108,27 @@ pub(crate) async fn query_parse(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        // The registry read lives in `query_registry_snapshot`, shared with
-        // `query_registry`.
-        //
-        // **RET2 removed the `unwrap_or(empty snapshot)` that used to sit
-        // here.** The registry decides `UnknownIdent` SUGGESTIONS, and an empty
-        // table produces a parse that confidently reports a declared property
-        // as unknown — a wrong answer the caller could not distinguish from a
-        // real one, because the refusal never reached it. A metadata read that
-        // cannot answer is now the parse's answer, and the frontend's existing
-        // readiness owner retries it under the same binding/generation
-        // cancellation as every other query read.
-        let snapshot = query_registry_snapshot(&slot)?;
-        let registry = tine_core::query::registry::Registry::from_snapshot(&snapshot);
-        Ok(parse_query_pair(
-            &text,
-            dialect,
-            &block_properties.unwrap_or_default(),
-            &registry,
-        ))
+        display_read(&state, &label, binding_generation, |graph| {
+            // The registry read lives in `query_registry_snapshot`, shared with
+            // `query_registry`.
+            //
+            // **RET2 removed the `unwrap_or(empty snapshot)` that used to sit
+            // here.** The registry decides `UnknownIdent` SUGGESTIONS, and an empty
+            // table produces a parse that confidently reports a declared property
+            // as unknown — a wrong answer the caller could not distinguish from a
+            // real one, because the refusal never reached it. A metadata read that
+            // cannot answer is now the parse's answer, and the frontend's existing
+            // readiness owner retries it under the same binding/generation
+            // cancellation as every other query read.
+            let snapshot = query_registry_snapshot(graph)?;
+            let registry = tine_core::query::registry::Registry::from_snapshot(&snapshot);
+            Ok(parse_query_pair(
+                &text,
+                dialect,
+                block_properties.as_deref().unwrap_or_default(),
+                &registry,
+            ))
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1167,8 +1175,9 @@ pub(crate) async fn query_registry(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        query_registry_snapshot(&slot)
+        display_read(&state, &label, binding_generation, |graph| {
+            query_registry_snapshot(graph)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1188,16 +1197,15 @@ pub(crate) async fn query_run(
     let context = context.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        let bounds = tine_core::query::ir::Bounds {
-            max_rows: RESULT_BRIDGE_MAX_ROWS,
-            max_bytes: RESULT_BRIDGE_MAX_BYTES,
-        };
-        let result = {
-            let graph = slot.graph();
-            tine_core::query::run_query_result_ir(&graph, &query, &view, bounds, &context)?
-        };
-        query_result_or_error(result)
+        display_read(&state, &label, binding_generation, |graph| {
+            let bounds = tine_core::query::ir::Bounds {
+                max_rows: RESULT_BRIDGE_MAX_ROWS,
+                max_bytes: RESULT_BRIDGE_MAX_BYTES,
+            };
+            let result =
+                { tine_core::query::run_query_result_ir(graph, &query, &view, bounds, &context)? };
+            query_result_or_error(result)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1215,17 +1223,17 @@ pub(crate) async fn query_explain_empty(
     let context = context.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        let bounds = tine_core::query::ir::Bounds {
-            max_rows: RESULT_BRIDGE_MAX_ROWS,
-            max_bytes: RESULT_BRIDGE_MAX_BYTES,
-        };
-        {
-            let graph = slot.graph();
-            Ok(tine_core::query::explain_empty_query(
-                &graph, &query, &view, bounds, &context,
-            )?)
-        }
+        display_read(&state, &label, binding_generation, |graph| {
+            let bounds = tine_core::query::ir::Bounds {
+                max_rows: RESULT_BRIDGE_MAX_ROWS,
+                max_bytes: RESULT_BRIDGE_MAX_BYTES,
+            };
+            {
+                Ok(tine_core::query::explain_empty_query(
+                    graph, &query, &view, bounds, &context,
+                )?)
+            }
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1239,29 +1247,29 @@ pub(crate) async fn query_facets(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        let autocomplete = autocomplete.unwrap_or(false);
-        {
-            let graph = slot.graph();
-            if autocomplete {
-                return Ok(graph
-                    .autocomplete_property_facets_bounded(
-                        AUTOCOMPLETE_FACET_MAX_ITEMS,
-                        AUTOCOMPLETE_FACET_MAX_BYTES,
-                    )
-                    .0);
+        display_read(&state, &label, binding_generation, |graph| {
+            let autocomplete = autocomplete.unwrap_or(false);
+            {
+                if autocomplete {
+                    return Ok(graph
+                        .autocomplete_property_facets_bounded(
+                            AUTOCOMPLETE_FACET_MAX_ITEMS,
+                            AUTOCOMPLETE_FACET_MAX_BYTES,
+                        )
+                        .0);
+                }
+                let (facets, exceeded) =
+                    graph.property_facets_bounded(RESULT_BRIDGE_MAX_ROWS, RESULT_BRIDGE_MAX_BYTES);
+                if exceeded {
+                    Err(CommandError::coded(
+                        "result-too-large",
+                        "property facets exceed the construction budget",
+                    ))
+                } else {
+                    Ok(facets)
+                }
             }
-            let (facets, exceeded) =
-                graph.property_facets_bounded(RESULT_BRIDGE_MAX_ROWS, RESULT_BRIDGE_MAX_BYTES);
-            if exceeded {
-                Err(CommandError::coded(
-                    "result-too-large",
-                    "property facets exceed the construction budget",
-                ))
-            } else {
-                Ok(facets)
-            }
-        }
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1306,8 +1314,9 @@ pub(crate) async fn existing_page_names(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().existing_page_names(&names))
+        display_read(&state, &label, binding_generation, |graph| {
+            Ok(graph.existing_page_names(&names))
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1480,12 +1489,13 @@ pub(crate) async fn search(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     let groups = tauri::async_runtime::spawn_blocking(move || -> Result<_, CommandError> {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        (match lane.as_deref() {
-            Some(lane) => slot.graph().search_latest(lane, &query, limit),
-            None => slot.graph().search(&query, limit),
-        })
-        .map_err(CommandError::from)
+        display_read(&state, &label, binding_generation, |graph| {
+            (match lane.as_deref() {
+                Some(lane) => graph.search_latest(lane, &query, limit),
+                None => graph.search(&query, limit),
+            })
+            .map_err(CommandError::from)
+        })?
     })
     .await
     .map_err(CommandError::worker)??;
@@ -1502,8 +1512,9 @@ pub(crate) async fn quick_switch(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().quick_switch(&query, limit))
+        display_read(&state, &label, binding_generation, |graph| {
+            Ok(graph.quick_switch(&query, limit))
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1688,12 +1699,13 @@ pub(crate) async fn resolve_block(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        let group = slot.graph().resolve_block(&uuid);
-        if let Some(group) = &group {
-            enforce_result_bridge_budget(std::slice::from_ref(group))?;
-        }
-        Ok(group)
+        display_read(&state, &label, binding_generation, |graph| {
+            let group = graph.resolve_block(&uuid);
+            if let Some(group) = &group {
+                enforce_result_bridge_budget(std::slice::from_ref(group))?;
+            }
+            Ok(group)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1713,11 +1725,9 @@ pub(crate) async fn resolve_blocks(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        {
-            let graph = slot.graph();
+        display_read(&state, &label, binding_generation, |graph| {
             let (groups, exceeded, total) = tine_core::query::resolve_blocks_bounded(
-                &graph,
+                graph,
                 &uuids,
                 RESULT_BRIDGE_MAX_ROWS,
                 RESULT_BRIDGE_MAX_BYTES,
@@ -1730,7 +1740,7 @@ pub(crate) async fn resolve_blocks(
             } else {
                 Ok(groups)
             }
-        }
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -1749,16 +1759,15 @@ pub(crate) async fn preview_block(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        let max_nodes = max_nodes.clamp(1, MAX_PREVIEW_NODES);
-        let max_bytes = RESULT_BRIDGE_MAX_BYTES.saturating_sub(4 * 1024);
-        let preview = slot
-            .graph()
-            .preview_block_with_budget(&uuid, max_nodes, max_bytes);
-        if let Some(preview) = &preview {
-            enforce_result_bridge_budget(std::slice::from_ref(&preview.group))?;
-        }
-        Ok(preview)
+        display_read(&state, &label, binding_generation, |graph| {
+            let max_nodes = max_nodes.clamp(1, MAX_PREVIEW_NODES);
+            let max_bytes = RESULT_BRIDGE_MAX_BYTES.saturating_sub(4 * 1024);
+            let preview = graph.preview_block_with_budget(&uuid, max_nodes, max_bytes);
+            if let Some(preview) = &preview {
+                enforce_result_bridge_budget(std::slice::from_ref(&preview.group))?;
+            }
+            Ok(preview)
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -2226,7 +2235,7 @@ pub(crate) async fn list_orphan_assets(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().orphan_assets())
+        slot.graph().orphan_assets().map_err(CommandError::from)
     })
     .await
     .map_err(CommandError::worker)?
@@ -2328,8 +2337,9 @@ pub(crate) async fn list_sync_conflicts(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.with_filesystem_graph(|g| Ok(g.list_sync_conflicts()))
+        display_read(&state, &label, binding_generation, |graph| {
+            Ok(graph.list_sync_conflicts())
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -2349,8 +2359,9 @@ pub(crate) async fn list_vcs_marker_conflicts(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.with_filesystem_graph(|g| Ok(g.list_vcs_marker_conflicts()))
+        display_read(&state, &label, binding_generation, |graph| {
+            Ok(graph.list_vcs_marker_conflicts())
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -2371,8 +2382,9 @@ pub(crate) async fn conflict_queue(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.with_filesystem_graph(|g| Ok(g.conflict_queue()))
+        display_read(&state, &label, binding_generation, |graph| {
+            Ok(graph.conflict_queue())
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -2389,11 +2401,11 @@ pub(crate) async fn vcs_marker_conflict_diff(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.with_filesystem_graph(|g| {
-            g.vcs_marker_conflict_diff(&path)
+        display_read(&state, &label, binding_generation, |graph| {
+            graph
+                .vcs_marker_conflict_diff(&path)
                 .map_err(CommandError::from)
-        })
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -2438,11 +2450,11 @@ pub(crate) async fn sync_conflict_diff(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.with_filesystem_graph(|g| {
-            g.sync_conflict_diff(&winner, &conflict)
+        display_read(&state, &label, binding_generation, |graph| {
+            graph
+                .sync_conflict_diff(&winner, &conflict)
                 .map_err(CommandError::from)
-        })
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -2462,11 +2474,11 @@ pub(crate) async fn duplicate_journal_diff(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.with_filesystem_graph(|g| {
-            g.duplicate_journal_diff(&canonical, &stray)
+        display_read(&state, &label, binding_generation, |graph| {
+            graph
+                .duplicate_journal_diff(&canonical, &stray)
                 .map_err(CommandError::from)
-        })
+        })?
     })
     .await
     .map_err(CommandError::worker)?
@@ -2856,8 +2868,9 @@ pub(crate) async fn get_page_by_path(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.graph().load_by_path(&path).map_err(CommandError::from)
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.load_by_path(&path).map_err(CommandError::from)
+        })?
     })
     .await
     .map_err(CommandError::worker)?

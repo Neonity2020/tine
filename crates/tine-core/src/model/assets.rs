@@ -14,9 +14,11 @@ impl Graph {
     /// media". Conservative: scans every block's `raw` + page `pre_block` for any
     /// `assets/<name>` mention; skips subdirectories (PDF area-image stores) and
     /// `.edn`/dotfiles (sidecars, not media) so nothing in use is ever flagged.
-    pub fn orphan_assets(&self) -> Vec<AssetInfo> {
+    /// A graph whose pages cannot be read is an error: with no references,
+    /// every asset would be listed as an orphan.
+    pub fn orphan_assets(&self) -> io::Result<Vec<AssetInfo>> {
         let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-        self.with_pages(|pages| {
+        self.try_with_pages(|pages| {
             for (_e, doc) in pages {
                 if let Some(pre) = &doc.pre_block {
                     collect_asset_refs(pre, &mut referenced);
@@ -25,8 +27,8 @@ impl Graph {
                     collect_block_asset_refs(b, &mut referenced);
                 }
             }
-        });
-        self.orphan_assets_with_references(&referenced)
+        })?;
+        Ok(self.orphan_assets_with_references(&referenced))
     }
 
     pub(crate) fn orphan_assets_with_references(

@@ -260,7 +260,7 @@ pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopy
     let plan = guide_copy_plan(title)?;
     // Name-only creation needs one current parsed identity snapshot. App-open
     // graphs already have it; keep this public operation correct for cold callers.
-    graph.with_pages(|_| ());
+    graph.try_with_pages(|_| ())?;
     graph.with_graph_text_write_transaction(move || {
         let mut created_pages = Vec::new();
         let mut skipped_pages = Vec::new();

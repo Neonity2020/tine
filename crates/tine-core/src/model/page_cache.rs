@@ -300,24 +300,45 @@ impl Graph {
     /// use copy-on-write under `cache.write()` when a scan still holds an older
     /// snapshot.
     pub fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
+        match self.page_snapshot(true) {
+            Ok(Some(snapshot)) => f(snapshot.as_slice()),
+            // A display read cut short by retirement, or a graph whose text
+            // cannot be read: the page set is empty.
+            Ok(None) | Err(_) => f(&[]),
+        }
+    }
+
+    /// [`Graph::with_pages`] for a read that acts on its answer (an asset
+    /// listing the user trashes from, a Guide copy): an unreadable graph is an
+    /// error here, never an empty page set, and a retired graph still parses.
+    pub fn try_with_pages<T>(
+        &self,
+        f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T,
+    ) -> io::Result<T> {
+        let snapshot = self
+            .page_snapshot(false)?
+            .expect("only a display read is cut short");
+        Ok(f(snapshot.as_slice()))
+    }
+
+    /// The parsed page set, building it on first use. `None` only for a
+    /// display read on a retired graph, which must not parse it.
+    fn page_snapshot(
+        &self,
+        display: bool,
+    ) -> io::Result<Option<Arc<Vec<(PageEntry, Arc<Document>)>>>> {
         loop {
-            let snapshot = {
-                let guard = self.cache.read().unwrap();
-                guard.as_ref().map(Arc::clone)
-            };
-            if let Some(snapshot) = snapshot {
-                return f(snapshot.as_slice());
+            let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone);
+            if snapshot.is_some() {
+                return Ok(snapshot);
             }
-            if self.skip_display_parse() {
-                return f(&[]);
+            if display && self.skip_display_parse() {
+                return Ok(None);
             }
             // Admission precedes flight ownership. Query callers retain their
             // historical retry semantics, while Direct creation uses the bounded
             // `repair_page_cache_once` entry point instead.
-            let permit = match self.admit_retained_graph_text_writer() {
-                Ok(permit) => permit,
-                Err(_) => return f(&[]),
-            };
+            let permit = self.admit_retained_graph_text_writer()?;
             let expected_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
             let (flight, owner) = self.claim_page_build(expected_generation);
             if owner {

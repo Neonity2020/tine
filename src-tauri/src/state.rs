@@ -728,6 +728,152 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    /// Every function that takes a window's graph without [`display_read`].
+    /// A read whose answer is only displayed goes through `display_read`, so a
+    /// refresh that replaces its graph cuts it short instead of letting it
+    /// parse the old graph (GH #543, R2-01). The functions below take the
+    /// graph directly because they write, export, act on their answer, or
+    /// resolve the graph for another accessor.
+    const DIRECT_GRAPH_ACCESS: &[&str] = &[
+        // The accessors themselves, graph binding, and app plumbing.
+        "capture_quick_switch_slot",
+        "display_read",
+        "drain_concord_ledgers_for_exit",
+        "load_graph_for_label",
+        "print_error",
+        "refresh_capture_graph_binding",
+        "refresh_changed_configs",
+        "refresh_graph_for_label",
+        "respond",
+        "run",
+        "slot_for_bound_window",
+        "slot_for_context",
+        "with_config_graph",
+        "with_filesystem_graph",
+        "with_trash_graph",
+        // Writes: pages, assets, settings, conflicts, editor sessions.
+        "activate_absent_editor",
+        "activate_editor",
+        "apply_journal_filename_migrations",
+        "apply_presentation_setting",
+        "begin_direct_cross_page_move",
+        "capture_live_save_conflict",
+        "copy_guide_into_bound_graph",
+        "create_graph_verification",
+        "delete_page",
+        "finish_direct_cross_page_move",
+        "import_asset",
+        "import_native_capture",
+        "merge_pages",
+        "open_pdf",
+        "present_conflict_override",
+        "rename_file_to_page",
+        "rename_page",
+        "resolve_conflict_capsule",
+        "resolve_duplicate_journal_day",
+        "resolve_durable_live_save_conflict",
+        "resolve_live_save_conflict",
+        "resolve_sync_conflict",
+        "resolve_vcs_marker_conflict",
+        "restore_backup",
+        "retire_editor_activation",
+        "save_asset",
+        "save_notices",
+        "save_page",
+        "save_pdf_area_image",
+        "save_session",
+        "save_workspaces",
+        "set_backup_keep",
+        "set_default_home",
+        "set_default_journal_template",
+        "set_doc_mode_enter_for_new_block",
+        "set_favorites",
+        "set_favorites_page",
+        "set_guide_announced",
+        "set_journal_title_format",
+        "set_logical_outdenting",
+        "set_preferred_format",
+        "set_preferred_workflow",
+        "set_show_brackets",
+        "set_start_of_week",
+        "set_timetracking_enabled",
+        "trash_journal_file",
+        "write_highlights",
+        "write_pdf_view_state",
+        // Exports, and reads whose answer is acted on: a partial answer would
+        // be wrong output or a wrong deletion, never just a stale display.
+        "edit_asset_external",
+        "export_query_subtrees",
+        "list_orphan_assets",
+        "open_asset",
+        "open_page_file",
+        "publish_html",
+        "publish_query",
+        "publish_query_plan",
+        // Conflict reviews tied to this graph instance's save epoch.
+        "conflict_capsule_diff",
+        "durable_live_save_conflict_diff",
+        "live_save_conflict_diff",
+        // Reads of named files or of state that never parses the page set.
+        "asset_trash_stats",
+        "capture_quick_switch_for",
+        "graph_source_files",
+        "indexing_progress",
+        "list_backups",
+        "list_journal_conflicts",
+        "list_journal_filename_migrations",
+        "load_notices",
+        "load_session",
+        "load_workspaces",
+        "read_asset",
+        "read_custom_css",
+        "read_highlights",
+        "read_journal_file",
+        "stream_asset_path",
+        "warm_done",
+    ];
+
+    /// The complete list of direct graph accessors: a new one fails here until
+    /// it is either routed through `display_read` or listed above.
+    #[test]
+    fn a_read_takes_its_graph_through_display_read_or_is_listed() {
+        const ACCESSORS: [&str; 6] = [
+            "slot_for_bound_window(",
+            "slot_for_window(",
+            "slot_for_context(",
+            "with_filesystem_graph(",
+            "with_config_graph(",
+            "capture_quick_switch_slot(",
+        ];
+        let mut owners = std::collections::BTreeSet::new();
+        for (_, source) in crate::test_support::rust_module_sources() {
+            let production = crate::test_support::without_cfg_test_items(&source);
+            for accessor in ACCESSORS {
+                for (index, _) in production.match_indices(accessor) {
+                    let before = &production[..index];
+                    if before.ends_with("fn ") {
+                        continue;
+                    }
+                    let Some(at) = before.rfind("fn ") else {
+                        continue;
+                    };
+                    let name = &production[at + 3..];
+                    owners.insert(name[..name.find(['(', '<']).unwrap()].to_string());
+                }
+            }
+        }
+        let owners = owners.into_iter().collect::<Vec<_>>();
+        let mut listed = DIRECT_GRAPH_ACCESS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            owners, listed,
+            "A function takes a window's graph without display_read. A read whose \
+             answer is only displayed must use state::display_read, or a refresh \
+             leaves it parsing the replaced graph (GH #543, I-13). A write, export, \
+             or read that acts on its answer is listed in DIRECT_GRAPH_ACCESS."
+        );
+    }
+
     /// Retirement is permanent, so it happens only where a graph is finally
     /// replaced or unbound: a registry bind or removal, or a refresh commit,
     /// which runs after the last step that can fail (GH #543, R2-03).

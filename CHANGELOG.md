@@ -70,6 +70,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- When the graph's pages could not be read, the unused-assets list offered
+  every asset for trashing, including media still in use. It now reports the
+  error instead.
 - Opening or saving a page while another edit was still being indexed could
   make the app read and parse the whole graph again, instead of waiting a
   moment for that edit (GH #543).

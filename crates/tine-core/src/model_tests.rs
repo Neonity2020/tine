@@ -6334,7 +6334,12 @@ fn orphan_assets_lists_only_unreferenced_media() {
     )
     .unwrap();
     let g = Graph::open(&dir);
-    let orphans: Vec<String> = g.orphan_assets().into_iter().map(|a| a.name).collect();
+    let orphans: Vec<String> = g
+        .orphan_assets()
+        .unwrap()
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
     assert_eq!(
         orphans,
         vec!["old_video.webm".to_string(), "stray.png".to_string()]
@@ -6346,6 +6351,35 @@ fn orphan_assets_lists_only_unreferenced_media() {
     // A name with a separator is refused (can't escape assets/).
     assert!(g.trash_asset("../pages/P.md").is_err());
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// With no readable pages there are no references, so every asset would be
+/// listed as an orphan for the user to trash. An unreadable graph is an error.
+#[cfg(unix)]
+#[test]
+fn orphan_assets_is_an_error_when_the_pages_cannot_be_read() {
+    let real = scratch("orphan-unreadable-real");
+    fs::create_dir_all(real.join("assets")).unwrap();
+    fs::write(real.join("assets").join("used.png"), b"x").unwrap();
+    fs::write(
+        real.join("pages").join("P.md"),
+        "- ![](../assets/used.png)\n",
+    )
+    .unwrap();
+    let link = real.with_file_name(format!(
+        "tine-orphan-unreadable-link-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let g = Graph::open(&link);
+    let listed = g.orphan_assets();
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_dir_all(&real);
+    assert!(
+        listed.is_err(),
+        "listed {listed:?} from a graph whose pages it could not read"
+    );
 }
 
 #[test]
@@ -6365,7 +6399,12 @@ fn orphan_assets_does_not_flag_percent_encoded_in_use_asset() {
     )
     .unwrap();
     let g = Graph::open(&dir);
-    let orphans: Vec<String> = g.orphan_assets().into_iter().map(|a| a.name).collect();
+    let orphans: Vec<String> = g
+        .orphan_assets()
+        .unwrap()
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
     assert_eq!(
         orphans,
         vec!["real orphan.png".to_string()],
