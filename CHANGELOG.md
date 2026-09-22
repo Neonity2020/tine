@@ -75,6 +75,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   moment for that edit (GH #543).
 - If the search index was damaged, several searches failing at once could
   rebuild it twice in a row (GH #543).
+- While one page file could not be read (for example a file still arriving
+  from a sync service), every page listing re-read and parsed the whole graph.
+  Only the unreadable file is re-checked now (GH #543).
 - Changing a display-only setting (bracket display, time tracking, logical
   outdenting, document-mode Enter) or dismissing the Guide notice reloaded the
   whole graph. On a first launch that restarted indexing from the beginning,

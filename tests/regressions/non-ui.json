@@ -5446,6 +5446,35 @@
   "failBefore": "proven"
  },
  "notes": "Found from Windows run 35719587395: a 100-page warm reopen showed one whole-graph parse offered as a full snapshot after a slow edit turn. wait_for_derived_read kept waiting only for a warm or a turn in progress; with an edit queued behind a turn it returned after the 250 ms delta wait, and with no parsed cache the page inventory, aliases, icons, journal days or block-ref counts parsed every page, then enqueued the parse as a full snapshot. Queued edits on a validated image now count as coming. Before validation they still do not (they wait for an inventory). Evidence: tine-agents/evidence/gh550-batch/derived-read-queued-edit-fail-before.log."
+},
+{
+ "id": "REG-UNREADABLE-PAGE-LISTING-PARSES-ONLY-THE-FAILED-PATH-543",
+ "title": "One unreadable page file does not make every page listing parse the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests.rs::gh543_listing_with_an_unreadable_page_does_not_reparse_healthy_pages",
+   "crates/tine-core/src/model_tests.rs::watcher_parse_failure_cannot_republish_stale_warm_page_inventory"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Audit finding IT-07. With a known page-index failure, list_pages skipped the parsed cache and ran exact_page_inventory_from_disk, which reads and parses every page; the listing memo is dropped by every save and watcher event, so while one file stayed unreadable each listing cost a whole-graph parse. The listing now re-reads only the failed paths and, if they are all still unreadable and the generation is unchanged, answers from the parsed cache minus those paths; any failed path that became readable falls back to the exact disk inventory. Fail-before: 5 healthy-page parses per listing on the 6-page fixture, 0 after. Evidence: tine-agents/evidence/gh550-batch/it07-unreadable-listing-fail-before.log."
 }
 ]
 }
