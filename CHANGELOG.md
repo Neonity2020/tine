@@ -70,6 +70,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- A named page (a restored tab, the home page, a favourite, a link) opens
+  straight from its file while Tine is still indexing the graph at launch,
+  instead of waiting for the index: 4 s to 1 ms on a 10,000-page graph. When
+  two files claim the same page name, the file named for the page is now the
+  one opened, before and after indexing, rather than whichever sorts first
+  (GH #543).
+
 - Reopening a graph after a few pages changed elsewhere (Syncthing, another
   device, an external editor) no longer rebuilds the whole search and query
   index: only the changed, added or deleted pages are re-indexed, and the index
