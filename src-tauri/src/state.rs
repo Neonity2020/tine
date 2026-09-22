@@ -213,6 +213,7 @@ impl GraphRegistry {
             if old.binding_generation != slot.binding_generation || old.root_key != slot.root_key {
                 old.background_cancelled
                     .store(true, std::sync::atomic::Ordering::Release);
+                old.graph().retire();
             }
             self.by_root.remove(&old.root_key);
         }
@@ -224,7 +225,8 @@ impl GraphRegistry {
         let slot = self.by_window.remove(window)?;
         slot.background_cancelled
             .store(true, std::sync::atomic::Ordering::Release);
-        // This only revokes Tauri background work.
+        slot.graph().retire();
+        // This revokes Tauri background work and display reads.
         self.by_root.remove(&slot.root_key);
         Some(slot)
     }
@@ -424,6 +426,29 @@ pub(crate) fn slot_for_bound_window(
     Ok(slot)
 }
 
+/// Answer a display-only read (a listing, aliases, icons, counts) from the
+/// window's current graph. A read that was running on a graph the app has
+/// since replaced returns no answer rather than parse that retired graph, and
+/// is asked again of its replacement (GH #543). After a real graph switch the
+/// binding no longer matches and the request ends as stale, as before.
+pub(crate) fn display_read<T>(
+    state: &AppState,
+    window: &str,
+    binding_generation: u64,
+    read: impl Fn(&Graph) -> T,
+) -> Result<T, CommandError> {
+    // A refresh retires the old graph before it binds the replacement; the
+    // bound limits the wait if that bind never comes.
+    for _ in 0..500 {
+        let graph = slot_for_bound_window(state, window, Some(binding_generation))?.graph();
+        if let Some(answer) = graph.display_read(|| read(&graph)) {
+            return Ok(answer);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(CommandError::prose("stale-graph-binding"))
+}
+
 /// Resolve the only graph capability granted to the capture WebView: a bounded
 /// page/tag quick-switch query. This is deliberately not a GraphContext route;
 /// capture retains no generic read or write access to the selected graph.
@@ -569,6 +594,7 @@ pub(crate) fn reopen_legacy_for_refresh(
     services: crate::graph::DirectFilesServicePaths,
 ) -> Result<GraphSlot, CommandError> {
     let old_graph = old.graph();
+    old_graph.retire();
     // The replacement attaches a projection at the SAME path; the old worker
     // must have released the writer lease first or the new one races it.
     if !old_graph.detach_direct_projection(Duration::from_secs(15)) {
@@ -903,6 +929,63 @@ mod tests {
                 .warm_generation
                 .load(std::sync::atomic::Ordering::Acquire),
             7
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_display_read_on_a_retired_graph_is_answered_by_its_replacement() {
+        let base = std::env::temp_dir().join(format!("tine-retired-read-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState {
+            graphs: RwLock::new(GraphRegistry::default()),
+            storage_supervisor:
+                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
+            watch_ctl: Mutex::new(None),
+            last_focused: Mutex::new(Some("main".into())),
+            capture_graph: Mutex::new(Default::default()),
+            #[cfg(desktop)]
+            next_window: AtomicU64::new(2),
+        });
+        let old = graph(&base);
+        std::fs::write(base.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        let generation = old.binding_generation;
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind("main".into(), Arc::clone(&old))
+            .unwrap();
+        // A refresh retires the old graph and binds its replacement shortly after.
+        old.graph().retire();
+        let binder = std::thread::spawn({
+            let state = Arc::clone(&state);
+            let old = Arc::clone(&old);
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                let replacement = Graph::open_checked_with_assets(&old.root_key, None).unwrap();
+                let slot = Arc::new(GraphSlot::refreshed(replacement, &old).unwrap());
+                state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind("main".into(), slot)
+                    .unwrap();
+            }
+        });
+        let started = std::time::Instant::now();
+        let names = display_read(&state, "main", generation, |graph| {
+            graph
+                .list_pages()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        binder.join().unwrap();
+        assert_eq!(names, vec!["Alpha".to_owned()]);
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the retired graph must not answer by parsing itself; the replacement answers"
         );
         let _ = std::fs::remove_dir_all(base);
     }

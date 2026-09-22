@@ -350,6 +350,10 @@ impl Graph {
             if projection.wait_ready_at(generation) {
                 return Some(generation);
             }
+            // A replaced graph's reads are no longer anyone's to wait for.
+            if self.is_retired() {
+                return None;
+            }
             let coming = match projection.progress_at(generation) {
                 // `Busy`: the worker has taken the queued warm or edit and is
                 // applying it.

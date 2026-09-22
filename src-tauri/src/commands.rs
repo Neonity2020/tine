@@ -4,9 +4,9 @@ use crate::debug::diag;
 #[cfg(desktop)]
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
-    capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_config_graph, with_filesystem_graph, with_trash_graph, AppState,
-    GraphContext,
+    capture_quick_switch_slot, display_read, owned_graph_context, refresh_graph,
+    slot_for_bound_window, slot_for_context, with_config_graph, with_filesystem_graph,
+    with_trash_graph, AppState, GraphContext,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -273,8 +273,9 @@ pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().list_pages())
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.list_pages()
+        })
     })
     .await
     .map_err(CommandError::worker)?
@@ -550,12 +551,10 @@ pub(crate) async fn get_backlink_filter_context(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        {
-            let graph = slot.graph();
-            tine_core::query::backlink_filter_context(&graph, &name, &targets, &search)
-                .map_err(CommandError::from)
-        }
+        display_read(&state, &label, binding_generation, |graph| {
+            tine_core::query::backlink_filter_context(graph, &name, &targets, &search)
+        })?
+        .map_err(CommandError::from)
     })
     .await
     .map_err(CommandError::worker)?
@@ -590,8 +589,10 @@ pub(crate) async fn block_ref_counts(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.graph().block_ref_counts().map_err(CommandError::from)
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.block_ref_counts()
+        })?
+        .map_err(CommandError::from)
     })
     .await
     .map_err(CommandError::worker)?
@@ -1273,8 +1274,9 @@ pub(crate) async fn page_aliases(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().page_aliases())
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.page_aliases()
+        })
     })
     .await
     .map_err(CommandError::worker)?
@@ -1288,8 +1290,9 @@ pub(crate) async fn page_icons(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().page_icons(&names))
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.page_icons(&names)
+        })
     })
     .await
     .map_err(CommandError::worker)?
@@ -1654,8 +1657,9 @@ pub(crate) async fn list_templates(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().templates())
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.templates()
+        })
     })
     .await
     .map_err(CommandError::worker)?
@@ -1668,8 +1672,9 @@ pub(crate) async fn journal_content_days(
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        Ok(slot.graph().journal_content_days())
+        display_read(&state, &label, binding_generation, |graph| {
+            graph.journal_content_days()
+        })
     })
     .await
     .map_err(CommandError::worker)?

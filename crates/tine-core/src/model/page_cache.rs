@@ -305,6 +305,9 @@ impl Graph {
             if let Some(snapshot) = snapshot {
                 return f(snapshot.as_slice());
             }
+            if self.skip_display_parse() {
+                return f(&[]);
+            }
             // Admission precedes flight ownership. Query callers retain their
             // historical retry semantics, while Direct creation uses the bounded
             // `repair_page_cache_once` entry point instead.

@@ -46,7 +46,9 @@ impl Graph {
                 None => return Vec::new(),
             }
         };
-        *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
+        if self.answer_is_complete() {
+            *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
+        }
         entries
     }
 
@@ -101,6 +103,9 @@ impl Graph {
     /// text scope itself could not be read; the caller then lists nothing, and
     /// the reason is left in `page_index_failures`.
     fn exact_page_inventory_from_disk(&self) -> Option<Vec<PageEntry>> {
+        if self.skip_display_parse() {
+            return None;
+        }
         let built = self.admit_retained_graph_text_writer().and_then(|permit| {
             let (entries, skipped) = self.graph_text_entries_and_skipped(&permit)?;
             let limits = graph_text_inventory_limits();

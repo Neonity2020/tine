@@ -9773,3 +9773,97 @@ fn gh543_a_page_list_before_the_scheduled_warm_starts_waits_for_it() {
     release_projection(&graph);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn gh543_a_display_read_on_a_retired_graph_parses_nothing() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-retired-display-read");
+    let database = scratch("gh543-retired-display-read-db").join("projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database.clone()).unwrap();
+    assert!(graph.warm_cache_cancellable(|| false));
+    wait_ready(&graph);
+    assert!(!graph.has_parsed_cache_test());
+    let parses = graph.page_build_parses_test();
+    let edit = |name: &str, text: &str| {
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let revision = page.rev.clone();
+        page.blocks[0].raw = text.into();
+        (page, revision)
+    };
+    let (one, one_rev) = edit("one", "TODO one edited");
+    let (two, two_rev) = edit("two", "DONE two edited");
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+        let _ = paused_tx.send(());
+        let _ = resume_rx.recv();
+    }));
+    graph.save_page(&one, one_rev.as_deref()).unwrap();
+    paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    graph.save_page(&two, two_rev.as_deref()).unwrap();
+    let reader = std::thread::spawn({
+        let graph = Arc::clone(&graph);
+        move || graph.display_read(|| graph.journal_content_days())
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    // The app replaces the graph (a refresh): it retires it, then detaches
+    // its projection.
+    graph.retire();
+    let detacher = std::thread::spawn({
+        let graph = Arc::clone(&graph);
+        move || graph.detach_direct_projection(Duration::from_secs(15))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    resume_tx.send(()).unwrap();
+    assert!(detacher.join().unwrap());
+    assert_eq!(
+        reader.join().unwrap(),
+        None,
+        "a display read cut short by retirement has no answer; the app asks the replacement"
+    );
+    assert_eq!(
+        graph.page_build_parses_test(),
+        parses,
+        "a display read on a replaced graph must not parse that graph"
+    );
+
+    // A read that acts on its answer is not a display read: on the same
+    // retired graph it still gets the complete answer.
+    assert_eq!(graph.journal_content_days(), vec![20260906]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn gh543_a_display_read_cut_short_leaves_no_memo_behind() {
+    let root = r6_graph("gh543-retired-read-memo");
+    let graph = Graph::open(&root);
+    let expected = Graph::open(&root).list_pages().len();
+    assert!(expected > 0);
+    // Retired while the read runs: the listing and the name lookup built
+    // from it skip the parse and are incomplete.
+    let cut_short = graph.display_read(|| {
+        graph.retire();
+        let listed = graph.list_pages().len();
+        let found = graph.find_entry("one", PageKind::Page);
+        (listed, found)
+    });
+    assert!(cut_short.is_none());
+    // A read that acts on its answer then gets the whole graph, not a memo of
+    // the gap.
+    assert_eq!(graph.list_pages().len(), expected);
+    assert!(graph.find_entry("one", PageKind::Page).is_some());
+    let _ = std::fs::remove_dir_all(root);
+}
