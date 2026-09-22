@@ -66,8 +66,10 @@ impl Graph {
     }
 
     /// What the graph-sized index work is doing, for the indexing progress bar
-    /// (GH #543). `None` once search is answered by a current index, or when
-    /// nothing graph-sized is running. Presentation only.
+    /// (GH #543). `None` only when nothing graph-sized is running: a current
+    /// index does not hide a whole-graph parse a page consumer started
+    /// (audit R5-03), so the running pass is consulted before readiness.
+    /// Presentation only.
     pub fn indexing_progress(&self) -> Option<crate::indexing_progress::IndexingProgress> {
         use crate::direct_projection::ProjectionProgress;
         use crate::indexing_progress::{IndexingPhase, IndexingProgress};
@@ -79,12 +81,12 @@ impl Graph {
         if let Some(build) = projection.build_progress() {
             return Some(build);
         }
+        if let Some(pass) = self.indexing_progress.snapshot() {
+            return Some(pass);
+        }
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         if projection.ready_at(generation) {
             return None;
-        }
-        if let Some(pass) = self.indexing_progress.snapshot() {
-            return Some(pass);
         }
         // Between passes: a queued snapshot or an announced warm is still
         // graph-sized work, so keep the bar up rather than flicker it off.

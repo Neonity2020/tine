@@ -5819,6 +5819,30 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 5, R5-02. An edit queued between the warm's drift check and its enqueue outranked the warm's generation; the refusal was reported as Retry and the warm fell back to a whole-graph parse. Fix (shape): enqueue_warm_with_repair returns a typed WarmRefusal (Unavailable, Superseded, Outranked) and takes the repair only when it queues. On Outranked the warm re-runs its drift check, which picks up the edit as a published update, and offers again, at most 8 times before the parse. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log; with the retry bound set to 0, 5 of 5 pages are parsed (tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-02.log)."
+},
+{
+ "id": "REG-A-READY-INDEX-DOES-NOT-HIDE-A-GRAPH-PARSE-FROM-PROGRESS-543",
+ "title": "The progress indicator shows a whole-graph page read even when the search index is already ready",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_ready_index_does_not_hide_a_consumer_parse_from_the_progress_bar"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 5, R5-03 (a sibling of R4-P2). Graph::indexing_progress returned None for a ready index before it checked the running core pass, so an asset listing's whole-graph parse showed as idle. Fix: the running pass is consulted first. The poller in src/indexingProgress.ts has no other ready-means-idle exit. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log and tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-03.log."
 }
 ]
 }

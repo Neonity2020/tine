@@ -10345,3 +10345,41 @@ fn an_edit_just_before_the_warm_offers_its_validation_parses_nothing() {
     assert_eq!(found, 1, "the edit never reached the index");
     assert_eq!(parses, 0, "one queued edit discarded the warm's inventory");
 }
+
+/// GH #543 (audit R5-03): a whole-graph parse a page consumer runs after the
+/// index is ready still shows on the progress bar. A ready index used to
+/// answer "idle" before the running pass was consulted.
+#[test]
+fn a_ready_index_does_not_hide_a_consumer_parse_from_the_progress_bar() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("r5-ready-progress");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    assert!(!graph.has_parsed_cache_test());
+    let pause = graph.pause_next_fast_parse_test();
+    let consumer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.orphan_assets().unwrap())
+    };
+    pause.reached.wait();
+    let during = graph.indexing_progress();
+    pause.release.wait();
+    consumer.join().unwrap();
+    let after = graph.indexing_progress();
+    release_projection(&graph);
+    assert!(
+        during.is_some(),
+        "a ready index hid an active whole-graph parse"
+    );
+    assert!(after.is_none(), "the finished parse left progress behind");
+}
