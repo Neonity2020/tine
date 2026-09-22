@@ -178,7 +178,13 @@ impl Graph {
         use std::sync::atomic::Ordering;
         let generation = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
-        let config_digest = self.config().parse_config().digest();
+        let config_digest = {
+            let config = self.config();
+            (
+                config.parse_config().digest(),
+                config.answer_settings_digest(),
+            )
+        };
         {
             let mut g = self.derived_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {

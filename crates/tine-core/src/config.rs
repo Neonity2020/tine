@@ -172,21 +172,39 @@ pub enum ConfigReach {
 /// listed here. A `settings` field must be one nothing copies at open or
 /// into the index (`config_reach_tests` checks the places that do).
 macro_rules! config_reach {
-    (graph: [$($g:ident),* $(,)?], settings: [$($s:ident),* $(,)?] $(,)?) => {
+    (
+        graph: [$($g:ident),* $(,)?],
+        answers: [$($a:ident),* $(,)?],
+        settings: [$($s:ident),* $(,)?] $(,)?
+    ) => {
         impl Config {
             /// The fields a [`ConfigReach::Settings`] change may move.
-            pub const SETTINGS_FIELDS: &'static [&'static str] = &[$(stringify!($s)),*];
+            pub const SETTINGS_FIELDS: &'static [&'static str] =
+                &[$(stringify!($a),)* $(stringify!($s)),*];
+
+            /// The settings a derived answer (references, queries) reads when it
+            /// runs, so a memoized answer is keyed on them.
+            pub const ANSWER_FIELDS: &'static [&'static str] = &[$(stringify!($a)),*];
 
             /// How far the change from `self` to `new` reaches.
             pub fn reach(&self, new: &Config) -> ConfigReach {
-                let Config { $($g,)* $($s,)* } = self;
+                let Config { $($g,)* $($a,)* $($s,)* } = self;
                 if false $(|| *$g != new.$g)* {
                     return ConfigReach::Graph;
                 }
-                if false $(|| *$s != new.$s)* {
+                if false $(|| *$a != new.$a)* $(|| *$s != new.$s)* {
                     return ConfigReach::Settings;
                 }
                 ConfigReach::Unchanged
+            }
+
+            /// A digest of the [`Config::ANSWER_FIELDS`], for keying memoized
+            /// answers (in-process only).
+            pub(crate) fn answer_settings_digest(&self) -> u64 {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                $(self.$a.hash(&mut hasher);)*
+                hasher.finish()
             }
         }
     };
@@ -210,6 +228,13 @@ config_reach! {
         property_pages_enabled,
         property_pages_excludelist,
     ],
+    // Read when a reference or query answer is computed, so a change must
+    // not be served an answer memoized under the old value (audit R3-06).
+    answers: [
+        favorites_page,
+    ],
+    // Read by the frontend, or by an action (export, file creation) when it
+    // runs; no memoized answer depends on them.
     settings: [
         preferred_workflow,
         shortcuts,
@@ -219,8 +244,6 @@ config_reach! {
         default_journal_template,
         default_home,
         favorites,
-        // Excluded from references when a query runs, not when it is indexed.
-        favorites_page,
         preferred_format,
         macros,
         enable_timetracking,
@@ -1458,6 +1481,76 @@ mod config_reach_tests {
         assert!(
             copied.is_empty(),
             "settings fields copied where a swap cannot reach: {copied:?}"
+        );
+    }
+
+    /// A memoized reference or query answer is keyed on the answer settings
+    /// only (`Config::answer_settings_digest`). A setting outside that list
+    /// read anywhere an answer is computed would be served stale after a
+    /// change (audit R3-06). The readers allowed here act when they run
+    /// (export, file creation) or describe the config to the frontend; to
+    /// read another setting while computing an answer, list it under
+    /// `answers:` in `config_reach!`.
+    #[test]
+    fn only_an_answer_setting_is_read_where_answers_are_computed() {
+        const ALLOWED: &[(&str, &[&str])] = &[
+            ("config.rs", &["*"]),
+            ("model/paths.rs", &["*"]),
+            ("publish.rs", &["*"]),
+            ("publish/", &["*"]),
+            ("model/pdf.rs", &["preferred_format"]),
+            ("model/pages_merge.rs", &["preferred_format"]),
+            ("model/graph_text_inventory.rs", &["preferred_format"]),
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut readers = Vec::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.contains("tests") || rel.ends_with("_test.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&file).unwrap();
+            for field in Config::SETTINGS_FIELDS {
+                if Config::ANSWER_FIELDS.contains(field) {
+                    continue;
+                }
+                let allowed = ALLOWED.iter().any(|(prefix, fields)| {
+                    rel.starts_with(prefix) && (fields.contains(&"*") || fields.contains(field))
+                });
+                if allowed {
+                    continue;
+                }
+                for read in [format!("config.{field}"), format!("config().{field}")] {
+                    let hit = source.match_indices(read.as_str()).any(|(at, _)| {
+                        !source[at + read.len()..]
+                            .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                    });
+                    if hit {
+                        readers.push(format!("{rel}: {field}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            readers.is_empty(),
+            "settings read outside the answer list where answers may be computed; \
+             list them under `answers:` in `config_reach!` (GH #543, audit R3-06): {readers:?}"
         );
     }
 }

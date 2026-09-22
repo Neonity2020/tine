@@ -6,9 +6,10 @@ use super::*;
 pub(super) struct DerivedCache {
     pub(super) generation: u64,
     pub(super) today: i64,
-    /// The parse configuration under which the reference results were built.
-    /// A mismatch drops the whole cache.
-    pub(super) config_digest: tine_storage::ContentDigest,
+    /// The parse configuration and the answer settings
+    /// ([`Config::ANSWER_FIELDS`]) under which the results were built. A
+    /// mismatch drops the whole cache.
+    pub(super) config_digest: (tine_storage::ContentDigest, u64),
     // `Arc<Vec<RefGroup>>` so serving a memoized result (every dataRev re-render)
     // is a refcount bump, not a deep clone of every matched block (see derived_memo).
     pub(super) results: std::collections::HashMap<String, (DerivedEntry, usize)>,

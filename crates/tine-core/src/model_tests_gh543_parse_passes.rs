@@ -35,6 +35,46 @@ fn a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure() {
     );
 }
 
+/// GH #543 (audit R3-06): the favorites page excludes references from
+/// answers, so changing it must key a fresh answer, not the memo computed
+/// under the old value.
+#[test]
+fn a_favorites_page_change_is_not_answered_from_the_old_memo() {
+    let dir = scratch("audit543-r3-favorites-memo");
+    fs::write(dir.join("pages/Target.md"), "- target\n").unwrap();
+    fs::write(dir.join("pages/Favorites.md"), "- [[Target]]\n").unwrap();
+    fs::write(dir.join("pages/Other.md"), "- [[Target]]\n").unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    let before = graph
+        .backlinks_bounded_indexed("Target", 100, 1_000_000)
+        .unwrap();
+    graph.set_favorites_page("Favorites").unwrap();
+    let after = graph
+        .backlinks_bounded_indexed("Target", 100, 1_000_000)
+        .unwrap();
+    let fresh = crate::query::backlinks_bounded_indexed(&graph, "Target", 100, 1_000_000).unwrap();
+    graph.detach_direct_projection(Duration::from_secs(5));
+    let names = |groups: &[RefGroup]| groups.iter().map(|g| g.page.clone()).collect::<Vec<_>>();
+    eprintln!(
+        "R3 favorites: before={:?} after={:?} fresh={:?}",
+        names(&before.groups),
+        names(&after.groups),
+        names(&fresh.groups)
+    );
+    assert_eq!(
+        names(&after.groups),
+        names(&fresh.groups),
+        "settings-only take-in left a cached answer under old reference exclusions"
+    );
+}
+
 /// GH #543 (audit R3-04): revalidating one readable page that failed to
 /// parse re-reads that page only, not every page in the graph.
 #[test]

@@ -5656,5 +5656,41 @@
  },
  "notes": "GH #543 indexing audit round 2, BY6.3. The watcher skipped config.edn when disk matched the bytes the graph opened with or the bytes it last wrote. A graph-reaching outside change folded into Tine's own read-modify-write matched the last write, and an outside revert matched the opening bytes, so both were never taken in. The gate is now one digest, Graph::served_config_description, of the bytes the served configuration was taken from; a change that reaches the graph never updates it. Fail-before on 01843ec7 (old gate shimmed): both cases read as unchanged. Evidence: tine-agents/evidence/gh550-batch/by63-fail-before.log."
 }
+},
+{
+ "id": "REG-FAVORITES-CHANGE-IS-NOT-ANSWERED-FROM-THE-OLD-MEMO-543",
+ "title": "Changing the favorites page updates linked references instead of serving the answer computed under the old value",
+ "family": "config-live-reload",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_favorites_page_change_is_not_answered_from_the_old_memo", "crates/tine-core/src/config.rs::only_an_answer_setting_is_read_where_answers_are_computed"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 3, R3-06 (regression of the unreleased in-place settings change). The favorites page excludes references from answers, but the derived memo was keyed on the parser config only, so a settings-only take-in served the old answer. Fix (shape): config_reach! now lists answer settings separately (answers: [favorites_page]); the memo key includes Config::answer_settings_digest, and a source guard fails when a setting outside that list is read where answers are computed (allowed: config, paths, publish, and preferred_format in pdf, pages_merge and graph_text_inventory, which act when they run). Fail-before at 788300f0: evidence tine-agents/evidence/gh550-batch/indexing-audit-r3/RECEIPT-indexing-audit-r3-probes.log; the guard fails when favorites_page is moved out of answers."
+},
+{
+ "id": "REG-A-LATER-WATCHER-FAILURE-SURVIVES-AN-EARLIER-CAPTURE-543",
+ "title": "A page that becomes unreadable while the graph is indexed stays known as unreadable, and the index does not report itself complete without it",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 3, R3-07. record_watcher_identity_failure moved the cache generation without recording a structural event, so a complete capture that started earlier installed over it, erased the failure and marked the index ready. Recording and clearing a watcher failure now record StructuralChange::Reread(path) before the generation moves, so the capture re-reads that path. Fail-before at 788300f0: evidence tine-agents/evidence/gh550-batch/indexing-audit-r3/RECEIPT-indexing-audit-r3-probes.log."
 ]
 }
