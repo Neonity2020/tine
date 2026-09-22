@@ -564,7 +564,7 @@ pub(crate) fn direct_files_service_paths(
 
 /// Attach the Direct Files services to a freshly opened `Graph`. This is the
 /// ONE place that does so: the ordinary open and the configuration refresh
-/// (`state::reopen_legacy_for_refresh`) both go through it, so a `Graph` that
+/// (`state::PreparedRefresh::commit`) both go through it, so a `Graph` that
 /// reaches the window registry always carries its projection. A refresh that
 /// reopened without attaching left every query `ProjectionUnavailable` until
 /// the next graph open (GH draft "Query Engine", 2026-09-11: dismissing the
@@ -1344,15 +1344,23 @@ mod tests {
             "the open path attaches before it publishes"
         );
         let state = production(include_str!("state.rs"));
+        let prepare = &state[state
+            .find("pub(crate) fn prepare_legacy_refresh")
+            .expect("refresh preparation")..];
+        let prepare = &prepare[..prepare.find("\n}\n").expect("end of preparation")];
+        assert!(
+            prepare.contains("Graph::open_checked_with_assets(")
+                && !prepare.contains("retire(")
+                && !prepare.contains("detach_direct_projection("),
+            "refresh preparation reopens the root and leaves the bound graph serving"
+        );
         let refresh = &state[state
-            .find("pub(crate) fn reopen_legacy_for_refresh")
-            .expect("refresh core")..];
+            .find("pub(crate) fn commit(self, old: &GraphSlot) -> GraphSlot")
+            .expect("refresh commit")..];
+        let retire = refresh.find(".retire()").expect("old graph retired");
         let detach = refresh
             .find("detach_direct_projection(")
             .expect("old worker retired");
-        let reopen = refresh
-            .find("Graph::open_checked_with_assets(")
-            .expect("refresh reopens");
         let attach = refresh
             .find("attach_direct_files_services(")
             .expect("refresh attaches");
@@ -1360,15 +1368,15 @@ mod tests {
             .find("GraphSlot::refreshed(")
             .expect("refresh publishes");
         assert!(
-            detach < reopen && reopen < attach && attach < slot,
-            "refresh retires the old projection worker, reopens, attaches, then builds the slot"
+            retire < detach && detach < attach && attach < slot,
+            "refresh commit retires the old graph, stops its projection worker, \
+             attaches, then builds the slot"
         );
         let refresh_entry = &state[state
             .find("pub(crate) fn refresh_graph_for_label")
             .expect("refresh entry")..];
         assert!(
-            refresh_entry.find("reopen_legacy_for_refresh(")
-                < refresh_entry.find("warm_cache_async("),
+            refresh_entry.find(".commit(&old)") < refresh_entry.find("warm_cache_async("),
             "the refreshed slot is warmed, or the projection never receives its payload"
         );
     }

@@ -413,7 +413,8 @@ cache after a SQL-only warm reopen. A whole-graph derived read (page inventory, 
 icons, journal days, block-ref counts) with no parsed cache waits while a warm,
 a turn in progress, or an edit queued on a validated image is coming, and
 parses the graph only when none is. Once the app replaces a graph (a switch or
-a refresh) it retires it: a display read still running on it (page list,
+a refresh) it retires it, only after every step that can fail, so a failed
+refresh leaves the bound graph serving: a display read still running on it (page list,
 aliases, icons, journal days, block-ref counts, templates, backlink filters)
 stops waiting, parses nothing, memoizes nothing, and is asked again of the
 replacement; reads that act on their answer keep their full answer. A rebuild, failed write, or idle image this

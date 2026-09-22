@@ -147,9 +147,9 @@ impl GraphSlot {
     /// assignment, not the particular in-memory `Graph` instance. Minting a new
     /// generation here made every later command from that window stale after a
     /// config refresh, including autosaves.
-    fn refreshed(graph: Graph, old: &GraphSlot) -> Result<Self, CommandError> {
+    fn refreshed(graph: Graph, old: &GraphSlot) -> Self {
         let graph_meta = graph.meta();
-        Ok(Self {
+        Self {
             graph: Arc::new(graph),
             graph_meta: RwLock::new(graph_meta),
             root_key: old.root_key.clone(),
@@ -160,7 +160,7 @@ impl GraphSlot {
                     .load(std::sync::atomic::Ordering::Acquire),
             ),
             background_cancelled: Arc::clone(&old.background_cancelled),
-        })
+        }
     }
 }
 
@@ -219,6 +219,26 @@ impl GraphRegistry {
         }
         self.by_root.insert(slot.root_key.clone(), window);
         Ok(())
+    }
+
+    /// Swap a refreshed slot in for `expected`, the slot the refresh reopened,
+    /// if the window still holds it; returns whether it did. A window that
+    /// moved on meanwhile keeps its graph: whatever replaced `expected`
+    /// already retired it, and binding the refresh over it would reopen the
+    /// old root in a window that has left it.
+    pub(crate) fn swap_refreshed(
+        &mut self,
+        window: &str,
+        expected: &Arc<GraphSlot>,
+        slot: Arc<GraphSlot>,
+    ) -> bool {
+        match self.by_window.get_mut(window) {
+            Some(current) if Arc::ptr_eq(current, expected) => {
+                *current = slot;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn remove(&mut self, window: &str) -> Option<Arc<GraphSlot>> {
@@ -563,56 +583,78 @@ pub(crate) fn refresh_graph_for_label(
     }
     let approved = crate::settings::approved_external_assets(app, &old.root_key);
     let services = crate::graph::direct_files_service_paths(app, &old.root_key);
-    let replacement = Arc::new(reopen_legacy_for_refresh(
-        &old,
-        approved.as_deref(),
-        services,
-    )?);
+    let prepared = prepare_legacy_refresh(&old, approved.as_deref(), services)?;
+    let replacement = Arc::new(prepared.commit(&old));
     // The reopened graph starts with a cold parsed cache, and the projection
     // attached above takes its full payload from the warm — exactly as the
     // open path does (`publish_prepared_direct_files`).
     let warm_generation = crate::graph::begin_warm_cache(&replacement);
-    state
+    if !state
         .graphs
         .write()
         .unwrap()
-        .bind(label.clone(), Arc::clone(&replacement))?;
+        .swap_refreshed(&label, &old, Arc::clone(&replacement))
+    {
+        return Err(CommandError::prose(
+            "graph changed while its configuration refresh was running",
+        ));
+    }
     crate::graph::warm_cache_async(app.clone(), label, replacement, warm_generation)?;
     poke_watcher(state);
     Ok(RefreshOutcome::Refreshed)
 }
 
-/// The app-handle-free body of a legacy (Direct Files) configuration refresh:
-/// retire the old graph's projection worker, reopen the root, attach the
-/// Direct Files services, and build the replacement slot. The caller binds
-/// the slot and starts the warm. Kept separate so the invariant — a refreshed
-/// graph carries the same services as an opened one — is testable without a
-/// Tauri app.
-pub(crate) fn reopen_legacy_for_refresh(
+/// A configuration refresh with its replacement graph opened, not yet swapped
+/// in.
+///
+/// A refresh has two steps so that nothing can fail after the bound graph is
+/// retired. [`prepare_legacy_refresh`] does all the fallible work, reopening
+/// and validating the root, and leaves the bound graph serving;
+/// [`PreparedRefresh::commit`] cannot fail. A retired graph never answers a
+/// display read again, so retiring it before a step that can still fail left
+/// the window bound to a graph that answers nothing (GH #543, indexing audit
+/// R2-03). Both steps are app-handle-free so a refreshed graph's services are
+/// testable without a Tauri app.
+pub(crate) struct PreparedRefresh {
+    graph: Graph,
+    services: crate::graph::DirectFilesServicePaths,
+}
+
+pub(crate) fn prepare_legacy_refresh(
     old: &GraphSlot,
     approved_assets: Option<&Path>,
     services: crate::graph::DirectFilesServicePaths,
-) -> Result<GraphSlot, CommandError> {
-    let old_graph = old.graph();
-    old_graph.retire();
-    // The replacement attaches a projection at the SAME path; the old worker
-    // must have released the writer lease first or the new one races it.
-    if !old_graph.detach_direct_projection(Duration::from_secs(15)) {
-        crate::debug::diag(
-            "Direct Files projection worker did not stop within 15 s before a refresh; \
-             the replacement attach may find its database busy"
-                .to_string(),
-        );
-    }
-    drop(old_graph);
-    let graph = Graph::open_checked_with_assets(&old.root_key, approved_assets)?;
+) -> Result<PreparedRefresh, CommandError> {
     // Concord invariant 4: a refresh re-reads configuration, it does not rewrite
     // the tree. Journal filename repairs are proposed and applied explicitly
     // (`apply_journal_filename_migrations`) — a settings change must not rename
-    // the user's files as a side effect. (This site did not even take the
-    // pre-migration snapshot the open path used to.)
-    crate::graph::attach_direct_files_services(&graph, services);
-    GraphSlot::refreshed(graph, old)
+    // the user's files as a side effect.
+    let graph = Graph::open_checked_with_assets(&old.root_key, approved_assets)?;
+    Ok(PreparedRefresh { graph, services })
+}
+
+impl PreparedRefresh {
+    /// Retire the bound graph, move the projection over, and build the
+    /// replacement slot.
+    pub(crate) fn commit(self, old: &GraphSlot) -> GraphSlot {
+        let old_graph = old.graph();
+        // First, so a display read on the old graph stops rather than falling
+        // back to a whole-graph parse once its projection is gone.
+        old_graph.retire();
+        // The replacement attaches a projection at the SAME path; the old
+        // worker must have released the writer lease first or the new one
+        // races it.
+        if !old_graph.detach_direct_projection(Duration::from_secs(15)) {
+            crate::debug::diag(
+                "Direct Files projection worker did not stop within 15 s before a refresh; \
+                 the replacement attach may find its database busy"
+                    .to_string(),
+            );
+        }
+        drop(old_graph);
+        crate::graph::attach_direct_files_services(&self.graph, self.services);
+        GraphSlot::refreshed(self.graph, old)
+    }
 }
 
 pub(crate) fn poke_watcher(state: &AppState) {
@@ -627,6 +669,93 @@ mod tests {
 
     use crate::test_support::rust_module_source;
     use std::time::Instant;
+
+    /// A reload that fails leaves the bound graph serving. It used to retire
+    /// the graph before reopening the root, so a transient failure left the
+    /// window bound to a graph that answered no display read again (GH #543,
+    /// indexing audit R2-03).
+    #[test]
+    fn a_failed_refresh_leaves_the_bound_graph_serving() {
+        let root =
+            std::env::temp_dir().join(format!("gh543-failed-refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        let old = Arc::new(GraphSlot::new(
+            Graph::open_checked(&root).unwrap(),
+            root.clone(),
+        ));
+        let mut registry = GraphRegistry::default();
+        registry.bind("main".into(), Arc::clone(&old)).unwrap();
+        // A transient invalid asset path makes the checked reopen fail.
+        std::fs::write(root.join("assets"), "temporarily not a directory").unwrap();
+        let prepared = prepare_legacy_refresh(
+            &old,
+            None,
+            crate::graph::DirectFilesServicePaths {
+                projection: Ok(root.join("private/projection.sqlite")),
+                concord_ledger: None,
+            },
+        );
+        assert!(prepared.is_err(), "the fixture's reopen must fail");
+        std::fs::remove_file(root.join("assets")).unwrap();
+        let current = registry.slot("main").unwrap();
+        let answer = current.graph().display_read(|| 42);
+        let _ = std::fs::remove_dir_all(root);
+        assert!(Arc::ptr_eq(&current, &old));
+        assert_eq!(
+            answer,
+            Some(42),
+            "a failed refresh retired the graph still bound to the window"
+        );
+    }
+
+    /// A refresh finishing after its window moved to another graph must not
+    /// bind the reopened root over it.
+    #[test]
+    fn a_refresh_does_not_swap_over_a_window_that_moved_on() {
+        let base =
+            std::env::temp_dir().join(format!("gh543-refresh-swap-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        let mut registry = GraphRegistry::default();
+        let old = graph(&a);
+        registry.bind("main".into(), Arc::clone(&old)).unwrap();
+        let switched = graph(&b);
+        registry.bind("main".into(), Arc::clone(&switched)).unwrap();
+        let refreshed = Arc::new(GraphSlot::refreshed(Graph::open(&a), &old));
+        assert!(!registry.swap_refreshed("main", &old, refreshed));
+        assert!(Arc::ptr_eq(&registry.slot("main").unwrap(), &switched));
+        assert_eq!(registry.owner(&b).as_deref(), Some("main"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Retirement is permanent, so it happens only where a graph is finally
+    /// replaced or unbound: a registry bind or removal, or a refresh commit,
+    /// which runs after the last step that can fail (GH #543, R2-03).
+    #[test]
+    fn graphs_are_retired_only_where_they_are_replaced() {
+        let mut sites = Vec::new();
+        for (_, source) in crate::test_support::rust_module_sources() {
+            let production = crate::test_support::without_cfg_test_items(&source);
+            for (index, _) in production.match_indices(".retire()") {
+                let owner = production[..index]
+                    .rfind("fn ")
+                    .map(|at| {
+                        let name = &production[at + 3..];
+                        name[..name.find(['(', '<']).unwrap()].to_string()
+                    })
+                    .unwrap();
+                sites.push(owner);
+            }
+        }
+        sites.sort();
+        assert_eq!(
+            sites,
+            ["bind", "commit", "remove"],
+            "Graph::retire is called outside the three places a graph is replaced. \
+             A retired graph never answers a display read again, so retire only \
+             after every fallible step; see PreparedRefresh::commit (I-13)."
+        );
+    }
 
     fn graph(root: &Path) -> Arc<GraphSlot> {
         std::fs::create_dir_all(root.join("pages")).unwrap();
@@ -780,7 +909,9 @@ mod tests {
         // `set_journal_title_format`, `set_default_home`) does: a config write,
         // then a refresh.
         old.graph().set_guide_announced(true).unwrap();
-        let replacement = reopen_legacy_for_refresh(&old, None, services()).unwrap();
+        let replacement = prepare_legacy_refresh(&old, None, services())
+            .unwrap()
+            .commit(&old);
         // The open path warms through `warm_cache_async`; the refresh core hands
         // that to its caller, so warm here exactly as the caller would.
         let reopened = replacement.graph();
@@ -917,7 +1048,7 @@ mod tests {
         old.warm_generation
             .store(7, std::sync::atomic::Ordering::Release);
 
-        let replacement = GraphSlot::refreshed(Graph::open(&base), &old).unwrap();
+        let replacement = GraphSlot::refreshed(Graph::open(&base), &old);
 
         assert_eq!(replacement.binding_generation, old.binding_generation);
         assert_eq!(replacement.root_key, old.root_key);
@@ -963,7 +1094,7 @@ mod tests {
             move || {
                 std::thread::sleep(Duration::from_millis(200));
                 let replacement = Graph::open_checked_with_assets(&old.root_key, None).unwrap();
-                let slot = Arc::new(GraphSlot::refreshed(replacement, &old).unwrap());
+                let slot = Arc::new(GraphSlot::refreshed(replacement, &old));
                 state
                     .graphs
                     .write()

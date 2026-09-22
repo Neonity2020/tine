@@ -5499,12 +5499,15 @@
   "tests": [
    "crates/tine-core/src/direct_projection_tests.rs::gh543_a_display_read_on_a_retired_graph_parses_nothing",
    "crates/tine-core/src/direct_projection_tests.rs::gh543_a_display_read_cut_short_leaves_no_memo_behind",
-   "src-tauri/src/state.rs::a_display_read_on_a_retired_graph_is_answered_by_its_replacement"
+   "src-tauri/src/state.rs::a_display_read_on_a_retired_graph_is_answered_by_its_replacement",
+   "src-tauri/src/state.rs::a_failed_refresh_leaves_the_bound_graph_serving",
+   "src-tauri/src/state.rs::a_refresh_does_not_swap_over_a_window_that_moved_on",
+   "src-tauri/src/state.rs::graphs_are_retired_only_where_they_are_replaced"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "Audit finding IT-09 (Martin chose option A, 2026-09-22). A derived read waiting on indexing when the app replaced its graph (switch, or a refresh from preferred format / default home / journal title format / restore backup) saw the projection stop, fell back to with_pages and parsed the whole retired graph: 5 of 5 fixture pages, graph-sized at 10k, competing with the replacement's cold index. Graph::retire (set on bind revocation, remove and refresh) makes display reads (commands list_pages, page_aliases, page_icons, block_ref_counts, list_templates, journal_content_days, backlink_filter_context, via state::display_read) stop waiting and skip the parse; the skipped answer is never memoized (page list, find-entry index, derived memo), and the command retries on the window's current graph. Reads that act on their answer (export, orphan assets, creation) are not display reads and keep the full answer. Fail-before: display read returned Some after retirement; memo test listed 0 of 5 pages. Evidence: tine-agents/evidence/gh550-batch/it09-*."
+ "notes": "Audit finding IT-09 (Martin chose option A, 2026-09-22). A derived read waiting on indexing when the app replaced its graph (switch, or a refresh from preferred format / default home / journal title format / restore backup) saw the projection stop, fell back to with_pages and parsed the whole retired graph: 5 of 5 fixture pages, graph-sized at 10k, competing with the replacement's cold index. Graph::retire (set on bind revocation, remove and refresh) makes display reads (commands list_pages, page_aliases, page_icons, block_ref_counts, list_templates, journal_content_days, backlink_filter_context, via state::display_read) stop waiting and skip the parse; the skipped answer is never memoized (page list, find-entry index, derived memo), and the command retries on the window's current graph. Reads that act on their answer (export, orphan assets, creation) are not display reads and keep the full answer. Fail-before: display read returned Some after retirement; memo test listed 0 of 5 pages. Evidence: tine-agents/evidence/gh550-batch/it09-*. Round-2 audit R2-03 (unreleased regression of this fix): a refresh retired the old graph before reopening the root, so a failed reopen left the window bound to a retired graph that answered no display read (probe: display=None). Refresh is now prepare (fallible, touches nothing) then commit (infallible, the only refresh retire), and the swap is compare-and-swap so a window that moved on keeps its graph. A source guard pins retire() to bind, remove and commit."
 },
 {
  "id": "REG-INDEX-READS-ANSWER-WHILE-A-JOINED-BUILD-RUNS-543",
