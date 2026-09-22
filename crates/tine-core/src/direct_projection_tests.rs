@@ -5634,7 +5634,6 @@ fn empty_projection_shared() -> ProjectionShared {
         worker_available: AtomicBool::new(true),
         worker_failed: AtomicBool::new(false),
         worker_busy: AtomicBool::new(false),
-        worker_building: AtomicBool::new(false),
         worker_finished: AtomicBool::new(false),
         worker_resources: Mutex::new(Some(Vec::new())),
         validated: AtomicBool::new(false),
@@ -6307,10 +6306,18 @@ fn warm_scale_probe_reports_time_to_projection_ready() {
 fn a_query_during_the_warm_inventory_read_retries_instead_of_repairing() {
     let _serial = serialize_projection_tests();
     let root = r6_graph("query-during-warm-read");
+    let database = root.join("private/projection.sqlite");
+    {
+        // A stored image, so the reopen validates it: with no image the warm
+        // builds at once and never reads an inventory to validate.
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
     let graph = Arc::new(Graph::open(&root));
-    graph
-        .attach_direct_projection(root.join("private/projection.sqlite"))
-        .unwrap();
+    graph.attach_direct_projection(database).unwrap();
     let pause = graph.pause_next_warm_validation_test();
     let warm = {
         let graph = Arc::clone(&graph);

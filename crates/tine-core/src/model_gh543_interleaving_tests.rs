@@ -640,3 +640,41 @@ fn gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm() {
     crate::direct_projection::release_projection(&graph);
     let _ = fs::remove_dir_all(root);
 }
+
+/// GH #543 (R6-04): a cold open with no index on disk walked every page to
+/// learn that the index had to be built from scratch, threw those reads
+/// away, and then read every page again to build it -- three reads per page
+/// in all, counting the build's own re-check. The index already knows it has
+/// no image, so the open builds straight away. A reopen over a clean image
+/// reads each page once, to validate it, and parses nothing.
+#[test]
+fn gh543_a_cold_open_reads_each_page_at_most_twice() {
+    const PAGES: usize = 12;
+    let root = scratch("gh543-cold-open-reads");
+    for index in 0..PAGES {
+        fs::write(
+            page_path(&root, &format!("p{index}")),
+            format!("- TODO t{index}\n"),
+        )
+        .unwrap();
+    }
+    let database = root.join("private/projection.sqlite");
+    let open = |expected_reads: usize, what: &str| {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        graph.warm_cache();
+        let reads = GRAPH_TEXT_CONTENT_READS.with(Cell::get);
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            reads <= expected_reads,
+            "{what} read {reads} page files for {PAGES} pages (at most {expected_reads})"
+        );
+        crate::direct_projection::release_projection(&graph);
+    };
+    open(2 * PAGES, "a cold open");
+    open(PAGES, "a reopen over a clean index");
+    let _ = fs::remove_dir_all(root);
+}

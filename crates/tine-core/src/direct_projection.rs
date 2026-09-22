@@ -275,6 +275,17 @@ struct PendingProjection {
     /// The attempt id of the most recent admitted warm. Monotonic; a waiter
     /// whose id is older has been superseded and must not wait.
     warm_attempt: u64,
+    /// The worker has opened (or found no) stored image. Until then nobody,
+    /// the worker included, knows what the image needs.
+    set_up: bool,
+    /// Only a complete source inventory may publish readiness again: there
+    /// is no stored image, or the last turn could not keep the one there
+    /// was. Kept here, not on the worker's stack, so [`index_need`] can read
+    /// it under the same lock as everything else it decides from.
+    requires_full_rebuild: bool,
+    /// The worker is running a turn that carries a full snapshot or a warm
+    /// validation. Queries do not capture from an image being replaced.
+    building: bool,
 }
 
 impl PendingProjection {
@@ -443,6 +454,58 @@ impl PendingProjection {
     }
 }
 
+/// What whole-graph work the index needs next; see [`index_need`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexNeed {
+    /// The worker has not yet opened its stored image.
+    SettingUp,
+    /// The worker is gone for good. Nothing enqueued is ever taken.
+    Terminal,
+    /// A full snapshot or a warm validation is queued or being applied.
+    InHand,
+    /// Only a complete parsed snapshot can make the index ready: there is no
+    /// usable image, or a read found the image damaged. Walking the graph to
+    /// validate the image first would only be read again.
+    Fresh,
+    /// The image may be good but has not been checked against the pages this
+    /// session, or an unnamed deletion may have left it describing pages
+    /// that are gone.
+    Validate,
+    /// Nothing whole-graph is owed: page updates keep the image current.
+    Nothing,
+}
+
+/// The one answer to "what whole-graph work does the index need?".
+///
+/// Computed on read, under the `pending` lock, from state that only ever
+/// changes under that lock, so it cannot disagree with its inputs or lag an
+/// enqueue: a queued full snapshot reads as `InHand` the moment it is queued.
+/// The order of the tests is the order of authority.
+fn index_need(shared: &ProjectionShared, pending: &PendingProjection) -> IndexNeed {
+    if pending.stop || !shared.worker_available.load(Ordering::Acquire) {
+        IndexNeed::Terminal
+    } else if !pending.set_up {
+        IndexNeed::SettingUp
+    } else if pending.full.is_some() || pending.warm.is_some() || pending.building {
+        IndexNeed::InHand
+    } else if pending.requires_full_rebuild || pending.rebuild {
+        IndexNeed::Fresh
+    } else if !shared.validated.load(Ordering::Acquire) || pending.stale {
+        IndexNeed::Validate
+    } else {
+        IndexNeed::Nothing
+    }
+}
+
+/// Whether a fresh build already owns this image's replacement: one is
+/// running, or a rebuild is queued with the payload that carries it. A
+/// read that failed on the current image owes nothing more then -- the
+/// build replaces that image whole -- and a second request would queue a
+/// second complete build behind it (GH #543, indexing audit IT-10).
+fn fresh_build_owns_image(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
+    shared.build_progress.snapshot().is_some() || (pending.rebuild && pending.full.is_some())
+}
+
 struct ProjectionShared {
     path: PathBuf,
     pending: Mutex<PendingProjection>,
@@ -480,7 +543,6 @@ struct ProjectionShared {
     /// surface that reruns on the completion edge announced a build finished
     /// in its most loaded moment (GH #543, re-audit A2-F1). `worker_busy` on
     /// its own is too broad: an ordinary one-page save turn is not a build.
-    worker_building: AtomicBool,
     /// The writer worker has RETURNED, and every resource it owned — the
     /// SQLite writer connection and the exclusive writer lease — is closed.
     ///
@@ -628,7 +690,7 @@ fn query_capture_admissible(shared: &ProjectionShared, pending: &PendingProjecti
     !pending.stop
         && !pending.rebuild
         && !shared.worker_failed.load(Ordering::Acquire)
-        && !shared.worker_building.load(Ordering::Acquire)
+        && !pending.building
         && shared.validated.load(Ordering::Acquire)
 }
 
@@ -995,7 +1057,6 @@ impl DirectProjection {
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
-            worker_building: AtomicBool::new(false),
             worker_finished: AtomicBool::new(false),
             worker_resources: Mutex::new(Some(Vec::new())),
             validated: AtomicBool::new(false),
@@ -1103,23 +1164,43 @@ impl DirectProjection {
         self.shared.validated.load(Ordering::Acquire)
     }
 
-    /// Whether a fresh build already owns this image's replacement: one is
-    /// running, or a rebuild is queued with the payload that carries it. A
-    /// read that failed on the current image owes nothing more then -- the
-    /// build replaces that image whole -- and a second request would queue a
-    /// second complete build behind it (GH #543, indexing audit IT-10).
+    /// See the free function [`fresh_build_owns_image`].
     pub(crate) fn fresh_build_owns_image(&self) -> bool {
-        if self.shared.build_progress.snapshot().is_some() {
-            return true;
-        }
-        let pending = self.shared.pending.lock().unwrap();
-        pending.rebuild && pending.full.is_some()
+        fresh_build_owns_image(&self.shared, &self.shared.pending.lock().unwrap())
     }
 
+    /// Ask for the image to be replaced whole. A no-op when a fresh build
+    /// already owns its replacement (IT-10): the rule is checked under the
+    /// same lock as the request, so two failed reads cannot both see "no
+    /// build yet" and queue two.
     pub(crate) fn request_rebuild(&self) {
         let mut pending = self.shared.pending.lock().unwrap();
+        if fresh_build_owns_image(&self.shared, &pending) {
+            return;
+        }
         pending.rebuild = true;
         self.shared.ready.store(false, Ordering::Release);
+        drop(pending);
+        self.shared.changed.notify_all();
+    }
+
+    /// What whole-graph work the index needs next, once the worker has
+    /// opened its stored image (see [`index_need`]). Waits while it is
+    /// still opening it; `SettingUp` is returned only when `cancelled`.
+    pub(crate) fn wait_index_need(&self, cancelled: &impl Fn() -> bool) -> IndexNeed {
+        let mut pending = self.shared.pending.lock().unwrap();
+        loop {
+            let need = index_need(&self.shared, &pending);
+            if need != IndexNeed::SettingUp || cancelled() {
+                return need;
+            }
+            pending = self
+                .shared
+                .changed
+                .wait_timeout(pending, std::time::Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
     }
 
     /// Withdraw a rebuild request that found no payload to carry it.
@@ -1439,6 +1520,7 @@ impl DirectProjection {
     pub(crate) fn mark_stale(&self) {
         self.shared.pending.lock().unwrap().stale = true;
         self.shared.ready.store(false, Ordering::Release);
+        self.shared.changed.notify_all();
         // Source-oriented navigation waits for reconciliation; live queries
         // can still read the complete committed image.
     }
@@ -2745,7 +2827,12 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         return;
     }
     let mut writer_slot = open_existing_projection_database(&shared);
-    let mut requires_full_rebuild = writer_slot.is_none();
+    {
+        let mut pending = shared.pending.lock().unwrap();
+        pending.requires_full_rebuild = writer_slot.is_none();
+        pending.set_up = true;
+    }
+    shared.changed.notify_all();
     loop {
         let turn = {
             let mut pending = shared.pending.lock().unwrap();
@@ -2776,10 +2863,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 continue;
             }
             shared.worker_busy.store(true, Ordering::Release);
-            shared.worker_building.store(
-                pending.full.is_some() || pending.warm.is_some(),
-                Ordering::Release,
-            );
+            pending.building = pending.full.is_some() || pending.warm.is_some();
             let rebuild = (pending.full.is_some() || pending.warm.is_some())
                 && std::mem::take(&mut pending.rebuild);
             // R6: a full snapshot queued beside a warm validation owns
@@ -2802,6 +2886,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 inventory,
                 latest_generation: pending.latest_generation,
                 rebuild,
+                requires_full_rebuild: pending.requires_full_rebuild,
             }
         };
         let WorkerTurn {
@@ -2811,6 +2896,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             inventory,
             latest_generation,
             rebuild,
+            requires_full_rebuild,
         } = turn;
         let had_full = full.is_some();
         let had_warm = warm.is_some();
@@ -3113,35 +3199,37 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             Ok(applied) => applied,
             Err(error) => {
                 shared.ready.store(false, Ordering::Release);
+                if matches!(error, ProjectionRefusal::Failed(_)) {
+                    // Taken before `pending`: never hold both.
+                    shared.committed_registry.lock().unwrap().take();
+                }
+                let mut pending = shared.pending.lock().unwrap();
+                pending.building = false;
                 match error {
                     // Nothing was written and nothing is broken: the
                     // committed image and its registry stand, readiness is
                     // withdrawn until an inventory arrives, and that inventory
                     // is applied without a reset.
                     ProjectionRefusal::AwaitingFullInventory => {
-                        requires_full_rebuild = true;
+                        pending.requires_full_rebuild = true;
                     }
                     ProjectionRefusal::Failed(_) => {
-                        shared.committed_registry.lock().unwrap().take();
-                        requires_full_rebuild = true;
+                        pending.requires_full_rebuild = true;
                         shared.worker_failed.store(true, Ordering::Release);
                     }
                     ProjectionRefusal::Stopped => {
-                        shared.worker_building.store(false, Ordering::Release);
                         shared.worker_busy.store(false, Ordering::Release);
                         shared.worker_available.store(false, Ordering::Release);
+                        drop(pending);
                         shared.changed.notify_all();
                         return;
                     }
                 }
-                {
-                    let mut pending = shared.pending.lock().unwrap();
-                    if had_warm {
-                        pending.warm_outcome = Some((pending.warm_attempt, WarmOutcome::Failed));
-                    }
+                if had_warm {
+                    pending.warm_outcome = Some((pending.warm_attempt, WarmOutcome::Failed));
                 }
-                shared.worker_building.store(false, Ordering::Release);
                 shared.worker_busy.store(false, Ordering::Release);
+                drop(pending);
                 shared.changed.notify_all();
                 if error.is_reportable_failure() {
                     report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
@@ -3156,12 +3244,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 continue;
             }
         };
-        if had_full {
-            requires_full_rebuild = false;
-        } else if had_warm {
-            requires_full_rebuild =
-                matches!(applied.warm_outcome, Some(WarmOutcome::FreshBuildRequired));
-        }
         if had_full || matches!(applied.warm_outcome, Some(WarmOutcome::Clean)) {
             shared.validated.store(true, Ordering::Release);
         }
@@ -3175,7 +3257,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             )
         });
         let mut pending = shared.pending.lock().unwrap();
-        shared.worker_building.store(false, Ordering::Release);
+        if had_full {
+            pending.requires_full_rebuild = false;
+        } else if had_warm {
+            pending.requires_full_rebuild =
+                matches!(applied.warm_outcome, Some(WarmOutcome::FreshBuildRequired));
+        }
+        pending.building = false;
         shared.worker_busy.store(false, Ordering::Release);
         if had_warm {
             if pending.warm_outcome.is_none() {
@@ -3222,6 +3310,7 @@ struct WorkerTurn {
     inventory: Option<Vec<String>>,
     latest_generation: u64,
     rebuild: bool,
+    requires_full_rebuild: bool,
 }
 
 fn projection_image_is_healthy(

@@ -605,6 +605,15 @@ impl Graph {
                 return Outcome::Owned;
             }
         }
+        // Walk the graph only to validate an image that may be good. With no
+        // usable image the walk's reads are thrown away and the build reads
+        // every page again (GH #543, R6-04).
+        match projection.wait_index_need(cancelled) {
+            crate::direct_projection::IndexNeed::Fresh => return Outcome::Retry,
+            crate::direct_projection::IndexNeed::Terminal => return Outcome::Unavailable,
+            crate::direct_projection::IndexNeed::SettingUp => return Outcome::Cancelled,
+            _ => {}
+        }
         // GH #543: announce this warm before the inventory read below. On a
         // 10k-page graph that read takes seconds (tens on Windows), and a
         // query landing inside it must see Indexing, not an idle projection
