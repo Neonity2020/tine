@@ -1076,19 +1076,34 @@ pub(crate) fn warm_cache_async(
             || {
                 let state: State<'_, AppState> = app.state();
                 let current = state.graphs.read().unwrap().slot(&window_label);
-                let still_current = current.as_ref().is_some_and(|current| {
-                    current.binding_generation == slot.binding_generation
-                        && current.root_key == slot.root_key
-                });
-                if still_current && slot.warm_generation.load(Ordering::Acquire) == warm_generation
-                {
-                    current.unwrap().warm_done.store(true, Ordering::Release);
+                if finish_warm(current, &slot, warm_generation) {
                     let _ = app.emit_to(&window_label, "warm-cache-done", ());
                 }
             },
         );
     });
     Ok(())
+}
+
+/// Mark indexing finished for the window, if this warm still owns it. Only
+/// the warm of the slot currently installed for the window may: a
+/// same-root refresh keeps the binding generation and copies the warm
+/// generation, so comparing those let a retired slot's warm settle the
+/// replacement's pending requests before the replacement's own pass had
+/// begun (GH #543, audit R3-05).
+fn finish_warm(
+    current: Option<Arc<GraphSlot>>,
+    slot: &Arc<GraphSlot>,
+    warm_generation: u64,
+) -> bool {
+    let Some(current) = current.filter(|current| Arc::ptr_eq(current, slot)) else {
+        return false;
+    };
+    if current.warm_generation.load(Ordering::Acquire) != warm_generation {
+        return false;
+    }
+    current.warm_done.store(true, Ordering::Release);
+    true
 }
 
 /// Run one launch warm and settle its completion signal. The signal is
@@ -1223,6 +1238,63 @@ mod tests {
         collect(root, Path::new(""), &mut files);
         files.sort_by(|left, right| left.0.cmp(&right.0));
         files
+    }
+
+    /// GH #543 (audit R3-05): a same-root refresh installs a replacement
+    /// slot and starts its own warm. The retired slot's warm must neither
+    /// mark the replacement finished (its pending alias and ref-count
+    /// requests would be answered from a graph that has not indexed yet) nor
+    /// keep parsing the graph nothing reads any more.
+    #[test]
+    fn a_retired_warm_cannot_finish_indexing_for_its_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("tine-r3-retired-warm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["pages", "journals", "logseq"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("logseq/config.edn"), "{}\n").unwrap();
+        std::fs::write(root.join("pages/Source.md"), "- [[OnlyReferenced]]\n").unwrap();
+        let root_key = std::fs::canonicalize(&root).unwrap();
+        let state = direct_test_state();
+        let (old, old_generation) =
+            publish_direct_files_slot(&state, "main", Graph::open(&root), root_key.clone())
+                .unwrap();
+        let services = DirectFilesServicePaths {
+            projection: Ok(root.join("private/projection.sqlite")),
+            concord_ledger: None,
+        };
+        let replacement = Arc::new(
+            crate::state::prepare_legacy_refresh(&old, None, services)
+                .unwrap()
+                .commit(&old),
+        );
+        let replacement_generation = begin_warm_cache(&replacement);
+        assert!(state.graphs.write().unwrap().swap_refreshed(
+            "main",
+            &old,
+            Arc::clone(&replacement)
+        ));
+
+        assert_ne!(
+            old.warm_generation.load(Ordering::Acquire),
+            old_generation,
+            "the retired warm keeps parsing a graph nothing reads"
+        );
+        let current = state.graphs.read().unwrap().slot("main");
+        assert!(!finish_warm(current, &old, old_generation));
+        assert!(
+            !replacement.warm_done.load(Ordering::Acquire),
+            "a retired warm settled the replacement's pending requests before its pass began"
+        );
+
+        let current = state.graphs.read().unwrap().slot("main");
+        assert!(finish_warm(current, &replacement, replacement_generation));
+        assert!(replacement.warm_done.load(Ordering::Acquire));
+        replacement
+            .graph()
+            .detach_direct_projection(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn direct_test_state() -> AppState {

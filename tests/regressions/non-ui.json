@@ -5354,12 +5354,13 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "src-tauri/src/graph.rs::a_launch_warm_that_ends_uncancelled_always_signals_completion"
+   "src-tauri/src/graph.rs::a_launch_warm_that_ends_uncancelled_always_signals_completion",
+   "src-tauri/src/graph.rs::a_retired_warm_cannot_finish_indexing_for_its_replacement"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "GH #543 indexing audit IT-04 (completion half; the cold-discard half was fixed earlier by the page-open counter change and is covered by gh543_cold_parse_survives_an_unchanged_page_open). warm_cache_async returned without warm_done or warm-cache-done whenever warm_cache_cancellable reported false, including failure, and a panic ended the thread the same way. waitForWarmCache has no other terminal channel, so aliases, page identities, block-ref counts and followIndexingProgress waited for the rest of the session. settle_launch_warm now signals on every uncancelled end, including a panic, and stays silent only when cancelled (a newer warm owns the window). Not run: the native cold-open barrier journey the audit lists as a remaining probe. Evidence: tine-agents/evidence/gh550-batch/it04-completion-fail-before.log."
+ "notes": "GH #543 indexing audit IT-04 (completion half; the cold-discard half was fixed earlier by the page-open counter change and is covered by gh543_cold_parse_survives_an_unchanged_page_open). warm_cache_async returned without warm_done or warm-cache-done whenever warm_cache_cancellable reported false, including failure, and a panic ended the thread the same way. waitForWarmCache has no other terminal channel, so aliases, page identities, block-ref counts and followIndexingProgress waited for the rest of the session. settle_launch_warm now signals on every uncancelled end, including a panic, and stays silent only when cancelled (a newer warm owns the window). Not run: the native cold-open barrier journey the audit lists as a remaining probe. Evidence: tine-agents/evidence/gh550-batch/it04-completion-fail-before.log. Round-3 audit R3-05: a same-root refresh keeps the binding generation and copies the warm generation, so the retired slot's warm matched the replacement and marked it done before the replacement's own pass began (probe: referenced names empty, then complete after its warm). Completion now requires the warmed slot to be the one installed (graph::finish_warm), and swap_refreshed moves the retired slot's warm generation so its warm stops parsing. Fail-before: tine-agents/evidence/gh550-batch/r3-05-fail-before.log."
 },
 {
  "id": "REG-PRESENTATION-SETTING-KEEPS-THE-INDEX-543",
@@ -5655,7 +5656,6 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 2, BY6.3. The watcher skipped config.edn when disk matched the bytes the graph opened with or the bytes it last wrote. A graph-reaching outside change folded into Tine's own read-modify-write matched the last write, and an outside revert matched the opening bytes, so both were never taken in. The gate is now one digest, Graph::served_config_description, of the bytes the served configuration was taken from; a change that reaches the graph never updates it. Fail-before on 01843ec7 (old gate shimmed): both cases read as unchanged. Evidence: tine-agents/evidence/gh550-batch/by63-fail-before.log."
-}
 },
 {
  "id": "REG-FAVORITES-CHANGE-IS-NOT-ANSWERED-FROM-THE-OLD-MEMO-543",
@@ -5692,5 +5692,6 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 3, R3-07. record_watcher_identity_failure moved the cache generation without recording a structural event, so a complete capture that started earlier installed over it, erased the failure and marked the index ready. Recording and clearing a watcher failure now record StructuralChange::Reread(path) before the generation moves, so the capture re-reads that path. Fail-before at 788300f0: evidence tine-agents/evidence/gh550-batch/indexing-audit-r3/RECEIPT-indexing-audit-r3-probes.log."
+}
 ]
 }

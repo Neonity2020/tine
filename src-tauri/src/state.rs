@@ -246,6 +246,11 @@ impl GraphRegistry {
     ) -> bool {
         match self.by_window.get_mut(window) {
             Some(current) if Arc::ptr_eq(current, expected) => {
+                // The retired slot's warm parses a graph nothing will read
+                // again; moving its generation stops it between pages.
+                expected
+                    .warm_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 *current = slot;
                 true
             }
