@@ -5795,6 +5795,30 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 5, R5-01 (a required neighbor of R4-04). When the last failed page recovered, cache_upsert_inner sent the recovery as a full snapshot instead of the page's delta; a warm in flight refuses a Consumer snapshot (R4-04), so the page never reached the index. Fix (shape, two layers): the recovery takes the ordinary delta, queued under the cache lock, whenever a warm owns readiness; direct_projection_enqueue_full returns a must_use FullOfferOutcome, and a recovery refused because a warm began after the lock was released sends the delta. Either layer alone passes the test; with both removed it fails. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log and tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-01.log (both layers off); tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-01-layer1-only.log shows the first layer alone."
+},
+{
+ "id": "REG-AN-EDIT-AT-THE-END-OF-THE-INDEX-CHECK-PARSES-NOTHING-543",
+ "title": "An edit that lands just as the index check finishes is applied as an update instead of re-parsing the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::an_edit_just_before_the_warm_offers_its_validation_parses_nothing"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 5, R5-02. An edit queued between the warm's drift check and its enqueue outranked the warm's generation; the refusal was reported as Retry and the warm fell back to a whole-graph parse. Fix (shape): enqueue_warm_with_repair returns a typed WarmRefusal (Unavailable, Superseded, Outranked) and takes the repair only when it queues. On Outranked the warm re-runs its drift check, which picks up the edit as a published update, and offers again, at most 8 times before the parse. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log; with the retry bound set to 0, 5 of 5 pages are parsed (tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-02.log)."
 }
 ]
 }

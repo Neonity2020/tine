@@ -166,6 +166,8 @@ pub(super) struct PageBuildTestState {
     /// Pause one warm validation after it has read every page and before it
     /// checks the generation, so a test can publish a page it already read.
     pub(super) warm_read_done_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause the next warm right before it offers its validation.
+    pub(super) before_warm_enqueue: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// Pause one page publication right after it releases the cache lock,
     /// with its new generation observable, before it returns.
     pub(super) upsert_published_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,

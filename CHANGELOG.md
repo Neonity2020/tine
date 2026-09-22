@@ -95,6 +95,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   search index now reaches search; before, it stayed missing from search for
   the rest of the session (GH #543).
 
+- An edit that lands just as Tine finishes checking its search index no
+  longer makes it re-read and re-parse the whole graph (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).

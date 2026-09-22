@@ -696,6 +696,12 @@ impl Graph {
         // and a graph still changing underneath it gets the rebuild.
         let mut repairs_left = 2usize;
         let mut repair = None;
+        // A page update queued between the drift check and the offer outranks
+        // the offer's generation. The inventory is still good, so the warm
+        // accounts for the update and offers again, at most this many times
+        // before the graph is parsed (audit R5-02): each retry costs one drift
+        // check, and a graph still changing that fast gets the full parse.
+        let mut outranked_left = 8usize;
         // When the warm read a page again after the walk; see `PassReadAt`.
         let mut reread_at = std::collections::HashMap::new();
         loop {
@@ -803,25 +809,46 @@ impl Graph {
                     )
                 });
             }
+            #[cfg(test)]
+            {
+                let pause = self
+                    .page_build_test
+                    .before_warm_enqueue
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(pause) = pause {
+                    pause.reached.wait();
+                    pause.release.wait();
+                }
+            }
             let attempt = projection.enqueue_warm_with_repair(
                 generation,
                 sources.clone(),
                 retained.clone(),
                 published_pages,
                 walk_order.clone(),
-                repair.take(),
+                &mut repair,
                 Arc::clone(&parse_config),
                 text_bytes,
             );
-            let Some(attempt) = attempt else {
-                // Refused: the worker is gone or failed without a rebuild
-                // queued (nothing a retry changes), or the queue outranks this
-                // generation.
-                return if projection.worker_failed() || !projection.worker_available() {
-                    Outcome::Unavailable
-                } else {
-                    Outcome::Retry
-                };
+            let attempt = match attempt {
+                Ok(attempt) => attempt,
+                Err(crate::direct_projection::WarmRefusal::Outranked) if outranked_left > 0 => {
+                    outranked_left -= 1;
+                    if cancelled() {
+                        return Outcome::Cancelled;
+                    }
+                    continue;
+                }
+                // Another producer owns readiness, or updates kept outranking.
+                Err(
+                    crate::direct_projection::WarmRefusal::Superseded
+                    | crate::direct_projection::WarmRefusal::Outranked,
+                ) => return Outcome::Retry,
+                Err(crate::direct_projection::WarmRefusal::Unavailable) => {
+                    return Outcome::Unavailable;
+                }
             };
             let outcome_started = std::time::Instant::now();
             // Waiting on THIS attempt's verdict: a warm admitted after this
@@ -1166,6 +1193,15 @@ impl Graph {
     pub(crate) fn pause_next_warm_after_read_test(&self) -> Arc<PageBuildTestPause> {
         let pause = Arc::new(PageBuildTestPause::new());
         *self.page_build_test.warm_read_done_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
+    /// Pause the next warm right before it offers its validation to the
+    /// queue, after its drift check.
+    #[cfg(test)]
+    pub(crate) fn pause_next_warm_before_enqueue_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.before_warm_enqueue.lock().unwrap() = Some(Arc::clone(&pause));
         pause
     }
 

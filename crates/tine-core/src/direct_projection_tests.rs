@@ -10308,3 +10308,40 @@ fn a_page_recovered_during_a_warm_reaches_the_index() {
     release_projection(&graph);
     assert_eq!(found, 1, "the recovered page never reached the index");
 }
+
+/// GH #543 (audit R5-02): an edit that lands after the warm checked what
+/// changed since its read, but before it offered its validation, outranks the
+/// offer. The warm used to discard its whole inventory and parse the graph;
+/// it now accounts for the edit and offers again.
+#[test]
+fn an_edit_just_before_the_warm_offers_its_validation_parses_nothing() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("r5-edit-before-offer");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_before_enqueue_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let changed = root.join("pages/two.md");
+    std::fs::write(&changed, "- TODO r5enqueueunique\n").unwrap();
+    graph.sync_file_checked(&changed).unwrap();
+    pause.release.wait();
+    warmer.join().unwrap();
+    wait_ready(&graph);
+    let parses = graph.page_build_parses_test();
+    let found = graph.search("r5enqueueunique", 50).unwrap().len();
+    release_projection(&graph);
+    assert_eq!(found, 1, "the edit never reached the index");
+    assert_eq!(parses, 0, "one queued edit discarded the warm's inventory");
+}
