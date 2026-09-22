@@ -957,6 +957,19 @@ impl Graph {
         pause
     }
 
+    /// GH #543 test hook: pause the NEXT public query whose read failed,
+    /// before it asks for repair.
+    #[cfg(test)]
+    pub(crate) fn pause_next_failed_read_repair_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self
+            .page_build_test
+            .failed_read_repair_pause
+            .lock()
+            .unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
     /// GH #543 test hook: pause the NEXT warm validation after it has read
     /// every page and before it checks whether the generation moved.
     #[cfg(test)]

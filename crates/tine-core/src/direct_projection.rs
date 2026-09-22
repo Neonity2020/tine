@@ -1060,6 +1060,26 @@ impl DirectProjection {
         self.shared.worker_available.load(Ordering::Acquire)
     }
 
+    /// Whether this session has validated the image. Queued edits lower only
+    /// onto a validated image; before that they wait for a complete inventory
+    /// (`AwaitingFullInventory`), so they are not by themselves coming.
+    pub(crate) fn validated(&self) -> bool {
+        self.shared.validated.load(Ordering::Acquire)
+    }
+
+    /// Whether a fresh build already owns this image's replacement: one is
+    /// running, or a rebuild is queued with the payload that carries it. A
+    /// read that failed on the current image owes nothing more then -- the
+    /// build replaces that image whole -- and a second request would queue a
+    /// second complete build behind it (GH #543, indexing audit IT-10).
+    pub(crate) fn fresh_build_owns_image(&self) -> bool {
+        if self.shared.build_progress.snapshot().is_some() {
+            return true;
+        }
+        let pending = self.shared.pending.lock().unwrap();
+        pending.rebuild && pending.full.is_some()
+    }
+
     pub(crate) fn request_rebuild(&self) {
         let mut pending = self.shared.pending.lock().unwrap();
         pending.rebuild = true;

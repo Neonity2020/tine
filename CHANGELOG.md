@@ -70,6 +70,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Opening or saving a page while another edit was still being indexed could
+  make the app read and parse the whole graph again, instead of waiting a
+  moment for that edit (GH #543).
+- If the search index was damaged, several searches failing at once could
+  rebuild it twice in a row (GH #543).
 - Changing a display-only setting (bracket display, time tracking, logical
   outdenting, document-mode Enter) or dismissing the Guide notice reloaded the
   whole graph. On a first launch that restarted indexing from the beginning,

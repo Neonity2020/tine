@@ -5390,6 +5390,62 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit IT-06. set_timetracking_enabled, set_show_brackets, set_doc_mode_enter_for_new_block, set_logical_outdenting and set_guide_announced wrote config and then ran refresh_graph, which retires the projection worker, reopens the Graph and starts a new launch check; on a first launch, dismissing the Guide toast discarded the whole cold index build. The frontend also rebound (aborting print, closing unsaved recovery). tine-core reads none of these five, so they now write config and update the slot's GraphMeta in place (GraphSlot::apply_presentation_setting). preferred_format, journal title format, default home and restore_backup still refresh because the core reads them. Evidence: tine-agents/evidence/gh550-batch/it06-presentation-settings-fail-before.log."
+},
+{
+ "id": "REG-FAILED-READ-DURING-REBUILD-QUEUES-NO-SECOND-BUILD-543",
+ "title": "A search that fails while the index is already being rebuilt does not queue a second full rebuild",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_a_read_failing_during_a_fresh_build_does_not_queue_another"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit IT-10. Concurrent queries on a damaged index all fail; the first failure's repair starts a fresh build, and the query epoch moves only when that build publishes, so a sibling failure admitted before it still reached repair and queued another reset plus full payload: a second complete build after the first (at 10k pages, tens of seconds). direct_projection_repair now skips when a fresh build already owns the image (running, or a rebuild queued with its payload). Evidence: tine-agents/evidence/gh550-batch/it10-failed-read-during-fresh-build-fail-before.log."
+},
+{
+ "id": "REG-DERIVED-READ-BEHIND-QUEUED-EDIT-PARSES-NOTHING-543",
+ "title": "Launch reads that arrive while an edit is still being indexed do not parse the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_a_derived_read_behind_a_queued_edit_waits_instead_of_parsing"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Found from Windows run 35719587395: a 100-page warm reopen showed one whole-graph parse offered as a full snapshot after a slow edit turn. wait_for_derived_read kept waiting only for a warm or a turn in progress; with an edit queued behind a turn it returned after the 250 ms delta wait, and with no parsed cache the page inventory, aliases, icons, journal days or block-ref counts parsed every page, then enqueued the parse as a full snapshot. Queued edits on a validated image now count as coming. Before validation they still do not (they wait for an inventory). Evidence: tine-agents/evidence/gh550-batch/derived-read-queued-edit-fail-before.log."
 }
 ]
 }
