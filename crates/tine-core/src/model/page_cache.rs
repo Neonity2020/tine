@@ -400,7 +400,11 @@ impl Graph {
             .installs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
-        self.direct_projection_enqueue_full(
+        // Refused during a warm, nothing is owed: this cache carries no page
+        // change the index lacks (every change moved the generation the
+        // install was checked against), and the warm delivers its own
+        // inventory or offers this cache when it finishes.
+        let _ = self.direct_projection_enqueue_full(
             expected_generation,
             pages,
             Arc::new(revs),
@@ -1335,13 +1339,22 @@ impl Graph {
         // this cache already is the normal complete parsed-snapshot producer:
         // publish that captured Arc and its exact revisions instead of sending
         // a delta the worker must refuse while it still owes a full inventory.
+        //
+        // While a warm owns readiness the snapshot would be refused (audit
+        // R4-04), so the page goes to the index as its ordinary delta, queued
+        // under the lock like any other; the warm's inventory carries the
+        // rest (audit R5-01).
+        let warm_owns_readiness = projection
+            .as_ref()
+            .is_some_and(|projection| projection.warm_in_flight());
         let recovered_projection_snapshot =
-            (cache_built && failures_changed && page_inventory_complete).then(|| {
-                (
-                    Arc::clone(guard.as_ref().expect("a built cache has pages")),
-                    Arc::new(self.disk_revs.read().unwrap().clone()),
-                )
-            });
+            (cache_built && failures_changed && page_inventory_complete && !warm_owns_readiness)
+                .then(|| {
+                    (
+                        Arc::clone(guard.as_ref().expect("a built cache has pages")),
+                        Arc::new(self.disk_revs.read().unwrap().clone()),
+                    )
+                });
         *failures_guard = resulting_failures;
         // The update is queued before the new generation can be observed. A
         // warm that reads this generation keeps its inventory and leaves this
@@ -1445,7 +1458,7 @@ impl Graph {
         // consumer happened to build one. Readiness still needs this
         // session's inventory validated first (the projection's own rule).
         if let Some((pages, revisions)) = recovered_projection_snapshot {
-            self.direct_projection_enqueue_full(
+            let outcome = self.direct_projection_enqueue_full(
                 newgen,
                 pages,
                 revisions,
@@ -1453,6 +1466,16 @@ impl Graph {
                 true,
                 projection_lifetime::FullOffer::Consumer,
             );
+            // A warm that began after the lock was released refuses the
+            // snapshot; the page's own update is still owed (audit R5-01).
+            if outcome == projection_lifetime::FullOfferOutcome::RefusedDuringWarm {
+                self.direct_projection_enqueue_replace(
+                    newgen,
+                    evict_entry,
+                    evict_doc,
+                    projection_revision,
+                );
+            }
         } else if !queued_under_lock {
             self.direct_projection_enqueue_replace(
                 newgen,

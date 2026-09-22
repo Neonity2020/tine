@@ -10268,3 +10268,43 @@ fn a_cache_installed_inside_a_cancelled_warm_is_offered_by_the_next_warm() {
     release_projection(&graph);
     assert!(ready, "the installed cache was never offered to the index");
 }
+
+/// GH #543 (audit R5-01): a page that recovers from a failed read while a warm
+/// owns readiness reaches the index. Its recovery used to ride on a full
+/// snapshot, which the warm refuses (R4-04), and nothing sent the page's own
+/// update, so search missed the page for the session.
+#[test]
+fn a_page_recovered_during_a_warm_reaches_the_index() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("r5-recovered-during-warm");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    // A consumer installs the parsed cache inside the warm.
+    graph.orphan_assets().unwrap();
+    let changed = root.join("pages/two.md");
+    std::fs::write(&changed, [0xff, 0xfe]).unwrap();
+    assert!(graph.sync_file_checked(&changed).is_err());
+    std::fs::write(&changed, "- TODO r5recoveryunique\n").unwrap();
+    graph.sync_file_checked(&changed).unwrap();
+    assert!(graph.page_index_failures().is_empty());
+    pause.release.wait();
+    warmer.join().unwrap();
+    wait_ready(&graph);
+    let found = graph.search("r5recoveryunique", 50).unwrap().len();
+    release_projection(&graph);
+    assert_eq!(found, 1, "the recovered page never reached the index");
+}

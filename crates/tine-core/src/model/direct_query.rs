@@ -998,7 +998,9 @@ impl Graph {
         }
         // A reset must be followed by a payload; see `direct_projection_enqueue_full`.
         let source_complete = self.page_index_failures.read().unwrap().is_empty();
-        self.direct_projection_enqueue_full(
+        // A repair offers as the warm owner and carries no page change of
+        // its own, so no outcome owes anything further.
+        let _ = self.direct_projection_enqueue_full(
             generation,
             pages,
             Arc::new(revisions),

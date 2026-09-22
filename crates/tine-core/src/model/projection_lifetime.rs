@@ -196,6 +196,11 @@ impl Graph {
     /// superseded the warm's cheap validation with a complete rebuild
     /// (GH #543, audit R4-04). The warm offers what was installed when it
     /// finishes ([`Graph::offer_installed_cache`]).
+    ///
+    /// The outcome says whether the snapshot was refused. A caller whose
+    /// snapshot also carried a page change owes that page's update another
+    /// way when it was: a refused recovery snapshot used to drop the
+    /// recovered page from the index for the session (audit R5-01).
     pub(super) fn direct_projection_enqueue_full(
         &self,
         generation: u64,
@@ -204,28 +209,30 @@ impl Graph {
         force: bool,
         source_complete: bool,
         offer: FullOffer,
-    ) {
-        if let Some(projection) = self.direct_projection.get() {
-            if offer == FullOffer::Consumer && projection.warm_in_flight() {
-                crate::direct_projection::projection_diag(|| {
-                    format!("full not offered at generation={generation}: a warm owns readiness")
-                });
-                return;
-            }
-            // R6: a projection already READY at this generation was validated
-            // from the same bytes this snapshot was parsed from; a redundant
-            // snapshot would only open a NotReady window while it re-validates.
-            if !force && projection.ready_at(generation) {
-                return;
-            }
-            projection.enqueue_full(
-                generation,
-                pages,
-                revisions,
-                Arc::new(self.config().parse_config()),
-                source_complete,
-            );
+    ) -> FullOfferOutcome {
+        let Some(projection) = self.direct_projection.get() else {
+            return FullOfferOutcome::NoIndex;
+        };
+        if offer == FullOffer::Consumer && projection.warm_in_flight() {
+            crate::direct_projection::projection_diag(|| {
+                format!("full not offered at generation={generation}: a warm owns readiness")
+            });
+            return FullOfferOutcome::RefusedDuringWarm;
         }
+        // R6: a projection already READY at this generation was validated
+        // from the same bytes this snapshot was parsed from; a redundant
+        // snapshot would only open a NotReady window while it re-validates.
+        if !force && projection.ready_at(generation) {
+            return FullOfferOutcome::AlreadyCurrent;
+        }
+        projection.enqueue_full(
+            generation,
+            pages,
+            revisions,
+            Arc::new(self.config().parse_config()),
+            source_complete,
+        );
+        FullOfferOutcome::Queued
     }
 
     /// Offer the installed parsed cache to the index as the warm's payload,
@@ -246,7 +253,8 @@ impl Graph {
             })
         };
         if let Some((generation, pages, revisions, source_complete)) = captured {
-            self.direct_projection_enqueue_full(
+            // The warm owner is never refused for being a consumer.
+            let _ = self.direct_projection_enqueue_full(
                 generation,
                 pages,
                 revisions,
@@ -533,6 +541,21 @@ impl Graph {
 pub struct LaunchWarmAnnouncement(
     #[allow(dead_code)] Option<crate::direct_projection::WarmInFlight>,
 );
+
+/// What became of a full snapshot offered to the index; see
+/// [`Graph::direct_projection_enqueue_full`].
+#[must_use = "a refused snapshot may owe its page changes another way"]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum FullOfferOutcome {
+    /// No index is attached; nothing is owed to one.
+    NoIndex,
+    /// The index takes it.
+    Queued,
+    /// The index is already current at this generation.
+    AlreadyCurrent,
+    /// A page consumer offered while a warm owns readiness.
+    RefusedDuringWarm,
+}
 
 /// Who offers the index a full snapshot; see
 /// [`Graph::direct_projection_enqueue_full`].

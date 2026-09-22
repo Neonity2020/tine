@@ -5771,6 +5771,30 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 4, R4-P2 (plausible, reproduced). Only the paced warm parse reported itself to indexing_progress; the fast parse a consumer owns (load_all_pages_with_permit) did not, so with no index to report (none attached, or not ready and no warm announced) the bar said idle through a whole-graph parse. The fast parse now begins a Reading pass and advances it per page, across its worker threads. Fail-before: tine-agents/evidence/gh550-batch/r4-fixes/fail-before-r4-p2.log."
+},
+{
+ "id": "REG-A-PAGE-RECOVERED-DURING-INDEXING-REACHES-SEARCH-543",
+ "title": "A page that fails to read and then recovers while the search index is being checked reaches search",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_page_recovered_during_a_warm_reaches_the_index"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 5, R5-01 (a required neighbor of R4-04). When the last failed page recovered, cache_upsert_inner sent the recovery as a full snapshot instead of the page's delta; a warm in flight refuses a Consumer snapshot (R4-04), so the page never reached the index. Fix (shape, two layers): the recovery takes the ordinary delta, queued under the cache lock, whenever a warm owns readiness; direct_projection_enqueue_full returns a must_use FullOfferOutcome, and a recovery refused because a warm began after the lock was released sends the delta. Either layer alone passes the test; with both removed it fails. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log and tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-01.log (both layers off); tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-01-layer1-only.log shows the first layer alone."
 }
 ]
 }

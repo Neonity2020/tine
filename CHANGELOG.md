@@ -91,6 +91,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - A whole-graph parse started by the page list or search now shows on the
   indexing progress bar instead of the app looking idle (GH #543).
 
+- A page that failed to read and then recovered while Tine was checking its
+  search index now reaches search; before, it stayed missing from search for
+  the rest of the session (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).
