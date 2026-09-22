@@ -70,6 +70,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Reopening a graph after a few pages changed elsewhere (Syncthing, another
+  device, an external editor) no longer rebuilds the whole search and query
+  index: only the changed, added or deleted pages are re-indexed, and the index
+  is ready once that check is clean. A larger change still rebuilds it once
+  (GH #543).
+
 - Reopening a large graph no longer re-reads every page when a page is
   opened while Tine is still checking its search index. Opening today's
   journal during that check used to discard it and parse the whole graph,

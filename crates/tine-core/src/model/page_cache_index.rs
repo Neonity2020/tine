@@ -165,6 +165,8 @@ pub(super) struct PageBuildTestState {
     pub(super) derived_read_open_once: std::sync::Mutex<Option<PathBuf>>,
     pub(super) enumerations: std::sync::atomic::AtomicUsize,
     pub(super) parses: std::sync::atomic::AtomicUsize,
+    /// Pages a warm repair parsed (one per changed page, never a graph pass).
+    pub(super) repair_parses: std::sync::atomic::AtomicUsize,
     pub(super) installs: std::sync::atomic::AtomicUsize,
     pub(super) censuses: std::sync::atomic::AtomicUsize,
     /// R6: pages parsed on demand for reference/fuzzy hydration without a
