@@ -628,7 +628,7 @@ pub(crate) fn refresh_graph_for_label(
     // The reopened graph starts with a cold parsed cache, and the projection
     // attached above takes its full payload from the warm — exactly as the
     // open path does (`publish_prepared_direct_files`).
-    let warm_generation = crate::graph::begin_warm_cache(&replacement);
+    let warm = crate::graph::begin_warm_cache(&replacement);
     if !state
         .graphs
         .write()
@@ -639,7 +639,7 @@ pub(crate) fn refresh_graph_for_label(
             "graph changed while its configuration refresh was running",
         ));
     }
-    crate::graph::warm_cache_async(app.clone(), label, replacement, warm_generation)?;
+    crate::graph::warm_cache_async(app.clone(), label, replacement, warm)?;
     poke_watcher(state);
     Ok(RefreshOutcome::Refreshed)
 }

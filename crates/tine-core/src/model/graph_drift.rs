@@ -247,9 +247,11 @@ impl GraphDrift {
 
 /// What one move of the cache generation does to the SQL index.
 pub(super) enum IndexEffect<'a> {
-    /// The mover sends the index a page delta, a delete or a stale mark for
-    /// this move once it has released the cache lock.
-    Sent,
+    /// The mover queues a page delta or page-set change for this move once it
+    /// has released the cache lock, and holds `IndexDeltaComing` until then,
+    /// so a reader in between waits for the delta instead of finding the
+    /// index behind with nothing queued and parsing the graph (GH #543).
+    Sent(&'a IndexDeltaComing),
     /// The move changes nothing the index describes, such as a page becoming
     /// unreadable (its last good content stays served) or recovering. The
     /// index is told the new generation directly: nothing else would ever
@@ -257,9 +259,35 @@ pub(super) enum IndexEffect<'a> {
     /// every indexed read fell back to parsing the graph (GH #543, audit
     /// R4-03). The projection is fetched before the cache lock is taken.
     Unchanged(Option<&'a Arc<crate::direct_projection::DirectProjection>>),
+    /// The move changes the page set in a way no delta describes, such as a
+    /// deleted file that could not be named. The index must not carry
+    /// readiness past it; the next warm validation or full snapshot
+    /// re-derives the page set.
+    Stale(Option<&'a Arc<crate::direct_projection::DirectProjection>>),
+}
+
+/// A mover's promise that the delta for its generation move follows; see
+/// [`IndexEffect::Sent`]. Hold it until the delta is queued. Dropping it
+/// without queuing leaves the index behind, and readers take their
+/// ordinary route.
+#[must_use]
+pub(super) struct IndexDeltaComing {
+    _coming: Option<crate::direct_projection::DeltaComing>,
 }
 
 impl Graph {
+    /// Announce a generation move whose delta the caller queues next. Take it
+    /// before the cache lock: no reader may see the moved generation without
+    /// it, and the projection slot is never locked under the cache lock.
+    pub(super) fn index_delta_coming(&self) -> IndexDeltaComing {
+        IndexDeltaComing {
+            _coming: self
+                .direct_projection
+                .get()
+                .map(|projection| projection.delta_coming()),
+        }
+    }
+
     /// The one place `cache_gen` moves. The caller holds the cache write lock
     /// and has published the change the move stands for; `change` names a
     /// page-set change that no page publication describes, and `effect`
@@ -273,9 +301,15 @@ impl Graph {
         if let Some(change) = change {
             self.cache_structural_gen.record(change);
         }
+        if let IndexEffect::Stale(Some(projection)) = effect {
+            projection.mark_stale();
+        }
         let generation = self.cache_gen.fetch_add(1, Ordering::Release) + 1;
-        if let IndexEffect::Unchanged(Some(projection)) = effect {
-            projection.advance_generation(generation);
+        match effect {
+            IndexEffect::Unchanged(Some(projection)) => projection.advance_generation(generation),
+            // The mover holds the promise until it has queued the delta.
+            IndexEffect::Sent(_coming) => {}
+            IndexEffect::Unchanged(None) | IndexEffect::Stale(_) => {}
         }
         generation
     }

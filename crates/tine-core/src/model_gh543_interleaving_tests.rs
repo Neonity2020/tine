@@ -1,0 +1,642 @@
+//! GH #543: seeded interleavings of graph operations against the projection.
+//!
+//! Each seed drives a small graph through a random sequence of saves,
+//! creations, deletes, renames, merges, external edits (reported and
+//! missed), watcher rescans and restarts, while the launch warm runs on its
+//! own thread and a reader keeps asking indexed questions. After the
+//! sequence settles, four user outcomes must hold:
+//!
+//! 1. every wait returned (no reader call, warm or close outlived its bound);
+//! 2. readiness is published at the graph's current generation;
+//! 3. the index answers what a fresh parse of the disk answers;
+//! 4. no consumer ran a whole-graph parse while the projection was alive.
+//!
+//! Stage 0 of the one-indexing-owner design
+//! (`tine-agents/specs/notes/2026-09-22-single-indexing-owner-design.md`).
+
+use super::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// xorshift64*: deterministic and dependency-free.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+const QUERIES: &[&str] = &["(task TODO)", "(task DONE)", "(property status active)"];
+const READ_BOUND: Duration = Duration::from_secs(20);
+const SETTLE_BOUND: Duration = Duration::from_secs(20);
+
+fn page_text(rng: &mut Rng, names: &[String]) -> String {
+    let mut text = String::new();
+    for _ in 0..=rng.below(3) {
+        let target = &names[rng.below(names.len() as u64) as usize];
+        let token = rng.below(1_000);
+        text.push_str(&match rng.below(4) {
+            0 => format!("- TODO task{token} [[{target}]]\n"),
+            1 => format!("- DONE done{token}\n"),
+            2 => format!("- plain{token} #{target}\n"),
+            _ => format!("- prop{token}\n  status:: active\n"),
+        });
+    }
+    text
+}
+
+fn page_path(root: &Path, name: &str) -> PathBuf {
+    root.join("pages").join(format!("{name}.md"))
+}
+
+/// One graph instance: the projection, the launch warm and a reader.
+struct Session {
+    graph: Arc<Graph>,
+    warm: Option<std::thread::JoinHandle<()>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    slowest_read_ms: Arc<AtomicU64>,
+    read_errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl Session {
+    fn open(root: &Path, database: &Path) -> Self {
+        let graph = Arc::new(Graph::open(root));
+        graph
+            .attach_direct_projection(database.to_path_buf())
+            .unwrap();
+        // As the app does: announced before anything else can reach the graph.
+        let announcement = graph.announce_launch_warm();
+        let warm = {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || {
+                graph.warm_cache_announced(announcement, || false);
+            })
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let slowest_read_ms = Arc::new(AtomicU64::new(0));
+        let read_errors = Arc::new(Mutex::new(Vec::new()));
+        let reader = {
+            let (graph, stop, slowest, errors) = (
+                Arc::clone(&graph),
+                Arc::clone(&stop),
+                Arc::clone(&slowest_read_ms),
+                Arc::clone(&read_errors),
+            );
+            std::thread::spawn(move || {
+                let mut turn = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    match turn % 3 {
+                        0 => match graph.run_query_bounded(
+                            QUERIES[turn % QUERIES.len()],
+                            100,
+                            1 << 20,
+                        ) {
+                            Ok(_) | Err(crate::query::QueryExecutionError::NotReady(_)) => {}
+                            Err(other) => errors.lock().unwrap().push(format!("query: {other}")),
+                        },
+                        1 => {
+                            let _ = graph.list_pages();
+                        }
+                        _ => {
+                            let _ = graph.referenced_page_names();
+                        }
+                    }
+                    slowest.fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    turn += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        Self {
+            graph,
+            warm: Some(warm),
+            reader: Some(reader),
+            stop,
+            slowest_read_ms,
+            read_errors,
+        }
+    }
+
+    /// Stop the reader and wait for the warm, each within its bound. A
+    /// thread that outlives its bound is a finding; it is leaked, not joined.
+    fn quiesce(&mut self, findings: &mut Vec<String>) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut ok = true;
+        for (what, handle) in [("reader", self.reader.take()), ("warm", self.warm.take())] {
+            let Some(handle) = handle else { continue };
+            let started = Instant::now();
+            while !handle.is_finished() && started.elapsed() < SETTLE_BOUND {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                if handle.join().is_err() {
+                    findings.push(format!("the {what} thread panicked"));
+                }
+            } else {
+                findings.push(format!("the {what} never returned (> {SETTLE_BOUND:?})"));
+                ok = false;
+            }
+        }
+        let slowest = Duration::from_millis(self.slowest_read_ms.load(Ordering::Relaxed));
+        if slowest > READ_BOUND {
+            findings.push(format!("a read waited {slowest:?}"));
+        }
+        findings.extend(self.read_errors.lock().unwrap().drain(..));
+        ok
+    }
+
+    fn close(self, findings: &mut Vec<String>) {
+        if let Some(projection) = self.graph.direct_projection_test() {
+            if !projection.close_and_wait_for_worker(SETTLE_BOUND) {
+                findings.push("the worker never released its lease".to_owned());
+            }
+        }
+    }
+}
+
+/// The settled checks: readiness at the current generation, and the index
+/// answering what a fresh parse of the disk answers.
+fn check_settled(root: &Path, graph: &Graph, findings: &mut Vec<String>) {
+    let started = Instant::now();
+    while !graph.direct_projection_ready_test() {
+        if started.elapsed() > SETTLE_BOUND {
+            findings.push(format!(
+                "readiness never reached cache_generation={} ({})",
+                graph.cache_generation(),
+                graph
+                    .direct_projection_test()
+                    .map(|projection| projection.debug_state_test())
+                    .unwrap_or_else(|| "no projection".to_owned())
+            ));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let oracle = Graph::open(root);
+    for query in QUERIES {
+        let expected = crate::query::run_query_bounded(&oracle, query, 1_000, 1 << 24);
+        match graph.run_query_bounded(query, 1_000, 1 << 24) {
+            Ok(indexed) => {
+                let answer = |groups: &[crate::model::RefGroup]| {
+                    let mut raws = groups
+                        .iter()
+                        .flat_map(|group| {
+                            group
+                                .blocks
+                                .iter()
+                                .map(move |block| format!("{}|{}", group.page, block.raw))
+                        })
+                        .collect::<Vec<_>>();
+                    raws.sort();
+                    raws
+                };
+                if answer(&indexed.groups) != answer(&expected.groups) {
+                    findings.push(format!(
+                        "{query}: index {:?} != disk {:?}",
+                        answer(&indexed.groups),
+                        answer(&expected.groups)
+                    ));
+                }
+            }
+            Err(error) => findings.push(format!("{query}: ready index refused: {error}")),
+        }
+    }
+    let names = |graph: &Graph| {
+        let mut names = graph
+            .list_pages()
+            .into_iter()
+            .map(|entry| entry.name.to_lowercase())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    if names(graph) != names(&oracle) {
+        findings.push(format!(
+            "page list {:?} != disk {:?}",
+            names(graph),
+            names(&oracle)
+        ));
+    }
+}
+
+/// What the watcher does with one drained batch: note the observation, take
+/// its ticket, reconcile the paths (after an uncertain event, first tell the
+/// graph its text identity is unknown), and acknowledge the ticket once the
+/// batch reconciled. An unacknowledged batch makes creation refuse, as it
+/// should.
+fn watcher_reconcile(graph: &Graph, uncertain: bool, paths: Vec<PathBuf>) -> Result<(), String> {
+    graph.note_graph_text_external_observation();
+    let ticket = graph.graph_text_external_observation_ticket();
+    if uncertain {
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .map_err(|e| e.to_string())?;
+    }
+    for path in paths {
+        let synced = if path.exists() {
+            graph.sync_file_checked(&path).map(|_| ())
+        } else {
+            graph.sync_deleted_file(&path).map(|_| ())
+        };
+        synced.map_err(|e| e.to_string())?;
+    }
+    graph.acknowledge_graph_text_external_observations(ticket);
+    Ok(())
+}
+
+/// Run one seed; returns its findings (empty = the seed converged).
+fn run_seed(seed: u64, steps: usize) -> Vec<String> {
+    let mut rng = Rng::new(seed);
+    let root = scratch(&format!("gh543-interleave-{seed}"));
+    let database = root.join("private/projection.sqlite");
+    let mut names = (0..5).map(|index| format!("p{index}")).collect::<Vec<_>>();
+    for name in names.clone() {
+        let text = page_text(&mut rng, &names);
+        fs::write(page_path(&root, &name), text).unwrap();
+    }
+    let mut next_name = names.len();
+    let mut findings = Vec::new();
+    // Every session reopens a stored image, so any whole-graph parse the
+    // sequence sees is a consumer's, not the first open's fresh build.
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(SETTLE_BOUND)
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    let mut session = Session::open(&root, &database);
+    // Files an external writer changed without the watcher reporting them.
+    let mut missed = Vec::<PathBuf>::new();
+
+    for step in 0..steps {
+        std::thread::sleep(Duration::from_millis(rng.below(6)));
+        let graph = Arc::clone(&session.graph);
+        let step_done = Arc::new(AtomicBool::new(false));
+        if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
+            let (graph, step_done) = (Arc::clone(&graph), Arc::clone(&step_done));
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                while !step_done.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if started.elapsed() > Duration::from_secs(5) {
+                        eprintln!(
+                            "  stuck {:?}: gen={} parses={} ready={} {}",
+                            started.elapsed(),
+                            graph.cache_generation(),
+                            graph.consumer_page_parses_test(),
+                            graph.direct_projection_ready_test(),
+                            graph
+                                .direct_projection_test()
+                                .map(|projection| projection.debug_state_test())
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+            });
+        }
+        let pick =
+            |rng: &mut Rng, names: &[String]| names[rng.below(names.len() as u64) as usize].clone();
+        let op = rng.below(100);
+        if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
+            eprintln!("seed {seed} step {step}: op {op} names {names:?}");
+        }
+        let outcome: Result<(), String> = match op {
+            // Save an existing page through the editor path.
+            0..=29 if !names.is_empty() => {
+                let name = pick(&mut rng, &names);
+                let text = page_text(&mut rng, &names);
+                match graph.load_named(&name, PageKind::Page) {
+                    Ok(Some(mut page)) => {
+                        page.blocks = markdown_page_dto(&name, &name, &text).unwrap().blocks;
+                        let base = page.rev.clone();
+                        graph
+                            .save_page(&page, base.as_deref())
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }
+                    other => Err(format!("load {name}: {other:?}")),
+                }
+            }
+            // Create a page.
+            30..=41 => {
+                let name = format!("p{next_name}");
+                next_name += 1;
+                let text = page_text(&mut rng, &names);
+                let created = graph
+                    .save_page(&markdown_page_dto(&name, &name, &text).unwrap(), None)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                if created.is_ok() {
+                    names.push(name);
+                }
+                created
+            }
+            42..=49 if names.len() > 1 => {
+                let name = pick(&mut rng, &names);
+                let deleted = graph
+                    .delete_page(&name, PageKind::Page)
+                    .map_err(|e| e.to_string());
+                if deleted.is_ok() {
+                    names.retain(|existing| existing != &name);
+                }
+                deleted
+            }
+            50..=57 if !names.is_empty() => {
+                let old = pick(&mut rng, &names);
+                let new = format!("p{next_name}");
+                next_name += 1;
+                let renamed = graph.rename_page(&old, &new).map_err(|e| e.to_string());
+                if renamed.is_ok() {
+                    names.retain(|existing| existing != &old);
+                    names.push(new);
+                }
+                renamed
+            }
+            58..=61 if names.len() > 1 => {
+                let source = pick(&mut rng, &names);
+                let target = pick(&mut rng, &names);
+                if source == target {
+                    Ok(())
+                } else {
+                    let merged = graph
+                        .merge_pages(&format!("pages/{source}.md"), &format!("pages/{target}.md"))
+                        .map_err(|e| e.to_string());
+                    if merged.is_ok() {
+                        names.retain(|existing| existing != &source);
+                    }
+                    merged
+                }
+            }
+            // An external edit the watcher reports.
+            62..=73 if !names.is_empty() => {
+                let name = pick(&mut rng, &names);
+                let path = page_path(&root, &name);
+                fs::write(&path, page_text(&mut rng, &names)).unwrap();
+                watcher_reconcile(&graph, false, vec![path])
+            }
+            // An external edit or delete the watcher missed.
+            74..=79 if names.len() > 1 => {
+                let name = pick(&mut rng, &names);
+                let path = page_path(&root, &name);
+                if rng.below(4) == 0 {
+                    let _ = fs::remove_file(&path);
+                    names.retain(|existing| existing != &name);
+                } else {
+                    fs::write(&path, page_text(&mut rng, &names)).unwrap();
+                }
+                missed.push(path);
+                Ok(())
+            }
+            // The watcher's rescan after an uncertain event: an uncertain
+            // observation, then the reconcile of every changed path.
+            80..=92 => watcher_reconcile(&graph, true, missed.drain(..).collect()),
+            // Restart: quiesce, release the lease, reopen on the same database.
+            93..=99 => {
+                let parses = graph.consumer_page_parses_test();
+                if parses > 0 {
+                    findings.push(format!(
+                        "step {step}: {parses} consumer parse(s) while the projection was alive"
+                    ));
+                }
+                drop(graph);
+                if !session.quiesce(&mut findings) {
+                    break;
+                }
+                session.close(&mut findings);
+                // A missed change is still missed after a restart; the
+                // launch check is what must find it.
+                missed.clear();
+                session = Session::open(&root, &database);
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        // An operation may be refused (a stale base, a name clash); what
+        // matters is that the index converges on whatever the disk holds.
+        step_done.store(true, Ordering::Relaxed);
+        if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
+            eprintln!(
+                "  -> {outcome:?} parses={}",
+                session.graph.consumer_page_parses_test()
+            );
+        }
+    }
+
+    // Settle: report the missed changes as the watcher's rescan would.
+    let graph = Arc::clone(&session.graph);
+    if !missed.is_empty() {
+        let _ = watcher_reconcile(&graph, true, missed.drain(..).collect());
+    }
+    if session.quiesce(&mut findings) {
+        check_settled(&root, &graph, &mut findings);
+        let parses = graph.consumer_page_parses_test();
+        if parses > 0 {
+            findings.push(format!(
+                "{parses} consumer parse(s) while the projection was alive"
+            ));
+        }
+        drop(graph);
+        session.close(&mut findings);
+        let _ = fs::remove_dir_all(&root);
+    }
+    findings
+}
+
+fn run_seeds(seeds: impl IntoIterator<Item = u64>, steps: usize) {
+    let failures = seeds
+        .into_iter()
+        .filter_map(|seed| {
+            let findings = run_seed(seed, steps);
+            (!findings.is_empty()).then(|| format!("seed {seed}:\n  {}", findings.join("\n  ")))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "GH #543: {} interleaving(s) did not converge:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn gh543_seeded_interleavings_converge() {
+    let seeds = match std::env::var("TINE_INTERLEAVING_SEED") {
+        Ok(seed) => vec![seed.parse().unwrap()],
+        Err(_) => (1..=12).collect(),
+    };
+    run_seeds(seeds, 30);
+}
+
+/// The long local run: `TINE_INTERLEAVING_SEEDS=500 cargo test -p tine-core
+/// gh543_long_interleaving_run -- --ignored`.
+#[test]
+#[ignore = "long local run"]
+fn gh543_long_interleaving_run() {
+    let count = std::env::var("TINE_INTERLEAVING_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200u64);
+    run_seeds(1_000..1_000 + count, 60);
+}
+
+fn save_existing(graph: &Graph, name: &str, text: &str) {
+    let mut page = graph
+        .load_named(name, PageKind::Page)
+        .unwrap()
+        .expect("the page exists");
+    page.blocks = markdown_page_dto(name, name, text).unwrap().blocks;
+    let base = page.rev.clone();
+    graph.save_page(&page, base.as_deref()).unwrap();
+}
+
+/// GH #543 (stage-0 harness, seed 6): a reopened image keeps the positions
+/// it was written with, so a page deleted last session leaves a gap. The
+/// launch check seeded the queue's order from the walk instead, the next new
+/// page took a stored page's position (`UNIQUE constraint failed:
+/// pages.position`), and every later turn failed: the index stayed down for
+/// the whole session.
+#[test]
+fn gh543_a_page_created_after_reopening_a_graph_with_a_deleted_page_is_indexed() {
+    let root = scratch("gh543-reopen-position-gap");
+    for index in 0..5 {
+        fs::write(
+            page_path(&root, &format!("p{index}")),
+            format!("- TODO t{index}\n"),
+        )
+        .unwrap();
+    }
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(10))
+            .unwrap();
+        graph.delete_page("p3", PageKind::Page).unwrap();
+        assert!(graph.direct_projection_test().unwrap().wait_drained_test());
+        crate::direct_projection::release_projection(&graph);
+    }
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(10))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    graph.rename_page("p1", "p9").unwrap();
+    assert!(
+        projection.wait_drained_test(),
+        "the index could not take the rename: {}",
+        projection.debug_state_test()
+    );
+    graph
+        .save_page(
+            &markdown_page_dto("p7", "p7", "- TODO seven\n").unwrap(),
+            None,
+        )
+        .unwrap();
+    assert!(
+        projection.wait_drained_test(),
+        "{}",
+        projection.debug_state_test()
+    );
+    let mut findings = Vec::new();
+    check_settled(&root, &graph, &mut findings);
+    assert!(findings.is_empty(), "{findings:#?}");
+    assert_eq!(
+        graph.consumer_page_parses_test(),
+        0,
+        "the index was healed by parsing the whole graph"
+    );
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// GH #543 (stage-0 harness, seed 6): the launch warm announced "a warm is
+/// coming" for its whole thread, its derived-map prefetch included. When a
+/// turn failed after the warm had validated, nothing was queued, so the
+/// prefetch waited for the warm -- itself -- forever, the window never heard
+/// `warm-cache-done`, and every page list waited with it.
+#[test]
+fn gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm() {
+    let root = scratch("gh543-warm-self-wait");
+    for index in 0..4 {
+        fs::write(
+            page_path(&root, &format!("p{index}")),
+            format!("- TODO t{index}\n"),
+        )
+        .unwrap();
+    }
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(10))
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    // The app announces the launch warm before its thread starts.
+    let announcement = graph.announce_launch_warm();
+    let pause = graph.pause_next_warm_before_derived_maps_test();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache_announced(announcement, || false))
+    };
+    pause.reached.wait();
+    let projection = graph.direct_projection_test().unwrap();
+    projection.inject_next_turn_failure_test();
+    save_existing(&graph, "p0", "- TODO edited\n");
+    assert!(
+        !projection.wait_drained_test(),
+        "the injected turn failure did not happen"
+    );
+    pause.release.wait();
+    let started = Instant::now();
+    while !warm.is_finished() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        warm.is_finished(),
+        "the warm's derived-map prefetch waited for the warm itself: {}",
+        projection.debug_state_test()
+    );
+    warm.join().unwrap();
+    let lister = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.list_pages().len())
+    };
+    let started = Instant::now();
+    while !lister.is_finished() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        lister.is_finished(),
+        "a page list waited for a warm that had ended"
+    );
+    assert_eq!(lister.join().unwrap(), 4);
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+}

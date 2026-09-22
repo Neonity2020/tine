@@ -324,19 +324,13 @@ impl Graph {
         }
     }
 
-    pub(super) fn direct_projection_mark_stale(&self) {
-        if let Some(projection) = self.direct_projection.get() {
-            projection.mark_stale();
-        }
-    }
-
     /// Announce the launch warm when it is scheduled rather than when its
     /// thread reaches the first page read. The app delays that thread so the
     /// first journal paint goes first, and the page list requested by that
     /// same paint used to find no warm announced, parse every page, and queue
-    /// a full snapshot ahead of the warm (GH #543). Hold the returned value
-    /// for the life of the thread that runs `warm_cache_cancellable`; a
-    /// thread that is cancelled or finishes drops it, so a reader can never
+    /// a full snapshot ahead of the warm (GH #543). Hand the returned value
+    /// to [`Graph::warm_cache_announced`], which ends it with the index
+    /// phase; a thread cancelled before then drops it, so a reader can never
     /// wait on a warm nobody runs.
     pub fn announce_launch_warm(&self) -> LaunchWarmAnnouncement {
         LaunchWarmAnnouncement(
@@ -364,6 +358,19 @@ impl Graph {
     ) -> Option<u64> {
         use crate::direct_projection::ProjectionProgress;
         use crate::query::QueryReadinessReason as Reason;
+        #[cfg(test)]
+        {
+            let pause = self
+                .page_build_test
+                .derived_read_wait
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
+        }
         loop {
             if projection.wait_ready_at(generation) {
                 return Some(generation);
@@ -384,8 +391,22 @@ impl Graph {
                 ProjectionProgress::Working(Reason::PendingEdits) => projection.validated(),
                 _ => false,
             };
-            if !coming || self.cache.read().unwrap().is_some() {
-                return projection.ready_at(generation).then_some(generation);
+            let cached = self.cache.read().unwrap().is_some();
+            if !coming || cached {
+                if projection.ready_at(generation) {
+                    return Some(generation);
+                }
+                // The graph moved on while this read waited, and the index
+                // may already be ready at the new generation: exact-generation
+                // readiness at the old one is not coming, and falling back
+                // parsed the whole graph to answer what the index holds
+                // (GH #543).
+                let current = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                if cached || current == generation {
+                    return None;
+                }
+                generation = current;
+                continue;
             }
             // Opening today's journal publishes it and moves the generation;
             // the warm keeps going across such moves, so follow it.

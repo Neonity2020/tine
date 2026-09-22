@@ -1381,7 +1381,9 @@ impl Graph {
 
     #[cfg(test)]
     pub(crate) fn direct_projection_mark_stale_test(&self) {
-        self.direct_projection_mark_stale();
+        if let Some(projection) = self.direct_projection.get() {
+            projection.mark_stale();
+        }
     }
 
     /// R3: the attached projection itself, so a test can open a query job on

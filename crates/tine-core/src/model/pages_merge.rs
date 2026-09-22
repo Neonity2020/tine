@@ -324,7 +324,8 @@ impl Graph {
         // physical kind/path. Preserve the separately updated list memo when its
         // pre-transaction generation was current.
         *self.find_entry_cache.write().unwrap() = None;
-        self.invalidate_cache_after_tine_mutation();
+        let coming = self.index_delta_coming();
+        self.discard_parsed_cache(graph_drift::IndexEffect::Sent(&coming));
         if let Some((inventory, failures)) = updated_page_inventory {
             self.publish_page_inventory_snapshot(inventory, failures);
         }

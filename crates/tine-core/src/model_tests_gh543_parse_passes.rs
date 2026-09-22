@@ -717,3 +717,152 @@ fn a_query_export_plan_during_indexing_is_typed_not_ready_and_parses_nothing() {
         "the plan failed after indexing finished: {after:?}"
     );
 }
+
+/// GH #543: a rename marked the index stale, and the mark outlived the
+/// rename's own delta. Once the rename had converged, a page failing to
+/// parse no longer carried the index to the new generation, so every
+/// indexed read after it parsed the whole graph.
+#[test]
+fn a_failed_page_after_a_rename_does_not_parse_the_graph() {
+    let dir = scratch("gh543-stale-after-rename");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let database = dir.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&dir);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(5))
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    let graph = Graph::open(&dir);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    graph.rename_page("p7", "p9").unwrap();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    assert!(!graph.has_parsed_cache_test());
+    let failed = dir.join("pages/p0.md");
+    fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
+    assert!(graph.sync_file_checked(&failed).is_err());
+    GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
+    let listed = graph.list_pages().len();
+    let parses = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+    let ready = graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .is_ok();
+    crate::direct_projection::release_projection(&graph);
+    assert!(ready, "a failure after a rename left the index not ready");
+    assert_eq!(listed, 7);
+    assert!(
+        parses <= 1,
+        "a listing after a rename parsed {parses} pages"
+    );
+}
+
+/// GH #543: a rename moved the generation and queued its delta only after
+/// it had re-read the renamed pages. A listing in between found the index
+/// behind with nothing queued, and parsed the whole graph.
+#[test]
+fn a_listing_during_a_rename_waits_for_the_rename_instead_of_parsing() {
+    let dir = scratch("gh543-listing-during-rename");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let database = dir.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&dir);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(5))
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    assert!(!graph.has_parsed_cache_test());
+    let parses_before = graph.page_build_parses_test();
+    let pause = graph.pause_after_next_parsed_cache_discard_test();
+    let renamer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.rename_page("p7", "p9").map(|_| ()))
+    };
+    pause.reached.wait();
+    let lister = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.list_pages())
+    };
+    // Long enough for the listing to reach its decision while the rename is
+    // held between its generation move and its delta.
+    std::thread::sleep(Duration::from_millis(300));
+    pause.release.wait();
+    renamer.join().unwrap().unwrap();
+    let listed = lister.join().unwrap();
+    let parses = graph.page_build_parses_test() - parses_before;
+    crate::direct_projection::release_projection(&graph);
+    assert_eq!(parses, 0, "a listing during a rename parsed {parses} pages");
+    let names = listed
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"p9") && !names.contains(&"p7"), "{names:?}");
+}
+
+/// GH #543: a listing took the graph's generation, and an edit moved it
+/// while the listing waited. The index became ready at the new generation,
+/// but readiness is exact, so the old generation's was not coming, and the
+/// listing parsed the whole graph instead of reading the index.
+#[test]
+fn a_listing_overtaken_by_an_edit_reads_the_index_instead_of_parsing() {
+    let dir = scratch("gh543-listing-overtaken");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let database = dir.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&dir);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(5))
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    assert!(!graph.has_parsed_cache_test());
+    let parses_before = graph.page_build_parses_test();
+    let pause = graph.pause_next_derived_read_test();
+    let lister = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.list_pages())
+    };
+    pause.reached.wait();
+    fs::write(dir.join("pages/p1.md"), "- saved\n").unwrap();
+    graph.sync_file_checked(&dir.join("pages/p1.md")).unwrap();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    pause.release.wait();
+    let listed = lister.join().unwrap();
+    let parses = graph.page_build_parses_test() - parses_before;
+    crate::direct_projection::release_projection(&graph);
+    assert_eq!(listed.len(), 8);
+    assert_eq!(parses, 0, "an overtaken listing parsed {parses} pages");
+}

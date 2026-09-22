@@ -9,8 +9,8 @@ pub(super) enum WarmProjectionOutcome {
     /// The projection (or a parsed snapshot already queued to it) owns
     /// readiness at the generation the warm observed.
     Owned,
-    /// The warm observed a generation that moved under it, or its enqueue was
-    /// refused by work the worker will drain shortly: run it again.
+    /// Validation settled nothing: the image needs a fresh build, a mutation
+    /// raced the warm, or updates kept outranking it. The caller builds.
     Retry,
     /// No projection can own readiness: none attached, the graph text scope
     /// unreadable, the writer lease held elsewhere, or the worker failed.
@@ -29,9 +29,7 @@ impl Graph {
             _ => return Err(entry.rel_path),
         };
         #[cfg(test)]
-        self.page_build_test
-            .parses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.count_page_parse_test();
         isolate_page_parse(entry, &self.journal_format, |entry| {
             Some(self.parse_session_page_content(entry, &content))
         })
@@ -270,9 +268,7 @@ impl Graph {
             match self.graph_text_read_optional_text_with_identity(permit, &entry.path) {
                 Ok(Some((content, identity))) => {
                     #[cfg(test)]
-                    self.page_build_test
-                        .parses
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.count_page_parse_test();
                     let revision = content_rev(&content);
                     let parsed = isolate_page_parse(entry, &self.journal_format, |entry| {
                         Some(self.parse_session_page_content(entry, &content))
@@ -305,11 +301,12 @@ impl Graph {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             // Real drift: a change with no name, which no reparse can follow.
+            let coming = self.index_delta_coming();
             let cache = self.cache.write().unwrap();
             self.move_cache_generation(
                 &cache,
                 Some(graph_drift::StructuralChange::Unnamed),
-                graph_drift::IndexEffect::Sent,
+                graph_drift::IndexEffect::Sent(&coming),
             );
         }
         let PageCacheBuild {
@@ -496,14 +493,24 @@ impl Graph {
     /// Build graph-open caches while allowing a revoked window binding to stop
     /// between files and derived-map phases. Returns false when cancelled.
     pub fn warm_cache_cancellable(&self, cancelled: impl Fn() -> bool) -> bool {
+        self.warm_cache_announced(self.announce_launch_warm(), cancelled)
+    }
+
+    /// [`Graph::warm_cache_cancellable`] for a warm announced ahead of time
+    /// (see [`Graph::announce_launch_warm`]). The announcement tells readers
+    /// that indexing is coming, so it ends with the index phase: the
+    /// derived-map prefetch after it is an ordinary reader, and prefetching
+    /// under the announcement waited for the warm itself -- forever, once a
+    /// turn failed with nothing queued (GH #543).
+    pub fn warm_cache_announced(
+        &self,
+        announcement: LaunchWarmAnnouncement,
+        cancelled: impl Fn() -> bool,
+    ) -> bool {
         // Validate a clean warm image without parsing. A stale, cold, damaged,
         // or raced image falls through to the existing parsed-page build
         // flight, whose captured snapshot is built unpublished and published
         // atomically by the projection worker.
-        let _retrying = self
-            .direct_projection
-            .get()
-            .map(|projection| projection.begin_warm());
         let warmed = match self.warm_projection_cancellable(&cancelled) {
             WarmProjectionOutcome::Owned => true,
             WarmProjectionOutcome::Cancelled => return false,
@@ -523,8 +530,22 @@ impl Graph {
                 projection.wait_until_ready_at(generation, &cancelled);
             }
         }
+        drop(announcement);
         if cancelled() {
             return false;
+        }
+        #[cfg(test)]
+        {
+            let pause = self
+                .page_build_test
+                .before_derived_maps
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
         }
         // Warm the derived maps the frontend fetches right after `warm-cache-done`
         // (aliases + block-ref counts), so those fetches are pure cache hits.
@@ -544,9 +565,10 @@ impl Graph {
     ///
     /// `Owned` means the projection (or a full snapshot already queued to it)
     /// owns readiness at the generation this warm observed. `Retry` means the
-    /// attempt accomplished nothing and MUST be run again — a mutation raced
-    /// it, or the queue was held by work that will drain shortly; the caller
-    /// owns that retry, and dropping the outcome is how an obligation ends up
+    /// validation settled nothing -- the image needs a fresh build, a mutation
+    /// raced it, or updates kept outranking it -- and the caller still owes
+    /// readiness: `warm_cache_announced` builds the parsed snapshot, which the
+    /// worker publishes. Dropping the outcome is how an obligation ends up
     /// with no producer (GH #543). `Unavailable` means no projection can own
     /// readiness at all: none attached, the graph text scope unreadable, the
     /// lease held by another instance, or the worker gone. `Cancelled` is the
@@ -973,6 +995,8 @@ impl Graph {
     }
 
     fn build_page_cache_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
+        #[cfg(test)]
+        let _indexing = IndexingBuildTest::enter();
         if cancelled() {
             return false;
         }
@@ -1031,9 +1055,7 @@ impl Graph {
                     let path = e.path.clone();
                     let revision = content_rev(&content);
                     #[cfg(test)]
-                    self.page_build_test
-                        .parses
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.count_page_parse_test();
                     let indexed =
                         built.collect(isolate_page_parse(e, &self.journal_format, |entry| {
                             Some(self.parse_session_page_content(entry, &content))
@@ -1105,7 +1127,8 @@ impl Graph {
         self.invalidate_guarded_graph_text_identity(
             "broad external cache invalidation has no exact path generation",
         );
-        self.invalidate_cache_after_tine_mutation();
+        let projection = self.direct_projection.get();
+        self.discard_parsed_cache(graph_drift::IndexEffect::Stale(projection.as_ref()));
     }
 
     #[cfg(test)]
@@ -1113,6 +1136,24 @@ impl Graph {
         self.page_build_test
             .repair_parses
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn count_page_parse_test(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.page_build_test.parses.fetch_add(1, Relaxed);
+        if INDEXING_BUILD_TEST.with(std::cell::Cell::get) {
+            self.page_build_test.indexing_parses.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Page parses outside an indexing build: a warm's or repair's own
+    /// rebuild is indexing, every other whole-graph parse is a consumer's.
+    #[cfg(test)]
+    pub(crate) fn consumer_page_parses_test(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.page_build_test.parses.load(Relaxed)
+            - self.page_build_test.indexing_parses.load(Relaxed)
     }
 
     #[cfg(test)]
@@ -1127,11 +1168,12 @@ impl Graph {
     /// There is no page to check the move against, so it counts as structural.
     #[cfg(test)]
     pub(crate) fn drift_generation_test(&self) {
+        let coming = self.index_delta_coming();
         let cache = self.cache.write().unwrap();
         self.move_cache_generation(
             &cache,
             Some(graph_drift::StructuralChange::Unnamed),
-            graph_drift::IndexEffect::Sent,
+            graph_drift::IndexEffect::Sent(&coming),
         );
     }
 
@@ -1196,6 +1238,37 @@ impl Graph {
         pause
     }
 
+    /// Pause the next derived read after it has taken its generation, before
+    /// it waits for the index.
+    #[cfg(test)]
+    pub(crate) fn pause_next_derived_read_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.derived_read_wait.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
+    /// Pause the next mutation that discards the parsed cache right after it
+    /// has moved the generation, before it queues its delta.
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_parsed_cache_discard_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self
+            .page_build_test
+            .after_parsed_cache_discard
+            .lock()
+            .unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
+    /// Pause the next warm after its index phase, before it prefetches the
+    /// derived maps.
+    #[cfg(test)]
+    pub(crate) fn pause_next_warm_before_derived_maps_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.before_derived_maps.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
     /// Pause the next warm right before it offers its validation to the
     /// queue, after its drift check.
     #[cfg(test)]
@@ -1210,8 +1283,9 @@ impl Graph {
         self.cache.read().unwrap().is_some()
     }
 
-    pub(super) fn invalidate_cache_after_tine_mutation(&self) {
-        self.direct_projection_mark_stale();
+    /// Drop the parsed cache and every map derived from it after a mutation
+    /// that moved or retired pages; `effect` says how the index hears of it.
+    pub(super) fn discard_parsed_cache(&self, effect: graph_drift::IndexEffect<'_>) {
         // Compatible IDs are owned by session_page_ids, independently of the
         // parsed cache. Reconciliation invalidates incompatible source revisions.
         let mut guard = self.cache.write().unwrap();
@@ -1224,12 +1298,21 @@ impl Graph {
                                                  // a reader that loads the new gen then reads the cache sees None (and
                                                  // rebuilds from disk) rather than the stale pre-invalidation content — same
                                                  // gen-after-content ordering as cache_upsert.
-        self.move_cache_generation(
-            &guard,
-            Some(graph_drift::StructuralChange::Unnamed),
-            graph_drift::IndexEffect::Sent,
-        );
+        self.move_cache_generation(&guard, Some(graph_drift::StructuralChange::Unnamed), effect);
         drop(guard);
+        #[cfg(test)]
+        {
+            let pause = self
+                .page_build_test
+                .after_parsed_cache_discard
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
+        }
     }
 
     /// Publish one page delta after a write or external reconciliation, without
@@ -1274,6 +1357,7 @@ impl Graph {
         // Taken before the cache lock: attaching holds the projection slot
         // while it reads the cache, so the slot is never locked under it.
         let projection = self.direct_projection.get();
+        let coming = self.index_delta_coming();
         let mut guard = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         self.publish_session_page_ids(
@@ -1340,7 +1424,8 @@ impl Graph {
         // (Bumping FIRST left a window where the gen was new but the doc still old.)
         // The bump is unconditional — even on a cold cache (no slot to update) — so
         // a concurrent lock-free with_pages build still detects the race and retries.
-        let newgen = self.move_cache_generation(&guard, None, graph_drift::IndexEffect::Sent);
+        let newgen =
+            self.move_cache_generation(&guard, None, graph_drift::IndexEffect::Sent(&coming));
         if bounded_foreground
             && cache_built
             && !identity_changed
@@ -1646,6 +1731,8 @@ impl Graph {
         // A page delete is a page-set change that can affect every backlink
         // and reference result, so drop the whole derived-reference cache.
         *self.derived_cache.write().unwrap() = None;
+        let projection = self.direct_projection.get();
+        let coming = self.index_delta_coming();
         let mut guard = self.cache.write().unwrap();
         let mut removed_entries = Vec::new();
         let cache_built = guard.is_some();
@@ -1713,7 +1800,13 @@ impl Graph {
                         .collect(),
                 )
             }),
-            graph_drift::IndexEffect::Sent,
+            if removed_entries.is_empty() && !cache_built {
+                // The deleted file could not be named; the next warm
+                // validation or full snapshot re-derives the inventory.
+                graph_drift::IndexEffect::Stale(projection.as_ref())
+            } else {
+                graph_drift::IndexEffect::Sent(&coming)
+            },
         );
         if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() =
@@ -1741,11 +1834,6 @@ impl Graph {
         if !page_list_advanced && self.page_index_failures.read().unwrap().is_empty() {
             self.publish_warm_page_inventory(newgen);
         }
-        if removed_entries.is_empty() && !cache_built {
-            // The deleted file could not be named; the next warm validation or
-            // full snapshot re-derives the inventory.
-            self.direct_projection_mark_stale();
-        }
         for entry in removed_entries {
             self.direct_projection_enqueue_delete(newgen, entry);
         }
@@ -1758,6 +1846,7 @@ impl Graph {
         // A page delete is a page-set change (affects namespaces, exists-by-ref,
         // every backlink/query) — drop the whole derived cache.
         *self.derived_cache.write().unwrap() = None;
+        let coming = self.index_delta_coming();
         let mut guard = self.cache.write().unwrap();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
@@ -1777,7 +1866,7 @@ impl Graph {
             Some(graph_drift::StructuralChange::Removed(vec![entry
                 .path
                 .clone()])),
-            graph_drift::IndexEffect::Sent,
+            graph_drift::IndexEffect::Sent(&coming),
         );
         if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() =
@@ -1802,5 +1891,29 @@ impl Graph {
             self.publish_warm_page_inventory(newgen);
         }
         self.direct_projection_enqueue_delete(newgen, entry.clone());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INDEXING_BUILD_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as running an indexing build for its lifetime, so the
+/// parses it makes count as indexing rather than a consumer's.
+#[cfg(test)]
+struct IndexingBuildTest(bool);
+
+#[cfg(test)]
+impl IndexingBuildTest {
+    fn enter() -> Self {
+        Self(INDEXING_BUILD_TEST.with(|flag| flag.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for IndexingBuildTest {
+    fn drop(&mut self) {
+        INDEXING_BUILD_TEST.with(|flag| flag.set(self.0));
     }
 }

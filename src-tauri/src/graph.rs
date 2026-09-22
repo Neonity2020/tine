@@ -17,11 +17,24 @@ use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tine_core::model::{Graph, GraphMeta};
 
-/// Reset the warm flag for a new graph load and return the new warm generation
-/// (passed to `warm_cache_async`, which only reports done if still current).
-pub(crate) fn begin_warm_cache(slot: &GraphSlot) -> u64 {
+/// A launch warm reserved for a graph that is about to be published: the warm
+/// generation `warm_cache_async` reports done against, and the announcement
+/// that tells readers a warm is coming.
+pub(crate) struct WarmTicket {
+    pub(crate) generation: u64,
+    announcement: tine_core::model::LaunchWarmAnnouncement,
+}
+
+/// Reset the warm flag for a new graph load and reserve its warm. Both callers
+/// take the ticket before the slot is published, so a command reaching the new
+/// graph sees a warm coming and waits for it instead of parsing the whole
+/// graph itself (GH #543); `warm_cache_async` accepts only a ticket.
+pub(crate) fn begin_warm_cache(slot: &GraphSlot) -> WarmTicket {
     slot.warm_done.store(false, Ordering::Release);
-    slot.warm_generation.fetch_add(1, Ordering::AcqRel) + 1
+    WarmTicket {
+        generation: slot.warm_generation.fetch_add(1, Ordering::AcqRel) + 1,
+        announcement: slot.graph().announce_launch_warm(),
+    }
 }
 
 /// Resolve the graph root: explicit path, else env var, else first CLI arg.
@@ -464,9 +477,9 @@ fn publish_direct_files_slot(
     window_label: &str,
     graph: Graph,
     root_key: PathBuf,
-) -> Result<(Arc<GraphSlot>, u64), crate::command_error::CommandError> {
+) -> Result<(Arc<GraphSlot>, WarmTicket), crate::command_error::CommandError> {
     let slot = Arc::new(GraphSlot::new(graph, root_key));
-    let warm_generation = begin_warm_cache(&slot);
+    let warm = begin_warm_cache(&slot);
     state
         .graphs
         .write()
@@ -475,7 +488,7 @@ fn publish_direct_files_slot(
         .map_err(crate::command_error::CommandError::from)?;
     state.note_focused(window_label);
     poke_watcher(state);
-    Ok((slot, warm_generation))
+    Ok((slot, warm))
 }
 
 fn direct_files_projection_path(
@@ -607,7 +620,7 @@ pub(crate) fn publish_prepared_direct_files(
         meta,
         root_key,
     } = prepared;
-    let (slot, warm_generation) = publish_direct_files_slot(state, window_label, graph, root_key)?;
+    let (slot, warm) = publish_direct_files_slot(state, window_label, graph, root_key)?;
     // Opening no longer mutates the tree, so the launch snapshot is never on a
     // rename's critical path: it stays the ordinary background backup.
     backup_async(app.clone(), window_label.to_string(), slot.clone())?;
@@ -621,7 +634,7 @@ pub(crate) fn publish_prepared_direct_files(
     }
     let binding_generation = slot.binding_generation;
     let application_page_admission = slot.application_page_admission();
-    warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
+    warm_cache_async(app.clone(), window_label.to_string(), slot, warm)?;
     Ok(DirectFilesOpen {
         meta,
         binding_generation,
@@ -1042,15 +1055,17 @@ pub(crate) fn warm_cache_async(
     app: tauri::AppHandle,
     window_label: String,
     slot: Arc<GraphSlot>,
-    warm_generation: u64,
+    warm: WarmTicket,
 ) -> Result<(), crate::command_error::CommandError> {
     let graph = slot.graph();
-    // Announced now, not after the delay below: the first paint's page list
-    // must see a warm coming and wait for it instead of parsing the whole
-    // graph itself (GH #543). Dropped when this thread ends, however it ends.
-    let announcement = graph.announce_launch_warm();
+    // The ticket's announcement was taken before the graph was published, not
+    // after the delay below; it is dropped when this thread ends, however it
+    // ends.
+    let WarmTicket {
+        generation: warm_generation,
+        announcement,
+    } = warm;
     std::thread::spawn(move || {
-        let _announcement = announcement;
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
         // background so the first search / query / `g j` agenda doesn't pay for
@@ -1079,7 +1094,7 @@ pub(crate) fn warm_cache_async(
                 || slot.warm_generation.load(Ordering::Acquire) != warm_generation
         };
         settle_launch_warm(
-            || graph.warm_cache_cancellable(cancelled),
+            || graph.warm_cache_announced(announcement, cancelled),
             cancelled,
             || {
                 let state: State<'_, AppState> = app.state();
@@ -1265,9 +1280,10 @@ mod tests {
         std::fs::write(root.join("pages/Source.md"), "- [[OnlyReferenced]]\n").unwrap();
         let root_key = std::fs::canonicalize(&root).unwrap();
         let state = direct_test_state();
-        let (old, old_generation) =
+        let (old, old_warm) =
             publish_direct_files_slot(&state, "main", Graph::open(&root), root_key.clone())
                 .unwrap();
+        let old_generation = old_warm.generation;
         let services = DirectFilesServicePaths {
             projection: Ok(root.join("private/projection.sqlite")),
             concord_ledger: None,
@@ -1277,7 +1293,7 @@ mod tests {
                 .unwrap()
                 .commit(&old),
         );
-        let replacement_generation = begin_warm_cache(&replacement);
+        let replacement_generation = begin_warm_cache(&replacement).generation;
         assert!(state.graphs.write().unwrap().swap_refreshed(
             "main",
             &old,
@@ -1459,6 +1475,29 @@ mod tests {
             refresh_entry.find(".commit(&old)") < refresh_entry.find("warm_cache_async("),
             "the refreshed slot is warmed, or the projection never receives its payload"
         );
+        // The warm ticket announces the warm, so it is taken before the graph
+        // is published; otherwise the first command on the new graph finds no
+        // warm coming and parses the whole graph (GH #543).
+        assert!(
+            refresh_entry
+                .find("begin_warm_cache(")
+                .expect("refresh reserves its warm")
+                < refresh_entry
+                    .find("swap_refreshed(")
+                    .expect("refresh publishes"),
+            "a refreshed graph's warm is announced before the swap publishes it"
+        );
+        let source = include_str!("graph.rs");
+        let publish = &source[source
+            .find("fn publish_direct_files_slot(")
+            .expect("open publication")..];
+        assert!(
+            publish
+                .find("begin_warm_cache(")
+                .expect("open reserves its warm")
+                < publish.find(".bind(").expect("open binds the slot"),
+            "an opened graph's warm is announced before the slot is bound"
+        );
     }
 
     #[test]
@@ -1552,7 +1591,7 @@ mod tests {
         let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
         assert_eq!(loaded.meta.root, dir.display().to_string());
         let state = direct_test_state();
-        let (slot, warm_generation) =
+        let (slot, warm) =
             publish_direct_files_slot(&state, "ordinary", loaded.graph, root_key.clone()).unwrap();
         let installed = state
             .graphs
@@ -1565,7 +1604,7 @@ mod tests {
         assert_eq!(installed.binding_generation, slot.binding_generation);
         assert_eq!(
             installed.warm_generation.load(Ordering::Acquire),
-            warm_generation,
+            warm.generation,
             "the installed Direct slot owns the scheduled warm generation"
         );
         assert_eq!(std::fs::read(&page).unwrap(), page_before);

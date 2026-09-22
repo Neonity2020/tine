@@ -614,7 +614,8 @@ impl Graph {
                     }
                 }
             }
-            self.invalidate_cache_after_tine_mutation();
+            let coming = self.index_delta_coming();
+            self.discard_parsed_cache(graph_drift::IndexEffect::Sent(&coming));
             self.reconcile_failed_graph_text_paths(
                 &write,
                 edits
@@ -652,14 +653,15 @@ impl Graph {
                 }
                 (inventory, failures)
             });
-        self.invalidate_cache_after_tine_mutation();
+        let coming = self.index_delta_coming();
+        self.discard_parsed_cache(graph_drift::IndexEffect::Sent(&coming));
         if let Some((inventory, failures)) = updated_page_inventory {
             self.publish_page_inventory_snapshot(inventory, failures);
         }
         // GH #543: a rename is a PRODUCER, exactly as a delete is.
-        // `invalidate_cache_after_tine_mutation` only marks the projection
-        // stale, and an existing complete committed image may still answer
-        // while an ordinary queued delta converges it. With no producer there
+        // Discarding the parsed cache only moves the generation, and an
+        // existing complete committed image may still answer while an
+        // ordinary queued delta converges it. With no producer there
         // was nothing to converge and nothing to refuse, so
         // search went on answering with the renamed page's OLD name and path
         // indefinitely, offering a page that no longer existed; and because

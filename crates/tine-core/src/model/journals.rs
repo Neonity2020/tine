@@ -184,7 +184,8 @@ impl Graph {
             // with nothing queued to correct them. The next ordinary save of a
             // migrated page then published its NEW path beside the retired
             // one's surviving row, so one file answered twice.
-            self.invalidate_cache_after_tine_mutation();
+            let coming = self.index_delta_coming();
+            self.discard_parsed_cache(graph_drift::IndexEffect::Sent(&coming));
             let mut page_set = Vec::new();
             for (retired, target) in moved {
                 if let Some(entry) = retired {

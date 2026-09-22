@@ -168,6 +168,11 @@ pub(super) struct PageBuildTestState {
     pub(super) warm_read_done_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// Pause the next warm right before it offers its validation.
     pub(super) before_warm_enqueue: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause the next warm after its index phase, before it prefetches the
+    /// derived maps.
+    pub(super) before_derived_maps: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    pub(super) derived_read_wait: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    pub(super) after_parsed_cache_discard: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// Pause one page publication right after it releases the cache lock,
     /// with its new generation observable, before it returns.
     pub(super) upsert_published_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
@@ -182,6 +187,9 @@ pub(super) struct PageBuildTestState {
     pub(super) derived_read_open_once: std::sync::Mutex<Option<PathBuf>>,
     pub(super) enumerations: std::sync::atomic::AtomicUsize,
     pub(super) parses: std::sync::atomic::AtomicUsize,
+    /// The part of `parses` made by an indexing build (see
+    /// `Graph::consumer_page_parses_test`).
+    pub(super) indexing_parses: std::sync::atomic::AtomicUsize,
     /// Pages a warm repair parsed (one per changed page, never a graph pass).
     pub(super) repair_parses: std::sync::atomic::AtomicUsize,
     pub(super) installs: std::sync::atomic::AtomicUsize,

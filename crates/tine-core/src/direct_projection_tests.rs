@@ -5650,6 +5650,7 @@ fn empty_projection_shared() -> ProjectionShared {
         projection_health_checks: AtomicU64::new(0),
         repairs_in_flight: AtomicUsize::new(0),
         warms_in_flight: AtomicUsize::new(0),
+        deltas_coming: AtomicUsize::new(0),
         build_progress: Default::default(),
         #[cfg(test)]
         capture_thread: Mutex::new(None),
@@ -5658,6 +5659,7 @@ fn empty_projection_shared() -> ProjectionShared {
         statement_reads: AtomicU64::new(0),
         registry_capture_attempts: AtomicU64::new(0),
         inject_read_failure: AtomicBool::new(false),
+        inject_turn_failure: AtomicBool::new(false),
         fallback_reads: AtomicU64::new(0),
         referenced_name_reads: AtomicU64::new(0),
     }

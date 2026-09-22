@@ -548,6 +548,11 @@ struct ProjectionShared {
     /// Before this marker, that race could trigger a redundant whole-graph
     /// reconstruction on the query thread.
     warms_in_flight: AtomicUsize,
+    /// Generation moves whose delta is on its way: the mover has moved the
+    /// generation and not yet queued the delta that describes it. A reader
+    /// landing in that window found the index behind with nothing queued and
+    /// parsed the whole graph (GH #543); it now waits, as for a queued edit.
+    deltas_coming: AtomicUsize,
     /// Pages written by the running fresh build, for the indexing progress
     /// bar only (GH #543).
     build_progress: crate::indexing_progress::ProgressCounter,
@@ -559,6 +564,9 @@ struct ProjectionShared {
     /// future arm silently drops (M9).
     #[cfg(test)]
     inject_read_failure: AtomicBool,
+    /// Fail the worker's next turn, as a disk error or a SQLite fault would.
+    #[cfg(test)]
+    inject_turn_failure: AtomicBool,
     #[cfg(test)]
     fallback_reads: AtomicU64,
     #[cfg(test)]
@@ -1021,9 +1029,12 @@ impl DirectProjection {
             registry_capture_attempts: AtomicU64::new(0),
             repairs_in_flight: AtomicUsize::new(0),
             warms_in_flight: AtomicUsize::new(0),
+            deltas_coming: AtomicUsize::new(0),
             build_progress: Default::default(),
             #[cfg(test)]
             inject_read_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            inject_turn_failure: AtomicBool::new(false),
             #[cfg(test)]
             fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -1050,6 +1061,13 @@ impl DirectProjection {
     /// retries instead of repairing an "idle" projection (GH #543). Held
     /// until the warm has enqueued (from then on the queue itself says
     /// Indexing) or given up.
+    /// Announce a generation move whose delta the caller queues next; see
+    /// `DeltaComing`.
+    pub(crate) fn delta_coming(&self) -> DeltaComing {
+        self.shared.deltas_coming.fetch_add(1, Ordering::AcqRel);
+        DeltaComing(Arc::clone(&self.shared))
+    }
+
     pub(crate) fn begin_warm(&self) -> WarmInFlight {
         self.shared.warms_in_flight.fetch_add(1, Ordering::AcqRel);
         WarmInFlight(Arc::clone(&self.shared))
@@ -2324,7 +2342,7 @@ impl DirectProjection {
         if pending.warm.is_some() || self.shared.warms_in_flight.load(Ordering::Acquire) > 0 {
             return ProjectionProgress::Working(Reason::Indexing);
         }
-        if !pending.deltas.is_empty() {
+        if !pending.deltas.is_empty() || self.shared.deltas_coming.load(Ordering::Acquire) > 0 {
             return ProjectionProgress::Working(Reason::PendingEdits);
         }
         if self.shared.worker_failed.load(Ordering::Acquire) {
@@ -2406,6 +2424,13 @@ impl DirectProjection {
     pub(crate) fn close_query_jobs_test(&self) {
         let fence = self.shared.query_jobs.begin_close();
         self.shared.query_jobs.wait_for_drain(fence);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_turn_failure_test(&self) {
+        self.shared
+            .inject_turn_failure
+            .store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -2638,6 +2663,17 @@ impl std::fmt::Display for ProjectionRefusal {
 /// Lives for one repair attempt; see `DirectProjection::begin_repair`.
 pub(crate) struct RepairInFlight(Arc<ProjectionShared>);
 
+/// Lives from a generation move until the mover has queued the delta that
+/// describes it; see `DirectProjection::delta_coming`.
+pub(crate) struct DeltaComing(Arc<ProjectionShared>);
+
+impl Drop for DeltaComing {
+    fn drop(&mut self) {
+        self.0.deltas_coming.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_all();
+    }
+}
+
 /// Lives from a warm validation's first page read until it has enqueued or
 /// given up; see `DirectProjection::begin_warm`.
 pub(crate) struct WarmInFlight(Arc<ProjectionShared>);
@@ -2835,6 +2871,12 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         #[cfg(test)]
         run_before_apply_deltas_hook();
         let applied: Result<AppliedTurn, ProjectionRefusal> = (|| {
+            #[cfg(test)]
+            if shared.inject_turn_failure.swap(false, Ordering::AcqRel) {
+                return Err(ProjectionRefusal::Failed(
+                    "injected turn failure".to_owned(),
+                ));
+            }
             if config_changed && !had_full {
                 let fence = shared.cancel_queued_captures(false);
                 shared.query_jobs.wait_for_drain(fence);
@@ -2916,8 +2958,37 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         let mut pending = shared.pending.lock().unwrap();
                         pending.reseed_after_repair(&order);
                         pending.place_taken(&mut deltas);
+                        validate_warm(database, warm).map_err(ProjectionRefusal::Failed)?
+                    } else {
+                        let outcome =
+                            validate_warm(database, warm).map_err(ProjectionRefusal::Failed)?;
+                        if matches!(outcome, WarmOutcome::Clean) {
+                            // The queue was seeded from the walk, but a
+                            // reopened image keeps the positions it was
+                            // written with: a page deleted last session left
+                            // a gap, and the next new page took a stored
+                            // page's position (`UNIQUE constraint failed:
+                            // pages.position`), failing every later turn
+                            // (GH #543). Give the image the queue's order; an
+                            // image already in that order is not written.
+                            let order = reconcile_page_order(
+                                database,
+                                &shared,
+                                &PhysicalGraphProjectionChange {
+                                    replacements: Vec::new(),
+                                    deletions: Vec::new(),
+                                    reference_postings: Vec::new(),
+                                },
+                                &[],
+                                &[],
+                            )
+                            .map_err(ProjectionRefusal::Failed)?;
+                            let mut pending = shared.pending.lock().unwrap();
+                            pending.reseed_after_repair(&order);
+                            pending.place_taken(&mut deltas);
+                        }
+                        outcome
                     }
-                    validate_warm(database, warm).map_err(ProjectionRefusal::Failed)?
                 } else {
                     WarmOutcome::FreshBuildRequired
                 };
@@ -3627,6 +3698,32 @@ fn apply_warm_repair(
     let lowered = lower_deltas(deltas)?;
     let mut change = lowered.change;
     change.deletions = repair.deletions;
+    projection_diag(|| {
+        format!(
+            "warm repair: relowering {} page(s), deleting {}",
+            change.replacements.len(),
+            change.deletions.len()
+        )
+    });
+    reconcile_page_order(
+        database,
+        shared,
+        &change,
+        &lowered.revisions,
+        &lowered.aliases,
+    )
+}
+
+/// Apply `change` and give every page the image holds afterwards its place in
+/// the queue's order (the walk, then pages this session created). Returns
+/// that order. Positions that already match are not written.
+fn reconcile_page_order(
+    database: &mut PhysicalGraphProjectionDatabase,
+    shared: &ProjectionShared,
+    change: &PhysicalGraphProjectionChange,
+    revisions: &[PhysicalGraphProjectionSourceRevision],
+    aliases: &[PhysicalAliasDeclaration],
+) -> Result<Vec<String>, String> {
     // Against an empty inventory every stored page reads as a deletion: that
     // is the set of paths the image holds.
     let mut after = database
@@ -3649,20 +3746,8 @@ fn apply_warm_repair(
         .collect::<Vec<_>>();
     // Nothing should be left; anything that is still gets a place at the end.
     order.extend(after);
-    projection_diag(|| {
-        format!(
-            "warm repair: relowering {} page(s), deleting {}",
-            change.replacements.len(),
-            change.deletions.len()
-        )
-    });
     database
-        .apply_with_source_revisions_aliases_and_page_order(
-            &change,
-            &lowered.revisions,
-            &lowered.aliases,
-            &order,
-        )
+        .apply_with_source_revisions_aliases_and_page_order(change, revisions, aliases, &order)
         .map_err(|error| error.to_string())?;
     Ok(order)
 }

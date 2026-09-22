@@ -4753,7 +4753,7 @@ fn late_page_build_claim_after_completed_install_is_non_owner() {
     assert!(!owner);
     assert_eq!(late_flight.wait(), PageBuildOutcome::AlreadyAvailable);
     assert!(graph.page_build_flight.lock().unwrap().is_none());
-    graph.invalidate_cache_after_tine_mutation();
+    graph.invalidate_cache();
     let (drifted_flight, owner) = graph.claim_page_build(expected_generation);
     assert!(!owner);
     assert_eq!(drifted_flight.wait(), PageBuildOutcome::GenerationDrift);
@@ -15961,3 +15961,6 @@ mod advanced_queries;
 
 #[path = "model_tests_gh543_parse_passes.rs"]
 mod gh543_parse_passes;
+
+#[path = "model_gh543_interleaving_tests.rs"]
+mod gh543_interleaving;

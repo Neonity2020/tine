@@ -5977,6 +5977,83 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 6, R6-02 and R6-07. A sync #[tauri::command] runs on the main thread and freezes every window until it returns. capture_quick_switch waited out the whole index pass there (wait_for_derived_read) and, on a graph a refresh had just retired, parsed that graph; set_journal_title_format waited for the storage transition lane and up to 15 s for the index worker to stop. Fourteen commands became async + spawn_blocking (capture_quick_switch, set_journal_title_format, list_journal_conflicts, list_journal_filename_migrations, graph_source_files, set_backup_keep, asset_trash_stats, empty_asset_trash, import_asset, import_native_capture, read_asset, read_local_image, list_installed_plugins, list_spellcheck_dictionaries); open_graph_window and restore_backup no longer open or refresh a graph inline on a runtime worker. Shape: state::refresh_graph is async, so no sync command can reach it; capture reads go through display_read. Guard: every remaining sync command is listed in SYNC_COMMANDS with the reason it is bounded, and the listing is exact both ways. refreshJournalConflicts keeps only the newest answer, since the listing now answers out of order. Fixed a vacuous sibling: a_display_read_on_a_retired_graph_is_answered_by_its_replacement measured its wait after joining the 200 ms binder thread. Fail-before: tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-02-tauri.log (14 unlisted sync commands, open_graph_window, capture answered by the retired graph in 2.9 ms), necessity-r6-02-frontend.log."
+},
+{
+ "id": "REG-A-FAILED-INDEX-TURN-DOES-NOT-HANG-THE-APP-543",
+ "title": "A search-index turn that fails after the launch check no longer leaves page lists, queries and search waiting forever",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 stage-0 interleaving harness, H1. The launch warm waited on its own announcement after a worker turn failed, so every derived read waited on a warm that could never finish. The warm now reconciles page order itself on a clean validation and a failed turn falls through to recovery. Fail-before: tine-agents/evidence/gh550-batch/stage0/necessity-warm-self-wait.log."
+},
+{
+ "id": "REG-A-PAGE-CREATED-AFTER-REOPENING-WITH-A-DELETED-PAGE-IS-INDEXED-543",
+ "title": "After reopening a graph whose stored index still lists a deleted page, a new or renamed page reaches the index instead of breaking indexing",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_page_created_after_reopening_a_graph_with_a_deleted_page_is_indexed"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 stage-0 interleaving harness, H2. A warm repair left a position gap for the deleted page, and the next insert failed its order check, leaving the index never ready. Warm repairs now go through reconcile_page_order, the same reconciliation as a clean warm. Fail-before: tine-agents/evidence/gh550-batch/stage0/necessity-position-gap.log."
+},
+{
+ "id": "REG-LISTINGS-DO-NOT-PARSE-THE-GRAPH-AROUND-A-RENAME-OR-EDIT-543",
+ "title": "Page listings, queries and searches during or after a rename, page merge, journal migration or concurrent edit, and right after opening a graph, read the index instead of re-parsing the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_failed_page_after_a_rename_does_not_parse_the_graph",
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_listing_during_a_rename_waits_for_the_rename_instead_of_parsing",
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_listing_overtaken_by_an_edit_reads_the_index_instead_of_parsing",
+   "src-tauri/src/graph.rs::every_direct_files_graph_is_attached_through_one_function",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 stage-0 interleaving harness, H3-H6. H3: a rename/merge/journal migration marked the index stale, and the mark outlived its own delta, so a later page failure could never make it ready. H4: a reader between the generation move and the queued delta saw nothing coming and parsed. H5: a derived read whose generation went stale while it waited parsed although the index was ready at the newer generation. H6: the launch warm was announced after the graph was published (open and configuration refresh). Shape: Graph::move_cache_generation takes IndexEffect::Sent(&IndexDeltaComing), a token the mover holds until the delta is queued and that progress_at reports as PendingEdits; only an unnamed delete and the test-only invalidate_cache use IndexEffect::Stale; wait_for_derived_read follows cache_gen when nothing is coming; begin_warm_cache returns a WarmTicket carrying the announcement, which warm_cache_async requires, and a source-order guard pins it before publication. Harness: the long run went from 33/300 to 1-2/300 failing seeds; the residuals (creation proof with page_index_failures; one session left unvalidated with nothing queued) are recorded for the single-owner design. Fail-before: tine-agents/evidence/gh550-batch/stage0/necessity-stale-after-rename.log, necessity-rename-window.log (8 parses), necessity-overtaken-listing.log (8 parses)."
 }
 ]
 }

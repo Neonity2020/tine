@@ -70,6 +70,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- If one step of search indexing failed right after the startup check, page
+  lists, queries and search could wait forever; they now recover (GH #543).
+
+- After reopening a graph whose search index still listed a deleted page,
+  creating or renaming a page could stop indexing for the rest of the session
+  (GH #543).
+
+- Page lists, queries and search no longer re-parse the whole graph after a
+  rename, page merge or journal-format migration, while one is running, when
+  an edit lands during the read, or right after a graph opens (GH #543).
+
 - Pages that changed on disk, or failed to read, while Tine was checking its
   search index at startup are now read again once the check finishes, instead
   of the index keeping their old content (GH #543).
