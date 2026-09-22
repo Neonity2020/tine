@@ -527,6 +527,41 @@ impl Graph {
     /// stable and consistent with queries / refs / the sidebar. Falls back to a
     /// disk parse for a page not yet in the cache (e.g. just created externally).
     pub fn load_page(&self, entry: &PageEntry) -> io::Result<PageDto> {
+        match self.load_exact_path(&entry.path)? {
+            Some(dto) => Ok(dto),
+            None => {
+                self.forget_file(&entry.path);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+        }
+    }
+
+    /// Load a page from a SPECIFIC file by its graph-root-relative path. This
+    /// is how a duplicate-day stray (`journals/Friday, 26-06-2026.org`) --
+    /// which shares a `(kind,name)` with the canonical `2026_06_26.org` and so
+    /// is unreachable by name -- gets opened and edited (#21). The cache is
+    /// keyed by path, so the stray's own slot is what it reads and publishes.
+    /// Returns `Ok(None)` if the path is invalid (see [`resolve_rel`]) or the
+    /// file is gone.
+    pub fn load_by_path(&self, rel: &str) -> io::Result<Option<PageDto>> {
+        let Some(abs) = self.resolve_rel(rel) else {
+            return Ok(None);
+        };
+        if self.entry_for_path(&abs).is_none() {
+            return Ok(None);
+        }
+        self.load_exact_path(&abs)
+    }
+
+    /// The one way a page is opened, by name or by path: read the exact file,
+    /// publish what was read through the page-delta path (so the index is
+    /// sent the same bytes the editor shows) unless the ready index already
+    /// holds those bytes, and answer from the cache when it holds them. `load_by_path` used to publish the page's ids on its
+    /// own, with no delta and outside the cache lock: a warm then took the
+    /// page as already sent to the index, and the watcher's later delivery of
+    /// the same bytes was suppressed, so search and queries missed the edit
+    /// for good (GH #543, audit R4-02).
+    fn load_exact_path(&self, path: &Path) -> io::Result<Option<PageDto>> {
         // A read is NOT an activation, and must not revoke one. Re-hydrating a
         // page that is already open — which this path does constantly — would
         // otherwise disarm a live banner the user can still see. The genuine
@@ -540,69 +575,28 @@ impl Graph {
             content,
             revision,
             file_identity,
-        }) = self.load_validated_graph_text_target(&permit, &entry.path)?
+        }) = self.load_validated_graph_text_target(&permit, path)?
         else {
-            self.forget_file(&entry.path);
-            return Err(io::Error::from(io::ErrorKind::NotFound));
+            return Ok(None);
         };
-        self.sync_file_content(None, &entry.path, &content, false)?;
+        if !self.publish_page_the_index_holds(path, &revision, &document) {
+            self.sync_file_content(None, path, &content, false)?;
+        }
         self.loaded_file_identities
             .write()
             .unwrap()
-            .insert(entry.path.clone(), (revision.clone(), file_identity));
+            .insert(path.to_path_buf(), (revision.clone(), file_identity));
 
         if let Some(mut dto) = self.peek_cached_page(&effective) {
-            dto.read_only = read_only_org(&entry.path, &content);
+            dto.read_only = read_only_org(path, &content);
             dto.rev = Some(revision);
-            dto.path = self.rel_path(&entry.path);
-            return Ok(dto);
+            dto.path = self.rel_path(path);
+            return Ok(Some(dto));
         }
         let mut dto = page_dto_checked(&effective, &document)?;
-        dto.read_only = read_only_org(&entry.path, &content);
+        dto.read_only = read_only_org(path, &content);
         dto.rev = Some(revision);
-        dto.path = self.rel_path(&entry.path);
-        Ok(dto)
-    }
-
-    /// Load a page from a SPECIFIC file by its graph-root-relative path, parsing it
-    /// directly and bypassing the `(kind,name)` page cache + `disk_revs`. This is
-    /// how a duplicate-day stray (`journals/Friday, 26-06-2026.org`) — which shares
-    /// a `(kind,name)` with the canonical `2026_06_26.org` and so is unreachable by
-    /// name — gets opened and edited (#21). The direct parse is deliberate: the
-    /// cache slot for that `(kind,name)` holds the CANONICAL file, so a cache lookup
-    /// here would serve the wrong file's content. Returns `Ok(None)` if the path is
-    /// invalid (see [`resolve_rel`]) or the file is gone.
-    pub fn load_by_path(&self, rel: &str) -> io::Result<Option<PageDto>> {
-        let Some(abs) = self.resolve_rel(rel) else {
-            return Ok(None);
-        };
-        // A read is NOT an activation — see `load_page`. (GH #254 increment 3.)
-        if self.entry_for_path(&abs).is_none() {
-            return Ok(None);
-        }
-        let permit = self.admit_retained_graph_text_writer()?;
-        let Some(ExactGraphLoadedPage {
-            entry: effective,
-            document,
-            content,
-            revision,
-            file_identity,
-        }) = self.load_validated_graph_text_target(&permit, &abs)?
-        else {
-            return Ok(None);
-        };
-        self.loaded_file_identities
-            .write()
-            .unwrap()
-            .insert(abs.clone(), (revision.clone(), file_identity));
-        let mut dto = page_dto_checked(&effective, &document)?;
-        dto.read_only = read_only_org(&abs, &content);
-        self.publish_session_page_ids(
-            abs.clone(),
-            SessionPageIds::capture(&revision, self.config().parse_config().digest(), &document),
-        );
-        dto.rev = Some(revision);
-        dto.path = self.rel_path(&abs);
+        dto.path = self.rel_path(path);
         Ok(Some(dto))
     }
 

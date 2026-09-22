@@ -26,6 +26,7 @@ SELECT path, result_id, entity_id, entity_type FROM (SELECT c.rowid AS entity_id
 SELECT preorder FROM blocks WHERE block_id = ? AND page_id = ?
 SELECT property.owner_id, name.raw, property.value FROM properties property JOIN names name ON name.name_id = property.name_id WHERE property.owner_type = 1 AND property.owner_id IN (?) ORDER BY property.owner_id, property.ordinal
 SELECT property.owner_id, property.page_id, name.raw, property.value, property.ordinal FROM properties property JOIN names name ON name.name_id = property.name_id WHERE property.owner_type = 0 AND property.owner_id IN (?) ORDER BY property.owner_id, property.ordinal, property.name_id
+SELECT revision FROM direct_source_revisions WHERE path = ?
 SELECT s.revision, b.result_id, b.order_key, b.estimated_bytes, b.page_id, (SELECT COUNT(*) FROM blocks child WHERE child.parent_block_id = b.block_id) FROM pages p JOIN direct_source_revisions s ON s.path = p.path JOIN blocks b ON b.page_id = p.page_id WHERE p.path = ? ORDER BY b.preorder
 SELECT source_entity_id FROM reference_postings WHERE target_type = 1 AND source_entity_type = 1 AND raw_uuid_claim = ?
 SELECT tag.owner_id, name.raw FROM tags tag JOIN names name ON name.name_id = tag.name_id WHERE tag.owner_type = 1 AND tag.owner_id IN (?) ORDER BY tag.owner_id, tag.ordinal

@@ -1565,9 +1565,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // functions verbatim into direct_projection/lowering.rs (`use super::*`).
     // With that file's rows read as direct_projection.rs, the surface hashes
     // to the digest above: paths moved, nothing else.
+    // 2026-09-22: GH #543 (audit R4-02) adds one read-only derived SQL
+    // snapshot, `holds_source_revision`, so a page open skips a delta the
+    // ready image already holds. No storage write crossing, schema or
+    // dependency pin changes.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "8fe1b5cfb75356da03228f821253afa8c106c0b544338bee20a1b0cc47cd9883",
+        "370bc2340b0d36e17affebb75345bad772433d1d45c70b9a5ad06b4f6210af87",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

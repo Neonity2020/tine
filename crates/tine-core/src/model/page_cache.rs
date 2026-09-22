@@ -1191,6 +1191,7 @@ impl Graph {
         let mut guard = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         self.publish_session_page_ids(
+            &guard,
             evict_entry.path.clone(),
             SessionPageIds::capture(
                 &projection_revision,

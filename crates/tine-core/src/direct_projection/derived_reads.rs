@@ -239,6 +239,31 @@ impl DirectProjection {
         self.ready_at(generation).then_some(pages)
     }
 
+    /// Whether the image, ready at `generation`, holds the page at `rel` at
+    /// exactly `revision` (a [`projection_source_revision`]: content and
+    /// parse configuration).
+    pub(crate) fn holds_source_revision(&self, generation: u64, rel: &str, revision: &str) -> bool {
+        let Some(_reader) = self.shared_reader_at(generation) else {
+            return false;
+        };
+        let Ok(mut snapshot) =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+        else {
+            return false;
+        };
+        let mut held = false;
+        let read = crate::query::projection_sql::visit(
+            &mut snapshot,
+            "SELECT revision FROM direct_source_revisions WHERE path = ?",
+            &[PhysicalQueryValue::Text(rel.to_owned())],
+            |row| {
+                held = matches!(row, [PhysicalQueryValue::Text(stored)] if stored == revision);
+                Ok(std::ops::ControlFlow::Break(()))
+            },
+        );
+        read.is_ok() && held && self.ready_at(generation)
+    }
+
     pub(crate) fn page_icon_rows(
         &self,
         generation: u64,

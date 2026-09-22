@@ -74,6 +74,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   search index at startup are now read again once the check finishes, instead
   of the index keeping their old content (GH #543).
 
+- A page opened while the search index was still being built now reaches
+  search; before, opening it could leave the index claiming the page's current
+  content without ever receiving it (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).

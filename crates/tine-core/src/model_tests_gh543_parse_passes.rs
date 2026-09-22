@@ -434,3 +434,43 @@ fn gh543_listing_with_an_unreadable_page_does_not_reparse_healthy_pages() {
         "one still-unreadable page made the listing reparse {parses} healthy pages"
     );
 }
+
+fn model_sources_matching(needle: &str) -> Vec<String> {
+    let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model");
+    let mut sites = Vec::new();
+    for entry in fs::read_dir(&model).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            let source: String = fs::read_to_string(&path)
+                .unwrap()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            for _ in source.matches(needle) {
+                sites.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    sites.sort();
+    sites
+}
+
+/// GH #543 (audit R4-02): a session id record claims the index was sent
+/// those bytes. It is written by a page publication
+/// (`Graph::publish_session_page_ids`, model/graph_drift.rs), restored from
+/// the index itself (model/derived_reads.rs), and removed with a page
+/// (model/projection_lifetime.rs), nowhere else.
+#[test]
+fn session_page_ids_have_three_writers() {
+    assert_eq!(
+        model_sources_matching("session_page_ids.write()"),
+        vec![
+            "derived_reads.rs".to_owned(),
+            "graph_drift.rs".to_owned(),
+            "projection_lifetime.rs".to_owned(),
+            "projection_lifetime.rs".to_owned(),
+        ],
+        "publish page ids only through Graph::publish_session_page_ids (model/graph_drift.rs)"
+    );
+}
+

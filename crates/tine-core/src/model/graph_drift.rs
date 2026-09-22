@@ -179,9 +179,59 @@ impl Graph {
     /// Publish the runtime ids of a page read or written now, stamped with
     /// the event sequence so a pass can tell whether it read the page before
     /// or after this publication.
-    pub(super) fn publish_session_page_ids(&self, path: PathBuf, mut ids: SessionPageIds) {
+    ///
+    /// Only a page publication may call this, and it takes the cache write
+    /// guard to prove it holds the lock the publication's delta and counters
+    /// move under ([`Graph::drift_since`] relies on that). A publication is a
+    /// claim that the index was sent these bytes; recording ids without the
+    /// delta made a warm and the watcher treat an unsent edit as sent
+    /// (GH #543, audit R4-02).
+    pub(super) fn publish_session_page_ids(
+        &self,
+        _cache: &std::sync::RwLockWriteGuard<'_, Option<Arc<Vec<(PageEntry, Arc<Document>)>>>>,
+        path: PathBuf,
+        mut ids: SessionPageIds,
+    ) {
         ids.published = self.cache_structural_gen.next_publication();
         self.session_page_ids.write().unwrap().insert(path, ids);
+    }
+
+    /// Publish the ids of a page opened at bytes the ready index already
+    /// holds, with no delta: the claim a publication makes is true, and a
+    /// delta would re-send bytes the index has, moving the generation under
+    /// every memoized answer on each first open of a page. Returns false
+    /// when the index may not hold them (none attached, not ready, a warm in
+    /// flight, other bytes, or a parsed cache that must take the page too);
+    /// the caller then publishes through the page-delta path (GH #543, audit
+    /// R4-02).
+    pub(super) fn publish_page_the_index_holds(
+        &self,
+        path: &Path,
+        revision: &str,
+        document: &Document,
+    ) -> bool {
+        let Some(projection) = self.direct_projection.get() else {
+            return false;
+        };
+        let config = self.config().parse_config().digest();
+        let generation = self.cache_gen.load(Ordering::Acquire);
+        if !projection.holds_source_revision(
+            generation,
+            &self.rel_path(path),
+            &crate::direct_projection::projection_source_revision(revision, config),
+        ) {
+            return false;
+        }
+        let cache = self.cache.write().unwrap();
+        if cache.is_some() || self.cache_gen.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.publish_session_page_ids(
+            &cache,
+            path.to_path_buf(),
+            SessionPageIds::capture(revision, config, document),
+        );
+        true
     }
 
     /// The page-set changes since a pass read the graph at `read_at`, where

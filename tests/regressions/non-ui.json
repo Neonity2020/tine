@@ -5692,6 +5692,32 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 3, R3-07. record_watcher_identity_failure moved the cache generation without recording a structural event, so a complete capture that started earlier installed over it, erased the failure and marked the index ready. Recording and clearing a watcher failure now record StructuralChange::Reread(path) before the generation moves, so the capture re-reads that path. Fail-before at 788300f0: evidence tine-agents/evidence/gh550-batch/indexing-audit-r3/RECEIPT-indexing-audit-r3-probes.log. Round-4 audit R4-01: the warm validation never read the reread set its drift account returned, so it installed a failure list without a page the watcher found unreadable while it ran. GraphDrift is now consumed only through into_parts, which names every kind of change; the warm reads each reread page again and its failures follow that read. Fail-before at 6ef32fd6: tine-agents/evidence/gh550-batch/indexing-audit-r4/verify-by-manager.log."
+},
+{
+ "id": "REG-A-PAGE-OPENED-DURING-INDEXING-REACHES-SEARCH-543",
+ "title": "A page opened while the graph is being indexed reaches search and queries at the bytes the editor shows",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_page_opened_by_path_during_a_warm_reaches_the_index",
+   "crates/tine-core/src/direct_projection_tests.rs::opening_a_page_the_index_holds_moves_no_generation",
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::session_page_ids_have_three_writers"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 4, R4-02. load_by_path published the page's session ids with no delta and outside the cache lock; the warm then counted the page as already sent to the index, and the watcher suppressed the later delivery of the same bytes, so search and queries missed the edit for the session. Fix (shape): both load routes go through one load_exact_path, which publishes through the page-delta path unless the ready index already holds those exact bytes (then it records the ids with no delta, so opening an unchanged page moves no generation); publish_session_page_ids takes the cache write guard as proof, and a source guard pins the three session-id writers. Fail-before at 6ef32fd6: tine-agents/evidence/gh550-batch/indexing-audit-r4/verify-by-manager.log; the unchanged-open sibling fails when every open takes the delta path (tine-agents/evidence/gh550-batch/r4-fixes/necessity-held-open.log)."
 }
 ]
 }

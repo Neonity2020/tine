@@ -4431,13 +4431,15 @@ fn bl1_six_surfaces_answer_from_sql_after_warm_reopen() {
     assert!(violations.is_empty(), "{violations:?}");
 }
 
-/// Opening a page publishes it and moves the generation. A derived read that
-/// saw the move answers again from the index instead of parsing the graph.
+/// Opening a page at bytes the index lacks publishes it and moves the
+/// generation. A derived read that saw the move answers again from the index
+/// instead of parsing the graph.
 #[test]
 fn bl1_six_surfaces_follow_a_page_opened_during_the_read() {
     let _serial = serialize_projection_tests();
     let root = bl1_fixture("bl1-six-moved");
-    // A page no derived read touches, so opening it always publishes.
+    // A page no derived read touches. Each round edits it after the warm, so
+    // opening it publishes bytes the index lacks.
     std::fs::write(root.join("pages/untouched.md"), "- plain\n").unwrap();
     let database = scratch("bl1-six-moved-db").join("projection.sqlite");
     let oracle = Graph::open(&root);
@@ -4457,6 +4459,11 @@ fn bl1_six_surfaces_follow_a_page_opened_during_the_read() {
         graph.attach_direct_projection(database.clone()).unwrap();
         graph.warm_cache();
         wait_ready(&graph);
+        std::fs::write(
+            root.join("pages/untouched.md"),
+            format!("- plain {surface}\n"),
+        )
+        .unwrap();
         graph.open_page_during_next_derived_read_test(Some(root.join("pages/untouched.md")));
         let generation = graph.cache_generation();
         let answer = bl1_answer(&graph, surface);
@@ -10082,5 +10089,96 @@ fn a_warm_keeps_a_watcher_failure_recorded_while_it_ran() {
     eprintln!("R4 warm failure: before={before:?} after={after:?} ready={ready}");
     release_projection(&graph);
     assert_eq!(after, before, "warm erased a newer watcher failure");
+}
+
+/// GH #543 (audit R4-02): a page opened by path during a warm, at bytes the
+/// index lacks, reaches the index. Its ids used to be published with no
+/// delta, so the warm took it as sent and search missed the edit for good.
+#[test]
+fn a_page_opened_by_path_during_a_warm_reaches_the_index() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("audit543-r4-path-open");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    std::fs::write(root.join("pages/two.md"), "- TODO r4pathunique\n").unwrap();
+    graph.load_by_path("pages/two.md").unwrap().unwrap();
+    // A normal concurrent page delivery moves the generation, making the
+    // drift account consult both publications.
+    std::fs::write(root.join("pages/one.md"), "- TODO r4otherunique\n").unwrap();
+    graph.sync_file_checked(&root.join("pages/one.md")).unwrap();
+    pause.release.wait();
+    warmer.join().unwrap();
+    wait_ready(&graph);
+    graph.sync_file_checked(&root.join("pages/two.md")).unwrap();
+    wait_ready(&graph);
+    let answer = graph
+        .run_query_bounded("(task TODO)", 100, 1_000_000)
+        .unwrap();
+    let found = answer
+        .groups
+        .iter()
+        .flat_map(|g| &g.blocks)
+        .any(|b| b.raw.contains("r4pathunique"));
+    eprintln!(
+        "R4 path open: current index includes opened bytes={found}; parses={}",
+        graph.page_build_parses_test()
+    );
+    release_projection(&graph);
+    assert!(
+        found,
+        "warm treated a path-only ID publication as an enqueued delta"
+    );
+}
+
+/// GH #543 (audit R4-02 sibling): opening a page at the bytes the ready index
+/// already holds sends nothing and moves no generation. The fix for R4-02
+/// first sent every first open of a page through the delta path, so each
+/// open re-sent unchanged bytes and invalidated every memoized answer.
+#[test]
+fn opening_a_page_the_index_holds_moves_no_generation() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("r4-open-held-page");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let generation = graph.cache_generation();
+    graph.load_by_path("pages/one.md").unwrap().unwrap();
+    let entry = graph
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.rel_path == "pages/one.md")
+        .unwrap();
+    graph.load_page(&entry).unwrap();
+    let after = graph.cache_generation();
+    let ready = graph.direct_projection_test().unwrap().ready_at(generation);
+    release_projection(&graph);
+    assert_eq!(
+        after, generation,
+        "opening an unchanged page moved the generation"
+    );
+    assert!(ready, "opening an unchanged page left the index not ready");
 }
 
