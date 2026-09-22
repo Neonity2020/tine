@@ -5747,6 +5747,30 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 4, R4-04. orphan_assets (and any whole-graph consumer) built the parsed cache during an in-flight warm, and install_built offered it as a full snapshot, which superseded the warm's cheap validation with a complete rebuild. Fix (shape): direct_projection_enqueue_full takes a FullOffer; a Consumer offer is refused while a warm is in flight, and the warm that owns readiness offers the installed cache when it has one (Graph::offer_installed_cache, from warm_page_cache_cancellable and from the warm's cache-present branch, so a cache installed inside a cancelled warm is not stranded). Fail-before at 6ef32fd6: tine-agents/evidence/gh550-batch/indexing-audit-r4/verify-by-manager.log; the cancelled-warm sibling fails without the cache-present offer (tine-agents/evidence/gh550-batch/r4-fixes/necessity-early-offer.log)."
+},
+{
+ "id": "REG-EVERY-WHOLE-GRAPH-PARSE-SHOWS-PROGRESS-543",
+ "title": "The progress indicator shows every whole-graph page read, including one started by a page list or asset list rather than the launch warm",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_consumer_whole_graph_parse_shows_on_the_progress_bar"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 4, R4-P2 (plausible, reproduced). Only the paced warm parse reported itself to indexing_progress; the fast parse a consumer owns (load_all_pages_with_permit) did not, so with no index to report (none attached, or not ready and no warm announced) the bar said idle through a whole-graph parse. The fast parse now begins a Reading pass and advances it per page, across its worker threads. Fail-before: tine-agents/evidence/gh550-batch/r4-fixes/fail-before-r4-p2.log."
 }
 ]
 }

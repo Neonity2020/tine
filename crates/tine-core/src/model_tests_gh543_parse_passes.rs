@@ -598,3 +598,31 @@ fn the_structural_event_log_keeps_only_what_running_passes_need() {
     );
 }
 
+/// GH #543 (audit R4-P2): a whole-graph parse a page consumer starts, with no
+/// index to report for it, shows on the progress bar while it runs and
+/// clears after. Only the paced warm parse used to report itself, so the bar
+/// said idle through a consumer's parse.
+#[test]
+fn a_consumer_whole_graph_parse_shows_on_the_progress_bar() {
+    let dir = scratch("r4-p2-fast-parse-progress");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- page\n").unwrap();
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    let pause = graph.pause_next_fast_parse_test();
+    let consumer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.orphan_assets().unwrap())
+    };
+    pause.reached.wait();
+    let during = graph.indexing_progress();
+    pause.release.wait();
+    consumer.join().unwrap();
+    let after = graph.indexing_progress();
+    eprintln!("R4-P2 fast parse progress: during={during:?} after={after:?}");
+    assert!(
+        during.is_some_and(|progress| progress.total >= 8),
+        "the bar said idle during a whole-graph parse: {during:?}"
+    );
+    assert_eq!(after, None, "the bar stuck after the parse");
+}

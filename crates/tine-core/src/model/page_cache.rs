@@ -72,7 +72,22 @@ impl Graph {
                 };
             }
         };
-        let mut built = self.parse_page_entries_with_permit(permit, entries);
+        // Every whole-graph parse reports itself, not only the paced warm's:
+        // a consumer's parse ran with the bar saying idle (GH #543, audit
+        // R4-P2).
+        let progress = self.indexing_progress.begin(
+            crate::indexing_progress::IndexingPhase::Reading,
+            entries.len(),
+        );
+        #[cfg(test)]
+        {
+            let pause = self.page_build_test.fast_parse_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
+        }
+        let mut built = self.parse_page_entries_with_permit(permit, entries, &progress);
         built.failures.extend(skipped);
         built
     }
@@ -81,6 +96,7 @@ impl Graph {
         &self,
         permit: &GraphTextWritePermit,
         entries: Vec<PageEntry>,
+        progress: &crate::indexing_progress::ProgressPass<'_>,
     ) -> PageCacheBuild {
         let entry_count = entries.len();
         let workers = page_cache_worker_count();
@@ -90,6 +106,7 @@ impl Graph {
             let mut built = PageCacheBuild::with_capacity(entries.len());
             for entry in entries {
                 built.collect(self.parse_page_entry_with_permit(permit, entry));
+                progress.advance(1);
             }
             return built;
         }
@@ -112,6 +129,7 @@ impl Graph {
                         let mut built = PageCacheBuild::with_capacity(chunk.len());
                         for entry in chunk {
                             built.collect(self.parse_page_entry_with_permit(permit, entry));
+                            progress.advance(1);
                         }
                         built
                     })
@@ -1102,6 +1120,15 @@ impl Graph {
 
     /// GH #543 test hook: pause the NEXT warm validation after it has
     /// announced itself and before it reads page bytes.
+    /// GH #543 test hook: pause the NEXT fast whole-graph parse after it has
+    /// listed the pages and before it parses them.
+    #[cfg(test)]
+    pub(crate) fn pause_next_fast_parse_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.fast_parse_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_next_warm_validation_test(&self) -> Arc<PageBuildTestPause> {
         let pause = Arc::new(PageBuildTestPause::new());
