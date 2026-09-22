@@ -5148,8 +5148,8 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/model_tests.rs::gh543_cold_parse_survives_an_unchanged_page_open",
-   "crates/tine-core/src/model_tests.rs::gh543_cold_parse_still_yields_to_an_edit_after_it_read_the_page"
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_cold_parse_survives_an_unchanged_page_open",
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_cold_parse_still_yields_to_an_edit_after_it_read_the_page"
   ],
   "scenario": null,
   "failBefore": "proven"
@@ -5468,7 +5468,7 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/model_tests.rs::gh543_listing_with_an_unreadable_page_does_not_reparse_healthy_pages",
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_listing_with_an_unreadable_page_does_not_reparse_healthy_pages",
    "crates/tine-core/src/model_tests.rs::watcher_parse_failure_cannot_republish_stale_warm_page_inventory"
   ],
   "scenario": null,
