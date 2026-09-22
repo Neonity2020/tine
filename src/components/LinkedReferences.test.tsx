@@ -5,7 +5,8 @@ import { backend, QueryNotReadyError } from "../backend";
 import type { BacklinkFilterContext, BacklinkFilterEntry, BlockDto, RefGroup } from "../types";
 import { LinkedReferences } from "./LinkedReferences";
 import { resetReferenceSectionState } from "../referenceSectionState";
-import { setGraphMeta } from "../ui";
+import { bumpGraphEpoch, setGraphMeta } from "../ui";
+import { bumpGraphBinding } from "../persistence";
 import { parseSearchQuery } from "../editor/searchQuery";
 import { mockSearchMatches } from "../mockSearchQuery";
 
@@ -927,5 +928,49 @@ describe("Linked References honor :ref/linked-references-collapsed-threshold (GH
     const over = await mountWithThreshold(100);
     expect(over.root.querySelector(".test-ref-group")).toBeNull();
     over.dispose();
+  });
+});
+
+// GH #543, audit R6-06: the right sidebar mounts this panel once and keeps it
+// across a same-root rebind (backup restore, journal format change). Keyed on
+// the page name alone, it neither refetched nor rejected the old binding's
+// answer.
+describe("LinkedReferences across a rebind of the same page", () => {
+  const group = (id: string): RefGroup => ({ page: `Page ${id}`, kind: "page", blocks: [block(id, `${id} [[Target]]`)] });
+
+  it("refetches when the graph is rebound", async () => {
+    const calls = vi.spyOn(backend(), "getBacklinks").mockResolvedValue([group("old")]);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    try {
+      await vi.waitFor(() => expect(root.textContent).toContain("old"));
+      calls.mockResolvedValue([group("new")]);
+      bumpGraphBinding();
+      bumpGraphEpoch();
+      await vi.waitFor(() => expect(root.textContent).toContain("new"));
+      expect(calls.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not publish an answer that was asked of the previous binding", async () => {
+    const first = deferred<RefGroup[]>();
+    vi.spyOn(backend(), "getBacklinks").mockImplementationOnce(() => first.promise)
+      .mockResolvedValue([group("new")]);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    try {
+      await wait(10);
+      bumpGraphBinding();
+      bumpGraphEpoch();
+      first.resolve([group("preRebind")]);
+      await vi.waitFor(() => expect(root.textContent).toContain("new"));
+      expect(root.textContent).not.toContain("preRebind");
+    } finally {
+      dispose();
+    }
   });
 });

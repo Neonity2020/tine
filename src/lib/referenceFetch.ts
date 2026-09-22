@@ -2,6 +2,8 @@ import { onCleanup } from "solid-js";
 import { OperationCancelledError, type QueryNotReadyError } from "../backend";
 import { runQueryWhenCurrent } from "../queryReadiness";
 import { classifyReferenceLoadError, type ReferenceLoadError } from "./referenceLoadError";
+import { graphEpoch } from "../ui";
+import { graphBinding } from "../persistence";
 
 /**
  * Fetch one references panel, waiting out a projection that is only mid-turn.
@@ -12,9 +14,10 @@ import { classifyReferenceLoadError, type ReferenceLoadError } from "./reference
  * way a query block's read does, and the waiting happens here.
  *
  * Both panels share this so the cancellation policy has ONE definition. A
- * retry stops when the pane routes to another page or the section unmounts;
- * without the unmount half, a disposed panel would keep retrying forever
- * because its captured page name never changes.
+ * retry stops when the pane routes to another page, the graph is rebound or
+ * repainted, or the section unmounts; without the unmount half, a disposed
+ * panel would keep retrying forever because its captured page name never
+ * changes.
  */
 /** What a references panel says while it waits for the index.
  *
@@ -27,19 +30,39 @@ export function referenceIndexPendingMessage(error: QueryNotReadyError | null): 
   return error.reasonCode === "recovering" ? "rebuilding the index…" : "indexing…";
 }
 
+/** Which read a references panel shows: the page, and the graph binding and
+ *  render epoch it was asked of. The panel's resource is keyed on all three,
+ *  so a rebind refetches and an answer asked of the previous binding is
+ *  dropped, wherever the panel is mounted (GH #543, audit R6-06: the right
+ *  sidebar never remounts its panels, so keying on the name alone kept the
+ *  old graph's rows there). */
+export interface ReferenceRead {
+  readonly name: string;
+  readonly graphEpoch: number;
+  readonly graphBinding: number;
+}
+
+export function referenceRead(name: string): ReferenceRead {
+  return { name, graphEpoch: graphEpoch(), graphBinding: graphBinding() };
+}
+
+function sameReferenceRead(a: ReferenceRead, b: ReferenceRead): boolean {
+  return a.name === b.name && a.graphEpoch === b.graphEpoch && a.graphBinding === b.graphBinding;
+}
+
 export function createReferenceFetcher(options: {
-  /** The page the panel is currently showing, read live. */
-  currentName: () => string;
+  /** The read the panel currently shows, read live. */
+  currentRead: () => ReferenceRead;
   setLoadError: (error: ReferenceLoadError | null) => void;
   /** Non-null while the read is waiting for the index rather than failing. */
   setIndexPending: (error: QueryNotReadyError | null) => void;
-}): <T>(name: string, load: () => Promise<T[]>) => Promise<T[]> {
+}): <T>(read: ReferenceRead, load: () => Promise<T[]>) => Promise<T[]> {
   let disposed = false;
   onCleanup(() => {
     disposed = true;
   });
-  return async <T>(name: string, load: () => Promise<T[]>): Promise<T[]> => {
-    const current = () => !disposed && options.currentName() === name;
+  return async <T>(read: ReferenceRead, load: () => Promise<T[]>): Promise<T[]> => {
+    const current = () => !disposed && sameReferenceRead(options.currentRead(), read);
     options.setLoadError(null);
     try {
       return await runQueryWhenCurrent(load, current, options.setIndexPending);

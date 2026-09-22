@@ -1,21 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { createRoot } from "solid-js";
 import { QueryNotReadyError } from "../backend";
-import { createReferenceFetcher } from "./referenceFetch";
+import { bumpGraphBinding } from "../persistence";
+import { createReferenceFetcher, referenceRead } from "./referenceFetch";
 import type { ReferenceLoadError } from "./referenceLoadError";
 
 function harness(currentName: () => string) {
   let dispose = () => {};
   const errors: (ReferenceLoadError | null)[] = [];
   const pending: (Error | null)[] = [];
-  const fetcher = createRoot((d) => {
+  const fetchRead = createRoot((d) => {
     dispose = d;
     return createReferenceFetcher({
-      currentName,
+      currentRead: () => referenceRead(currentName()),
       setLoadError: (error) => errors.push(error),
       setIndexPending: (error) => pending.push(error),
     });
   });
+  const fetcher = <T>(name: string, load: () => Promise<T[]>) => fetchRead(referenceRead(name), load);
   return { fetcher, dispose, errors, pending };
 }
 
@@ -91,6 +93,25 @@ describe("createReferenceFetcher", () => {
     showing = "Somewhere Else";
     await expect(promise).resolves.toEqual([]);
     dispose();
+  });
+
+  // GH #543, audit R6-06: a panel that stays mounted across a rebind (the
+  // right sidebar) must not keep the previous binding's read alive.
+  it("stops retrying, and drops the answer, when the graph is rebound", async () => {
+    const { fetcher, dispose, errors } = harness(() => "Target");
+    let attempts = 0;
+    const promise = fetcher("Target", async () => {
+      attempts += 1;
+      throw new QueryNotReadyError("indexing");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    bumpGraphBinding();
+    await expect(promise).resolves.toEqual([]);
+    const settled = attempts;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(attempts).toBe(settled);
+    dispose();
+    expect(errors.every((error) => error === null)).toBe(true);
   });
 
   it("still reports a real backend refusal", async () => {

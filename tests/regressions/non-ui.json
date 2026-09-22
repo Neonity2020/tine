@@ -5869,6 +5869,32 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 5, R5-04 (I-20). runQueryWhenCurrent's eager first attempt rethrew its own refusal after its caller had stopped being current, and createReferenceFetcher wrote that refusal to the shared panel error. Fix (shape, at the shared seam): the eager attempt settles like every retry, so a caller that is no longer current gets OperationCancelledError whether the attempt succeeded or failed; the reference fetcher also gates its error write on the current page. The sibling callers (LinkedReferences filter context, QueryBuilder, Macro) already gate on their own revision, except the query-block save rebase in Macro.tsx, which used to rebase on a stale reading and now stops with the query-changed message. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r5/verify-by-manager.log and tine-agents/evidence/gh550-batch/r5-fixes/necessity-r5-04.log (3 tests)."
+},
+{
+ "id": "REG-SIDEBAR-REFERENCES-FOLLOW-A-REBIND-543",
+ "title": "Linked and unlinked references in the right sidebar refresh after the graph is rebound and never show the previous binding's rows",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/components/LinkedReferences.test.tsx::refetches when the graph is rebound",
+   "src/components/LinkedReferences.test.tsx::does not publish an answer that was asked of the previous binding",
+   "src/lib/referenceFetch.test.ts::stops retrying, and drops the answer, when the graph is rebound"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 6, R6-06 (I-20). Both references panels keyed their resource and their ownership check on the page name alone. The main pane happens to remount them on a rebind, but the right sidebar never does, so after a rename, a backup restore or a journal-format change it kept the old binding's rows, and a late pre-rebind answer could land. Fix (shape, at the shared seam): createReferenceFetcher's read is a ReferenceRead of page name, graph binding and render epoch; both panels key their resource on it and the fetcher owns a read only while all three still match, so the panels are correct wherever they are mounted. Siblings reviewed: inline page/block previews and block embeds key on the render epoch, which every rebind also bumps; query blocks and QueryBuilder already scope by epoch and binding. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r6/RECEIPT-indexing-audit-r6-frontend-probes.log and tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-06.log."
 }
 ]
 }

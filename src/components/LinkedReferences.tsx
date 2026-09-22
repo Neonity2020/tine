@@ -11,7 +11,7 @@ import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
-import { createReferenceFetcher } from "../lib/referenceFetch";
+import { createReferenceFetcher, referenceRead } from "../lib/referenceFetch";
 import {
   collapsedGroupsFor,
   sectionOverride,
@@ -105,13 +105,13 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   // The section renders nothing until it has groups, so waiting for the index
   // looks exactly like the first load already does. No extra affordance here.
   const fetchReferences = createReferenceFetcher({
-    currentName: () => props.name,
+    currentRead: () => referenceRead(props.name),
     setLoadError,
     setIndexPending: () => {},
   });
   const [groupsResource] = createResource(
-    () => props.name,
-    (n) => fetchReferences(n, () => backend().getBacklinks(n))
+    () => referenceRead(props.name),
+    (read) => fetchReferences(read, () => backend().getBacklinks(read.name))
   );
   // `createReferenceFetcher` already routes a failure to `loadError` (rendered
   // below), so this covers the read itself rather than replacing that channel.

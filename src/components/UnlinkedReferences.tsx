@@ -11,7 +11,7 @@ import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
-import { createReferenceFetcher, referenceIndexPendingMessage } from "../lib/referenceFetch";
+import { createReferenceFetcher, referenceRead, referenceIndexPendingMessage } from "../lib/referenceFetch";
 import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
@@ -64,13 +64,13 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
   });
   const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
   const fetchReferences = createReferenceFetcher({
-    currentName: () => props.name,
+    currentRead: () => referenceRead(props.name),
     setLoadError,
     setIndexPending,
   });
   const [groupsResource] = createResource(
-    () => props.name,
-    (n) => fetchReferences(n, () => backend().getUnlinkedRefs(n))
+    () => referenceRead(props.name),
+    (read) => fetchReferences(read, () => backend().getUnlinkedRefs(read.name))
   );
   // `createReferenceFetcher` already routes a failure to `loadError` (rendered
   // below), so this covers the read itself rather than replacing that channel.
