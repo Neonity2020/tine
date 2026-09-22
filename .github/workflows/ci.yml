@@ -77,9 +77,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32-unknown-unknown
-          # `--profile minimal` is what this action installs, so rustfmt is
-          # not present unless it is asked for by name.
-          components: rustfmt
+          # `--profile minimal` is what this action installs, so rustfmt and
+          # clippy are not present unless they are asked for by name.
+          components: rustfmt, clippy
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -153,6 +153,14 @@ jobs:
         with:
           tool: nextest@0.9.143
 
+      # A lock taken in an `if let`/`match` condition stays held for the whole
+      # block, in edition 2024 as in 2021. A lock held across a wait froze
+      # every reader and the indexing progress bar until a whole-graph build
+      # finished (GH #543, indexing audit R2-04; I-13). Take the value into a
+      # `let` first; the Direct projection's `ProjectionSlot` is the exemplar.
+      - name: No lock is held across an if-let or match block
+        run: cargo clippy -p tine-core -p tine-search --all-targets -- -A clippy::all -D clippy::significant_drop_in_scrutinee
+
       - name: Rust core tests (curated release selection)
         run: node scripts/tine-core-nextest-contract.mjs --mode linux --run-selection
 
@@ -189,6 +197,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -285,6 +294,11 @@ jobs:
       # was never executed by CI until GH #331; `cargo check -p tine` compiles it
       # but runs nothing, which hid a failing command-surface contract, an
       # unreleased cross-page-move regression, and five stale watcher tests.
+      # The app crate too, which the landed-code job cannot compile without
+      # these system libraries. See that job's lock-scope step (I-13).
+      - name: No lock is held across an if-let or match block (workspace)
+        run: cargo clippy --workspace --exclude tine-plugin-sdk --all-targets -- -A clippy::all -D clippy::significant_drop_in_scrutinee
+
       - name: Rust app-crate tests
         run: |
           cargo test -p tine --lib

@@ -5505,6 +5505,34 @@
   "failBefore": "proven"
  },
  "notes": "Audit finding IT-09 (Martin chose option A, 2026-09-22). A derived read waiting on indexing when the app replaced its graph (switch, or a refresh from preferred format / default home / journal title format / restore backup) saw the projection stop, fell back to with_pages and parsed the whole retired graph: 5 of 5 fixture pages, graph-sized at 10k, competing with the replacement's cold index. Graph::retire (set on bind revocation, remove and refresh) makes display reads (commands list_pages, page_aliases, page_icons, block_ref_counts, list_templates, journal_content_days, backlink_filter_context, via state::display_read) stop waiting and skip the parse; the skipped answer is never memoized (page list, find-entry index, derived memo), and the command retries on the window's current graph. Reads that act on their answer (export, orphan assets, creation) are not display reads and keep the full answer. Fail-before: display read returned Some after retirement; memo test listed 0 of 5 pages. Evidence: tine-agents/evidence/gh550-batch/it09-*."
+},
+{
+ "id": "REG-INDEX-READS-ANSWER-WHILE-A-JOINED-BUILD-RUNS-543",
+ "title": "The indexing bar and index-backed reads answer while a whole-graph index build runs",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_progress_answers_while_a_joined_build_runs"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Audit finding R2-04. A warm that found the snapshot already captured (an orphan-asset listing got there first) joined the running SQL build and waited for it inside `if let Some(p) = self.direct_projection.lock().unwrap().as_ref().map(Arc::clone) { p.wait_until_ready_at(..) }`. The lock in that condition stays held for the whole block, in edition 2024 as in 2021, so indexing_progress and every other projection read blocked until the build finished. Fix (shape): the field is now a ProjectionSlot whose only reads return a released clone, so no caller can hold the slot lock across a wait. Guard: CI denies clippy::significant_drop_in_scrutinee on the whole workspace (the same class at 20 sites, all converted, including test hooks that ran while their own lock was held). Fail-before at aa851886: the progress read did not return while the build was paused. Evidence: tine-agents/evidence/gh550-batch/r204-fail-before.log, indexing-audit-r2/."
 }
 ]
 }

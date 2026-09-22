@@ -49,7 +49,8 @@ static BEFORE_APPLY_PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::ne
 
 #[cfg(test)]
 fn run_before_apply_deltas_hook() {
-    if let Some(hook) = BEFORE_APPLY_PENDING.lock().unwrap().take() {
+    let hook = BEFORE_APPLY_PENDING.lock().unwrap().take();
+    if let Some(hook) = hook {
         hook();
     }
 }
@@ -632,8 +633,11 @@ fn capture_query_job(
     slot: crate::query_jobs::OwnedJobSlot,
 ) -> QueryJobOpen {
     #[cfg(test)]
-    if let Some(observed) = shared.capture_thread.lock().unwrap().take() {
-        observed.send(std::thread::current().id()).unwrap();
+    {
+        let observed = shared.capture_thread.lock().unwrap().take();
+        if let Some(observed) = observed {
+            observed.send(std::thread::current().id()).unwrap();
+        }
     }
     if slot.is_cancelled() {
         return QueryJobOpen::Cancelled;
@@ -1857,14 +1861,16 @@ impl DirectProjection {
             return None;
         }
         #[cfg(test)]
-        if let Some(hook) = self
-            .shared
-            .before_shared_reader_admission
-            .lock()
-            .unwrap()
-            .take()
         {
-            hook();
+            let hook = self
+                .shared
+                .before_shared_reader_admission
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let mut reader = self.shared.reader.lock().unwrap();
         if !self.ready_at(cache_generation) {
@@ -1875,14 +1881,16 @@ impl DirectProjection {
         }
         reader.as_ref()?;
         #[cfg(test)]
-        if let Some(hook) = self
-            .shared
-            .after_shared_reader_admission
-            .lock()
-            .unwrap()
-            .take()
         {
-            hook();
+            let hook = self
+                .shared
+                .after_shared_reader_admission
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         Some(reader)
     }
@@ -3071,8 +3079,11 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             };
             applied.registry_pages = registry_after;
             #[cfg(test)]
-            if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
-                hook();
+            {
+                let hook = shared.after_sql_commit.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
             shared.record_session_pages(&applied.pages);
             let changes = registry_sql::registry_changes(&registry_before, &applied.registry_pages);
@@ -3451,8 +3462,11 @@ fn build_and_publish_fresh_projection(
                 )
                 .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
             #[cfg(test)]
-            if let Some(hook) = shared.after_fresh_build_batch.lock().unwrap().take() {
-                hook();
+            {
+                let hook = shared.after_fresh_build_batch.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
             if fresh_build_stopped(shared) {
                 return Err(FreshBuildError::Stopped);
@@ -3486,18 +3500,23 @@ fn build_and_publish_fresh_projection(
         let fence = shared.cancel_queued_captures(false);
         shared.query_jobs.wait_for_drain(fence);
         #[cfg(test)]
-        if let Some(hook) = shared
-            .before_shared_reader_drain_lock
-            .lock()
-            .unwrap()
-            .take()
         {
-            hook();
+            let hook = shared
+                .before_shared_reader_drain_lock
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let mut reader = shared.reader.lock().unwrap();
         #[cfg(test)]
-        if let Some(hook) = shared.after_shared_reader_drain_lock.lock().unwrap().take() {
-            hook();
+        {
+            let hook = shared.after_shared_reader_drain_lock.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         reader.take();
         drop(reader);
@@ -3513,8 +3532,11 @@ fn build_and_publish_fresh_projection(
             .map_err(FreshBuildError::Failed)?;
 
         #[cfg(test)]
-        if let Some(hook) = shared.before_fresh_publication.lock().unwrap().take() {
-            hook().map_err(FreshBuildError::Failed)?;
+        {
+            let hook = shared.before_fresh_publication.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook().map_err(FreshBuildError::Failed)?;
+            }
         }
         // This is the cancellation boundary. Once the storage primitive below
         // starts, its atomic name operation owns the outcome; a stop arriving
@@ -3528,8 +3550,11 @@ fn build_and_publish_fresh_projection(
             .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
 
         #[cfg(test)]
-        if let Some(hook) = shared.after_fresh_publication.lock().unwrap().take() {
-            hook().map_err(FreshBuildError::Failed)?;
+        {
+            let hook = shared.after_fresh_publication.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook().map_err(FreshBuildError::Failed)?;
+            }
         }
         if fresh_build_stopped(shared) {
             return Err(FreshBuildError::Stopped);

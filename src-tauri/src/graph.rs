@@ -658,7 +658,8 @@ pub(crate) fn load_graph_for_label(
         lookup_id,
         StorageTransitionPhase::LookingUpSelection,
     )?;
-    if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
+    let owner = state.graphs.read().unwrap().owner(&root_key);
+    if let Some(owner) = owner {
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)
                 .map_err(crate::command_error::CommandError::from)?;

@@ -141,12 +141,10 @@ impl Graph {
         // incarnation; never recapture a moving target inside this request.
         // Capture the lifecycle identity once, before recovery. Ordinary saves
         // keep the same epoch and do not cancel the request.
-        let request = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|projection| (Arc::clone(projection), projection.query_epoch()));
+        let request = self.direct_projection.get().map(|projection| {
+            let epoch = projection.query_epoch();
+            (projection, epoch)
+        });
         let cancelled = || {
             let replaced = request
                 .as_ref()
@@ -248,12 +246,7 @@ impl Graph {
         &self,
     ) -> Option<crate::direct_projection::ProjectionProgress> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         Some(projection.progress_at(generation))
     }
 
@@ -908,8 +901,7 @@ impl Graph {
             )
         });
         let (reset, _in_flight) = {
-            let projection = self.direct_projection.lock().unwrap();
-            let Some(projection) = projection.as_ref() else {
+            let Some(projection) = self.direct_projection.get() else {
                 return;
             };
             if projection.warm_in_flight() {
@@ -982,7 +974,7 @@ impl Graph {
                 }
             };
             if !owned {
-                if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+                if let Some(projection) = self.direct_projection.get() {
                     projection.withdraw_rebuild_request();
                 }
             }
@@ -998,7 +990,7 @@ impl Graph {
                 "repair snapshot abandoned: generation moved while it was assembled".to_owned()
             });
             if reset {
-                if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+                if let Some(projection) = self.direct_projection.get() {
                     projection.withdraw_rebuild_request();
                 }
             }
@@ -1016,25 +1008,14 @@ impl Graph {
     }
 
     pub(super) fn direct_projection_note_fallback_read(&self) {
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
+        if let Some(projection) = self.direct_projection.get() {
             projection.note_fallback_read();
         }
     }
 
     pub(super) fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         let names = projection.referenced_page_names(generation)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
     }
@@ -1311,12 +1292,7 @@ impl Graph {
 
     pub(super) fn direct_projection_real_page_names(&self) -> Option<crate::query::RealPageNames> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         let mut names = projection.real_page_names(generation)?;
         for (path, _) in names.values_mut() {
             *path = self.root.join(&*path);
@@ -1336,12 +1312,7 @@ impl Graph {
         Option<std::collections::HashSet<PathBuf>>,
     )> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         if !projection.wait_for_reference_generation(generation) {
             return None;
         }
@@ -1359,12 +1330,7 @@ impl Graph {
 
     pub(super) fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         let hint = projection.block_page_hint(generation, uuid)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(hint)
     }
@@ -1380,12 +1346,7 @@ impl Graph {
         uuid: &str,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
         self.direct_projection_pages_for_paths(generation, paths)
     }
@@ -1394,9 +1355,7 @@ impl Graph {
     pub(crate) fn direct_projection_ready_test(&self) -> bool {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .is_some_and(|projection| projection.ready_at(generation))
     }
 
@@ -1411,11 +1370,7 @@ impl Graph {
     pub(crate) fn direct_projection_test(
         &self,
     ) -> Option<Arc<crate::direct_projection::DirectProjection>> {
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
+        self.direct_projection.get()
     }
 
     /// R3: the production rebuild path a failed read takes — request the
@@ -1428,9 +1383,7 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn direct_projection_indexed_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.indexed_reads())
     }
 
@@ -1438,18 +1391,14 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn direct_projection_statement_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.statement_reads())
     }
 
     #[cfg(test)]
     pub(crate) fn direct_projection_fallback_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.fallback_reads())
     }
 
@@ -1486,7 +1435,7 @@ impl Graph {
     /// truncated projection file, a disk error or a resource limit would.
     #[cfg(test)]
     pub(crate) fn direct_projection_inject_read_failure_test(&self) {
-        if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+        if let Some(projection) = self.direct_projection.get() {
             projection.inject_next_statement_failure();
         }
     }
@@ -1494,9 +1443,7 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn direct_projection_referenced_name_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.referenced_name_reads())
     }
 }

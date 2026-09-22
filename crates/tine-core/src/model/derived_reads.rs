@@ -75,12 +75,7 @@ impl Graph {
     }
 
     fn derived_reader(&self) -> Option<(Arc<DirectProjection>, u64)> {
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         let generation = self.wait_for_derived_read(&projection, self.cache_generation())?;
         Some((projection, generation))
     }
@@ -99,15 +94,17 @@ impl Graph {
             let (projection, generation) = self.derived_reader()?;
             let answer = read(&projection, generation);
             #[cfg(test)]
-            if let Some(path) = self
-                .page_build_test
-                .derived_read_open_once
-                .lock()
-                .unwrap()
-                .take()
             {
-                let entry = self.entry_for_path(&path).expect("test page exists");
-                self.load_page(&entry).expect("test page opens");
+                let path = self
+                    .page_build_test
+                    .derived_read_open_once
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(path) = path {
+                    let entry = self.entry_for_path(&path).expect("test page exists");
+                    self.load_page(&entry).expect("test page opens");
+                }
             }
             if self.cache_generation() == generation {
                 return answer;

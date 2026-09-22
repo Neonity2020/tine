@@ -83,6 +83,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   while that graph was still indexing could make Tine parse the whole old
   graph for an answer nobody would see. Those reads now stop and are answered
   by the graph that replaced it (GH #543).
+- While the search index was being built, a page listing that had already
+  triggered the build could make the indexing bar, and other reads that use
+  the index, freeze until the whole build finished (GH #543).
 - The indexing bar showed only the indexing done at launch. If Tine later had
   to rebuild the search index in the same session (for example after finding
   it damaged), that rebuild ran with no indication. It now shows too

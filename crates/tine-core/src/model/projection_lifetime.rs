@@ -12,22 +12,19 @@ impl Graph {
     /// when the ordinary background warm completes.
     pub fn attach_direct_projection(&self, path: PathBuf) -> io::Result<()> {
         let projection = Arc::new(crate::direct_projection::DirectProjection::start(path)?);
-        let mut slot = self.direct_projection.lock().unwrap();
-        if slot.is_some() {
-            return Ok(());
-        }
-        *slot = Some(Arc::clone(&projection));
-        let cache = self.cache.read().unwrap();
-        if let Some(snapshot) = cache.as_ref().map(Arc::clone) {
-            let revisions = Arc::new(self.disk_revs.read().unwrap().clone());
-            projection.enqueue_full(
-                self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
-                snapshot,
-                revisions,
-                Arc::new(self.config.parse_config()),
-                self.page_index_failures.read().unwrap().is_empty(),
-            );
-        }
+        self.direct_projection.attach(projection, |projection| {
+            let cache = self.cache.read().unwrap();
+            if let Some(snapshot) = cache.as_ref().map(Arc::clone) {
+                let revisions = Arc::new(self.disk_revs.read().unwrap().clone());
+                projection.enqueue_full(
+                    self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                    snapshot,
+                    revisions,
+                    Arc::new(self.config.parse_config()),
+                    self.page_index_failures.read().unwrap().is_empty(),
+                );
+            }
+        });
         Ok(())
     }
 
@@ -40,7 +37,7 @@ impl Graph {
     /// Returns whether it exited within `timeout`; `false` is reported by the
     /// caller, never treated as fatal — the replacement attach then decides.
     pub fn detach_direct_projection(&self, timeout: std::time::Duration) -> bool {
-        let projection = self.direct_projection.lock().unwrap().take();
+        let projection = self.direct_projection.take();
         match projection {
             Some(projection) => projection.close_and_wait_for_worker(timeout),
             None => true,
@@ -55,9 +52,7 @@ impl Graph {
         wake: std::sync::mpsc::Sender<()>,
     ) -> Option<u64> {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map(|projection| projection.observe_commits(wake))
     }
 
@@ -68,12 +63,7 @@ impl Graph {
         use crate::direct_projection::ProjectionProgress;
         use crate::indexing_progress::{IndexingPhase, IndexingProgress};
         use crate::query::QueryReadinessReason as Reason;
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone);
+        let projection = self.direct_projection.get();
         let Some(projection) = projection else {
             return self.indexing_progress.snapshot();
         };
@@ -105,13 +95,7 @@ impl Graph {
         timeout: std::time::Duration,
     ) -> io::Result<()> {
         use crate::direct_projection::ProjectionProgress;
-        let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        else {
+        let Some(projection) = self.direct_projection.get() else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "snapshot query projection is not attached",
@@ -204,13 +188,7 @@ impl Graph {
         force: bool,
         source_complete: bool,
     ) {
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
+        if let Some(projection) = self.direct_projection.get() {
             // R6: a projection already READY at this generation was validated
             // from the same bytes this snapshot was parsed from; a redundant
             // snapshot would only open a NotReady window while it re-validates.
@@ -234,13 +212,7 @@ impl Graph {
         document: Arc<Document>,
         revision: String,
     ) {
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
+        if let Some(projection) = self.direct_projection.get() {
             projection.enqueue_replace(
                 generation,
                 entry,
@@ -273,39 +245,21 @@ impl Graph {
                 self.session_page_ids.write().unwrap().remove(&entry.path);
             }
         }
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
+        if let Some(projection) = self.direct_projection.get() {
             projection.enqueue_page_set(generation, changes, Arc::new(self.config.parse_config()));
         }
     }
 
     pub(super) fn direct_projection_enqueue_delete(&self, generation: u64, entry: PageEntry) {
         self.session_page_ids.write().unwrap().remove(&entry.path);
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
+        if let Some(projection) = self.direct_projection.get() {
             // A delete lowers nothing, so it carries no parse config (F11).
             projection.enqueue_delete(generation, entry);
         }
     }
 
     pub(super) fn direct_projection_mark_stale(&self) {
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
+        if let Some(projection) = self.direct_projection.get() {
             projection.mark_stale();
         }
     }
@@ -321,9 +275,7 @@ impl Graph {
     pub fn announce_launch_warm(&self) -> LaunchWarmAnnouncement {
         LaunchWarmAnnouncement(
             self.direct_projection
-                .lock()
-                .unwrap()
-                .as_ref()
+                .get()
                 .map(|projection| projection.begin_warm()),
         )
     }

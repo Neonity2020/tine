@@ -459,7 +459,7 @@ impl Graph {
             #[cfg(test)]
             page_build_test: PageBuildTestState::default(),
             derived_cache: RwLock::new(None),
-            direct_projection: std::sync::Mutex::new(None),
+            direct_projection: projection_slot::ProjectionSlot::empty(),
             page_list_cache: RwLock::new(None),
             referenced_names_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),

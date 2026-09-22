@@ -74,6 +74,7 @@ mod pdf;
 mod persistent_map;
 pub use atomic_copy::*;
 mod projection_rename;
+mod projection_slot;
 use bounded_walks::*;
 use budgets::*;
 use graph_text_capture::*;
@@ -396,7 +397,7 @@ pub struct Graph {
     /// Disposable SQLite facts for Direct Files. Markdown/Org and the parsed
     /// page cache remain authoritative; indexed reads are admitted only when
     /// this worker has published the exact current `cache_gen`.
-    direct_projection: std::sync::Mutex<Option<Arc<crate::direct_projection::DirectProjection>>>,
+    direct_projection: projection_slot::ProjectionSlot,
     /// Memoized `list_pages()` (the journals//pages/ directory scan), keyed by
     /// cache_gen — which bumps on every page create/delete/rename (Tine or watcher)
     /// — so quick-switch / [[ ]] autocomplete don't re-read both dirs on every

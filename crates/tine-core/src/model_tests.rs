@@ -15481,6 +15481,10 @@ fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
         "under the default formats the title parses as nothing, so it is an ordinary page"
     );
     let before_digest = before.config.parse_config().digest();
+    // Reopening attaches a projection at the same database; the old worker
+    // must have released its writer lease first, or under load the new one
+    // cannot open it and never converges.
+    crate::direct_projection::release_projection(&before);
     drop(before);
 
     fs::write(

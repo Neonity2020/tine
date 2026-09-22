@@ -173,9 +173,12 @@ impl Graph {
         *active = Some(Arc::clone(&flight));
         drop(active);
         #[cfg(test)]
-        if let Some(pause) = self.page_build_test.owner_pause.lock().unwrap().clone() {
-            pause.reached.wait();
-            pause.release.wait();
+        {
+            let pause = self.page_build_test.owner_pause.lock().unwrap().clone();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
         }
         (flight, true)
     }
@@ -353,9 +356,7 @@ impl Graph {
         // atomically by the projection worker.
         let _retrying = self
             .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map(|projection| projection.begin_warm());
         let warmed = match self.warm_projection_cancellable(&cancelled) {
             WarmProjectionOutcome::Owned => true,
@@ -371,13 +372,7 @@ impl Graph {
             // parse the whole graph (GH #543). Nothing is owed if readiness is
             // no longer coming at this generation: the reads then take their
             // ordinary route.
-            if let Some(projection) = self
-                .direct_projection
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(Arc::clone)
-            {
+            if let Some(projection) = self.direct_projection.get() {
                 let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
                 projection.wait_until_ready_at(generation, &cancelled);
             }
@@ -418,13 +413,7 @@ impl Graph {
         if cancelled() {
             return Outcome::Cancelled;
         }
-        let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        else {
+        let Some(projection) = self.direct_projection.get() else {
             // No projection to own readiness; a parsed cache is all there is.
             return if self.cache.read().unwrap().is_some() {
                 Outcome::Owned
@@ -1056,12 +1045,7 @@ impl Graph {
         let mut identity_changed = false;
         // Taken before the cache lock: attaching holds the projection slot
         // while it reads the cache, so the slot is never locked under it.
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone);
+        let projection = self.direct_projection.get();
         let mut guard = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         self.session_page_ids.write().unwrap().insert(

@@ -9867,3 +9867,58 @@ fn gh543_a_display_read_cut_short_leaves_no_memo_behind() {
     assert!(graph.find_entry("one", PageKind::Page).is_some());
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A warm that finds the snapshot already captured (here by an orphan-asset
+/// listing) joins the running SQL build and waits for it. The indexing
+/// progress bar and every other projection read must still answer meanwhile.
+#[test]
+fn gh543_progress_answers_while_a_joined_build_runs() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-joined-build-lock");
+    for i in 0..80 {
+        std::fs::write(root.join(format!("pages/bulk-{i}.md")), "- TODO item\n").unwrap();
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    *projection.shared.after_fresh_build_batch.lock().unwrap() = Some(Box::new({
+        let reached = Arc::clone(&reached);
+        let release = Arc::clone(&release);
+        move || {
+            reached.wait();
+            release.wait();
+        }
+    }));
+    // An explicit whole-graph consumer (e.g. orphan-asset listing) captures
+    // the shared snapshot before the delayed launch warm reaches it.
+    let _ = graph.orphan_assets();
+    reached.wait();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    // Let the warm reach its readiness wait on the paused build.
+    std::thread::sleep(Duration::from_millis(300));
+    let (tx, rx) = mpsc::channel();
+    let interactive = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || {
+            let _ = tx.send(graph.indexing_progress());
+        })
+    };
+    let prompt = rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    release.wait();
+    interactive.join().unwrap();
+    warm.join().unwrap();
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+    assert!(
+        prompt,
+        "the indexing progress read waited for the paused whole-graph build: a joining warm \
+         held the projection-slot lock through it (GH #543, indexing audit R2-04)"
+    );
+}
