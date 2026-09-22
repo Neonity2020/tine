@@ -5360,6 +5360,36 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit IT-04 (completion half; the cold-discard half was fixed earlier by the page-open counter change and is covered by gh543_cold_parse_survives_an_unchanged_page_open). warm_cache_async returned without warm_done or warm-cache-done whenever warm_cache_cancellable reported false, including failure, and a panic ended the thread the same way. waitForWarmCache has no other terminal channel, so aliases, page identities, block-ref counts and followIndexingProgress waited for the rest of the session. settle_launch_warm now signals on every uncancelled end, including a panic, and stays silent only when cancelled (a newer warm owns the window). Not run: the native cold-open barrier journey the audit lists as a remaining probe. Evidence: tine-agents/evidence/gh550-batch/it04-completion-fail-before.log."
+},
+{
+ "id": "REG-PRESENTATION-SETTING-KEEPS-THE-INDEX-543",
+ "title": "Changing a display-only setting does not restart indexing or close the unsaved-edit recovery",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-native",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/backend_command_parity.rs::presentation_settings_do_not_reopen_the_graph",
+   "src-tauri/src/state.rs::a_presentation_setting_keeps_the_graph_and_its_index",
+   "src/instanceReplacement.test.ts::keeps the binding for a presentation-only setting (GH #543)"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit IT-06. set_timetracking_enabled, set_show_brackets, set_doc_mode_enter_for_new_block, set_logical_outdenting and set_guide_announced wrote config and then ran refresh_graph, which retires the projection worker, reopens the Graph and starts a new launch check; on a first launch, dismissing the Guide toast discarded the whole cold index build. The frontend also rebound (aborting print, closing unsaved recovery). tine-core reads none of these five, so they now write config and update the slot's GraphMeta in place (GraphSlot::apply_presentation_setting). preferred_format, journal title format, default home and restore_backup still refresh because the core reads them. Evidence: tine-agents/evidence/gh550-batch/it06-presentation-settings-fail-before.log."
 }
 ]
 }

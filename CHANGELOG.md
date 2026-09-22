@@ -70,6 +70,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Changing a display-only setting (bracket display, time tracking, logical
+  outdenting, document-mode Enter) or dismissing the Guide notice reloaded the
+  whole graph. On a first launch that restarted indexing from the beginning,
+  and it also cancelled a print in progress and closed an unsaved-edit
+  recovery. These settings now apply in place (GH #543).
 - If launch indexing failed, page aliases, block-reference counts and
   reference-only page names never appeared for that session, and the indexing
   indicator kept polling. Launch indexing now always reports that it ended,

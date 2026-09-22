@@ -1360,12 +1360,10 @@ pub(crate) fn set_timetracking_enabled(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_timetracking_enabled(enabled)
-            .map_err(CommandError::from)
-    })?;
-    refresh_graph(&state)?;
-    Ok(())
+    slot_for_context(&state)?.apply_presentation_setting(
+        |g| g.set_timetracking_enabled(enabled),
+        |meta| meta.enable_timetracking = enabled,
+    )
 }
 
 #[tauri::command]
@@ -1373,11 +1371,10 @@ pub(crate) fn set_show_brackets(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_show_brackets(enabled).map_err(CommandError::from)
-    })?;
-    refresh_graph(&state)?;
-    Ok(())
+    slot_for_context(&state)?.apply_presentation_setting(
+        |g| g.set_show_brackets(enabled),
+        |meta| meta.show_brackets = enabled,
+    )
 }
 
 #[tauri::command]
@@ -1385,12 +1382,10 @@ pub(crate) fn set_doc_mode_enter_for_new_block(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_doc_mode_enter_for_new_block(enabled)
-            .map_err(CommandError::from)
-    })?;
-    refresh_graph(&state)?;
-    Ok(())
+    slot_for_context(&state)?.apply_presentation_setting(
+        |g| g.set_doc_mode_enter_for_new_block(enabled),
+        |meta| meta.doc_mode_enter_for_new_block = enabled,
+    )
 }
 
 #[tauri::command]
@@ -1398,12 +1393,10 @@ pub(crate) fn set_logical_outdenting(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_logical_outdenting(enabled)
-            .map_err(CommandError::from)
-    })?;
-    refresh_graph(&state)?;
-    Ok(())
+    slot_for_context(&state)?.apply_presentation_setting(
+        |g| g.set_logical_outdenting(enabled),
+        |meta| meta.logical_outdenting = enabled,
+    )
 }
 
 #[tauri::command]
@@ -1411,11 +1404,10 @@ pub(crate) fn set_guide_announced(
     announced: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    with_config_graph(&state, |g| {
-        g.set_guide_announced(announced).map_err(CommandError::from)
-    })?;
-    refresh_graph(&state)?;
-    Ok(())
+    slot_for_context(&state)?.apply_presentation_setting(
+        |g| g.set_guide_announced(announced),
+        |meta| meta.guide_announced = announced,
+    )
 }
 
 #[tauri::command]

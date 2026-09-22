@@ -127,6 +127,21 @@ impl GraphSlot {
         self.graph_meta.read().unwrap().clone()
     }
 
+    /// Persist a presentation-only setting and update the meta the frontend
+    /// reads, keeping this `Graph` and its index. Only for settings nothing in
+    /// the core reads: `refresh_graph` retires the projection worker, reopens
+    /// the graph and starts the launch check again, which on a first launch
+    /// threw away the whole index build for a toggle (GH #543, IT-06).
+    pub(crate) fn apply_presentation_setting(
+        &self,
+        write: impl FnOnce(&Graph) -> std::io::Result<()>,
+        update: impl FnOnce(&mut tine_core::model::GraphMeta),
+    ) -> Result<(), CommandError> {
+        self.with_config_graph(|graph| write(graph).map_err(CommandError::from))?;
+        update(&mut self.graph_meta.write().unwrap());
+        Ok(())
+    }
+
     /// Re-open the graph object for the same window/root without revoking the
     /// frontend's lease. A binding generation identifies a window -> graph-root
     /// assignment, not the particular in-memory `Graph` instance. Minting a new
@@ -593,6 +608,111 @@ mod tests {
         Arc::new(GraphSlot::new(Graph::open(root), root.to_path_buf()))
     }
 
+    /// Rows of the OG query `[[Alpha]]`, straight from the graph's index.
+    fn alpha_ref_count(graph: &Graph) -> Result<usize, tine_core::query::QueryExecutionError> {
+        let registry = tine_core::query::registry::Registry::from_snapshot(
+            &tine_core::query::ir::RegistrySnapshot {
+                rows: Vec::new(),
+                generation: 0,
+            },
+        );
+        let (query, _view) = tine_core::query::parse_query_input(
+            "[[Alpha]]",
+            tine_core::query::QueryInput::Og,
+            tine_core::date::JournalDate::today(),
+            &registry,
+        );
+        let result = tine_core::query::run_query_result_ir(
+            graph,
+            &query,
+            &tine_core::query::ir::ViewSettings::default(),
+            tine_core::query::ir::Bounds::unbounded(),
+            &tine_core::query::ir::ExecutionContext::none(),
+        )?;
+        Ok(match result.rows {
+            tine_core::query::ir::QueryRows::Page { pages } => pages.len(),
+            tine_core::query::ir::QueryRows::Block { groups } => {
+                groups.iter().map(|group| group.blocks.len()).sum()
+            }
+        })
+    }
+    fn alpha_ref_count_when_ready(
+        graph: &Graph,
+    ) -> Result<usize, tine_core::query::QueryExecutionError> {
+        let started = Instant::now();
+        loop {
+            match alpha_ref_count(graph) {
+                Err(tine_core::query::QueryExecutionError::NotReady(_)) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "the projection never became ready"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// GH #543 (indexing audit IT-06): a presentation-only setting keeps the
+    /// Graph, its index and its launch check. Toggling one used to refresh the
+    /// graph: the projection worker was retired and the graph reopened, and on
+    /// a first launch -- when dismissing the Guide toast is most likely -- the
+    /// whole index build restarted from nothing.
+    #[test]
+    fn a_presentation_setting_keeps_the_graph_and_its_index() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-presentation-setting-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["pages", "journals", "logseq"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("logseq/config.edn"), "{}\n").unwrap();
+        std::fs::write(root.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        std::fs::write(root.join("pages/Beta.md"), "- see [[Alpha]]\n").unwrap();
+        let graph = Graph::open_checked_with_assets(&root, None).unwrap();
+        crate::graph::attach_direct_files_services(
+            &graph,
+            crate::graph::DirectFilesServicePaths {
+                projection: Ok(root.join("private/projection.sqlite")),
+                concord_ledger: None,
+            },
+        );
+        graph.warm_cache();
+        let slot = GraphSlot::new(graph, root.clone());
+        let before = slot.graph();
+        let answered = alpha_ref_count_when_ready(&before).expect("queries answer before");
+        assert!(answered > 0, "the fixture has a referring block");
+        assert!(!slot.graph_meta().show_brackets || !slot.graph_meta().guide_announced);
+
+        slot.apply_presentation_setting(
+            |graph| graph.set_show_brackets(true),
+            |meta| meta.show_brackets = true,
+        )
+        .unwrap();
+        slot.apply_presentation_setting(
+            |graph| graph.set_guide_announced(true),
+            |meta| meta.guide_announced = true,
+        )
+        .unwrap();
+
+        assert!(
+            Arc::ptr_eq(&before, &slot.graph()),
+            "the graph was replaced"
+        );
+        assert!(slot.graph_meta().show_brackets && slot.graph_meta().guide_announced);
+        // Persisted: the next open reads both.
+        let reopened = Graph::open(&root).meta();
+        assert!(reopened.show_brackets && reopened.guide_announced);
+        // The index was never detached: the same query answers at once, with
+        // no second launch check (a refresh would need one before answering).
+        assert_eq!(alpha_ref_count(&before).ok(), Some(answered));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// GH draft "Query Engine" (2026-09-11): dismissing the Guide toast made
     /// every query `ProjectionUnavailable` until the next graph open, because
     /// `set_guide_announced` → `refresh_graph` rebuilt the `Graph` without the
@@ -601,48 +721,6 @@ mod tests {
     /// `config.edn` rewrite. The refresh body must attach what the open attaches.
     #[test]
     fn a_config_refresh_keeps_queries_answering() {
-        fn count(graph: &Graph) -> Result<usize, tine_core::query::QueryExecutionError> {
-            let registry = tine_core::query::registry::Registry::from_snapshot(
-                &tine_core::query::ir::RegistrySnapshot {
-                    rows: Vec::new(),
-                    generation: 0,
-                },
-            );
-            let (query, _view) = tine_core::query::parse_query_input(
-                "[[Alpha]]",
-                tine_core::query::QueryInput::Og,
-                tine_core::date::JournalDate::today(),
-                &registry,
-            );
-            let result = tine_core::query::run_query_result_ir(
-                graph,
-                &query,
-                &tine_core::query::ir::ViewSettings::default(),
-                tine_core::query::ir::Bounds::unbounded(),
-                &tine_core::query::ir::ExecutionContext::none(),
-            )?;
-            Ok(match result.rows {
-                tine_core::query::ir::QueryRows::Page { pages } => pages.len(),
-                tine_core::query::ir::QueryRows::Block { groups } => {
-                    groups.iter().map(|group| group.blocks.len()).sum()
-                }
-            })
-        }
-        fn when_ready(graph: &Graph) -> Result<usize, tine_core::query::QueryExecutionError> {
-            let started = Instant::now();
-            loop {
-                match count(graph) {
-                    Err(tine_core::query::QueryExecutionError::NotReady(_)) => {
-                        assert!(
-                            started.elapsed() < Duration::from_secs(30),
-                            "the projection never became ready"
-                        );
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    other => return other,
-                }
-            }
-        }
         let root = std::env::temp_dir().join(format!(
             "tine-refresh-keeps-projection-{}-{:?}",
             std::process::id(),
@@ -669,17 +747,19 @@ mod tests {
         crate::graph::attach_direct_files_services(&graph, services());
         graph.warm_cache();
         let old = Arc::new(GraphSlot::new(graph, root.clone()));
-        let before = when_ready(&old.graph()).expect("queries answer before");
+        let before = alpha_ref_count_when_ready(&old.graph()).expect("queries answer before");
         assert!(before > 0, "the fixture has referring blocks");
 
-        // What `set_guide_announced` does: a config write, then a refresh.
+        // What a refreshing settings command (`set_preferred_format`,
+        // `set_journal_title_format`, `set_default_home`) does: a config write,
+        // then a refresh.
         old.graph().set_guide_announced(true).unwrap();
         let replacement = reopen_legacy_for_refresh(&old, None, services()).unwrap();
         // The open path warms through `warm_cache_async`; the refresh core hands
         // that to its caller, so warm here exactly as the caller would.
         let reopened = replacement.graph();
         reopened.warm_cache();
-        let after = when_ready(&reopened);
+        let after = alpha_ref_count_when_ready(&reopened);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
             after.ok(),
