@@ -70,6 +70,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- While Tine checks the search index after opening a graph, looking up a
+  block's page, listing page names, or finding references no longer parses the
+  whole graph beside that check; they wait for it instead (GH #543).
+
 - A page deleted by another program while Tine was indexing the graph no
   longer counts as a page Tine could not read. That record made creating a
   new page fail, or re-parse the whole graph first, until Tine was restarted

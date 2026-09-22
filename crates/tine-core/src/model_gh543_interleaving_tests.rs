@@ -983,6 +983,76 @@ fn gh543_a_page_deleted_during_a_pass_is_gone_not_unreadable() {
     }
 }
 
+/// GH #543 (design v4 stage 3): readers with no retry of their own -- a
+/// block reference's page, the real page names a query resolves against,
+/// and the print/publish reference walk -- wait while the owner's launch
+/// pass is coming, instead of parsing the graph that pass is reading. Each
+/// read answers from the index once the pass lands.
+#[test]
+fn gh543_readers_without_a_retry_wait_for_the_launch_pass() {
+    const PAGES: usize = 6;
+    for reader in ["block page hint", "real page names", "reference walk"] {
+        let root = scratch("gh543-ng4-readers");
+        write_pages(&root, PAGES);
+        fs::write(
+            page_path(&root, "p1"),
+            "- TODO t1\n  id:: 6512a0f4-0000-4000-8000-000000000001\n- see [[p3]]\n",
+        )
+        .unwrap();
+        let database = root.join("private/projection.sqlite");
+        prebuild_index(&root, &database);
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database).unwrap();
+        let pause = graph.pause_next_warm_after_read_test();
+        let owner = OwnerRun::start(&graph);
+        pause.reached.wait();
+        let read = {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || match reader {
+                "block page hint" => graph
+                    .block_page_hint("6512a0f4-0000-4000-8000-000000000001")
+                    .unwrap_or_default(),
+                "real page names" => {
+                    let names = crate::query::real_page_names(&*graph);
+                    names
+                        .get("p3")
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_default()
+                }
+                _ => {
+                    let found = graph.reference_candidate_pages(
+                        &["p3".to_owned()],
+                        "elsewhere",
+                        ReferenceKind::Plain,
+                    );
+                    found
+                        .pages
+                        .iter()
+                        .map(|(entry, _)| entry.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        pause.release.wait();
+        let answer = read.join().unwrap();
+        assert_eq!(
+            graph.consumer_page_parses_test(),
+            0,
+            "{reader}: parsed the graph beside the launch pass"
+        );
+        assert!(
+            answer.contains("p1") || answer == "p3",
+            "{reader}: answered {answer:?}"
+        );
+        assert!(owner.wait_settled(Duration::from_secs(10)));
+        owner.stop();
+        crate::direct_projection::release_projection(&graph);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 /// GH #543 (design v4 stage 2): a rename landing inside the launch check
 /// costs at most one more whole-graph pass, and the owner settles.
 #[test]

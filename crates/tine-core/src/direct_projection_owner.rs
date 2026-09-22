@@ -207,11 +207,6 @@ impl DirectProjection {
         backing_off(&self.shared.pending.lock().unwrap())
     }
 
-    /// See the free function [`fresh_build_owns_image`].
-    pub(crate) fn fresh_build_owns_image(&self) -> bool {
-        fresh_build_owns_image(&self.shared, &self.shared.pending.lock().unwrap())
-    }
-
     /// Ask for the image to be replaced whole. A no-op when a fresh build
     /// already owns its replacement (IT-10): the rule is checked under the
     /// same lock as the request, so two failed reads cannot both see "no

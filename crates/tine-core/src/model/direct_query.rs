@@ -49,6 +49,18 @@ LIMIT 1";
 
 const BACKLINK_FILTER_SOURCE_BATCH: usize = 256;
 
+/// How long an index-backed read waits for the index before its caller
+/// falls back to parsing (GH #543).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexWait {
+    /// While whole-graph index work is coming: the caller has no retry, so
+    /// its fallback would parse the graph the coming pass is reading.
+    WhileComing,
+    /// A short latency ceiling for one queued delta: an interactive caller
+    /// that reports `NotReady` and retries instead of parsing.
+    Bounded,
+}
+
 impl Graph {
     /// **SPEC §5.9's Direct Files dispatch, in ONE place.**
     ///
@@ -917,101 +929,31 @@ impl Graph {
                 self.cache.read().unwrap().is_some()
             )
         });
-        let (reset, _in_flight) = {
-            let Some(projection) = self.direct_projection.get() else {
-                return;
-            };
-            if projection.owner_registered() {
-                // Whole-graph index work is the owner's to start: a repair
-                // here would be a second pass racing it on the query thread,
-                // both reading every page (GH #543). Report the need and
-                // leave it. A failed read is a damaged image; anything else
-                // the owner already sees as its need.
-                if reset || projection.worker_failed() {
-                    projection.request_rebuild();
-                }
-                crate::direct_projection::projection_diag(|| {
-                    "repair left to the index owner".to_owned()
-                });
-                return;
-            }
-            if projection.fresh_build_owns_image() {
-                // Concurrent reads on a damaged image all fail, and the query
-                // epoch moves only when the rebuild publishes, so a sibling's
-                // failure arrives here while the first one's rebuild runs.
-                // That build replaces the image whole; requesting another
-                // would queue a second complete build behind it (IT-10).
-                crate::direct_projection::projection_diag(|| {
-                    "repair skipped: a fresh build already replaces this image".to_owned()
-                });
-                return;
-            }
-            let reset = reset || projection.worker_failed();
-            if reset {
-                projection.request_rebuild();
-            }
-            // Published BEFORE the payload is computed, which takes seconds on
-            // a large graph: a query racing this repair must read it as work in
-            // progress, not as an idle stale projection nobody is repairing.
-            (reset, projection.begin_repair())
-        };
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        // Take the revisions WHILE STILL HOLDING the cache read lock. A
-        // publisher inserts into `disk_revs` and bumps `cache_gen` under one
-        // held cache WRITE lock (`page_cache.rs`), releasing `disk_revs`
-        // between the two — so a reader that lets go of the cache lock in
-        // between can read the NEW revision and then re-read the OLD
-        // generation. The re-check below passes, and stale documents are
-        // published stamped with the hash of the current file, which defeats
-        // the very comparison a later warm would use to notice they are stale
-        // (re-audit A2-N1). Lock order is cache → disk_revs, the same order
-        // the publisher takes, so holding both here cannot deadlock.
-        let snapshot = self
-            .cache
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|pages| (Arc::clone(pages), self.disk_revs.read().unwrap().clone()));
-        let Some((pages, revisions)) = snapshot else {
-            // A failed read cannot validate the damaged image. Capture one
-            // parsed source snapshot and hand it to the unpublished fresh
-            // builder. An ordinary not-yet-started image still gets the cheap
-            // revision-only validation first and parses only when that says a
-            // cold/stale build is required.
-            // A payload that is not taken leaves the rebuild requested: the
-            // next query's repair tries again.
-            if reset {
-                self.warm_page_cache_cancellable(&|| false);
-            } else if self.warm_projection_cancellable(&|| false)
-                == super::page_cache::WarmProjectionOutcome::Retry
-            {
-                self.warm_page_cache_cancellable(&|| false);
-            }
+        let Some(projection) = self.direct_projection.get() else {
             return;
         };
-        // The pages and revisions are now coherent with each other, but the
-        // generation was read before either. Re-read it: if it moved, this pair
-        // is older than the queue and must not be published (GH #543). The
-        // obligation a `reset` created goes with it, or it would be latched
-        // with no payload behind it.
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+        if reset || projection.worker_failed() {
+            // A failed read is a damaged image. `request_rebuild` is a no-op
+            // while a fresh build already replaces it (IT-10).
+            projection.request_rebuild();
+        }
+        if projection.owner_registered() {
+            // Whole-graph index work is the owner's to start: a repair here
+            // would be a second pass racing it on the query thread, both
+            // reading every page (GH #543). The need is reported; leave it.
             crate::direct_projection::projection_diag(|| {
-                "repair snapshot abandoned: generation moved while it was assembled".to_owned()
+                "repair left to the index owner".to_owned()
             });
             return;
         }
-        // A reset must be followed by a payload; see `direct_projection_enqueue_full`.
-        let source_complete = self.page_index_failures.read().unwrap().is_empty();
-        // A repair offers as the warm owner and carries no page change of
-        // its own, so no outcome owes anything further.
-        let _ = self.direct_projection_enqueue_full(
-            generation,
-            pages,
-            Arc::new(revisions),
-            reset,
-            source_complete,
-            super::projection_lifetime::FullOffer::WarmOwner,
-        );
+        // No owner (the CLI, headless runs, tests): run one owner iteration
+        // inline -- the same pass the owner loop runs, for the need as it
+        // stands now. Published before the pass, which takes seconds on a
+        // large graph: a query racing it reads work in progress, not an idle
+        // stale projection nobody is repairing.
+        let _in_flight = projection.begin_repair();
+        let (need, _) = projection.index_need_now();
+        let _ = self.inline_index_pass(&projection, need, &|| false);
     }
 
     pub(super) fn direct_projection_note_fallback_read(&self) {
@@ -1298,13 +1240,13 @@ impl Graph {
     }
 
     pub(super) fn direct_projection_real_page_names(&self) -> Option<crate::query::RealPageNames> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self.direct_projection.get()?;
-        let mut names = projection.real_page_names(generation)?;
-        for (path, _) in names.values_mut() {
-            *path = self.root.join(&*path);
-        }
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+        self.indexed_read(|projection, generation| {
+            let mut names = projection.real_page_names(generation)?;
+            for (path, _) in names.values_mut() {
+                *path = self.root.join(&*path);
+            }
+            Some(names)
+        })
     }
 
     pub(super) fn direct_projection_reference_candidate_pages(
@@ -1313,33 +1255,40 @@ impl Graph {
         self_page: &str,
         kind: ReferenceKind,
         mode: crate::query::candidate::CandidateMode,
+        wait: IndexWait,
     ) -> Option<(
         Vec<(PageEntry, Arc<Document>)>,
         Option<std::collections::HashSet<String>>,
         Option<std::collections::HashSet<PathBuf>>,
     )> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self.direct_projection.get()?;
-        if !projection.wait_for_reference_generation(generation) {
-            return None;
+        let read = |projection: &Arc<crate::direct_projection::DirectProjection>,
+                    generation: u64| {
+            let candidates = projection.reference_candidates(
+                generation,
+                names_norm,
+                self_page,
+                kind,
+                mode,
+                &self.config(),
+            )?;
+            let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
+            Some((pages, candidates.blocks, candidates.page_owners))
+        };
+        match wait {
+            IndexWait::WhileComing => self.indexed_read(read),
+            IndexWait::Bounded => {
+                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                let projection = self.direct_projection.get()?;
+                if !projection.wait_for_reference_generation(generation) {
+                    return None;
+                }
+                read(&projection, generation)
+            }
         }
-        let candidates = projection.reference_candidates(
-            generation,
-            names_norm,
-            self_page,
-            kind,
-            mode,
-            &self.config(),
-        )?;
-        let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
-        Some((pages, candidates.blocks, candidates.page_owners))
     }
 
     pub(super) fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self.direct_projection.get()?;
-        let hint = projection.block_page_hint(generation, uuid)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(hint)
+        self.indexed_read(|projection, generation| projection.block_page_hint(generation, uuid))
     }
 
     pub(super) fn direct_projection_block_ref_counts(

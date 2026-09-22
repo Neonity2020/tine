@@ -360,6 +360,7 @@ impl Graph {
                 self_page,
                 kind,
                 crate::query::candidate::CandidateMode::Exhaustive,
+                super::direct_query::IndexWait::WhileComing,
             )
         {
             // R6: the inventory is the projection's (memoized), never a reason
@@ -423,6 +424,7 @@ impl Graph {
                 } else {
                     crate::query::candidate::CandidateMode::Exhaustive
                 },
+                super::direct_query::IndexWait::Bounded,
             )
         {
             let full_page_count = self.list_pages().len();

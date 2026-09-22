@@ -6072,6 +6072,24 @@
   "failBefore": "proven"
  },
  "notes": "Harness residual (a). The graph listing (graph_text_inventory admit_or_skip), the launch check's walk and re-read, and the parsed build each recorded a page that vanished between listing and read as a page index failure; the reparse path already dropped it. The failure left the inventory incomplete, so page creation either refused ('failure-bearing cold identity evidence cannot authorize name-only creation') or parsed the whole graph on the save thread. All four sites now treat NotFound as gone. The watcher's sync_file_checked still records a vanished path as a failure; its delete event clears it and carries the UI removal, so it is left as is. Fail-before: tine-agents/evidence/gh550-batch/stage2/necessity-vanished-page.log."
+},
+{
+ "id": "REG-READERS-WAIT-FOR-THE-LAUNCH-INDEX-PASS-543",
+ "title": "Looking up a block's page, listing page names, or finding references while the launch index check runs waits for it instead of parsing the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_readers_without_a_retry_wait_for_the_launch_pass"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Design v4 stage 3. These readers had no retry path, so while the launch pass was running they fell back to parsing every page (6 of 6 in the fixture). They now go through indexed_read, which waits while index work is coming (IndexWait::WhileComing); the bounded reference path used by a caller that can retry keeps its bounded wait. Fail-before: tine-agents/evidence/gh550-batch/stage3/necessity-readers-wait.log."
 }
 ]
 }

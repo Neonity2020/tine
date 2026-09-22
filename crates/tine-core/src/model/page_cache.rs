@@ -511,31 +511,53 @@ impl Graph {
     /// ordinary reader, and prefetching under it waited for the pass itself
     /// -- forever, once a turn failed with nothing queued (GH #543).
     pub fn warm_cache_owned(&self, owner: IndexOwner, cancelled: impl Fn() -> bool) -> bool {
-        // Validate a clean warm image without parsing. A stale, cold, damaged,
-        // or raced image falls through to the existing parsed-page build
-        // flight, whose captured snapshot is built unpublished and published
-        // atomically by the projection worker.
-        let warmed = match self.warm_projection_cancellable(&cancelled) {
-            WarmProjectionOutcome::Owned => true,
-            WarmProjectionOutcome::Cancelled => return false,
-            WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => false,
-        };
-        if !warmed && (!self.warm_page_cache_cancellable(&cancelled) || cancelled()) {
-            return false;
-        }
-        if warmed {
-            // The validation/build turn may still be running; the
-            // derived-map reads below use a bounded wait and would otherwise
-            // parse the whole graph (GH #543). Nothing is owed if readiness is
-            // no longer coming at this generation: the reads then take their
-            // ordinary route.
-            if let Some(projection) = self.direct_projection.get() {
-                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-                projection.wait_until_ready_at(generation, &cancelled);
+        let passed = match self.direct_projection.get() {
+            Some(projection) => {
+                let need = projection.wait_index_need(&cancelled);
+                match self.inline_index_pass(&projection, need, &cancelled) {
+                    None => return false,
+                    Some(true) => {
+                        // The worker may still be applying what the pass
+                        // queued; the derived-map reads below would otherwise
+                        // parse the whole graph (GH #543). Nothing is owed if
+                        // readiness is no longer coming at this generation.
+                        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                        projection.wait_until_ready_at(generation, &cancelled);
+                        true
+                    }
+                    Some(false) => true,
+                }
             }
+            // No index: the parsed cache is all there is.
+            None => self.warm_page_cache_cancellable(&cancelled),
+        };
+        if !passed || cancelled() {
+            return false;
         }
         drop(owner);
         self.prefetch_derived_maps(&cancelled)
+    }
+
+    /// One owner iteration inline, for callers that run no owner loop (the
+    /// CLI, headless runs, tests, and a failed query's repair with no owner):
+    /// the pass the owner loop would run for `need`, then -- with no loop to
+    /// come back -- a fresh build when that pass settled nothing. Whether the
+    /// need is settled; `None` when `cancelled`.
+    pub(super) fn inline_index_pass(
+        &self,
+        projection: &crate::direct_projection::DirectProjection,
+        need: crate::direct_projection::IndexNeed,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<bool> {
+        use crate::direct_projection::IndexNeed;
+        if !matches!(need, IndexNeed::Validate | IndexNeed::Fresh) {
+            return Some(true);
+        }
+        let mut escalate = false;
+        if self.index_pass(projection, need, &mut escalate, cancelled)? {
+            return Some(true);
+        }
+        self.index_pass(projection, IndexNeed::Fresh, &mut escalate, cancelled)
     }
 
     /// Warm the derived maps the frontend fetches right after `warm-cache-done`
@@ -573,9 +595,9 @@ impl Graph {
     /// index needs -- a validation of the stored image, or a fresh build --
     /// runs that pass holding `permit` (the app's process-wide warm permit,
     /// so two graphs never parse at once), and lets the worker take it from
-    /// there. A pass that ends without the worker taking a payload backs off
-    /// (`1 s · 2^(n−1)`, at most 30 min), so a deterministic failure cannot
-    /// repeat whole-graph passes back to back.
+    /// there. A pass that ends without the worker taking a payload is retried
+    /// once at once and then backs off (see `note_unsettled`), so a
+    /// deterministic failure cannot repeat whole-graph passes back to back.
     ///
     /// `settle` is the launch completion: it is called once, the first time
     /// nothing is coming any more -- the index is ready, backing off, or gone
@@ -646,21 +668,10 @@ impl Graph {
                     if backing_off || !matches!(need, IndexNeed::Validate | IndexNeed::Fresh) {
                         continue;
                     }
-                    #[cfg(test)]
-                    self.page_build_test
-                        .owner_passes
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let settled = if need == IndexNeed::Fresh || std::mem::take(&mut escalate) {
-                        self.fresh_index_pass(&cancelled)
-                    } else {
-                        match self.warm_projection_cancellable(&cancelled) {
-                            WarmProjectionOutcome::Owned => true,
-                            WarmProjectionOutcome::Cancelled => return,
-                            WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => {
-                                escalate = !projection.validated();
-                                false
-                            }
-                        }
+                    let Some(settled) =
+                        self.index_pass(&projection, need, &mut escalate, &cancelled)
+                    else {
+                        return;
                     };
                     if cancelled() {
                         return;
@@ -669,6 +680,37 @@ impl Graph {
                         projection.note_unsettled_pass();
                     }
                 }
+            }
+        }
+    }
+
+    /// One whole-graph index pass for `need`, the only one there is: the
+    /// owner loop runs it, and so does a repair when no owner is registered
+    /// (the CLI, headless runs, tests). `Validate` walks the graph against
+    /// the stored revisions; `Fresh` -- or `escalate`, set when a validation
+    /// of an image never validated this session settled nothing -- builds and
+    /// offers the parsed snapshot. Whether the pass settled the need; `None`
+    /// when `cancelled`.
+    pub(super) fn index_pass(
+        &self,
+        projection: &crate::direct_projection::DirectProjection,
+        need: crate::direct_projection::IndexNeed,
+        escalate: &mut bool,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<bool> {
+        #[cfg(test)]
+        self.page_build_test
+            .owner_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if need == crate::direct_projection::IndexNeed::Fresh || std::mem::take(escalate) {
+            return Some(self.fresh_index_pass(cancelled));
+        }
+        match self.warm_projection_cancellable(cancelled) {
+            WarmProjectionOutcome::Owned => Some(true),
+            WarmProjectionOutcome::Cancelled => None,
+            WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => {
+                *escalate = !projection.validated();
+                Some(false)
             }
         }
     }
