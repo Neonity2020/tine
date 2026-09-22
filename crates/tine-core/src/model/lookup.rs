@@ -16,9 +16,9 @@ impl Graph {
     pub fn find_entry(&self, name: &str, kind: PageKind) -> Option<PageEntry> {
         let key = (kind, crate::refs::page_key(name));
         loop {
-            let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
             if let Some((g, index)) = self.find_entry_cache.read().unwrap().as_ref() {
-                if *g == gen && index.has_kind(kind) {
+                if *g == generation && index.has_kind(kind) {
                     return index.entries.get(&key).cloned();
                 }
             }
@@ -59,7 +59,7 @@ impl Graph {
             let found = {
                 let mut guard = self.find_entry_cache.write().unwrap();
                 match guard.as_mut() {
-                    Some((g, index)) if *g == gen => {
+                    Some((g, index)) if *g == generation => {
                         if !index.has_kind(kind) {
                             index.entries.extend(built.entries);
                             index.mark_kind_loaded(kind);
@@ -68,12 +68,12 @@ impl Graph {
                     }
                     _ => {
                         let found = built.entries.get(&key).cloned();
-                        *guard = Some((gen, built));
+                        *guard = Some((generation, built));
                         found
                     }
                 }
             };
-            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == gen {
+            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
                 return found;
             }
         }

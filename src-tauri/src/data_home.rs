@@ -107,7 +107,9 @@ pub(crate) fn ensure_usable(identifier: &str) {
         if probe_writable(&candidate, identifier).is_err() {
             continue;
         }
-        std::env::set_var("XDG_DATA_HOME", &candidate);
+        // SAFETY: `run` calls `ensure_usable` before Tauri, GTK or any Tine
+        // thread starts, so no other thread can be reading the environment.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &candidate) };
         diag(format!(
             "app-data home relocated to {} for this launch",
             candidate.display()

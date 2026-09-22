@@ -6,16 +6,16 @@ use super::*;
 impl Graph {
     /// List all pages and journals in the graph.
     pub fn list_pages(&self) -> Vec<PageEntry> {
-        let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         if let Some((g, entries)) = self.page_list_cache.read().unwrap().as_ref() {
-            if *g == gen {
+            if *g == generation {
                 return entries.clone();
             }
         }
         // R6: a ready projection already holds the effective inventory; the
         // whole-graph parse below is the not-ready fallback.
-        if let Some((gen, entries)) = self.direct_projection_page_inventory() {
-            *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
+        if let Some((generation, entries)) = self.direct_projection_page_inventory() {
+            *self.page_list_cache.write().unwrap() = Some((generation, entries.clone()));
             return entries;
         }
         // Cold inventory used to run its own whole-graph parse, independently
@@ -38,7 +38,7 @@ impl Graph {
                     .map(|(entry, _)| entry.clone())
                     .collect::<Vec<_>>()
             })
-        } else if let Some(entries) = self.cached_inventory_with_failures_revalidated(gen) {
+        } else if let Some(entries) = self.cached_inventory_with_failures_revalidated(generation) {
             entries
         } else {
             match self.exact_page_inventory_from_disk() {
@@ -47,7 +47,7 @@ impl Graph {
             }
         };
         if self.answer_is_complete() {
-            *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
+            *self.page_list_cache.write().unwrap() = Some((generation, entries.clone()));
         }
         entries
     }

@@ -4,7 +4,7 @@
 use super::*;
 
 pub(super) struct DerivedCache {
-    pub(super) gen: u64,
+    pub(super) generation: u64,
     pub(super) today: i64,
     /// The parse configuration under which the reference results were built.
     /// A mismatch drops the whole cache.

@@ -140,7 +140,9 @@ pub(crate) fn debug_header() {
 
 pub(crate) fn install_panic_logger() {
     if debug_enabled() && std::env::var_os("RUST_BACKTRACE").is_none() {
-        std::env::set_var("RUST_BACKTRACE", "1");
+        // SAFETY: `run` installs the panic logger before Tauri, GTK or any Tine
+        // thread starts, so no other thread can be reading the environment.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

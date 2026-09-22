@@ -176,13 +176,16 @@ impl Graph {
         compute: impl FnOnce() -> Result<(DerivedEntry, bool), E>,
     ) -> Result<DerivedEntry, E> {
         use std::sync::atomic::Ordering;
-        let gen = self.cache_gen.load(Ordering::Acquire);
+        let generation = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
         let config_digest = self.config.parse_config().digest();
         {
             let mut g = self.derived_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {
-                if dc.gen == gen && dc.today == today && dc.config_digest == config_digest {
+                if dc.generation == generation
+                    && dc.today == today
+                    && dc.config_digest == config_digest
+                {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
                         touch_lru(&mut dc.lru, &key);
@@ -202,7 +205,11 @@ impl Graph {
         }
         let mut g = self.derived_cache.write().unwrap();
         match g.as_mut() {
-            Some(dc) if dc.gen == gen && dc.today == today && dc.config_digest == config_digest => {
+            Some(dc)
+                if dc.generation == generation
+                    && dc.today == today
+                    && dc.config_digest == config_digest =>
+            {
                 if let Some((_, old_bytes)) = dc
                     .results
                     .insert(key.clone(), (result.clone(), result_bytes))
@@ -217,7 +224,7 @@ impl Graph {
                 let mut results = std::collections::HashMap::new();
                 results.insert(key.clone(), (result.clone(), result_bytes));
                 *g = Some(DerivedCache {
-                    gen,
+                    generation,
                     today,
                     config_digest,
                     results,

@@ -558,7 +558,9 @@ pub fn run() {
     if std::env::var("TINE_GPU").as_deref() == Ok("0")
         && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
     {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // SAFETY: `run` calls this before Tauri, GTK or any Tine thread starts,
+        // so no other thread can be reading the environment.
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
         diag("TINE_GPU=0 → set WEBKIT_DISABLE_DMABUF_RENDERER=1 (software compositing)");
     }
 

@@ -141,7 +141,8 @@ impl QueryRankPrograms {
     pub(crate) fn function(
         &self,
         cancellation: PhysicalProjectionQueryCancellation,
-    ) -> impl Fn(u64, &str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + 'static {
+    ) -> impl Fn(u64, &str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + 'static + use<>
+    {
         let bindings = self.bindings.clone();
         move |id, text| {
             if cancellation.is_cancelled() {
@@ -170,7 +171,8 @@ impl QueryRankPrograms {
     #[cfg(test)]
     pub(crate) fn uncancelled_function(
         &self,
-    ) -> impl Fn(u64, &str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + 'static {
+    ) -> impl Fn(u64, &str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + 'static + use<>
+    {
         let bindings = self.bindings.clone();
         move |id, text| {
             let Some(program) = id.checked_sub(1).and_then(|at| bindings.get(at as usize)) else {

@@ -1145,7 +1145,7 @@ impl PortableListing {
     fn sharing_identity_with<'a>(
         &'a self,
         component: &str,
-    ) -> impl Iterator<Item = &'a (String, cap_std::fs::FileType)> + 'a {
+    ) -> impl Iterator<Item = &'a (String, cap_std::fs::FileType)> + use<'a> {
         self.by_identity
             .get(&PortablePathKey::from_graph_text_path(component))
             .into_iter()

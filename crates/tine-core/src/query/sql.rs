@@ -213,7 +213,7 @@ impl QueryRegexProgram {
     /// (§5.9's recovery), never a silently smaller result set.
     pub(crate) fn predicate(
         &self,
-    ) -> impl Fn(u64, &str) -> Result<bool, MaterializationError> + Send + 'static {
+    ) -> impl Fn(u64, &str) -> Result<bool, MaterializationError> + Send + 'static + use<> {
         let table: Arc<HashMap<u64, regex::Regex>> = Arc::new(
             self.bindings
                 .iter()

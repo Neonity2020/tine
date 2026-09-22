@@ -1397,7 +1397,7 @@ impl Graph {
             });
             dc.bytes = dc.bytes.saturating_sub(removed_bytes);
             dc.lru.retain(|key| dc.results.contains_key(key));
-            dc.gen = newgen; // survivors are valid for the post-bump generation
+            dc.generation = newgen; // survivors are valid for the post-bump generation
         }
     }
 
