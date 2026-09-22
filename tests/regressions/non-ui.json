@@ -5387,7 +5387,7 @@
    "crates/tine-core/src/config.rs::a_change_reaches_the_graph_only_through_a_graph_field",
    "crates/tine-core/src/config.rs::a_settings_field_is_not_copied_at_open_or_into_the_index",
    "crates/tine-core/src/config.rs::a_setting_written_through_the_graph_is_the_one_it_reads",
-   "src/instanceReplacement.test.ts::keeps the binding for a presentation-only setting (GH #543)"
+   "src/instanceReplacement.test.ts::keeps the binding for a settings change (GH #543)"
   ],
   "scenario": null,
   "failBefore": "proven"
@@ -5597,6 +5597,60 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 2, R2-02 (cold parse) and R2-05 (warm validation). Both whole-graph passes discarded their work when any page was saved or deleted while they read, so the next reader read and parsed the whole graph again. Both now take one account of what changed since they read (Graph::drift_since over a StructuralGeneration whose counter moves only through record(Removed(paths)) or record(Unnamed)): changed pages are parsed again, removed pages are dropped, and only an unnamed change discards the pass. Fail-before on 6c4d5e2e: the cold pass was discarded for one edit, and the warm validation parsed 4 surviving pages after one delete. Evidence: tine-agents/evidence/gh550-batch/r205-fail-before.log."
+},
+{
+ "id": "REG-UNREADABLE-GRAPH-EXPORT-IS-AN-ERROR-543",
+ "title": "Exporting or printing a graph whose files cannot be read reports that, instead of exporting an empty graph or saying the page does not exist",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/publish_tests.rs::an_unreadable_graph_is_an_error_to_publish_and_print_not_an_empty_graph"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 2, BY6.1. Graph::list_pages is the display listing: an unreadable graph (admission failure) lists nothing. Publication source capture, PDF print, the rename/delete outside-root check and the CLI doctor acted on that listing; they now use Graph::try_list_pages, which returns the error. The display listing also memoized the empty answer; neither a failed nor a retired-graph answer is memoized now. All 13 production list_pages callers were reviewed; the remaining ones display, or read a publication snapshot whose cache is preinstalled. Fail-before on 01843ec7: publication capture returned Ok(empty) on a symlinked root. Evidence: tine-agents/evidence/gh550-batch/by61-fail-before.log."
+},
+{
+ "id": "REG-ONE-FULL-SNAPSHOT-IS-VALIDATED-ONCE-543",
+ "title": "Opening a graph validates its search index against the parsed pages once, not twice",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/direct_projection_tests.rs::the_same_full_snapshot_offered_twice_is_taken_once"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 2, BY6.2. attach_direct_projection seeds the projection with the installed parsed cache, and install_built offers the same snapshot after publishing it; when the attach landed between the two, the projection took both, re-validated the whole image a second time and dropped readiness meanwhile, so queries fell back to parsing. DirectProjection::enqueue_full now remembers the accepted snapshot (generation + identity) and takes a repeated offer once, unless a rebuild is pending, a newer generation is queued, or the worker failed. Fail-before on 01843ec7: the repeated offer dropped readiness. Evidence: tine-agents/evidence/gh550-batch/by62-fail-before.log."
+},
+{
+ "id": "REG-CONFIG-WATCHER-SEES-WHAT-WAS-NOT-TAKEN-IN-543",
+ "title": "An outside config.edn change reaches the running graph even when it was folded into Tine's own settings write or reverts to the bytes the graph opened with",
+ "family": "config-live-reload",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/config.rs::the_watcher_gate_matches_disk_only_when_disk_was_taken_in"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 2, BY6.3. The watcher skipped config.edn when disk matched the bytes the graph opened with or the bytes it last wrote. A graph-reaching outside change folded into Tine's own read-modify-write matched the last write, and an outside revert matched the opening bytes, so both were never taken in. The gate is now one digest, Graph::served_config_description, of the bytes the served configuration was taken from; a change that reaches the graph never updates it. Fail-before on 01843ec7 (old gate shimmed): both cases read as unchanged. Evidence: tine-agents/evidence/gh550-batch/by63-fail-before.log."
 }
 ]
 }

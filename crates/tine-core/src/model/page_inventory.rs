@@ -4,19 +4,31 @@
 use super::*;
 
 impl Graph {
-    /// List all pages and journals in the graph.
+    /// List all pages and journals in the graph, for display: a graph whose
+    /// text cannot be read lists nothing. A caller that acts on the listing
+    /// (exports it, checks a name against it) uses [`Graph::try_list_pages`].
     pub fn list_pages(&self) -> Vec<PageEntry> {
+        self.page_listing(false).unwrap_or_default()
+    }
+
+    /// [`Graph::list_pages`] for a caller that acts on the listing: a graph
+    /// whose text cannot be read is an error, never an empty graph.
+    pub fn try_list_pages(&self) -> io::Result<Vec<PageEntry>> {
+        self.page_listing(true)
+    }
+
+    fn page_listing(&self, exact: bool) -> io::Result<Vec<PageEntry>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         if let Some((g, entries)) = self.page_list_cache.read().unwrap().as_ref() {
             if *g == generation {
-                return entries.clone();
+                return Ok(entries.clone());
             }
         }
         // R6: a ready projection already holds the effective inventory; the
         // whole-graph parse below is the not-ready fallback.
         if let Some((generation, entries)) = self.direct_projection_page_inventory() {
             *self.page_list_cache.write().unwrap() = Some((generation, entries.clone()));
-            return entries;
+            return Ok(entries);
         }
         // Cold inventory used to run its own whole-graph parse, independently
         // of the page-build flight used by templates, queries and background
@@ -31,25 +43,33 @@ impl Graph {
         // unreadable, so joining it here would republish exactly the stale
         // entry that mechanism exists to drop. Cold open has no failures, so
         // it keeps the shared flight.
+        //
+        // A graph whose text cannot be read, or a display read on a retired
+        // graph, lists nothing for display and is an error to an acting
+        // caller; neither answer is memoized, so it cannot outlive its cause.
         let entries = if self.page_index_failures.read().unwrap().is_empty() {
-            self.with_pages(|pages| {
-                pages
-                    .iter()
-                    .map(|(entry, _)| entry.clone())
-                    .collect::<Vec<_>>()
-            })
+            match self.page_snapshot(!exact) {
+                Ok(Some(pages)) => pages.iter().map(|(entry, _)| entry.clone()).collect(),
+                Ok(None) => return Ok(Vec::new()),
+                Err(error) if exact => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            }
         } else if let Some(entries) = self.cached_inventory_with_failures_revalidated(generation) {
             entries
         } else {
             match self.exact_page_inventory_from_disk() {
                 Some(entries) => entries,
-                None => return Vec::new(),
+                None => {
+                    return Err(io::Error::other(
+                        "the graph's page folders could not be read",
+                    ))
+                }
             }
         };
         if self.answer_is_complete() {
             *self.page_list_cache.write().unwrap() = Some((generation, entries.clone()));
         }
-        entries
+        Ok(entries)
     }
 
     /// The listing after a known parse failure, from the parsed cache: its

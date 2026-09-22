@@ -1435,21 +1435,13 @@ fn refresh_changed_configs(
         let Ok(slot) = slot_for_window(&state, label) else {
             continue;
         };
-        // A Direct graph carries a digest of the exact bytes it was opened
-        // with, so this costs nothing after Tine's own settings write: that
-        // command already refreshed the slot, and the reopened graph matches
-        // disk. Skipping here is what keeps a settings toggle from paying for
-        // a second whole-graph reopen -- which discards every cache the graph
-        // has built.
+        // The graph knows which bytes its configuration was taken from, so
+        // Tine's own settings write (already taken in) and a redelivery of
+        // identical bytes cost nothing here. Anything it has not taken in --
+        // including an outside change folded into Tine's own write, or an
+        // outside revert to the bytes it was opened with -- differs.
         let disk = tine_core::model::config_file_description(root);
-        let unchanged = {
-            let lease = slot.graph();
-            // Either the graph was opened with these exact bytes, or it
-            // published them itself. The second case is what keeps a star
-            // toggled in the sidebar from reading as an outside change.
-            lease.open_config_description() == disk || lease.recent_config_write() == disk
-        };
-        if unchanged {
+        if slot.graph().served_config_description() == disk {
             continue;
         }
         let before = slot.graph_meta();

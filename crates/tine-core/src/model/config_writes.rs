@@ -29,9 +29,9 @@ impl Graph {
     /// Publish one configuration edit.
     ///
     /// Every setter goes through here rather than calling `atomic_update`
-    /// directly, so a self-write is always recorded. Without that record the
-    /// configuration watcher cannot tell Tine's own settings write from an
-    /// outside one, and every star toggled in the sidebar would cost a
+    /// directly, so a self-write is always taken in. Without that the
+    /// configuration watcher would see disk differ from the served
+    /// configuration, and every star toggled in the sidebar would cost a
     /// whole-graph reopen — which discards every cache the graph has built.
     fn write_config(
         &self,
@@ -39,7 +39,6 @@ impl Graph {
         edit: impl Fn(&str) -> io::Result<String>,
     ) -> io::Result<()> {
         crate::filesystem_durability::atomic_update(path, &CONFIG_LOCK, edit)?;
-        self.note_config_write();
         // A setting is read when it is used, so it applies now; a change that
         // reaches the graph waits for the caller to open a new one.
         self.take_in_config();

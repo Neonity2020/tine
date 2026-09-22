@@ -434,7 +434,9 @@ impl Graph {
             reconciliation_scan_open_config_description: config_bytes
                 .as_deref()
                 .map(BlobDescription::of),
-            recent_config_write: RwLock::new(None),
+            served_config_description: RwLock::new(
+                config_bytes.as_deref().map(BlobDescription::of),
+            ),
             graph_text_admission_instance,
             guarded_graph_text_identity: RwLock::new(GuardedGraphTextIdentityState {
                 observed_resource_epoch: guarded_resource_epoch,

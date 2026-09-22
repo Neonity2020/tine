@@ -70,6 +70,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Exporting, printing, or renaming/deleting on a graph whose files cannot be
+  read now reports that, instead of exporting an empty site or saying the page
+  does not exist (GH #543).
+
+- Opening a graph no longer validates its search index twice when the index
+  attaches just as the page read finishes; meanwhile searches fell back to
+  parsing the whole graph (GH #543).
+
+- An outside change to `config.edn` is now always picked up: one folded into a
+  setting Tine was saving at the same moment, or one that restored the file to
+  how it was when the graph opened, used to be ignored until restart (GH #543).
+
 - Changing the home page or the format for new pages, or an outside edit to
   a setting in `config.edn`, reopened the graph and restarted indexing. On
   the first launch after upgrading, moving a home page set on this device

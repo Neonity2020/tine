@@ -839,7 +839,7 @@ impl Graph {
                 ),
             ));
         }
-        if self.list_pages().iter().any(|entry| {
+        if self.try_list_pages()?.iter().any(|entry| {
             entry.kind == kind
                 && crate::refs::same_page(&entry.name, name)
                 && self

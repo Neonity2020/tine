@@ -405,7 +405,7 @@ impl Graph {
 
     /// The parsed page set, building it on first use. `None` only for a
     /// display read on a retired graph, which must not parse it.
-    fn page_snapshot(
+    pub(super) fn page_snapshot(
         &self,
         display: bool,
     ) -> io::Result<Option<Arc<Vec<(PageEntry, Arc<Document>)>>>> {

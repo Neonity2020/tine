@@ -10011,3 +10011,37 @@ fn gh543_a_delete_during_the_warm_validation_parses_nothing() {
     assert!(survivors > 0);
     assert_eq!(parses, 0, "the delete discarded the warm validation");
 }
+
+/// Attach seeds the projection with the installed parsed cache, and the build
+/// that installed it offers the same snapshot. The projection must take that
+/// snapshot once: a second acceptance re-validates the whole graph and drops
+/// readiness meanwhile, so queries fall back to parsing (GH #543 round 2).
+#[test]
+fn the_same_full_snapshot_offered_twice_is_taken_once() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("same-full-snapshot-once");
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    let snapshot = graph.installed_page_snapshot_test().expect("warm cache");
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+    projection.reset_projection_health_checks_test();
+
+    let (_, revisions, config) = parsed_snapshot(&graph);
+    projection.enqueue_full(graph.cache_generation(), snapshot, revisions, config, true);
+    assert!(
+        projection.ready_at(graph.cache_generation()),
+        "a repeated offer must not reopen a not-ready window"
+    );
+    wait_ready(&graph);
+    assert_eq!(
+        projection.projection_health_checks_test(),
+        0,
+        "a repeated offer must not re-validate the whole image"
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
+}

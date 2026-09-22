@@ -77,9 +77,9 @@ describe("config live-reload contract matches the source", () => {
   });
 
   it("names the two digests the cheapness gate compares", () => {
-    expect(reload).toContain("`Graph::open_config_description()`");
+    expect(reload).toContain("`Graph::served_config_description()`");
     expect(reload).toContain("`model::config_file_description(root)`");
-    expect(model).toContain("pub fn open_config_description(&self)");
+    expect(model).toContain("pub fn served_config_description(&self)");
     expect(model).toContain("pub fn config_file_description(root: &Path)");
   });
 
@@ -100,7 +100,7 @@ describe("config live-reload contract matches the source", () => {
     expect(funnelStart).toBeGreaterThan(-1);
     const funnel = model.slice(funnelStart, model.indexOf("\n    }\n", funnelStart));
     expect(funnel).toMatch(/\batomic_update\(path, &CONFIG_LOCK\b/);
-    expect(watcher).toContain("lease.recent_config_write() == disk");
+    expect(watcher).toContain("slot.graph().served_config_description() == disk");
   });
 
   it("keeps GraphMeta comparable, which is what suppresses a no-op announcement", () => {

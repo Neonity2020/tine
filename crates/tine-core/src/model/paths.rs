@@ -52,19 +52,12 @@ impl Graph {
         self.reconciliation_scan_open_config_description
     }
 
-    /// Digest of the configuration bytes this instance last wrote, if any.
-    ///
-    /// `None` on an instance that has published nothing — including every
-    /// short-lived capability, whose refresh is cheap enough not to
-    /// need the distinction.
-    pub fn recent_config_write(&self) -> Option<BlobDescription> {
-        *self.recent_config_write.read().unwrap()
-    }
-
-    /// Record what a configuration write just published. Called by the one
-    /// funnel every setter goes through (`Graph::write_config`).
-    pub(crate) fn note_config_write(&self) {
-        *self.recent_config_write.write().unwrap() = config_file_description(&self.root);
+    /// Digest of the `config.edn` bytes the configuration this instance
+    /// serves was taken from (`None`: no readable file). Equal to
+    /// [`config_file_description`] exactly when disk holds nothing this
+    /// instance has not taken in, which is the watcher's reason to do nothing.
+    pub fn served_config_description(&self) -> Option<BlobDescription> {
+        *self.served_config_description.read().unwrap()
     }
 
     /// The configuration as last taken in.
@@ -83,6 +76,7 @@ impl Graph {
     /// a new `Graph`, which is the only way that change is taken in.
     pub fn take_in_config(&self) -> crate::config::ConfigReach {
         let bytes = fs::read(reconciliation_scan_config_path_at_open(&self.root)).ok();
+        let description = bytes.as_deref().map(BlobDescription::of);
         let new = bytes
             .as_deref()
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
@@ -92,6 +86,9 @@ impl Graph {
         let reach = current.reach(&new);
         if reach == crate::config::ConfigReach::Settings {
             *current = Arc::new(new);
+        }
+        if reach != crate::config::ConfigReach::Graph {
+            *self.served_config_description.write().unwrap() = description;
         }
         reach
     }

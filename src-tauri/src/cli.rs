@@ -321,7 +321,9 @@ fn doctor(path: &Path) -> CliResult<()> {
         return Err(format!("graph is not a directory: {}", root.display()).into());
     }
     let graph = Graph::open(&root);
-    let pages = graph.list_pages();
+    let pages = graph
+        .try_list_pages()
+        .map_err(|error| format!("cannot list pages of {}: {error}", root.display()))?;
     let failures = graph.page_index_failures();
     let mut identities: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for page in &pages {

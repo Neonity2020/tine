@@ -39,21 +39,23 @@ A refresh discards the entire page cache, and Logseq rewrites `config.edn` on
 many ordinary UI actions while Syncthing redelivers it on every peer change. A
 byte-identity gate is therefore **mandatory, not an optimization**.
 
-`Graph::open_config_description()` is a digest of the bytes the running instance
-was opened with; `model::config_file_description(root)` digests what is on disk
-now. A Direct graph refreshes only when they differ — which also means a
-settings write Tine performed itself costs nothing here, because the command
-already refreshed and the reopened graph matches disk.
+`Graph::served_config_description()` is a digest of the bytes the served
+configuration was taken from: the bytes the instance was opened with, then
+whatever `Graph::take_in_config` last took in. `model::config_file_description(root)`
+digests what is on disk now. The watcher does nothing when they are equal, and
+otherwise asks `take_in_config`, whose `ConfigReach` decides: `Unchanged` and
+`Settings` are taken in by the running graph, `Graph` reopens it.
 
-`Graph::recent_config_write()` is the second half of the same gate. A setting
-Tine writes itself leaves the running graph's *parsed* view stale — it always
-has, and `set_favorites` in particular never refreshed — so the open-time digest
-alone would read every star toggled in the sidebar as an outside change.
 `Graph::write_config` is therefore the single funnel every setter publishes
-through, and it records what it wrote.
+through, and it takes in what it wrote, so a star toggled in the sidebar costs
+no reopen. A change that reaches the graph is never taken in, so it leaves the
+digest behind: an outside change folded into Tine's own read-modify-write still
+reopens, and an outside revert to the opening bytes still reads as a change.
+(Two earlier digests — the open-time bytes and the last bytes written — each
+missed one of those.)
 
 Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`,
-`config::tests::a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change`
+`config::tests::the_watcher_gate_matches_disk_only_when_disk_was_taken_in`
 and `config::tests::only_the_graph_s_own_config_edn_is_recognized_as_configuration`.
 
 ## 4. What reaches the frontend

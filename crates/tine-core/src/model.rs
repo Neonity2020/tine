@@ -317,12 +317,12 @@ pub struct Graph {
     /// configured text roots. A scan must require a fresh Graph when the case-insensitive
     /// on-disk config path no longer has this description.
     reconciliation_scan_open_config_description: Option<BlobDescription>,
-    /// Digest of the configuration bytes THIS instance last published.
-    ///
-    /// The watcher cannot otherwise tell Tine's own settings write from an
-    /// outside one, and would reopen the whole graph — discarding every cache
-    /// it has built — every time the user toggles a star.
-    recent_config_write: RwLock<Option<BlobDescription>>,
+    /// Digest of the `config.edn` bytes the served configuration was taken
+    /// from: the bytes opened with, then whatever `take_in_config` last took
+    /// in. A change that reaches the graph is not taken in, so it leaves this
+    /// as it was, and the watcher keeps seeing disk differ until a new graph
+    /// takes it in.
+    served_config_description: RwLock<Option<BlobDescription>>,
     /// Unforgeable identity of this exact Graph instance. Reopening the same
     /// resource intentionally produces a different token.
     graph_text_admission_instance: Arc<GraphTextAdmissionInstance>,

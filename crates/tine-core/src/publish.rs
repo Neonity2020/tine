@@ -2725,7 +2725,7 @@ pub fn page_print_html(
     name: &str,
     opts: PrintOpts,
 ) -> Result<Option<String>, PrintPreparationError> {
-    let Some(entry) = graph.list_pages().into_iter().find(|e| e.name == name) else {
+    let Some(entry) = graph.try_list_pages()?.into_iter().find(|e| e.name == name) else {
         return Ok(None);
     };
     let content = fs::read_to_string(&entry.path)?;
@@ -3316,7 +3316,7 @@ pub(crate) fn capture_direct_publication_sources(
 )> {
     let mut pages = Vec::new();
     let mut sources = Vec::new();
-    for listed in graph.list_pages() {
+    for listed in graph.try_list_pages()? {
         let content = fs::read_to_string(&listed.path)?;
         let (entry, mut document, revision) =
             crate::model::parse_exact_page(graph, &listed, &content)?;

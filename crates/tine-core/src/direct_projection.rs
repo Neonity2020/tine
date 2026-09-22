@@ -230,6 +230,13 @@ struct PendingProjection {
     // Each capture owns one slot from the shared two-job cap.
     captures: Vec<PendingQueryCapture>,
     full: Option<PendingFull>,
+    /// The last full snapshot accepted, by generation and identity. The same
+    /// snapshot offered again at the same generation is the same work, and is
+    /// taken once: attach seeds the parsed cache, and the build that installed
+    /// that cache offers it too, so without this the second offer re-ran the
+    /// whole-graph validation and reopened a not-ready window in which every
+    /// query fell back to parsing (GH #543).
+    accepted_full: Option<(u64, std::sync::Weak<Vec<(PageEntry, Arc<Document>)>>)>,
     rebuild: bool,
     deltas: BTreeMap<String, (u64, PageDelta)>,
     latest_generation: u64,
@@ -1171,6 +1178,29 @@ impl DirectProjection {
             });
             return;
         }
+        let already_accepted =
+            pending
+                .accepted_full
+                .as_ref()
+                .is_some_and(|(accepted, snapshot)| {
+                    *accepted == generation
+                        && snapshot
+                            .upgrade()
+                            .is_some_and(|snapshot| Arc::ptr_eq(&snapshot, &pages))
+                });
+        if already_accepted
+            && !pending.rebuild
+            && generation == pending.latest_generation
+            && !self.shared.worker_failed.load(Ordering::Acquire)
+        {
+            projection_diag(|| {
+                format!(
+                    "full ignored: this snapshot was already accepted at generation={generation}"
+                )
+            });
+            return;
+        }
+        pending.accepted_full = Some((generation, Arc::downgrade(&pages)));
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));

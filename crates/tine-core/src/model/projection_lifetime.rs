@@ -28,6 +28,15 @@ impl Graph {
         Ok(())
     }
 
+    /// The parsed page set, if one is installed, as the very snapshot the
+    /// projection was offered.
+    #[cfg(test)]
+    pub(crate) fn installed_page_snapshot_test(
+        &self,
+    ) -> Option<Arc<Vec<(PageEntry, Arc<Document>)>>> {
+        self.cache.read().unwrap().as_ref().map(Arc::clone)
+    }
+
     /// Detach the Direct Files projection and wait for its writer to exit.
     ///
     /// A configuration refresh reopens the same root and attaches a projection

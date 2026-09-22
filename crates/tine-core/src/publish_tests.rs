@@ -3458,3 +3458,34 @@ fn query_export_without_an_embedded_frontend_warns_and_ships_no_app() {
     assert!(!dir.join("published-queries/broken").exists());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[cfg(unix)]
+/// A graph whose text cannot be admitted (here: opened through a symlinked
+/// root) lists no pages for display. An export or a print acts on that listing,
+/// so it must report the graph as unreadable rather than export an empty site
+/// or say the page does not exist (GH #543 round 2).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_graph_is_an_error_to_publish_and_print_not_an_empty_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("pages")).unwrap();
+    std::fs::write(real.join("pages/P.md"), "public:: true\n\n- hello\n").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut graph = Graph::open(&link);
+    graph.config_mut().all_pages_public = true;
+
+    assert!(graph.list_pages().is_empty(), "display listing stays empty");
+    assert!(graph.try_list_pages().is_err());
+    let sources = capture_direct_publication_sources(&graph);
+    assert!(
+        sources.is_err(),
+        "publication must not capture an empty graph"
+    );
+    let printed = graph.page_print_html("P", PrintOpts::default());
+    assert!(
+        matches!(printed, Err(PrintPreparationError::Io(_))),
+        "print must report the unreadable graph, not a missing page: {printed:?}"
+    );
+}

@@ -1697,12 +1697,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
     }
 
-    /// The other half of the watcher's economy. A settings write leaves the
-    /// running graph's parsed view stale (it always has), so the byte gate
-    /// alone would read every star toggled in the sidebar as an outside change
-    /// and reopen the whole graph — discarding every cache it has built.
+    /// The watcher does nothing exactly when disk holds the bytes the served
+    /// configuration was taken from. Tine's own settings write is taken in, so
+    /// a star toggled in the sidebar costs no reopen; anything not taken in
+    /// must differ, or the running graph serves stale configuration.
     #[test]
-    fn a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change() {
+    fn the_watcher_gate_matches_disk_only_when_disk_was_taken_in() {
         let dir = std::env::temp_dir().join(format!(
             "tine-config-selfwrite-{}-{:?}",
             std::process::id(),
@@ -1710,34 +1710,55 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logseq")).unwrap();
-        std::fs::write(dir.join("logseq").join("config.edn"), "{}\n").unwrap();
+        let config = dir.join("logseq").join("config.edn");
+        std::fs::write(&config, "{}\n").unwrap();
+        let disk = || crate::model::config_file_description(&dir);
 
         let g = crate::model::Graph::open(&dir);
-        assert_eq!(g.recent_config_write(), None, "nothing published yet");
+        assert_eq!(
+            g.served_config_description(),
+            disk(),
+            "opened with these bytes"
+        );
 
         g.set_favorites(&["Alpha".to_owned()]).unwrap();
-        let disk = crate::model::config_file_description(&dir);
-
-        assert_ne!(
-            g.open_config_description(),
-            disk,
-            "the parsed view is stale after a write, as it has always been"
-        );
         assert_eq!(
-            g.recent_config_write(),
-            disk,
-            "but the bytes on disk are the ones this instance published"
+            g.served_config_description(),
+            disk(),
+            "Tine's own settings write is taken in"
         );
 
         // An outside edit after our own write is still an outside edit.
-        std::fs::write(
-            dir.join("logseq").join("config.edn"),
-            "{:favorites [\"Alpha\" \"AddedInLogseq\"]}\n",
-        )
-        .unwrap();
-        let disk = crate::model::config_file_description(&dir);
-        assert_ne!(g.open_config_description(), disk);
-        assert_ne!(g.recent_config_write(), disk);
+        std::fs::write(&config, "{:favorites [\"Alpha\" \"AddedInLogseq\"]}\n").unwrap();
+        assert_ne!(g.served_config_description(), disk());
+
+        // An outside revert to the bytes the graph was opened with: the served
+        // configuration still has Alpha, so this is a change.
+        std::fs::write(&config, "{}\n").unwrap();
+        assert_ne!(
+            g.served_config_description(),
+            disk(),
+            "a revert to the opening bytes is a change to what is served"
+        );
+        g.take_in_config();
+        assert!(g.config().favorites.is_empty());
+        assert_eq!(g.served_config_description(), disk());
+
+        // An outside change that reaches the graph, folded into Tine's own
+        // settings write: the write cannot take it in, so disk must still
+        // differ and the watcher must reopen.
+        std::fs::write(&config, "{:pages-directory \"notes\"}\n").unwrap();
+        g.set_favorites(&["Beta".to_owned()]).unwrap();
+        assert_ne!(
+            g.served_config_description(),
+            disk(),
+            "a folded change that reaches the graph is not taken in"
+        );
+        assert_eq!(
+            g.take_in_config(),
+            crate::config::ConfigReach::Graph,
+            "and the watcher's own take-in says it needs a new graph"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
