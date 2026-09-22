@@ -22,7 +22,7 @@ impl Graph {
                     revisions,
                     Arc::new(self.config().parse_config()),
                     self.page_index_failures.read().unwrap().is_empty(),
-                    self.unreadable_pages(),
+                    self.unread_sources(),
                 );
             }
         });
@@ -89,8 +89,12 @@ impl Graph {
         if projection.ready_at(generation) {
             return None;
         }
-        // Between passes: a queued snapshot or an announced warm is still
-        // graph-sized work, so keep the bar up rather than flicker it off.
+        // Between passes: a queued snapshot or an owner's coming pass is
+        // still graph-sized work, so keep the bar up rather than flicker it
+        // off. A backoff is not: nothing runs until it ends.
+        if projection.backing_off() {
+            return None;
+        }
         match projection.progress_at(generation) {
             ProjectionProgress::Working(Reason::Recovering | Reason::Indexing) => {
                 Some(IndexingProgress::unmeasured(IndexingPhase::Indexing))
@@ -193,11 +197,11 @@ impl Graph {
     /// the rebuild latched with nothing to ride in on and every later capture
     /// refused for the lifetime of the graph.
     ///
-    /// `offer` says who is offering. While a warm is in flight only its owner
-    /// may: a page consumer that built the cache inside the warm (an asset
-    /// listing, a whole-graph read) used to offer a full snapshot that
+    /// `offer` says who is offering. While index work is coming only its
+    /// owner may: a page consumer that built the cache inside the warm (an
+    /// asset listing, a whole-graph read) used to offer a full snapshot that
     /// superseded the warm's cheap validation with a complete rebuild
-    /// (GH #543, audit R4-04). The warm offers what was installed when it
+    /// (GH #543, audit R4-04). The owner offers what was installed when it
     /// finishes ([`Graph::offer_installed_cache`]).
     ///
     /// The outcome says whether the snapshot was refused. A caller whose
@@ -216,7 +220,7 @@ impl Graph {
         let Some(projection) = self.direct_projection.get() else {
             return FullOfferOutcome::NoIndex;
         };
-        if offer == FullOffer::Consumer && projection.warm_in_flight() {
+        if offer == FullOffer::Consumer && projection.coming() {
             crate::direct_projection::projection_diag(|| {
                 format!("full not offered at generation={generation}: a warm owns readiness")
             });
@@ -231,30 +235,39 @@ impl Graph {
         let retained = if source_complete {
             Vec::new()
         } else {
-            self.unreadable_pages()
+            self.unread_sources()
         };
-        projection.enqueue_full(
+        if projection.enqueue_full(
             generation,
             pages,
             revisions,
             Arc::new(self.config().parse_config()),
             source_complete,
             retained,
-        );
-        FullOfferOutcome::Queued
+        ) {
+            FullOfferOutcome::Queued
+        } else {
+            FullOfferOutcome::Outdated
+        }
     }
 
-    /// The pages the installed parsed cache could not read or parse that
-    /// still exist. The index keeps their stored rows; a failed page that is
-    /// gone is not listed, so its rows go.
-    fn unreadable_pages(&self) -> Vec<PageEntry> {
-        self.page_index_failures
-            .read()
-            .unwrap()
+    /// What the installed parsed cache could not read, list or parse and
+    /// still exists: pages and directories, as graph-relative paths, or `""`
+    /// when the graph itself could not be listed. The index keeps the stored
+    /// rows beneath them; a failed page that is gone is not listed, so its
+    /// rows go.
+    fn unread_sources(&self) -> Vec<String> {
+        let failures = self.page_index_failures.read().unwrap();
+        if failures
             .iter()
-            .map(|rel_path| self.root.join(rel_path))
-            .filter(|path| std::fs::symlink_metadata(path).is_ok())
-            .filter_map(|path| self.entry_for_path(&path))
+            .any(|failure| failure.starts_with(super::page_cache::GRAPH_TEXT_SCOPE_FAILURE))
+        {
+            return vec![String::new()];
+        }
+        failures
+            .iter()
+            .filter(|rel_path| std::fs::symlink_metadata(self.root.join(rel_path)).is_ok())
+            .cloned()
             .collect()
     }
 
@@ -263,7 +276,7 @@ impl Graph {
     /// it joined, or one a consumer installed while it ran and could not
     /// offer. The index takes an identical snapshot at one generation once
     /// and skips one it is already ready at.
-    pub(super) fn offer_installed_cache(&self) {
+    pub(super) fn offer_installed_cache(&self) -> FullOfferOutcome {
         let captured = {
             let cache = self.cache.read().unwrap();
             cache.as_ref().map(|pages| {
@@ -275,17 +288,18 @@ impl Graph {
                 )
             })
         };
-        if let Some((generation, pages, revisions, source_complete)) = captured {
-            // The warm owner is never refused for being a consumer.
-            let _ = self.direct_projection_enqueue_full(
-                generation,
-                pages,
-                revisions,
-                false,
-                source_complete,
-                FullOffer::WarmOwner,
-            );
-        }
+        let Some((generation, pages, revisions, source_complete)) = captured else {
+            return FullOfferOutcome::NoIndex;
+        };
+        // The warm owner is never refused for being a consumer.
+        self.direct_projection_enqueue_full(
+            generation,
+            pages,
+            revisions,
+            false,
+            source_complete,
+            FullOffer::WarmOwner,
+        )
     }
 
     pub(super) fn direct_projection_enqueue_replace(
@@ -345,19 +359,18 @@ impl Graph {
         }
     }
 
-    /// Announce the launch warm when it is scheduled rather than when its
-    /// thread reaches the first page read. The app delays that thread so the
-    /// first journal paint goes first, and the page list requested by that
-    /// same paint used to find no warm announced, parse every page, and queue
-    /// a full snapshot ahead of the warm (GH #543). Hand the returned value
-    /// to [`Graph::warm_cache_announced`], which ends it with the index
-    /// phase; a thread cancelled before then drops it, so a reader can never
-    /// wait on a warm nobody runs.
-    pub fn announce_launch_warm(&self) -> LaunchWarmAnnouncement {
-        LaunchWarmAnnouncement(
+    /// Register this graph's index owner when its thread is scheduled, not
+    /// when it starts. The app delays that thread so the first journal paint
+    /// goes first, and the page list requested by that same paint used to
+    /// find no warm announced, parse every page, and queue a full snapshot
+    /// ahead of the warm (GH #543). Hand the returned value to
+    /// [`Graph::run_index_owner`]; a thread cancelled before then drops it,
+    /// so a reader never waits on an owner nobody runs.
+    pub fn register_index_owner(&self) -> IndexOwner {
+        IndexOwner(
             self.direct_projection
                 .get()
-                .map(|projection| projection.begin_warm()),
+                .map(|projection| projection.register_owner()),
         )
     }
 
@@ -400,18 +413,25 @@ impl Graph {
             if self.is_retired() {
                 return None;
             }
-            let coming = match projection.progress_at(generation) {
-                // `Busy`: the worker has taken the queued warm or edit and is
-                // applying it.
-                ProjectionProgress::Working(Reason::Indexing | Reason::Busy) => true,
-                // An edit queued behind a turn -- today's journal and a save at
-                // launch, behind a slow disk -- lands on a validated image and
-                // readiness follows. Parsing the graph instead reads every page
-                // to answer what one delta settles. Before validation the edit
-                // waits for an inventory, so it is not by itself coming.
-                ProjectionProgress::Working(Reason::PendingEdits) => projection.validated(),
-                _ => false,
-            };
+            // With an index owner registered, whether work is coming is the
+            // one predicate the owner itself runs on: a rebuild it will run
+            // or a validation it owes is coming even before it starts, and a
+            // backoff is not. Parsing here instead reads every page to answer
+            // what that pass is about to settle (GH #543). Without an owner,
+            // only work already handed to the worker is coming.
+            let coming = projection.coming()
+                || match projection.progress_at(generation) {
+                    // `Busy`: the worker has taken the queued warm or edit and is
+                    // applying it.
+                    ProjectionProgress::Working(Reason::Indexing | Reason::Busy) => true,
+                    // An edit queued behind a turn -- today's journal and a save at
+                    // launch, behind a slow disk -- lands on a validated image and
+                    // readiness follows. Parsing the graph instead reads every page
+                    // to answer what one delta settles. Before validation the edit
+                    // waits for an inventory, so it is not by itself coming.
+                    ProjectionProgress::Working(Reason::PendingEdits) => projection.validated(),
+                    _ => false,
+                };
             let cached = self.cache.read().unwrap().is_some();
             if !coming || cached {
                 if projection.ready_at(generation) {
@@ -581,10 +601,8 @@ impl Graph {
     }
 }
 
-/// A scheduled launch warm; see `Graph::announce_launch_warm`.
-pub struct LaunchWarmAnnouncement(
-    #[allow(dead_code)] Option<crate::direct_projection::WarmInFlight>,
-);
+/// A registered index owner; see `Graph::register_index_owner`.
+pub struct IndexOwner(#[allow(dead_code)] Option<crate::direct_projection::IndexOwnerRegistration>);
 
 /// What became of a full snapshot offered to the index; see
 /// [`Graph::direct_projection_enqueue_full`].
@@ -597,8 +615,10 @@ pub(super) enum FullOfferOutcome {
     Queued,
     /// The index is already current at this generation.
     AlreadyCurrent,
-    /// A page consumer offered while a warm owns readiness.
+    /// A page consumer offered while index work is coming.
     RefusedDuringWarm,
+    /// The snapshot is older than the queue.
+    Outdated,
 }
 
 /// Who offers the index a full snapshot; see

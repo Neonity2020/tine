@@ -103,7 +103,7 @@ mod write_gate;
 pub use dto::*;
 use write_gate::*;
 mod projection_lifetime;
-pub use projection_lifetime::LaunchWarmAnnouncement;
+pub use projection_lifetime::IndexOwner;
 mod retired_files;
 use retired_files::*;
 mod queries;

@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// The page-index failure recorded when the graph's text scope itself could
+/// not be listed: nothing under it was read.
+pub(super) const GRAPH_TEXT_SCOPE_FAILURE: &str = "graph-text-scope: ";
+
 /// What `warm_projection_cancellable` achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WarmProjectionOutcome {
@@ -36,6 +40,8 @@ impl Graph {
     }
 
     /// The page inventory plus the entries the read walk skipped (GH #332).
+    /// A listing failure is recorded as one failure naming the whole scope
+    /// ([`GRAPH_TEXT_SCOPE_FAILURE`]).
     /// Skipped entries become page index failures, so the source is never
     /// reported complete while a page may be missing from it.
     fn page_build_entries(
@@ -47,7 +53,7 @@ impl Graph {
             .enumerations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.graph_text_entries_and_skipped(permit)
-            .map_err(|error| format!("graph-text-scope: {error}"))
+            .map_err(|error| format!("{GRAPH_TEXT_SCOPE_FAILURE}{error}"))
     }
 
     /// Enumerate, read and parse every page from disk once (recording unreadable
@@ -493,20 +499,18 @@ impl Graph {
     /// Build graph-open caches while allowing a revoked window binding to stop
     /// between files and derived-map phases. Returns false when cancelled.
     pub fn warm_cache_cancellable(&self, cancelled: impl Fn() -> bool) -> bool {
-        self.warm_cache_announced(self.announce_launch_warm(), cancelled)
+        self.warm_cache_owned(self.register_index_owner(), cancelled)
     }
 
-    /// [`Graph::warm_cache_cancellable`] for a warm announced ahead of time
-    /// (see [`Graph::announce_launch_warm`]). The announcement tells readers
-    /// that indexing is coming, so it ends with the index phase: the
-    /// derived-map prefetch after it is an ordinary reader, and prefetching
-    /// under the announcement waited for the warm itself -- forever, once a
-    /// turn failed with nothing queued (GH #543).
-    pub fn warm_cache_announced(
-        &self,
-        announcement: LaunchWarmAnnouncement,
-        cancelled: impl Fn() -> bool,
-    ) -> bool {
+    /// One inline index pass under a registered owner, for callers that run
+    /// no owner loop (the CLI, headless runs, tests): validate the image, or
+    /// build and offer the parsed snapshot when it cannot be validated, wait
+    /// for the index, then prefetch the derived maps. The registration makes
+    /// readers wait for this pass instead of parsing the graph beside it; it
+    /// ends with the index phase, because the prefetch after it is an
+    /// ordinary reader, and prefetching under it waited for the pass itself
+    /// -- forever, once a turn failed with nothing queued (GH #543).
+    pub fn warm_cache_owned(&self, owner: IndexOwner, cancelled: impl Fn() -> bool) -> bool {
         // Validate a clean warm image without parsing. A stale, cold, damaged,
         // or raced image falls through to the existing parsed-page build
         // flight, whose captured snapshot is built unpublished and published
@@ -530,7 +534,14 @@ impl Graph {
                 projection.wait_until_ready_at(generation, &cancelled);
             }
         }
-        drop(announcement);
+        drop(owner);
+        self.prefetch_derived_maps(&cancelled)
+    }
+
+    /// Warm the derived maps the frontend fetches right after `warm-cache-done`
+    /// (aliases + block-ref counts), so those fetches are pure cache hits.
+    /// Returns false when cancelled.
+    fn prefetch_derived_maps(&self, cancelled: &impl Fn() -> bool) -> bool {
         if cancelled() {
             return false;
         }
@@ -547,8 +558,6 @@ impl Graph {
                 pause.release.wait();
             }
         }
-        // Warm the derived maps the frontend fetches right after `warm-cache-done`
-        // (aliases + block-ref counts), so those fetches are pure cache hits.
         let _ = self.page_aliases();
         if cancelled() {
             return false;
@@ -559,6 +568,124 @@ impl Graph {
         !cancelled()
     }
 
+    /// The graph's index owner (GH #543): the one place that starts
+    /// whole-graph index work while it is registered. It waits for what the
+    /// index needs -- a validation of the stored image, or a fresh build --
+    /// runs that pass holding `permit` (the app's process-wide warm permit,
+    /// so two graphs never parse at once), and lets the worker take it from
+    /// there. A pass that ends without the worker taking a payload backs off
+    /// (`1 s · 2^(n−1)`, at most 30 min), so a deterministic failure cannot
+    /// repeat whole-graph passes back to back.
+    ///
+    /// `settle` is the launch completion: it is called once, the first time
+    /// nothing is coming any more -- the index is ready, backing off, or gone
+    /// -- after the derived maps are prefetched. The owner keeps running
+    /// after it, answering later needs (a failed read, an unnamed deletion,
+    /// a failed turn), until `cancelled` or the worker is gone.
+    pub fn run_index_owner(
+        &self,
+        owner: IndexOwner,
+        permit: &std::sync::Mutex<()>,
+        cancelled: impl Fn() -> bool,
+        mut settle: impl FnMut(),
+    ) {
+        use crate::direct_projection::{IndexNeed, OwnerStep};
+        let lock = || {
+            permit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        let Some(projection) = self.direct_projection.get() else {
+            // No index: the parsed cache is all there is.
+            let built = {
+                let _permit = lock();
+                self.warm_page_cache_cancellable(&cancelled)
+            };
+            if built && self.prefetch_derived_maps(&cancelled) {
+                settle();
+            }
+            drop(owner);
+            return;
+        };
+        let mut settle_owed = true;
+        // A validation that settled nothing on an image never validated this
+        // session is not walked again: the next pass builds.
+        let mut escalate = false;
+        loop {
+            match projection.wait_owner_step(settle_owed, &cancelled) {
+                OwnerStep::Cancelled => return,
+                OwnerStep::Terminal => {
+                    if settle_owed {
+                        // No index will be ready: warm the parsed cache the
+                        // readers fall back to, as a graph without one does.
+                        let built = {
+                            let _permit = lock();
+                            self.warm_page_cache_cancellable(&cancelled)
+                        };
+                        if built && self.prefetch_derived_maps(&cancelled) {
+                            settle();
+                        }
+                    }
+                    return;
+                }
+                OwnerStep::Settle => {
+                    settle_owed = false;
+                    if !self.prefetch_derived_maps(&cancelled) {
+                        return;
+                    }
+                    settle();
+                }
+                OwnerStep::Pass(_) => {
+                    let _permit = lock();
+                    if cancelled() {
+                        return;
+                    }
+                    // Another graph's pass may have held the permit a long
+                    // time; the need may have been met or changed meanwhile.
+                    let (need, backing_off) = projection.index_need_now();
+                    if backing_off || !matches!(need, IndexNeed::Validate | IndexNeed::Fresh) {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    self.page_build_test
+                        .owner_passes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let settled = if need == IndexNeed::Fresh || std::mem::take(&mut escalate) {
+                        self.fresh_index_pass(&cancelled)
+                    } else {
+                        match self.warm_projection_cancellable(&cancelled) {
+                            WarmProjectionOutcome::Owned => true,
+                            WarmProjectionOutcome::Cancelled => return,
+                            WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => {
+                                escalate = !projection.validated();
+                                false
+                            }
+                        }
+                    };
+                    if cancelled() {
+                        return;
+                    }
+                    if !settled {
+                        projection.note_unsettled_pass();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build the parsed snapshot and offer it to the index. Whether the
+    /// index took it (or already was current at it).
+    fn fresh_index_pass(&self, cancelled: &impl Fn() -> bool) -> bool {
+        if !self.build_page_cache_cancellable(cancelled) {
+            return false;
+        }
+        matches!(
+            self.offer_installed_cache(),
+            projection_lifetime::FullOfferOutcome::Queued
+                | projection_lifetime::FullOfferOutcome::AlreadyCurrent
+        )
+    }
+
     /// R6 warm validation: publish Direct Files projection readiness from the
     /// walk inventory and each page's exact content revision, parsing nothing
     /// unless the worker names replacements.
@@ -567,7 +694,7 @@ impl Graph {
     /// owns readiness at the generation this warm observed. `Retry` means the
     /// validation settled nothing -- the image needs a fresh build, a mutation
     /// raced it, or updates kept outranking it -- and the caller still owes
-    /// readiness: `warm_cache_announced` builds the parsed snapshot, which the
+    /// readiness: the owner builds the parsed snapshot, which the
     /// worker publishes. Dropping the outcome is how an obligation ends up
     /// with no producer (GH #543). `Unavailable` means no projection can own
     /// readiness at all: none attached, the graph text scope unreadable, the
@@ -601,8 +728,13 @@ impl Graph {
             if self.page_index_failures.read().unwrap().is_empty() {
                 // A consumer may have installed it inside an earlier warm and
                 // been refused the offer; this warm owns it now.
-                self.offer_installed_cache();
-                return Outcome::Owned;
+                return match self.offer_installed_cache() {
+                    super::projection_lifetime::FullOfferOutcome::Queued
+                    | super::projection_lifetime::FullOfferOutcome::AlreadyCurrent => {
+                        Outcome::Owned
+                    }
+                    _ => Outcome::Retry,
+                };
             }
         }
         // Walk the graph only to validate an image that may be good. With no
@@ -614,12 +746,9 @@ impl Graph {
             crate::direct_projection::IndexNeed::SettingUp => return Outcome::Cancelled,
             _ => {}
         }
-        // GH #543: announce this warm before the inventory read below. On a
-        // 10k-page graph that read takes seconds (tens on Windows), and a
-        // query landing inside it must see Indexing, not an idle projection
-        // it should repair — its repair would be a second warm racing this
-        // one on the query thread.
-        let in_flight = projection.begin_warm();
+        // A query landing inside the inventory read below (seconds on a
+        // 10k-page graph, tens on Windows) sees Indexing through the owner's
+        // registration, not an idle projection it should repair (GH #543).
         let warm_started = std::time::Instant::now();
         crate::direct_projection::projection_diag(|| {
             "warm announced; reading inventory".to_owned()
@@ -648,6 +777,8 @@ impl Graph {
         let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
             return Outcome::Unavailable;
         };
+        #[cfg(test)]
+        self.vanish_after_listing_test();
         let mut walk_order = entries
             .iter()
             .map(|entry| entry.rel_path.clone())
@@ -672,8 +803,11 @@ impl Graph {
                     sources.push((entry, revision));
                 }
                 // The file is genuinely gone: omitting it from `sources` is
-                // how the walk says "delete its rows".
-                Ok(None) => failures.push(entry.rel_path),
+                // how the walk says "delete its rows". A gone page is not an
+                // unreadable one; naming it a failure left the inventory
+                // looking incomplete, and page creation then refused or parsed
+                // the whole graph (GH #543).
+                Ok(None) => walk_order.retain(|rel_path| rel_path != &entry.rel_path),
                 // The file EXISTS and could not be read. Omitting it would
                 // delete a live page's rows over a transient disk error or a
                 // Windows sharing violation (GH #543), so name it retained:
@@ -804,7 +938,6 @@ impl Graph {
                             retained.remove(i);
                         }
                         walk_order.retain(|candidate| candidate != &rel_path);
-                        failures.push(rel_path);
                     }
                     Err(_) => {
                         if let Some(i) = listed {
@@ -909,7 +1042,6 @@ impl Graph {
             });
             match outcome {
                 crate::direct_projection::WarmOutcome::Clean => {
-                    drop(in_flight);
                     self.publish_page_index_failures(generation, failures);
                     return Outcome::Owned;
                 }
@@ -998,7 +1130,7 @@ impl Graph {
     pub(super) fn warm_page_cache_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
         let built = self.build_page_cache_cancellable(cancelled);
         if built {
-            self.offer_installed_cache();
+            let _ = self.offer_installed_cache();
         }
         built
     }
@@ -1045,6 +1177,8 @@ impl Graph {
                 return outcome.installed() && !cancelled();
             }
         };
+        #[cfg(test)]
+        self.vanish_after_listing_test();
         let mut built = PageCacheBuild::with_capacity(entries.len());
         built.failures.extend(skipped);
         let mut baselines: Vec<(PathBuf, ContentDigest, String)> =
@@ -1073,7 +1207,10 @@ impl Graph {
                         baselines.push((path, identity, revision));
                     }
                 }
-                _ => built.failures.push(e.rel_path),
+                // Gone since the listing: it leaves the parse, as in
+                // `reparse_into`; it is not a page Tine failed to read.
+                Ok(None) => {}
+                Err(_) => built.failures.push(e.rel_path),
             }
             if i % 24 == 23 {
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1148,12 +1285,43 @@ impl Graph {
     }
 
     #[cfg(test)]
+    fn vanish_after_listing_test(&self) {
+        let vanish = self
+            .page_build_test
+            .vanish_after_listing
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(path) = vanish {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vanish_inside_next_listing_test(&self, path: PathBuf) {
+        *self.page_build_test.vanish_inside_listing.lock().unwrap() = Some(path);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vanish_after_next_listing_test(&self, path: PathBuf) {
+        *self.page_build_test.vanish_after_listing.lock().unwrap() = Some(path);
+    }
+
+    #[cfg(test)]
     fn count_page_parse_test(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.page_build_test.parses.fetch_add(1, Relaxed);
         if INDEXING_BUILD_TEST.with(std::cell::Cell::get) {
             self.page_build_test.indexing_parses.fetch_add(1, Relaxed);
         }
+    }
+
+    /// Whole-graph passes the index owner ran.
+    #[cfg(test)]
+    pub(crate) fn owner_passes_test(&self) -> usize {
+        self.page_build_test
+            .owner_passes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Page parses outside an indexing build: a warm's or repair's own
@@ -1476,7 +1644,7 @@ impl Graph {
         // rest (audit R5-01).
         let warm_owns_readiness = projection
             .as_ref()
-            .is_some_and(|projection| projection.warm_in_flight());
+            .is_some_and(|projection| projection.coming());
         let recovered_projection_snapshot =
             (cache_built && failures_changed && page_inventory_complete && !warm_owns_readiness)
                 .then(|| {
@@ -1596,9 +1764,14 @@ impl Graph {
                 true,
                 projection_lifetime::FullOffer::Consumer,
             );
-            // A warm that began after the lock was released refuses the
-            // snapshot; the page's own update is still owed (audit R5-01).
-            if outcome == projection_lifetime::FullOfferOutcome::RefusedDuringWarm {
+            // A warm that began after the lock was released, or a newer
+            // queue, refuses the snapshot; the page's own update is still
+            // owed (audit R5-01).
+            if matches!(
+                outcome,
+                projection_lifetime::FullOfferOutcome::RefusedDuringWarm
+                    | projection_lifetime::FullOfferOutcome::Outdated
+            ) {
                 self.direct_projection_enqueue_replace(
                     newgen,
                     evict_entry,

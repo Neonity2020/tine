@@ -24,6 +24,11 @@ use tine_storage::sqlite::{
 };
 use uuid::Uuid;
 
+#[path = "direct_projection_owner.rs"]
+mod owner;
+use owner::{backing_off, index_need, note_unsettled};
+pub(crate) use owner::{IndexNeed, IndexOwnerRegistration, OwnerStep};
+
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
 type PageRevisions = Arc<HashMap<PathBuf, String>>;
 
@@ -132,10 +137,11 @@ struct PendingFull {
     /// parsed. A partial cache may still be useful to the app, but it must not
     /// replace a healthy complete projection and silently erase retained rows.
     source_complete: bool,
-    /// Pages that exist but could not be read or parsed for this snapshot.
-    /// Over a healthy image they keep their stored rows (see
-    /// `apply_incomplete_full`).
-    retained: Vec<PageEntry>,
+    /// Sources that exist but could not be read, listed or parsed for this
+    /// snapshot, as graph-relative paths: a page, or a directory whose pages
+    /// all count as unread (`""` is the whole graph). Over a healthy image
+    /// they keep their stored rows (see `apply_incomplete_full`).
+    retained: Vec<String>,
 }
 
 /// R6 warm validation: the walk inventory with each page's exact content
@@ -290,6 +296,15 @@ struct PendingProjection {
     /// The worker is running a turn that carries a full snapshot or a warm
     /// validation. Queries do not capture from an image being replaced.
     building: bool,
+    /// Index owners registered for this graph: the app's owner loop, or an
+    /// inline warm while it runs. While one is, whole-graph index work is
+    /// that owner's to start and nobody else's (GH #543).
+    owners: usize,
+    /// Whole-graph passes and worker turns that ended without making the
+    /// index ready, since it last was. Reset where readiness is published.
+    unsettled_passes: u32,
+    /// No owner pass starts before this instant; see [`note_unsettled`].
+    retry_after: Option<std::time::Instant>,
 }
 
 impl PendingProjection {
@@ -458,58 +473,6 @@ impl PendingProjection {
     }
 }
 
-/// What whole-graph work the index needs next; see [`index_need`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IndexNeed {
-    /// The worker has not yet opened its stored image.
-    SettingUp,
-    /// The worker is gone for good. Nothing enqueued is ever taken.
-    Terminal,
-    /// A full snapshot or a warm validation is queued or being applied.
-    InHand,
-    /// Only a complete parsed snapshot can make the index ready: there is no
-    /// usable image, or a read found the image damaged. Walking the graph to
-    /// validate the image first would only be read again.
-    Fresh,
-    /// The image may be good but has not been checked against the pages this
-    /// session, or an unnamed deletion may have left it describing pages
-    /// that are gone.
-    Validate,
-    /// Nothing whole-graph is owed: page updates keep the image current.
-    Nothing,
-}
-
-/// The one answer to "what whole-graph work does the index need?".
-///
-/// Computed on read, under the `pending` lock, from state that only ever
-/// changes under that lock, so it cannot disagree with its inputs or lag an
-/// enqueue: a queued full snapshot reads as `InHand` the moment it is queued.
-/// The order of the tests is the order of authority.
-fn index_need(shared: &ProjectionShared, pending: &PendingProjection) -> IndexNeed {
-    if pending.stop || !shared.worker_available.load(Ordering::Acquire) {
-        IndexNeed::Terminal
-    } else if !pending.set_up {
-        IndexNeed::SettingUp
-    } else if pending.full.is_some() || pending.warm.is_some() || pending.building {
-        IndexNeed::InHand
-    } else if pending.requires_full_rebuild || pending.rebuild {
-        IndexNeed::Fresh
-    } else if !shared.validated.load(Ordering::Acquire) || pending.stale {
-        IndexNeed::Validate
-    } else {
-        IndexNeed::Nothing
-    }
-}
-
-/// Whether a fresh build already owns this image's replacement: one is
-/// running, or a rebuild is queued with the payload that carries it. A
-/// read that failed on the current image owes nothing more then -- the
-/// build replaces that image whole -- and a second request would queue a
-/// second complete build behind it (GH #543, indexing audit IT-10).
-fn fresh_build_owns_image(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
-    shared.build_progress.snapshot().is_some() || (pending.rebuild && pending.full.is_some())
-}
-
 struct ProjectionShared {
     path: PathBuf,
     pending: Mutex<PendingProjection>,
@@ -606,14 +569,6 @@ struct ProjectionShared {
     /// `Unavailable(ReadFailed)` on a projection that is being repaired
     /// perfectly well by the thread beside it.
     repairs_in_flight: AtomicUsize,
-    /// Warm validations currently reading page bytes for the inventory they
-    /// will enqueue (GH #543). Same shape as `repairs_in_flight`: until
-    /// `enqueue_warm` the warm has published nothing, so a query landing in
-    /// that window read the projection as idle and stale and started its own
-    /// repair — a second validation on the query thread, racing the open path's.
-    /// Before this marker, that race could trigger a redundant whole-graph
-    /// reconstruction on the query thread.
-    warms_in_flight: AtomicUsize,
     /// Generation moves whose delta is on its way: the mover has moved the
     /// generation and not yet queued the delta that describes it. A reader
     /// landing in that window found the index behind with nothing queued and
@@ -1093,7 +1048,6 @@ impl DirectProjection {
             #[cfg(test)]
             registry_capture_attempts: AtomicU64::new(0),
             repairs_in_flight: AtomicUsize::new(0),
-            warms_in_flight: AtomicUsize::new(0),
             deltas_coming: AtomicUsize::new(0),
             build_progress: Default::default(),
             #[cfg(test)]
@@ -1121,29 +1075,11 @@ impl DirectProjection {
         RepairInFlight(Arc::clone(&self.shared))
     }
 
-    /// Announce a warm validation BEFORE it reads a single page byte, so a
-    /// query landing during that read reports `NotReady(Indexing)` and
-    /// retries instead of repairing an "idle" projection (GH #543). Held
-    /// until the warm has enqueued (from then on the queue itself says
-    /// Indexing) or given up.
     /// Announce a generation move whose delta the caller queues next; see
     /// `DeltaComing`.
     pub(crate) fn delta_coming(&self) -> DeltaComing {
         self.shared.deltas_coming.fetch_add(1, Ordering::AcqRel);
         DeltaComing(Arc::clone(&self.shared))
-    }
-
-    pub(crate) fn begin_warm(&self) -> WarmInFlight {
-        self.shared.warms_in_flight.fetch_add(1, Ordering::AcqRel);
-        WarmInFlight(Arc::clone(&self.shared))
-    }
-
-    /// True while some thread has announced a warm and not yet finished it.
-    /// `projection_recovery` serializes repairs against each other but not
-    /// against the open path's warm, so a query arriving during a cold open
-    /// could start a SECOND warm of the same graph (GH #543).
-    pub(crate) fn warm_in_flight(&self) -> bool {
-        self.shared.warms_in_flight.load(Ordering::Acquire) > 0
     }
 
     /// True while the last worker turn failed. The flag clears on the next
@@ -1168,75 +1104,6 @@ impl DirectProjection {
         self.shared.validated.load(Ordering::Acquire)
     }
 
-    /// See the free function [`fresh_build_owns_image`].
-    pub(crate) fn fresh_build_owns_image(&self) -> bool {
-        fresh_build_owns_image(&self.shared, &self.shared.pending.lock().unwrap())
-    }
-
-    /// Ask for the image to be replaced whole. A no-op when a fresh build
-    /// already owns its replacement (IT-10): the rule is checked under the
-    /// same lock as the request, so two failed reads cannot both see "no
-    /// build yet" and queue two.
-    pub(crate) fn request_rebuild(&self) {
-        let mut pending = self.shared.pending.lock().unwrap();
-        if fresh_build_owns_image(&self.shared, &pending) {
-            return;
-        }
-        pending.rebuild = true;
-        self.shared.ready.store(false, Ordering::Release);
-        drop(pending);
-        self.shared.changed.notify_all();
-    }
-
-    /// What whole-graph work the index needs next, once the worker has
-    /// opened its stored image (see [`index_need`]). Waits while it is
-    /// still opening it; `SettingUp` is returned only when `cancelled`.
-    pub(crate) fn wait_index_need(&self, cancelled: &impl Fn() -> bool) -> IndexNeed {
-        let mut pending = self.shared.pending.lock().unwrap();
-        loop {
-            let need = index_need(&self.shared, &pending);
-            if need != IndexNeed::SettingUp || cancelled() {
-                return need;
-            }
-            pending = self
-                .shared
-                .changed
-                .wait_timeout(pending, std::time::Duration::from_millis(50))
-                .unwrap()
-                .0;
-        }
-    }
-
-    /// Withdraw a rebuild request that found no payload to carry it.
-    ///
-    /// `rebuild` is an obligation, not a state: [`Self::request_rebuild`]
-    /// promises a full snapshot or a warm inventory will follow, because the
-    /// worker consumes the flag ONLY beside one of those two payloads, and
-    /// [`PendingProjection::has_work`] does not count it. A request nobody can
-    /// discharge is therefore permanent: the worker sleeps, every capture is
-    /// refused by [`query_capture_admissible`], and [`Self::progress_at`]
-    /// reports `Working(Recovering)` forever — the user watches "Rebuilding
-    /// the search index…" on an idle process (GH #543).
-    ///
-    /// That is reachable without any filesystem activity: a query read fails,
-    /// repair sets the flag, and a newer producer refuses the payload that was
-    /// going to carry it. Withdrawing lets the next query's repair try again;
-    /// holding the flag does not.
-    ///
-    /// Returns whether the request was withdrawn. A payload that arrived in
-    /// the meantime owns the rebuild, so the flag stays.
-    pub(crate) fn withdraw_rebuild_request(&self) -> bool {
-        let mut pending = self.shared.pending.lock().unwrap();
-        if pending.full.is_some() || pending.warm.is_some() {
-            return false;
-        }
-        let withdrawn = std::mem::take(&mut pending.rebuild);
-        if withdrawn {
-            projection_diag(|| "rebuild request withdrawn: no payload followed".to_owned());
-        }
-        withdrawn
-    }
-
     pub(crate) fn enqueue_full(
         &self,
         generation: u64,
@@ -1244,8 +1111,8 @@ impl DirectProjection {
         revisions: PageRevisions,
         parse_config: Arc<ParseConfig>,
         source_complete: bool,
-        retained: Vec<PageEntry>,
-    ) {
+        retained: Vec<String>,
+    ) -> bool {
         let mut pending = self.shared.pending.lock().unwrap();
         // A snapshot older than the queue is not a supersession, it is a
         // rollback. `install_built` validates the generation under the cache
@@ -1270,24 +1137,18 @@ impl DirectProjection {
         // the old text with no producer queued to correct it, and the file on
         // disk disagreed with the index indefinitely (third audit A3-N1).
         //
-        // So refuse, and withdraw the obligation with the payload it promised:
-        // a rebuild latched with nothing to ride in on refuses every later
-        // query for the lifetime of the graph (GH #543, B1). The next repair
-        // assembles a snapshot at the current generation and rides in on that.
+        // So refuse, and keep the obligation: the need stays `Fresh`, and the
+        // index owner assembles a snapshot at the current generation (with
+        // no owner, the next query's repair does). Withdrawing it with the
+        // payload silently dropped a damaged image's rebuild (GH #543, NG3).
         if generation < pending.latest_generation {
-            let withdrawn = std::mem::take(&mut pending.rebuild);
             projection_diag(|| {
                 format!(
-                    "full refused: snapshot generation={generation} older than queue {}{}",
+                    "full refused: snapshot generation={generation} older than queue {}",
                     pending.latest_generation,
-                    if withdrawn {
-                        "; rebuild request withdrawn with it"
-                    } else {
-                        ""
-                    }
                 )
             });
-            return;
+            return false;
         }
         let already_accepted =
             pending
@@ -1309,7 +1170,7 @@ impl DirectProjection {
                     "full ignored: this snapshot was already accepted at generation={generation}"
                 )
             });
-            return;
+            return true;
         }
         pending.accepted_full = Some((generation, Arc::downgrade(&pages)));
         self.shared.ready.store(false, Ordering::Release);
@@ -1333,6 +1194,7 @@ impl DirectProjection {
             pending.warm_outcome = Some((pending.warm_attempt, WarmOutcome::Superseded));
         }
         self.shared.changed.notify_all();
+        true
     }
 
     /// R6: the projected page inventory as `(name, path, text_kind)` rows,
@@ -2421,17 +2283,31 @@ impl DirectProjection {
         if pending.stop || !self.shared.worker_available.load(Ordering::Acquire) {
             return ProjectionProgress::Stopped;
         }
-        if pending.rebuild || pending.full.is_some() {
+        // With an owner registered, whole-graph work the index needs is the
+        // owner's to run; a query reports it and never starts it (GH #543).
+        let owned = pending.owners > 0;
+        let need = index_need(&self.shared, &pending);
+        if pending.full.is_some() || (pending.rebuild && owned) {
             return ProjectionProgress::Working(Reason::Recovering);
         }
         if self.shared.repairs_in_flight.load(Ordering::Acquire) > 0 {
             return ProjectionProgress::Working(Reason::Recovering);
         }
-        if pending.warm.is_some() || self.shared.warms_in_flight.load(Ordering::Acquire) > 0 {
+        let owner_pass_coming = owned
+            && matches!(
+                need,
+                IndexNeed::SettingUp | IndexNeed::Validate | IndexNeed::Fresh
+            );
+        if pending.warm.is_some() || (owner_pass_coming && !backing_off(&pending)) {
             return ProjectionProgress::Working(Reason::Indexing);
         }
         if !pending.deltas.is_empty() || self.shared.deltas_coming.load(Ordering::Acquire) > 0 {
             return ProjectionProgress::Working(Reason::PendingEdits);
+        }
+        if owner_pass_coming {
+            // Backing off: the owner retries when the backoff ends. A pass on
+            // the query thread would bypass it.
+            return ProjectionProgress::Working(Reason::Recovering);
         }
         if self.shared.worker_failed.load(Ordering::Acquire) {
             // The queue is empty and the last turn failed: nothing is coming.
@@ -2758,17 +2634,6 @@ pub(crate) struct DeltaComing(Arc<ProjectionShared>);
 impl Drop for DeltaComing {
     fn drop(&mut self) {
         self.0.deltas_coming.fetch_sub(1, Ordering::AcqRel);
-        self.0.changed.notify_all();
-    }
-}
-
-/// Lives from a warm validation's first page read until it has enqueued or
-/// given up; see `DirectProjection::begin_warm`.
-pub(crate) struct WarmInFlight(Arc<ProjectionShared>);
-
-impl Drop for WarmInFlight {
-    fn drop(&mut self) {
-        self.0.warms_in_flight.fetch_sub(1, Ordering::AcqRel);
         self.0.changed.notify_all();
     }
 }
@@ -3224,6 +3089,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     ProjectionRefusal::Failed(_) => {
                         pending.requires_full_rebuild = true;
                         shared.worker_failed.store(true, Ordering::Release);
+                        note_unsettled(&mut pending);
                     }
                     ProjectionRefusal::Stopped => {
                         shared.worker_busy.store(false, Ordering::Release);
@@ -3292,6 +3158,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 .ready_generation
                 .store(ready_generation, Ordering::Release);
             shared.ready.store(true, Ordering::Release);
+            pending.unsettled_passes = 0;
+            pending.retry_after = None;
             projection_diag(|| format!("ready at generation={ready_generation}"));
         }
         drop(pending);
@@ -3802,14 +3670,19 @@ fn apply_incomplete_full(
     let mut source_delta = database
         .source_delta(&sources)
         .map_err(|error| error.to_string())?;
-    let retained = full
-        .retained
-        .iter()
-        .map(|entry| entry.rel_path.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    source_delta
-        .deletions
-        .retain(|path| !retained.contains(path.as_str()));
+    // A page under an unreadable directory is as unread as an unreadable
+    // page: deleting its rows would empty the index for as long as the
+    // directory stays unreadable, and publish that as ready.
+    let unread = |path: &str| {
+        full.retained.iter().any(|retained| {
+            retained.is_empty()
+                || path == retained
+                || path
+                    .strip_prefix(retained.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    source_delta.deletions.retain(|path| !unread(path));
     let replacements = source_delta
         .replacements
         .iter()
@@ -3822,7 +3695,7 @@ fn apply_incomplete_full(
         .collect::<Result<Vec<_>, String>>()?;
     projection_diag(|| {
         format!(
-            "incomplete full: keeping {} unreadable page(s)",
+            "incomplete full: keeping the rows under {} unread source(s)",
             full.retained.len()
         )
     });

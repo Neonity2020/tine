@@ -63,6 +63,11 @@ impl Graph {
             ($result:expr, $relative:expr, $may_hold_page:expr) => {
                 match $result {
                     Ok(value) => value,
+                    // Gone since the directory read named it: a deleted
+                    // page, not one Tine failed to read (GH #543).
+                    Err(error) if graph_wide && error.kind() == io::ErrorKind::NotFound => {
+                        continue;
+                    }
                     Err(error) if graph_wide => {
                         if $may_hold_page {
                             skipped.push(format!("{}: {error}", $relative));
@@ -241,6 +246,13 @@ impl Graph {
                 if file_type.is_file() {
                     if graph_wide && !self.graph_text_scope.is_eligible(&child_relative) {
                         continue;
+                    }
+                    #[cfg(test)]
+                    {
+                        let mut vanish = self.page_build_test.vanish_inside_listing.lock().unwrap();
+                        if vanish.as_ref() == Some(&child_path) {
+                            std::fs::remove_file(vanish.take().unwrap()).unwrap();
+                        }
                     }
                     let file = admit_or_skip!(
                         open_projection_file_nofollow(&directory, name_text),

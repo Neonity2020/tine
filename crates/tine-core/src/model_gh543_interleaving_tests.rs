@@ -62,10 +62,15 @@ fn page_path(root: &Path, name: &str) -> PathBuf {
     root.join("pages").join(format!("{name}.md"))
 }
 
-/// One graph instance: the projection, the launch warm and a reader.
+/// The app's process-wide permit for whole-graph index passes.
+static OWNER_PERMIT: Mutex<()> = Mutex::new(());
+
+/// One graph instance: the projection, its index owner and a reader.
 struct Session {
     graph: Arc<Graph>,
-    warm: Option<std::thread::JoinHandle<()>>,
+    owner: Option<std::thread::JoinHandle<()>>,
+    owner_stop: Arc<AtomicBool>,
+    settled: Arc<AtomicU64>,
     reader: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     slowest_read_ms: Arc<AtomicU64>,
@@ -78,12 +83,26 @@ impl Session {
         graph
             .attach_direct_projection(database.to_path_buf())
             .unwrap();
-        // As the app does: announced before anything else can reach the graph.
-        let announcement = graph.announce_launch_warm();
-        let warm = {
-            let graph = Arc::clone(&graph);
+        // As the app does: the owner is registered before anything else can
+        // reach the graph, and runs until the session closes.
+        let registration = graph.register_index_owner();
+        let owner_stop = Arc::new(AtomicBool::new(false));
+        let settled = Arc::new(AtomicU64::new(0));
+        let owner = {
+            let (graph, owner_stop, settled) = (
+                Arc::clone(&graph),
+                Arc::clone(&owner_stop),
+                Arc::clone(&settled),
+            );
             std::thread::spawn(move || {
-                graph.warm_cache_announced(announcement, || false);
+                graph.run_index_owner(
+                    registration,
+                    &OWNER_PERMIT,
+                    || owner_stop.load(Ordering::Acquire),
+                    || {
+                        settled.fetch_add(1, Ordering::AcqRel);
+                    },
+                );
             })
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -124,7 +143,9 @@ impl Session {
         };
         Self {
             graph,
-            warm: Some(warm),
+            owner: Some(owner),
+            owner_stop,
+            settled,
             reader: Some(reader),
             stop,
             slowest_read_ms,
@@ -132,25 +153,25 @@ impl Session {
         }
     }
 
-    /// Stop the reader and wait for the warm, each within its bound. A
-    /// thread that outlives its bound is a finding; it is leaked, not joined.
+    /// Stop the reader and wait for the owner's launch completion, each
+    /// within its bound. The owner keeps running. A thread that outlives its
+    /// bound is a finding; it is leaked, not joined.
     fn quiesce(&mut self, findings: &mut Vec<String>) -> bool {
         self.stop.store(true, Ordering::Relaxed);
-        let mut ok = true;
-        for (what, handle) in [("reader", self.reader.take()), ("warm", self.warm.take())] {
-            let Some(handle) = handle else { continue };
-            let started = Instant::now();
-            while !handle.is_finished() && started.elapsed() < SETTLE_BOUND {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if handle.is_finished() {
-                if handle.join().is_err() {
-                    findings.push(format!("the {what} thread panicked"));
-                }
-            } else {
-                findings.push(format!("the {what} never returned (> {SETTLE_BOUND:?})"));
+        let mut ok = join_within("reader", self.reader.take(), findings);
+        let started = Instant::now();
+        while self.settled.load(Ordering::Acquire) == 0 && started.elapsed() < SETTLE_BOUND {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match self.settled.load(Ordering::Acquire) {
+            1 => {}
+            0 => {
+                findings.push(format!(
+                    "the owner never signalled completion (> {SETTLE_BOUND:?})"
+                ));
                 ok = false;
             }
+            n => findings.push(format!("the owner signalled completion {n} times")),
         }
         let slowest = Duration::from_millis(self.slowest_read_ms.load(Ordering::Relaxed));
         if slowest > READ_BOUND {
@@ -160,13 +181,39 @@ impl Session {
         ok
     }
 
-    fn close(self, findings: &mut Vec<String>) {
+    fn close(mut self, findings: &mut Vec<String>) {
+        self.owner_stop.store(true, Ordering::Release);
+        join_within("owner", self.owner.take(), findings);
         if let Some(projection) = self.graph.direct_projection_test() {
             if !projection.close_and_wait_for_worker(SETTLE_BOUND) {
                 findings.push("the worker never released its lease".to_owned());
             }
         }
     }
+}
+
+/// Wait for a thread within `SETTLE_BOUND`. A thread that outlives it is a
+/// finding; it is leaked, not joined.
+fn join_within(
+    what: &str,
+    handle: Option<std::thread::JoinHandle<()>>,
+    findings: &mut Vec<String>,
+) -> bool {
+    let Some(handle) = handle else {
+        return true;
+    };
+    let started = Instant::now();
+    while !handle.is_finished() && started.elapsed() < SETTLE_BOUND {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !handle.is_finished() {
+        findings.push(format!("the {what} never returned (> {SETTLE_BOUND:?})"));
+        return false;
+    }
+    if handle.join().is_err() {
+        findings.push(format!("the {what} thread panicked"));
+    }
+    true
 }
 
 /// The settled checks: readiness at the current generation, and the index
@@ -599,11 +646,11 @@ fn gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm() {
     let graph = Arc::new(Graph::open(&root));
     graph.attach_direct_projection(database).unwrap();
     // The app announces the launch warm before its thread starts.
-    let announcement = graph.announce_launch_warm();
+    let announcement = graph.register_index_owner();
     let pause = graph.pause_next_warm_before_derived_maps_test();
     let warm = {
         let graph = Arc::clone(&graph);
-        std::thread::spawn(move || graph.warm_cache_announced(announcement, || false))
+        std::thread::spawn(move || graph.warm_cache_owned(announcement, || false))
     };
     pause.reached.wait();
     let projection = graph.direct_projection_test().unwrap();
@@ -731,4 +778,342 @@ fn gh543_an_unreadable_page_does_not_keep_the_index_down() {
     assert_eq!(hits("ibis"), 1);
     crate::direct_projection::release_projection(&graph);
     let _ = fs::remove_dir_all(root);
+}
+
+/// An index owner run as the app runs it, on its own thread, until stopped.
+struct OwnerRun {
+    graph: Arc<Graph>,
+    stop: Arc<AtomicBool>,
+    settled: Arc<AtomicU64>,
+    /// The page files the owner's thread read, returned when it ends.
+    handle: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl OwnerRun {
+    fn start(graph: &Arc<Graph>) -> Self {
+        let registration = graph.register_index_owner();
+        let stop = Arc::new(AtomicBool::new(false));
+        let settled = Arc::new(AtomicU64::new(0));
+        let handle = {
+            let (graph, stop, settled) =
+                (Arc::clone(graph), Arc::clone(&stop), Arc::clone(&settled));
+            std::thread::spawn(move || {
+                GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+                graph.run_index_owner(
+                    registration,
+                    &OWNER_PERMIT,
+                    || stop.load(Ordering::Acquire),
+                    || {
+                        settled.fetch_add(1, Ordering::AcqRel);
+                    },
+                );
+                GRAPH_TEXT_CONTENT_READS.with(Cell::get)
+            })
+        };
+        Self {
+            graph: Arc::clone(graph),
+            stop,
+            settled,
+            handle: Some(handle),
+        }
+    }
+
+    /// Wait for the launch completion; `false` if it did not come in time.
+    fn wait_settled(&self, bound: Duration) -> bool {
+        let started = Instant::now();
+        while self.settled.load(Ordering::Acquire) == 0 {
+            if started.elapsed() > bound {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    fn wait_ready(&self, bound: Duration) -> bool {
+        let started = Instant::now();
+        while !self.graph.direct_projection_ready_test() {
+            if started.elapsed() > bound {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Stop the owner; the page files its thread read.
+    fn stop(mut self) -> usize {
+        self.stop.store(true, Ordering::Release);
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+
+/// Build and release a stored index for `root`, as a previous session did.
+fn prebuild_index(root: &Path, database: &Path) {
+    let graph = Graph::open(root);
+    graph
+        .attach_direct_projection(database.to_path_buf())
+        .unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(10))
+        .unwrap();
+    crate::direct_projection::release_projection(&graph);
+}
+
+fn write_pages(root: &Path, count: usize) {
+    for index in 0..count {
+        fs::write(
+            page_path(root, &format!("p{index}")),
+            format!("- TODO t{index}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// GH #543 (design v4 stage 2): the index owner signals launch completion
+/// once, when the index is ready, and keeps owning index work after it. A
+/// query whose read then fails reports the need and returns; it used to
+/// repair on the query thread, reading and parsing every page itself while
+/// the user waited for the answer.
+#[test]
+fn gh543_after_launch_a_failed_read_is_repaired_by_the_owner_not_the_query() {
+    const PAGES: usize = 6;
+    let root = scratch("gh543-owner-failed-read");
+    write_pages(&root, PAGES);
+    let database = root.join("private/projection.sqlite");
+    // A reopen: the index is validated, and no parsed cache exists that a
+    // repair could reuse without reading the pages.
+    prebuild_index(&root, &database);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let owner = OwnerRun::start(&graph);
+    assert!(
+        owner.wait_settled(Duration::from_secs(10)),
+        "no completion signal"
+    );
+    assert!(
+        graph.direct_projection_ready_test(),
+        "completion was signalled before the index was ready"
+    );
+    let projection = graph.direct_projection_test().unwrap();
+    projection.inject_next_statement_failure();
+    GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+    let _ = graph.run_query_bounded("(task TODO)", 100, 1 << 20);
+    let query_reads = GRAPH_TEXT_CONTENT_READS.with(Cell::get);
+    assert_eq!(
+        query_reads, 0,
+        "the query thread read {query_reads} page files to repair the index itself"
+    );
+    assert!(
+        owner.wait_ready(Duration::from_secs(10)),
+        "the owner did not repair the index: {}",
+        projection.debug_state_test()
+    );
+    let answer = graph
+        .run_query_bounded("(task TODO)", 100, 1 << 20)
+        .unwrap();
+    assert_eq!(answer.groups.len(), PAGES);
+    assert_eq!(owner.settled.load(Ordering::Acquire), 1);
+    assert_eq!(graph.consumer_page_parses_test(), 0);
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// GH #543: a page deleted between a whole-graph listing and its read is a
+/// page that is gone, not one Tine failed to read -- and so is one deleted
+/// between the listing's directory read and its open of the file. Recording it as a read
+/// failure left the index looking incomplete, so the next page creation
+/// parsed the whole graph on the save thread to prove its name was free.
+/// Both passes that list the graph -- the launch check of a stored index and
+/// the parse of a graph with no index -- must agree.
+#[test]
+fn gh543_a_page_deleted_during_a_pass_is_gone_not_unreadable() {
+    const PAGES: usize = 6;
+    for (stored_index, inside_listing) in
+        [(true, false), (false, false), (true, true), (false, true)]
+    {
+        let root = scratch("gh543-vanished-page");
+        write_pages(&root, PAGES);
+        let database = root.join("private/projection.sqlite");
+        if stored_index {
+            prebuild_index(&root, &database);
+        }
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database).unwrap();
+        if inside_listing {
+            graph.vanish_inside_next_listing_test(page_path(&root, "p2"));
+        } else {
+            graph.vanish_after_next_listing_test(page_path(&root, "p2"));
+        }
+        let owner = OwnerRun::start(&graph);
+        assert!(
+            owner.wait_settled(Duration::from_secs(10)),
+            "no completion signal (stored index: {stored_index}, inside listing: {inside_listing})"
+        );
+        assert!(owner.wait_ready(Duration::from_secs(10)));
+        let failures = graph.page_index_failures.read().unwrap().clone();
+        assert!(
+            failures.is_empty(),
+            "a deleted page was recorded as unreadable (stored index: {stored_index}, inside listing: {inside_listing}): {failures:?}"
+        );
+        let parses_before = graph.consumer_page_parses_test();
+        graph
+            .save_page(
+                &markdown_page_dto("fresh", "fresh", "- new\n").unwrap(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            graph.consumer_page_parses_test() - parses_before,
+            0,
+            "creating a page parsed the graph (stored index: {stored_index}, inside listing: {inside_listing})"
+        );
+        let names = graph
+            .list_pages()
+            .into_iter()
+            .map(|entry| entry.name.to_lowercase())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"p2".to_owned()), "{names:?}");
+        assert!(names.contains(&"fresh".to_owned()), "{names:?}");
+        owner.stop();
+        crate::direct_projection::release_projection(&graph);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// GH #543 (design v4 stage 2): a rename landing inside the launch check
+/// costs at most one more whole-graph pass, and the owner settles.
+#[test]
+fn gh543_a_rename_during_the_launch_check_costs_one_more_pass() {
+    const PAGES: usize = 8;
+    let root = scratch("gh543-owner-rename");
+    write_pages(&root, PAGES);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let owner = OwnerRun::start(&graph);
+    pause.reached.wait();
+    // The walk holds the graph-text permit, so the rename lands as soon as
+    // the walk lets go of it: between its read and its drift check.
+    let rename = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.rename_page("p3", "renamed").unwrap())
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    pause.release.wait();
+    rename.join().unwrap();
+    assert!(
+        owner.wait_settled(Duration::from_secs(10)),
+        "no completion signal"
+    );
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    let passes = graph.owner_passes_test();
+    assert!(
+        passes <= 2,
+        "{passes} whole-graph passes for one raced check"
+    );
+    assert_eq!(graph.consumer_page_parses_test(), 0);
+    let names = graph
+        .list_pages()
+        .into_iter()
+        .map(|entry| entry.name.to_lowercase())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"renamed".to_owned()) && !names.contains(&"p3".to_owned()));
+    let reads = owner.stop();
+    assert!(
+        reads <= 3 * PAGES + 2,
+        "the owner read {reads} page files for {PAGES} pages"
+    );
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// GH #543 (design v4 stage 2): a page that panics the parser does not keep
+/// the owner passing over the whole graph. The index keeps the page's
+/// stored rows, becomes ready, and no further pass follows.
+#[test]
+fn gh543_a_panicking_page_costs_a_bounded_number_of_passes() {
+    const PAGES: usize = 6;
+    let root = scratch("gh543-owner-panic");
+    write_pages(&root, PAGES);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    // While the app was closed: one page came to panic the parser, another
+    // changed.
+    fs::write(
+        page_path(&root, "p0"),
+        format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n"),
+    )
+    .unwrap();
+    fs::write(page_path(&root, "p1"), "- TODO changed\n").unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let owner = OwnerRun::start(&graph);
+    assert!(
+        owner.wait_settled(Duration::from_secs(10)),
+        "no completion signal"
+    );
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        owner.wait_ready(Duration::from_secs(10)),
+        "the panicking page kept the index unready: {}",
+        projection.debug_state_test()
+    );
+    std::thread::sleep(Duration::from_millis(1_500));
+    let passes = graph.owner_passes_test();
+    assert!(
+        passes <= 2,
+        "{passes} whole-graph passes over one panicking page"
+    );
+    assert_eq!(graph.search("changed", 20).unwrap().len(), 1);
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// GH #543 (design v4 stage 2): a graph that cannot be listed backs the
+/// owner off instead of passing over it again and again, and launch
+/// completion is still signalled so the app's waiting reads go ahead.
+#[cfg(unix)]
+#[test]
+fn gh543_an_unlistable_graph_backs_the_owner_off() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("gh543-owner-unlistable");
+    write_pages(&root, 4);
+    // The index lives outside the graph, so only the graph is unreadable.
+    let database = root.with_extension("projection.sqlite");
+    let _ = fs::remove_file(&database);
+    prebuild_index(&root, &database);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&root).is_ok() {
+        // Running with permissions that ignore the mode (root): nothing to test.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let owner = OwnerRun::start(&graph);
+    let settled = owner.wait_settled(Duration::from_secs(10));
+    std::thread::sleep(Duration::from_secs(4));
+    let passes = graph.owner_passes_test();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    owner.stop();
+    assert!(
+        settled,
+        "no completion signal while the graph was unlistable"
+    );
+    // Two at once, then after 1 s and 2 s more: at most five in these ~4 s.
+    assert!(passes >= 2, "the owner never tried: {passes} passes");
+    assert!(
+        passes <= 5,
+        "{passes} whole-graph passes in 4 s over an unlistable graph"
+    );
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(database);
 }

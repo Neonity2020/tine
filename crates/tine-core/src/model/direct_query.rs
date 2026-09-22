@@ -921,17 +921,17 @@ impl Graph {
             let Some(projection) = self.direct_projection.get() else {
                 return;
             };
-            if projection.warm_in_flight() {
-                // Another thread is already reading this graph's inventory —
-                // the open path's warm, or a warm this repair's own earlier
-                // pass started. `projection_recovery` serializes repairs but
-                // not that warm, so continuing here would run a second warm of
-                // the same graph concurrently: both read every page, both
-                // compete for the single `warm_outcome` slot, and the loser
-                // used to wait for a producer that no longer existed
-                // (GH #543). The warm in flight is the payload; let it finish.
+            if projection.owner_registered() {
+                // Whole-graph index work is the owner's to start: a repair
+                // here would be a second pass racing it on the query thread,
+                // both reading every page (GH #543). Report the need and
+                // leave it. A failed read is a damaged image; anything else
+                // the owner already sees as its need.
+                if reset || projection.worker_failed() {
+                    projection.request_rebuild();
+                }
                 crate::direct_projection::projection_diag(|| {
-                    "repair skipped: a warm is already in flight".to_owned()
+                    "repair left to the index owner".to_owned()
                 });
                 return;
             }
@@ -978,22 +978,14 @@ impl Graph {
             // builder. An ordinary not-yet-started image still gets the cheap
             // revision-only validation first and parses only when that says a
             // cold/stale build is required.
-            let owned = if reset {
-                self.warm_page_cache_cancellable(&|| false)
-            } else {
-                match self.warm_projection_cancellable(&|| false) {
-                    super::page_cache::WarmProjectionOutcome::Owned => true,
-                    super::page_cache::WarmProjectionOutcome::Retry => {
-                        self.warm_page_cache_cancellable(&|| false)
-                    }
-                    super::page_cache::WarmProjectionOutcome::Cancelled
-                    | super::page_cache::WarmProjectionOutcome::Unavailable => false,
-                }
-            };
-            if !owned {
-                if let Some(projection) = self.direct_projection.get() {
-                    projection.withdraw_rebuild_request();
-                }
+            // A payload that is not taken leaves the rebuild requested: the
+            // next query's repair tries again.
+            if reset {
+                self.warm_page_cache_cancellable(&|| false);
+            } else if self.warm_projection_cancellable(&|| false)
+                == super::page_cache::WarmProjectionOutcome::Retry
+            {
+                self.warm_page_cache_cancellable(&|| false);
             }
             return;
         };
@@ -1006,11 +998,6 @@ impl Graph {
             crate::direct_projection::projection_diag(|| {
                 "repair snapshot abandoned: generation moved while it was assembled".to_owned()
             });
-            if reset {
-                if let Some(projection) = self.direct_projection.get() {
-                    projection.withdraw_rebuild_request();
-                }
-            }
             return;
         }
         // A reset must be followed by a payload; see `direct_projection_enqueue_full`.

@@ -78,7 +78,7 @@ impl Graph {
     ) -> io::Result<Vec<PageEntry>> {
         if let Some(scope) = failures
             .iter()
-            .find(|failure| failure.starts_with("graph-text-scope:"))
+            .find(|failure| failure.starts_with(super::page_cache::GRAPH_TEXT_SCOPE_FAILURE))
         {
             return Err(io::Error::other(scope.clone()));
         }

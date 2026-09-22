@@ -153,10 +153,18 @@ impl PageBuildFlight {
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct PageBuildTestState {
+    /// Whole-graph passes the index owner ran (validations and fresh builds).
+    pub(super) owner_passes: std::sync::atomic::AtomicUsize,
     /// Pause one cold parse after it read every page and before it checks
     /// the pages it read, so a test can land an edit in that window.
     pub(super) cold_read_done: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) owner_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Delete this page right after the next whole-graph listing, before
+    /// its read: a delete no event reported, landing inside a pass.
+    pub(super) vanish_after_listing: std::sync::Mutex<Option<PathBuf>>,
+    /// Delete this page inside the next graph listing, after the directory
+    /// read names it and before the listing opens it.
+    pub(super) vanish_inside_listing: std::sync::Mutex<Option<PathBuf>>,
     /// Pause one fast whole-graph parse after it listed the pages and before
     /// it parses them, so a test can look at the progress bar mid-pass.
     pub(super) fast_parse_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,

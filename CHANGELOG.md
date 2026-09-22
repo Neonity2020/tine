@@ -70,6 +70,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- A page deleted by another program while Tine was indexing the graph no
+  longer counts as a page Tine could not read. That record made creating a
+  new page fail, or re-parse the whole graph first, until Tine was restarted
+  (GH #543).
+
+- Search indexing now runs from one background owner. After a failed search
+  query, the query no longer rebuilds the index on its own thread, and a page
+  that always fails to index, or a graph folder that cannot be read, costs a
+  few spaced-out retries instead of a whole-graph pass after every edit
+  (GH #543).
+
 - If one step of search indexing failed right after the startup check, page
   lists, queries and search could wait forever; they now recover (GH #543).
 

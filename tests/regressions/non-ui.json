@@ -5270,7 +5270,7 @@
    "crates/tine-core/src/direct_projection_tests.rs::pages_changed_between_sessions_are_repaired_page_by_page",
    "crates/tine-core/src/direct_projection_tests.rs::many_pages_changed_between_sessions_build_one_complete_fresh_image",
    "crates/tine-core/src/direct_projection_tests.rs::gh550_launch_reads_of_changed_and_new_pages_settle_without_failing",
-   "crates/tine-core/src/direct_projection_tests.rs::an_incomplete_stale_snapshot_keeps_the_old_coherent_image_until_reconstruction_succeeds"
+   "crates/tine-core/src/direct_projection_tests.rs::an_incomplete_stale_snapshot_keeps_the_unreadable_pages_rows_and_updates_the_rest"
   ],
   "scenario": null,
   "failBefore": "proven"
@@ -6054,6 +6054,24 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 stage-0 interleaving harness, H3-H6. H3: a rename/merge/journal migration marked the index stale, and the mark outlived its own delta, so a later page failure could never make it ready. H4: a reader between the generation move and the queued delta saw nothing coming and parsed. H5: a derived read whose generation went stale while it waited parsed although the index was ready at the newer generation. H6: the launch warm was announced after the graph was published (open and configuration refresh). Shape: Graph::move_cache_generation takes IndexEffect::Sent(&IndexDeltaComing), a token the mover holds until the delta is queued and that progress_at reports as PendingEdits; only an unnamed delete and the test-only invalidate_cache use IndexEffect::Stale; wait_for_derived_read follows cache_gen when nothing is coming; begin_warm_cache returns a WarmTicket carrying the announcement, which warm_cache_async requires, and a source-order guard pins it before publication. Harness: the long run went from 33/300 to 1-2/300 failing seeds; the residuals (creation proof with page_index_failures; one session left unvalidated with nothing queued) are recorded for the single-owner design. Fail-before: tine-agents/evidence/gh550-batch/stage0/necessity-stale-after-rename.log, necessity-rename-window.log (8 parses), necessity-overtaken-listing.log (8 parses)."
+},
+{
+ "id": "REG-A-PAGE-DELETED-DURING-INDEXING-IS-GONE-NOT-UNREADABLE-543",
+ "title": "A page deleted while Tine lists or checks the graph is treated as deleted, not unreadable, so creating a page afterwards neither fails nor re-parses the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_page_deleted_during_a_pass_is_gone_not_unreadable", "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Harness residual (a). The graph listing (graph_text_inventory admit_or_skip), the launch check's walk and re-read, and the parsed build each recorded a page that vanished between listing and read as a page index failure; the reparse path already dropped it. The failure left the inventory incomplete, so page creation either refused ('failure-bearing cold identity evidence cannot authorize name-only creation') or parsed the whole graph on the save thread. All four sites now treat NotFound as gone. The watcher's sync_file_checked still records a vanished path as a failure; its delete event clears it and carries the UI removal, so it is left as is. Fail-before: tine-agents/evidence/gh550-batch/stage2/necessity-vanished-page.log."
 }
 ]
 }

@@ -5664,7 +5664,6 @@ fn empty_projection_shared() -> ProjectionShared {
         serving_writer_cache_budget: AtomicU64::new(0),
         projection_health_checks: AtomicU64::new(0),
         repairs_in_flight: AtomicUsize::new(0),
-        warms_in_flight: AtomicUsize::new(0),
         deltas_coming: AtomicUsize::new(0),
         build_progress: Default::default(),
         #[cfg(test)]
@@ -6378,7 +6377,7 @@ fn a_query_during_the_warm_inventory_read_retries_instead_of_repairing() {
 /// converging this graph? — for the label beside that query, and answered it
 /// differently: it tested only the projection's pending QUEUE, and a warm that
 /// has announced itself queues nothing until the inventory read finishes.
-/// `progress_at` already counts `warms_in_flight` for exactly this reason
+/// `progress_at` already counts the owner's coming pass for exactly this reason
 /// (`Working(Reason::Indexing)`); `index_progress` did not, so the two
 /// disagreed for the whole of the build's most expensive phase — seconds on a
 /// 10k-page graph, tens on Windows, and re-run from the top on every drift
@@ -7039,6 +7038,52 @@ fn a_page_the_walk_could_not_read_keeps_its_place_for_later_updates() {
     );
 }
 
+/// GH #543 (design v4 §0.1): an incomplete snapshot over a healthy image
+/// keeps the rows of everything it could not read, and a directory it could
+/// not read counts for every page beneath it. A snapshot whose listing failed
+/// outright holds no pages at all; applied as an ordinary snapshot it would
+/// erase the whole index and publish that as ready.
+#[test]
+fn an_incomplete_snapshot_keeps_the_rows_beneath_what_it_could_not_read() {
+    let _serial = serialize_projection_tests();
+    for (case, retained, kept) in [
+        ("an unlistable graph", "", true),
+        ("an unread directory", "pages", true),
+        ("a sibling name is not a parent directory", "pag", false),
+    ] {
+        let root = r6_graph(&format!("incomplete-retains-{}", retained.len()));
+        std::fs::write(root.join("pages/kept.md"), "- retained beneath sentinel\n").unwrap();
+        let database = root.join("private/projection.sqlite");
+        let first = Graph::open(&root);
+        first.attach_direct_projection(database.clone()).unwrap();
+        first.warm_cache();
+        wait_ready(&first);
+        release_projection(&first);
+        drop(first);
+
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        let projection = graph.direct_projection_test().unwrap();
+        assert!(projection.enqueue_full(
+            graph.cache_generation(),
+            Arc::new(Vec::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(graph.config().parse_config()),
+            false,
+            vec![retained.to_owned()],
+        ));
+        assert!(projection.wait_drained_test(), "{case}: the turn failed");
+        assert_eq!(
+            projection_contains(&database, "retained beneath sentinel"),
+            kept,
+            "{case}: {}",
+            projection.debug_state_test()
+        );
+        assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 fn an_incomplete_stale_snapshot_keeps_the_unreadable_pages_rows_and_updates_the_rest() {
     let _serial = serialize_projection_tests();
@@ -7317,12 +7362,18 @@ fn a_rebuild_does_not_discard_a_save_newer_than_its_snapshot() {
     );
 
     // A reset repair whose snapshot predates that save. The payload is
-    // refused, and the rebuild obligation must go with it rather than latch.
+    // refused, and the rebuild obligation stays: the damaged image is still
+    // owed its replacement, which the next payload carries (the owner's
+    // next pass, or with no owner the next query's repair; design v4 NG3).
     projection.request_rebuild();
-    projection.enqueue_full(stale_generation, pages, revisions, config, true, Vec::new());
     assert!(
-        !projection.shared.pending.lock().unwrap().rebuild,
-        "the refused payload left the rebuild latched with nothing to ride in on: {}",
+        !projection.enqueue_full(stale_generation, pages, revisions, config, true, Vec::new()),
+        "a snapshot older than the queue was accepted: {}",
+        projection.debug_state_test()
+    );
+    assert!(
+        projection.shared.pending.lock().unwrap().rebuild,
+        "the refused payload dropped the rebuild the damaged image is owed: {}",
         projection.debug_state_test()
     );
     let latest = projection.shared.pending.lock().unwrap().latest_generation;
@@ -9805,7 +9856,7 @@ fn gh543_a_page_list_before_the_scheduled_warm_starts_waits_for_it() {
     // goes first; that paint lists pages inside the delay.
     let graph = Arc::new(Graph::open(&root));
     graph.attach_direct_projection(database).unwrap();
-    let announcement = graph.announce_launch_warm();
+    let announcement = graph.register_index_owner();
     let reads = {
         let graph = Arc::clone(&graph);
         std::thread::spawn(move || graph.list_pages().len())

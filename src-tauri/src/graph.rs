@@ -18,22 +18,23 @@ use tauri::{Emitter, Manager, State};
 use tine_core::model::{Graph, GraphMeta};
 
 /// A launch warm reserved for a graph that is about to be published: the warm
-/// generation `warm_cache_async` reports done against, and the announcement
-/// that tells readers a warm is coming.
+/// generation `warm_cache_async` reports done against, and the graph's
+/// registered index owner, which tells readers index work is coming.
 pub(crate) struct WarmTicket {
     pub(crate) generation: u64,
-    announcement: tine_core::model::LaunchWarmAnnouncement,
+    owner: tine_core::model::IndexOwner,
 }
 
-/// Reset the warm flag for a new graph load and reserve its warm. Both callers
-/// take the ticket before the slot is published, so a command reaching the new
-/// graph sees a warm coming and waits for it instead of parsing the whole
-/// graph itself (GH #543); `warm_cache_async` accepts only a ticket.
+/// Reset the warm flag for a new graph load and register its index owner.
+/// Both callers take the ticket before the slot is published, so a command
+/// reaching the new graph sees index work coming and waits for it instead of
+/// parsing the whole graph itself (GH #543); `warm_cache_async` accepts only a
+/// ticket.
 pub(crate) fn begin_warm_cache(slot: &GraphSlot) -> WarmTicket {
     slot.warm_done.store(false, Ordering::Release);
     WarmTicket {
         generation: slot.warm_generation.fetch_add(1, Ordering::AcqRel) + 1,
-        announcement: slot.graph().announce_launch_warm(),
+        owner: slot.graph().register_index_owner(),
     }
 }
 
@@ -1044,13 +1045,14 @@ pub(crate) fn default_graph_parent(
     Ok(dir.display().to_string())
 }
 
-/// Build the search/backlinks cache off the hot path. We let the frontend's
-/// first journal load grab the graph lock first, then warm in the background so
-/// the first search is instant instead of re-parsing the whole tree. When the
-/// warm completes (and this graph is still the current one — generation check),
-/// flip `warm_done` and tell the frontend, which has been HOLDING its
-/// whole-graph fetches (aliases, ref-count badges) so graph open never does
-/// graph-sized work in the foreground.
+/// Run the graph's index owner off the hot path. We let the frontend's first
+/// journal load grab the graph lock first, then the owner validates or builds
+/// the index in the background, and keeps answering what the index needs for
+/// as long as this graph is bound to the window. When nothing is coming any
+/// more (and this graph is still the current one — generation check), flip
+/// `warm_done` and tell the frontend, which has been HOLDING its whole-graph
+/// fetches (aliases, ref-count badges) so graph open never does graph-sized
+/// work in the foreground.
 pub(crate) fn warm_cache_async(
     app: tauri::AppHandle,
     window_label: String,
@@ -1058,12 +1060,12 @@ pub(crate) fn warm_cache_async(
     warm: WarmTicket,
 ) -> Result<(), crate::command_error::CommandError> {
     let graph = slot.graph();
-    // The ticket's announcement was taken before the graph was published, not
+    // The ticket's owner was registered before the graph was published, not
     // after the delay below; it is dropped when this thread ends, however it
     // ends.
     let WarmTicket {
         generation: warm_generation,
-        announcement,
+        owner,
     } = warm;
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
@@ -1076,25 +1078,18 @@ pub(crate) fn warm_cache_async(
         {
             return; // the graph was switched while we slept — a newer warm owns it
         }
-        // At most one process-wide graph warm parses files at a time. Rapid
-        // switches may leave short-lived sleepers, but cannot amplify disk/CPU
-        // work; revoked slots stop between page parses.
+        // At most one process-wide whole-graph index pass reads files at a
+        // time: every graph's owner takes this permit for its passes only.
+        // Rapid switches cannot amplify disk/CPU work; revoked slots stop
+        // between page parses.
         static WARM_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _worker = WARM_WORK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        if slot.background_cancelled.load(Ordering::Acquire)
-            || slot.warm_generation.load(Ordering::Acquire) != warm_generation
-        {
-            return;
-        }
+        let permit = WARM_WORK.get_or_init(|| std::sync::Mutex::new(()));
         let cancelled = || {
             slot.background_cancelled.load(Ordering::Acquire)
                 || slot.warm_generation.load(Ordering::Acquire) != warm_generation
         };
         settle_launch_warm(
-            || graph.warm_cache_announced(announcement, cancelled),
+            |settle| graph.run_index_owner(owner, permit, cancelled, settle),
             cancelled,
             || {
                 let state: State<'_, AppState> = app.state();
@@ -1129,15 +1124,17 @@ fn finish_warm(
     true
 }
 
-/// Run one launch warm and settle its completion signal. The signal is
-/// `warm-cache-done`: the frontend's alias, page-identity and block-ref-count
-/// fetches and the indexing progress bar wait for it, and nothing else ends
-/// that wait. A warm that ended for any reason other than cancellation --
-/// finished, failed, or panicked -- still sends it, and the waiting reads then
-/// take their ordinary route. Only a cancelled warm (graph switched or closed)
-/// stays silent, because a newer warm owns the window (GH #543, IT-04).
+/// Run the index owner and settle its launch completion signal, at most
+/// once. The signal is `warm-cache-done`: the frontend's alias, page-identity
+/// and block-ref-count fetches and the indexing progress bar wait for it, and
+/// nothing else ends that wait. The owner sends it through the callback it is
+/// given, the first time nothing is coming; an owner that ended before that
+/// for any reason other than cancellation -- the worker gone, a failed build,
+/// a panic -- still sends it, and the waiting reads then take their ordinary
+/// route. Only a cancelled owner (graph switched or closed) stays silent,
+/// because a newer owner has the window (GH #543, IT-04).
 fn settle_launch_warm(
-    warm: impl FnOnce() -> bool,
+    owner: impl FnOnce(&mut dyn FnMut()),
     cancelled: impl Fn() -> bool,
     finish: impl FnOnce(),
 ) {
@@ -1145,20 +1142,25 @@ fn settle_launch_warm(
         cancelled: C,
         finish: Option<F>,
     }
-    impl<C: Fn() -> bool, F: FnOnce()> Drop for Settle<C, F> {
-        fn drop(&mut self) {
-            if !(self.cancelled)() {
-                if let Some(finish) = self.finish.take() {
-                    finish();
-                }
+    impl<C: Fn() -> bool, F: FnOnce()> Settle<C, F> {
+        fn fire(&mut self) {
+            if let Some(finish) = self.finish.take() {
+                finish();
             }
         }
     }
-    let _settle = Settle {
+    impl<C: Fn() -> bool, F: FnOnce()> Drop for Settle<C, F> {
+        fn drop(&mut self) {
+            if !(self.cancelled)() {
+                self.fire();
+            }
+        }
+    }
+    let mut settle = Settle {
         cancelled,
         finish: Some(finish),
     };
-    let _completed = warm();
+    owner(&mut || settle.fire());
 }
 
 /// "Have the whole-graph derived caches finished warming for the current graph?"
@@ -1203,16 +1205,29 @@ mod tests {
     /// progress poll waited for a signal that never came.
     #[test]
     fn a_launch_warm_that_ends_uncancelled_always_signals_completion() {
-        for (case, succeeds) in [("finished", true), ("failed", false)] {
-            let signalled = std::cell::Cell::new(false);
-            settle_launch_warm(|| succeeds, || false, || signalled.set(true));
-            assert!(signalled.get(), "{case}: no completion signal");
+        for (case, settles) in [("settled", true), ("ended unsettled", false)] {
+            let signalled = std::cell::Cell::new(0);
+            settle_launch_warm(
+                |settle| {
+                    if settles {
+                        settle();
+                        settle();
+                    }
+                },
+                || false,
+                || signalled.set(signalled.get() + 1),
+            );
+            assert_eq!(
+                signalled.get(),
+                1,
+                "{case}: not exactly one completion signal"
+            );
         }
 
         let signalled = std::sync::atomic::AtomicBool::new(false);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             settle_launch_warm(
-                || panic!("warm panicked"),
+                |_| panic!("owner panicked"),
                 || false,
                 || signalled.store(true, Ordering::Release),
             )
@@ -1224,7 +1239,7 @@ mod tests {
         );
 
         let signalled = std::cell::Cell::new(false);
-        settle_launch_warm(|| false, || true, || signalled.set(true));
+        settle_launch_warm(|_| {}, || true, || signalled.set(true));
         assert!(
             !signalled.get(),
             "cancelled: a newer warm owns the window's signal"
