@@ -129,20 +129,52 @@ impl PassReadAt<'_> {
 }
 
 /// The page-set changes since a pass read the graph.
+///
+/// The fields are private and [`GraphDrift::into_parts`] is the only way out:
+/// it hands every kind of change back positionally, so a consumer names each
+/// one. The warm validation used to read `removed` and `changed` by field and
+/// never saw `reread` when it was added, installing an index that dropped a
+/// newer watcher failure (GH #543, audit R4-01).
 pub(super) struct GraphDrift {
-    /// The generation the pass may install or queue at.
-    pub(super) generation: u64,
+    generation: u64,
+    changed: HashSet<PathBuf>,
+    removed: HashSet<PathBuf>,
+    reread: HashSet<PathBuf>,
+}
+
+/// Pages that need a look since a pass read them, by what happened.
+pub(super) struct DriftPaths {
     /// Pages published after the pass read them, at bytes or a parse
     /// configuration other than it saw, including pages it never listed.
     pub(super) changed: HashSet<PathBuf>,
     /// Pages removed after the pass read them. A page removed and then
-    /// created again is in both sets; its publication describes it as it is now.
+    /// created again is in both `removed` and `changed`; its publication
+    /// describes it as it is now.
     pub(super) removed: HashSet<PathBuf>,
     /// Pages whose state changed after the pass read them without a
-    /// publication, such as becoming unreadable.
+    /// publication, such as becoming unreadable: read them again.
     pub(super) reread: HashSet<PathBuf>,
 }
 
+impl GraphDrift {
+    /// The generation the pass may install or queue at, and every change.
+    pub(super) fn into_parts(self) -> (u64, DriftPaths) {
+        let Self {
+            generation,
+            changed,
+            removed,
+            reread,
+        } = self;
+        (
+            generation,
+            DriftPaths {
+                changed,
+                removed,
+                reread,
+            },
+        )
+    }
+}
 impl Graph {
     /// Publish the runtime ids of a page read or written now, stamped with
     /// the event sequence so a pass can tell whether it read the page before

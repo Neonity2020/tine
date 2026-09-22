@@ -70,6 +70,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Pages that changed on disk, or failed to read, while Tine was checking its
+  search index at startup are now read again once the check finishes, instead
+  of the index keeping their old content (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).

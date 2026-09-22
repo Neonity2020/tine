@@ -5687,11 +5687,11 @@
  "layer": "rust-core",
  "status": "covered",
  "coverage": {
-  "tests": ["crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure"],
+  "tests": ["crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure", "crates/tine-core/src/direct_projection_tests.rs::a_warm_keeps_a_watcher_failure_recorded_while_it_ran"],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "GH #543 indexing audit round 3, R3-07. record_watcher_identity_failure moved the cache generation without recording a structural event, so a complete capture that started earlier installed over it, erased the failure and marked the index ready. Recording and clearing a watcher failure now record StructuralChange::Reread(path) before the generation moves, so the capture re-reads that path. Fail-before at 788300f0: evidence tine-agents/evidence/gh550-batch/indexing-audit-r3/RECEIPT-indexing-audit-r3-probes.log."
+ "notes": "GH #543 indexing audit round 3, R3-07. record_watcher_identity_failure moved the cache generation without recording a structural event, so a complete capture that started earlier installed over it, erased the failure and marked the index ready. Recording and clearing a watcher failure now record StructuralChange::Reread(path) before the generation moves, so the capture re-reads that path. Fail-before at 788300f0: evidence tine-agents/evidence/gh550-batch/indexing-audit-r3/RECEIPT-indexing-audit-r3-probes.log. Round-4 audit R4-01: the warm validation never read the reread set its drift account returned, so it installed a failure list without a page the watcher found unreadable while it ran. GraphDrift is now consumed only through into_parts, which names every kind of change; the warm reads each reread page again and its failures follow that read. Fail-before at 6ef32fd6: tine-agents/evidence/gh550-batch/indexing-audit-r4/verify-by-manager.log."
 }
 ]
 }

@@ -10045,3 +10045,42 @@ fn the_same_full_snapshot_offered_twice_is_taken_once() {
     assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// GH #543 (audit R4-01): a page that became unreadable while a warm read
+/// the graph stays recorded as failed once the warm installs; the warm read
+/// it before it failed and must not answer for it.
+#[test]
+fn a_warm_keeps_a_watcher_failure_recorded_while_it_ran() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("audit543-r4-warm-failure");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let failed = root.join("pages/two.md");
+    std::fs::write(&failed, [0xff, 0xfe]).unwrap();
+    assert!(graph.sync_file_checked(&failed).is_err());
+    let before = graph.page_index_failures();
+    pause.release.wait();
+    warmer.join().unwrap();
+    let after = graph.page_index_failures();
+    let ready = graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(2))
+        .is_ok();
+    eprintln!("R4 warm failure: before={before:?} after={after:?} ready={ready}");
+    release_projection(&graph);
+    assert_eq!(after, before, "warm erased a newer watcher failure");
+}
+

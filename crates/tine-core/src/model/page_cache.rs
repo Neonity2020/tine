@@ -328,16 +328,18 @@ impl Graph {
         // A page that became unreadable after it was read is read again, so
         // its failure is recorded rather than overwritten by the older, clean
         // capture (audit R3-07).
-        let stale = drift
-            .changed
+        let (
+            expected_generation,
+            graph_drift::DriftPaths {
+                changed,
+                removed,
+                reread: reread_since,
+            },
+        ) = drift.into_parts();
+        let stale = changed
             .into_iter()
-            .chain(drift.reread)
-            .chain(
-                drift
-                    .removed
-                    .into_iter()
-                    .filter(|path| revs.contains_key(path)),
-            )
+            .chain(reread_since)
+            .chain(removed.into_iter().filter(|path| revs.contains_key(path)))
             .collect::<std::collections::HashSet<_>>();
         if !stale.is_empty() {
             drop(guard);
@@ -358,7 +360,6 @@ impl Graph {
                 stale,
             ));
         }
-        let expected_generation = drift.generation;
         let source_complete = failures.is_empty();
         let effective_index = Arc::new(build_effective_identity_index(
             expected_generation,
@@ -666,6 +667,8 @@ impl Graph {
         // and a graph still changing underneath it gets the rebuild.
         let mut repairs_left = 2usize;
         let mut repair = None;
+        // When the warm read a page again after the walk; see `PassReadAt`.
+        let mut reread_at = std::collections::HashMap::new();
         loop {
             // A page removed since the read leaves the walk (its queued
             // deletion follows), and every page published since the read at
@@ -680,26 +683,72 @@ impl Graph {
                 let read_at = graph_drift::PassReadAt {
                     generation: read_at,
                     structural,
-                    reread: &std::collections::HashMap::new(),
+                    reread: &reread_at,
                 };
                 self.drift_since(&cache, &read_at, |path| read.get(path).copied())
             };
             let Some(drift) = drift else {
                 return abandoned();
             };
-            if !drift.removed.is_empty() {
-                let removed = sources
+            let (
+                generation,
+                graph_drift::DriftPaths {
+                    changed: published,
+                    removed,
+                    reread,
+                },
+            ) = drift.into_parts();
+            if !removed.is_empty() {
+                let removed_rel = sources
                     .iter()
                     .map(|(entry, _)| entry)
                     .chain(&retained)
-                    .filter(|entry| drift.removed.contains(&entry.path))
+                    .filter(|entry| removed.contains(&entry.path))
                     .map(|entry| entry.rel_path.clone())
                     .collect::<std::collections::HashSet<_>>();
-                sources.retain(|(entry, _)| !drift.removed.contains(&entry.path));
-                retained.retain(|entry| !drift.removed.contains(&entry.path));
-                walk_order.retain(|rel_path| !removed.contains(rel_path));
+                sources.retain(|(entry, _)| !removed.contains(&entry.path));
+                retained.retain(|entry| !removed.contains(&entry.path));
+                walk_order.retain(|rel_path| !removed_rel.contains(rel_path));
             }
-            let (generation, published) = (drift.generation, drift.changed);
+            // A page whose state changed after the walk read it without a
+            // publication -- typically one the watcher found unreadable -- is
+            // read again now, so the failures this warm publishes are no older
+            // than the watcher's (audit R4-01). Only these pages are read.
+            for path in reread {
+                reread_at.insert(path.clone(), self.cache_structural_gen.load());
+                let rel_path = self.rel_path(&path);
+                failures.retain(|failure| failure != &rel_path);
+                let listed = sources.iter().position(|(entry, _)| entry.path == path);
+                let kept = retained.iter().position(|entry| entry.path == path);
+                match self.graph_text_read_optional_text_with_identity(&permit, &path) {
+                    Ok(Some((content, _))) => {
+                        let revision = content_rev(&content);
+                        if let Some(i) = listed {
+                            sources[i].1 = revision;
+                        } else if let Some(i) = kept {
+                            let entry = retained.remove(i);
+                            sources.push((entry, revision));
+                        }
+                    }
+                    Ok(None) => {
+                        if let Some(i) = listed {
+                            sources.remove(i);
+                        }
+                        if let Some(i) = kept {
+                            retained.remove(i);
+                        }
+                        walk_order.retain(|candidate| candidate != &rel_path);
+                        failures.push(rel_path);
+                    }
+                    Err(_) => {
+                        if let Some(i) = listed {
+                            let (entry, _) = sources.remove(i);
+                            retained.push(entry);
+                        }
+                        failures.push(rel_path);
+                    }
+                }
+            }
             // Validation leaves these pages as the image holds them, and the
             // updates they published replace them after it (audit IT-03).
             let mut published_pages = Vec::with_capacity(published.len());
