@@ -9972,3 +9972,42 @@ fn gh543_progress_answers_while_a_joined_build_runs() {
          held the projection-slot lock through it (GH #543, indexing audit R2-04)"
     );
 }
+
+/// A page deleted while the warm validation reads is named by the delete, so
+/// the validation drops it and keeps the rest; discarding it parsed every
+/// surviving page (GH #543, indexing audit R2-05).
+#[test]
+fn gh543_a_delete_during_the_warm_validation_parses_nothing() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-warm-delete");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let deleted = root.join("pages/two.md");
+    std::fs::remove_file(&deleted).unwrap();
+    graph.sync_deleted_file(&deleted).unwrap();
+    pause.release.wait();
+    warmer.join().unwrap();
+    wait_ready(&graph);
+    let parses = graph.page_build_parses_test();
+    let still_listed = graph.list_pages().iter().any(|entry| entry.path == deleted);
+    let survivors = graph.list_pages().len();
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+    assert!(!still_listed);
+    assert!(survivors > 0);
+    assert_eq!(parses, 0, "the delete discarded the warm validation");
+}

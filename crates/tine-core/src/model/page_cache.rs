@@ -152,9 +152,7 @@ impl Graph {
         let (completed, structural) = {
             let cache = self.cache.read().unwrap();
             let current_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            let structural = self
-                .cache_structural_gen
-                .load(std::sync::atomic::Ordering::Acquire);
+            let structural = self.cache_structural_gen.load();
             let completed = if current_generation != expected_generation {
                 Some(PageBuildOutcome::GenerationDrift)
             } else if cache.is_some() {
@@ -201,30 +199,95 @@ impl Graph {
             return flight.wait();
         }
         let built = self.load_all_pages_with_permit(permit);
-        let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
+        let outcome = PageBuildOutcome::from(self.install_reconciled(&flight, permit, built));
         self.finish_page_build(&flight, outcome);
         outcome
+    }
+
+    /// Install a whole-graph parse, first reparsing each page an edit, open or
+    /// delete changed while it was read (see [`Graph::drift_since`]). A parse
+    /// is discarded only when a change has no name, or pages keep changing
+    /// under three reconciliations in a row.
+    pub(super) fn install_reconciled(
+        &self,
+        flight: &PageBuildFlight,
+        permit: &GraphTextWritePermit,
+        mut built: PageCacheBuild,
+    ) -> PageCacheInstallOutcome {
+        for _ in 0..3 {
+            match self.install_built(flight, built) {
+                Ok(outcome) => return outcome,
+                Err((back, stale)) => {
+                    built = back;
+                    self.reparse_into(permit, &mut built, &stale);
+                }
+            }
+        }
+        PageCacheInstallOutcome::GenerationDrift
+    }
+
+    /// Replace the named pages in a parse with their current bytes; a page
+    /// that is gone leaves the parse. Returns each reparsed page's file
+    /// identity and revision, for a caller that checks them again.
+    fn reparse_into(
+        &self,
+        permit: &GraphTextWritePermit,
+        built: &mut PageCacheBuild,
+        paths: &std::collections::HashSet<PathBuf>,
+    ) -> Vec<(PathBuf, ContentDigest, String)> {
+        built
+            .pages
+            .retain(|(entry, _, _)| !paths.contains(&entry.path));
+        built
+            .failures
+            .retain(|failure| !paths.contains(&self.root.join(failure)));
+        let mut baselines = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Ok(Some(entry)) = self.graph_text_entry_for_path(path) else {
+                continue;
+            };
+            match self.graph_text_read_optional_text_with_identity(permit, &entry.path) {
+                Ok(Some((content, identity))) => {
+                    #[cfg(test)]
+                    self.page_build_test
+                        .parses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let revision = content_rev(&content);
+                    let parsed = isolate_page_parse(entry, &self.journal_format, |entry| {
+                        Some(self.parse_session_page_content(entry, &content))
+                    });
+                    if built.collect(parsed) {
+                        baselines.push((path.clone(), identity, revision));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => built.failures.push(entry.rel_path),
+            }
+        }
+        baselines
     }
 
     /// Install a freshly-built whole-graph snapshot atomically: the parsed pages
     /// into the cache, their on-disk revs into `disk_revs`. Cache set BEFORE
     /// disk_revs so a reader never observes a fresh rev paired with a stale cache.
+    /// `Err` hands the parse back with the pages changed since it was read;
+    /// [`Graph::install_reconciled`] reparses them and installs again.
     pub(super) fn install_built(
         &self,
         flight: &PageBuildFlight,
         built: PageCacheBuild,
-    ) -> PageCacheInstallOutcome {
-        let expected_generation = flight.expected_generation;
+    ) -> Result<PageCacheInstallOutcome, (PageCacheBuild, std::collections::HashSet<PathBuf>)> {
         #[cfg(test)]
         if self
             .page_build_test
             .drift_before_install
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            // Real drift: a structural move, which no revision match excuses.
-            self.cache_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            // Real drift: a change with no name, which no reparse can follow.
+            let _cache = self.cache.write().unwrap();
             self.cache_structural_gen
+                .record(graph_drift::StructuralChange::Unnamed);
+            self.cache_gen
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         let PageCacheBuild {
@@ -233,7 +296,6 @@ impl Graph {
         } = built;
         failures.sort();
         failures.dedup();
-        let source_complete = failures.is_empty();
         let revs: std::collections::HashMap<PathBuf, String> = built
             .iter()
             .map(|(e, _, r)| (e.path.clone(), r.clone()))
@@ -249,25 +311,45 @@ impl Graph {
         // parsed. A cache that another publisher already supplied is likewise
         // never overwritten.
         let mut guard = self.cache.write().unwrap();
-        // Opening a page publishes it even when its bytes are unchanged; a
-        // cold open does that for today's journal while this parse runs, and
-        // discarding the parse for it sent the next reader into a second
-        // whole-graph parse (GH #543). Such a move leaves the parse current.
-        let Some(generation) = self.generation_after_benign_drift(
-            expected_generation,
+        let Some(drift) = self.drift_since(
+            &guard,
+            flight.expected_generation,
             flight.expected_structural,
             |path| revs.get(path).map(String::as_str),
         ) else {
-            return PageCacheInstallOutcome::GenerationDrift;
+            return Ok(PageCacheInstallOutcome::GenerationDrift);
         };
-        let expected_generation = generation;
+        let stale = drift
+            .changed
+            .into_iter()
+            .chain(
+                drift
+                    .removed
+                    .into_iter()
+                    .filter(|path| revs.contains_key(path)),
+            )
+            .collect::<std::collections::HashSet<_>>();
+        if !stale.is_empty() {
+            drop(guard);
+            let pages = pages
+                .into_iter()
+                .map(|(entry, document)| {
+                    let revision = revs[&entry.path].clone();
+                    let document = Arc::try_unwrap(document).unwrap_or_else(|d| (*d).clone());
+                    (entry, document, revision)
+                })
+                .collect();
+            return Err((PageCacheBuild { pages, failures }, stale));
+        }
+        let expected_generation = drift.generation;
+        let source_complete = failures.is_empty();
         let effective_index = Arc::new(build_effective_identity_index(
             expected_generation,
             &pages,
             failures.clone(),
         ));
         if guard.is_some() && self.page_index_failures.read().unwrap().is_empty() {
-            return PageCacheInstallOutcome::AlreadyAvailable;
+            return Ok(PageCacheInstallOutcome::AlreadyAvailable);
         }
         let pages = Arc::new(pages);
         *guard = Some(Arc::clone(&pages));
@@ -288,7 +370,7 @@ impl Graph {
             false,
             source_complete,
         );
-        PageCacheInstallOutcome::Installed
+        Ok(PageCacheInstallOutcome::Installed)
     }
 
     /// Run `f` over every parsed page, building the cache on first use.
@@ -343,7 +425,8 @@ impl Graph {
             let (flight, owner) = self.claim_page_build(expected_generation);
             if owner {
                 let built = self.load_all_pages_with_permit(&permit);
-                let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
+                let outcome =
+                    PageBuildOutcome::from(self.install_reconciled(&flight, &permit, built));
                 self.finish_page_build(&flight, outcome);
             } else {
                 let _ = flight.wait();
@@ -482,14 +565,12 @@ impl Graph {
         let Ok(permit) = self.admit_retained_graph_text_writer() else {
             return Outcome::Unavailable;
         };
-        let structural = self
-            .cache_structural_gen
-            .load(std::sync::atomic::Ordering::Acquire);
+        let structural = self.cache_structural_gen.load();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
             return Outcome::Unavailable;
         };
-        let walk_order = entries
+        let mut walk_order = entries
             .iter()
             .map(|entry| entry.rel_path.clone())
             .collect::<Vec<_>>();
@@ -569,11 +650,34 @@ impl Graph {
         let mut repairs_left = 2usize;
         let mut repair = None;
         loop {
-            let Some((generation, published)) =
-                self.warm_generation_after_drift(read_at, structural, &sources)
-            else {
+            // A page removed since the read leaves the walk (its queued
+            // deletion follows), and every page published since the read at
+            // other bytes is left as the image holds it, its queued update
+            // applied after validation (audit IT-03, R2-05).
+            let drift = {
+                let read = sources
+                    .iter()
+                    .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let cache = self.cache.read().unwrap();
+                self.drift_since(&cache, read_at, structural, |path| read.get(path).copied())
+            };
+            let Some(drift) = drift else {
                 return abandoned();
             };
+            if !drift.removed.is_empty() {
+                let removed = sources
+                    .iter()
+                    .map(|(entry, _)| entry)
+                    .chain(&retained)
+                    .filter(|entry| drift.removed.contains(&entry.path))
+                    .map(|entry| entry.rel_path.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                sources.retain(|(entry, _)| !drift.removed.contains(&entry.path));
+                retained.retain(|entry| !drift.removed.contains(&entry.path));
+                walk_order.retain(|rel_path| !removed.contains(rel_path));
+            }
+            let (generation, published) = (drift.generation, drift.changed);
             // Validation leaves these pages as the image holds them, and the
             // updates they published replace them after it (audit IT-03).
             let mut published_pages = Vec::with_capacity(published.len());
@@ -723,85 +827,6 @@ impl Graph {
         Some(parsed)
     }
 
-    /// The generation a finished warm inventory read may be queued at, and
-    /// the pages published since the read at other bytes than it saw; `None`
-    /// when it must be read again.
-    ///
-    /// Opening a page publishes it even when its bytes are unchanged, and a
-    /// launch opens today's journal while the warm is still reading. On a
-    /// 10,000-page Windows graph that read takes seconds, and throwing it away
-    /// for that publication sent every warm reopen to a whole-graph parse
-    /// (GH #543). An edited or new page published during the read did the
-    /// same (audit IT-03), although its publication queued the update that
-    /// brings the index to its current bytes. So the read survives any move
-    /// that is not structural: a publication at the revision the warm read is
-    /// benign, and every other published page is returned for validation to
-    /// leave as the image holds it, with its update applied after. A removal
-    /// or invalidation (structural) still discards the read: nothing queued
-    /// describes what it took away.
-    fn warm_generation_after_drift(
-        &self,
-        read_at: u64,
-        structural: u64,
-        sources: &[(PageEntry, String)],
-    ) -> Option<(u64, std::collections::HashSet<PathBuf>)> {
-        use std::sync::atomic::Ordering;
-        let read: std::collections::HashMap<&Path, &str> = sources
-            .iter()
-            .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
-            .collect();
-        // Every mover publishes its session record and bumps both counters
-        // under the cache write lock, so this read lock sees them together.
-        let _cache = self.cache.read().unwrap();
-        let current = self.cache_gen.load(Ordering::Acquire);
-        if current == read_at {
-            return Some((current, std::collections::HashSet::new()));
-        }
-        if self.cache_structural_gen.load(Ordering::Acquire) != structural {
-            return None;
-        }
-        let config = self.config.parse_config().digest();
-        let published = self
-            .session_page_ids
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(path, ids)| {
-                ids.config != config || read.get(path.as_path()) != Some(&ids.revision.as_str())
-            })
-            .map(|(path, _)| path.clone())
-            .collect();
-        Some((current, published))
-    }
-
-    /// The shared rule behind `warm_generation_after_drift` and cold
-    /// installation. The caller holds the cache lock (read or write), which
-    /// every mover takes to publish its session record and bump the counters.
-    fn generation_after_benign_drift<'a>(
-        &self,
-        read_at: u64,
-        structural: u64,
-        read: impl Fn(&Path) -> Option<&'a str>,
-    ) -> Option<u64> {
-        use std::sync::atomic::Ordering;
-        let current = self.cache_gen.load(Ordering::Acquire);
-        if current == read_at {
-            return Some(current);
-        }
-        if self.cache_structural_gen.load(Ordering::Acquire) != structural {
-            return None;
-        }
-        let config = self.config.parse_config().digest();
-        self.session_page_ids
-            .read()
-            .unwrap()
-            .iter()
-            .all(|(path, ids)| {
-                ids.config == config && read(path.as_path()) == Some(ids.revision.as_str())
-            })
-            .then_some(current)
-    }
-
     fn publish_page_index_failures(&self, generation: u64, mut failures: Vec<String>) {
         failures.sort();
         failures.dedup();
@@ -844,7 +869,8 @@ impl Graph {
                     pages: Vec::new(),
                     failures: vec![failure],
                 };
-                let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
+                let outcome =
+                    PageBuildOutcome::from(self.install_reconciled(&flight, &permit, built));
                 self.finish_page_build(&flight, outcome);
                 return outcome.installed() && !cancelled();
             }
@@ -894,21 +920,44 @@ impl Graph {
             self.finish_page_build(&flight, PageBuildOutcome::Failed);
             return false;
         }
-        for (path, identity, revision) in &baselines {
-            match self.graph_text_read_optional_text_with_identity(&permit, path) {
-                Ok(Some((content, current_identity)))
-                    if current_identity == *identity && content_rev(&content) == *revision => {}
-                _ => {
-                    self.finish_page_build(&flight, PageBuildOutcome::Failed);
-                    return false;
-                }
+        #[cfg(test)]
+        {
+            let pause = self.page_build_test.cold_read_done.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
             }
+        }
+        // A page whose bytes changed after it was parsed (an external edit the
+        // watcher has not delivered yet) is parsed again, not the whole graph.
+        let mut rounds = 0;
+        while !baselines.is_empty() {
+            let changed = baselines
+                .iter()
+                .filter(|(path, identity, revision)| {
+                    !matches!(
+                        self.graph_text_read_optional_text_with_identity(&permit, path),
+                        Ok(Some((content, current_identity)))
+                            if current_identity == *identity && content_rev(&content) == *revision
+                    )
+                })
+                .map(|(path, _, _)| path.clone())
+                .collect::<std::collections::HashSet<_>>();
+            if changed.is_empty() {
+                break;
+            }
+            rounds += 1;
+            if rounds > 3 {
+                self.finish_page_build(&flight, PageBuildOutcome::Failed);
+                return false;
+            }
+            baselines = self.reparse_into(&permit, &mut built, &changed);
         }
         if cancelled() {
             self.finish_page_build(&flight, PageBuildOutcome::Cancelled);
             return false;
         }
-        let outcome = PageBuildOutcome::from(self.install_built(&flight, built));
+        let outcome = PageBuildOutcome::from(self.install_reconciled(&flight, &permit, built));
         self.finish_page_build(&flight, outcome);
         outcome.installed() && !cancelled()
     }
@@ -941,8 +990,9 @@ impl Graph {
     /// There is no page to check the move against, so it counts as structural.
     #[cfg(test)]
     pub(crate) fn drift_generation_test(&self) {
+        let _cache = self.cache.write().unwrap();
         self.cache_structural_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .record(graph_drift::StructuralChange::Unnamed);
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -1019,7 +1069,7 @@ impl Graph {
                                                  // rebuilds from disk) rather than the stale pre-invalidation content — same
                                                  // gen-after-content ordering as cache_upsert.
         self.cache_structural_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .record(graph_drift::StructuralChange::Unnamed);
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         drop(guard);
@@ -1471,7 +1521,16 @@ impl Graph {
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
         self.cache_structural_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .record(if removed_entries.is_empty() {
+                graph_drift::StructuralChange::Unnamed
+            } else {
+                graph_drift::StructuralChange::Removed(
+                    removed_entries
+                        .iter()
+                        .map(|entry| entry.path.clone())
+                        .collect(),
+                )
+            });
         let newgen = self
             .cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release)
@@ -1534,7 +1593,9 @@ impl Graph {
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
         self.cache_structural_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .record(graph_drift::StructuralChange::Removed(vec![entry
+                .path
+                .clone()]));
         let newgen = self
             .cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release)

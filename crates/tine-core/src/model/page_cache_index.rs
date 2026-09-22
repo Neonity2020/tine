@@ -146,6 +146,9 @@ impl PageBuildFlight {
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct PageBuildTestState {
+    /// Pause one cold parse after it read every page and before it checks
+    /// the pages it read, so a test can land an edit in that window.
+    pub(super) cold_read_done: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) owner_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// GH #543: pause one warm validation after it has announced itself and
     /// before it reads page bytes, so a test can land a query in that window.

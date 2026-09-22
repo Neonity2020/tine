@@ -49,6 +49,7 @@ mod dto;
 mod editor_activation;
 mod editor_types;
 mod graph_dir;
+mod graph_drift;
 mod graph_text_admission;
 mod graph_text_capture;
 mod graph_text_errors;
@@ -367,8 +368,9 @@ pub struct Graph {
     /// cache invalidation. A warm validation that sees `cache_gen` move while
     /// this stays put knows each move published one page and its session
     /// revision, so it can check those pages against what it read instead of
-    /// rereading the whole graph (GH #543).
-    cache_structural_gen: std::sync::atomic::AtomicU64,
+    /// rereading the whole graph (GH #543). Each move names what it removed;
+    /// see `graph_drift`.
+    cache_structural_gen: graph_drift::StructuralGeneration,
     /// Pages counted by the running whole-graph check or read, for the
     /// indexing progress bar only (GH #543).
     indexing_progress: crate::indexing_progress::ProgressCounter,

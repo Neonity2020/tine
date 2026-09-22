@@ -3,6 +3,45 @@
 
 use super::*;
 
+/// An edit saved after the cold parse read every page must cost one page
+/// parse, not the whole graph again (GH #543, indexing audit R2-02).
+#[test]
+fn gh543_an_edit_during_the_cold_parse_costs_one_page() {
+    let dir = scratch("gh543-cold-parse-one-edit");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- TODO original\n").unwrap();
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    let pause = Arc::new(PageBuildTestPause::new());
+    *graph.page_build_test.cold_read_done.lock().unwrap() = Some(Arc::clone(&pause));
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache_cancellable(|| false))
+    };
+    pause.reached.wait();
+    let entry = graph.entry_for_path(&dir.join("pages/p0.md")).unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    page.blocks[0].raw = "TODO edited during cold parse".into();
+    graph.save_page(&page, page.rev.as_deref()).unwrap();
+    pause.release.wait();
+    let completed = warmer.join().unwrap();
+    let first = graph.page_build_parses_test();
+    let listed = graph.list_pages().len();
+    let total = graph.page_build_parses_test();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    graph.detach_direct_projection(Duration::from_secs(5));
+    let _ = fs::remove_dir_all(&dir);
+    assert!(completed, "the cold parse was discarded for one edit");
+    assert_eq!(listed, 8);
+    assert!(first <= 9, "the edit cost {first} parses of 8 pages");
+    assert_eq!(total, first, "a listing parsed the graph again");
+}
+
 /// Opening an unchanged page during the cold parse publishes it and moves the
 /// cache generation. The parse must still install: discarding it made the
 /// next reader parse the whole graph again (GH #543).
@@ -46,35 +85,48 @@ fn gh543_cold_parse_survives_an_unchanged_page_open() {
     assert_eq!(total_parses, first_parses, "a second whole-graph parse ran");
 }
 
-/// An edit that lands after the cold parse read the page is real drift: the
-/// parse holds the old bytes and must not install over the edit.
+/// An edit that lands after the cold parse read the page must not be
+/// installed over: the parse names the page, and only that page is parsed
+/// again before the parse installs (GH #543, R2-02).
 #[test]
-fn gh543_cold_parse_still_yields_to_an_edit_after_it_read_the_page() {
+fn gh543_cold_parse_reparses_a_page_edited_after_it_read_it() {
     let dir = scratch("gh543-cold-parse-edited");
     fs::write(dir.join("pages/Existing.md"), "- unchanged\n").unwrap();
+    fs::write(dir.join("pages/Other.md"), "- other\n").unwrap();
     let graph = Graph::open(&dir);
     let permit = graph.admit_retained_graph_text_writer().unwrap();
-    let flight = PageBuildFlight::new(
-        graph.cache_generation(),
-        graph
-            .cache_structural_gen
-            .load(std::sync::atomic::Ordering::Acquire),
-    );
+    let flight = PageBuildFlight::new(graph.cache_generation(), graph.cache_structural_gen.load());
     let built = graph.load_all_pages_with_permit(&permit);
-    drop(permit);
-    let entry = graph
-        .entry_for_path(&dir.join("pages/Existing.md"))
-        .unwrap();
+    let path = dir.join("pages/Existing.md");
+    let entry = graph.entry_for_path(&path).unwrap();
     let mut page = graph.load_page(&entry).unwrap();
     let base = page.rev.clone().unwrap();
     page.blocks[0].raw = "changed".into();
     graph.save_page(&page, Some(&base)).unwrap();
 
+    let Err((built, stale)) = graph.install_built(&flight, built) else {
+        panic!("the parse installed over the edit");
+    };
+    assert_eq!(stale, std::collections::HashSet::from([path.clone()]));
+    let parses = graph.page_build_parses_test();
     assert_eq!(
-        graph.install_built(&flight, built),
-        PageCacheInstallOutcome::GenerationDrift
+        graph.install_reconciled(&flight, &permit, built),
+        PageCacheInstallOutcome::Installed
     );
+    assert_eq!(
+        graph.page_build_parses_test(),
+        parses + 1,
+        "only the edited page is parsed again"
+    );
+    let cached = graph.with_captured_pages(|pages| {
+        pages
+            .iter()
+            .find(|(entry, _)| entry.path == path)
+            .map(|(_, document)| document.roots[0].raw.clone())
+    });
+    drop(permit);
     let _ = fs::remove_dir_all(&dir);
+    assert_eq!(cached.flatten().as_deref(), Some("changed"));
 }
 
 /// GH #543 (indexing audit IT-07): with a page that cannot be read and no

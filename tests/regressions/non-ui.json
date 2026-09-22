@@ -5149,12 +5149,12 @@
  "coverage": {
   "tests": [
    "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_cold_parse_survives_an_unchanged_page_open",
-   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_cold_parse_still_yields_to_an_edit_after_it_read_the_page"
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_cold_parse_reparses_a_page_edited_after_it_read_it"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "GH #543 indexing audit IT-04. Opening a page publishes it and moves the cache generation even when its bytes are unchanged (the publication re-lowers the page with this session's block ids, which the stored index may not carry). The cold page-reading pass installed only at its exact starting generation, so opening today's journal while it ran discarded the pass and the next reader parsed the whole graph again. Installation now uses the rule the warm check already uses: no structural move, and every page published this session has the revision and config the pass read. An edit after the pass read the page still discards it. The first test fails when installation requires the exact generation. Evidence: tine-agents/evidence/gh550-batch/gh543-derived-wait/cold-install-fail-before.log."
+ "notes": "GH #543 indexing audit IT-04. Opening a page publishes it and moves the cache generation even when its bytes are unchanged (the publication re-lowers the page with this session's block ids, which the stored index may not carry). The cold page-reading pass installed only at its exact starting generation, so opening today's journal while it ran discarded the pass and the next reader parsed the whole graph again. Installation now uses the rule the warm check already uses: no structural move, and every page published this session has the revision and config the pass read. An edit after the pass read the page no longer discards it: since R2-02 the pass parses that page again and installs (see REG-EDIT-OR-DELETE-DURING-INDEXING-KEEPS-THE-PASS-543). The first test fails when installation requires the exact generation. Evidence: tine-agents/evidence/gh550-batch/gh543-derived-wait/cold-install-fail-before.log."
 },
 {
  "id": "REG-WARM-REOPEN-RENDER-READS-INDEXED-543",
@@ -5564,6 +5564,36 @@
   "failBefore": "proven"
  },
  "notes": "Found while fixing GH #543 R2-01 (Graph::with_pages answers an empty page set when graph-text admission fails). orphan_assets scanned that empty set for references, so every asset, in use or not, was offered for trashing. It now uses Graph::try_with_pages, which returns the admission error. Fail-before: a symlinked graph root (no retained no-follow capability) listed used.png as an orphan. Evidence: tine-agents/evidence/gh550-batch/r201/orphan-fail-before.log."
+},
+{
+ "id": "REG-EDIT-OR-DELETE-DURING-INDEXING-KEEPS-THE-PASS-543",
+ "title": "Saving or deleting a page while the graph is being read for indexing costs that page, not a second read of the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_an_edit_during_the_cold_parse_costs_one_page",
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::gh543_cold_parse_reparses_a_page_edited_after_it_read_it",
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_a_delete_during_the_warm_validation_parses_nothing"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 2, R2-02 (cold parse) and R2-05 (warm validation). Both whole-graph passes discarded their work when any page was saved or deleted while they read, so the next reader read and parsed the whole graph again. Both now take one account of what changed since they read (Graph::drift_since over a StructuralGeneration whose counter moves only through record(Removed(paths)) or record(Unnamed)): changed pages are parsed again, removed pages are dropped, and only an unnamed change discards the pass. Fail-before on 6c4d5e2e: the cold pass was discarded for one edit, and the warm validation parsed 4 surviving pages after one delete. Evidence: tine-agents/evidence/gh550-batch/r205-fail-before.log."
 }
 ]
 }

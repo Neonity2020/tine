@@ -4904,23 +4904,15 @@ fn install_built_publishes_only_at_its_exact_generation() {
         let permit = graph.admit_retained_graph_text_writer().unwrap();
         let expected = graph.cache_generation();
         let built = graph.load_all_pages_with_permit(&permit);
-        let flight = PageBuildFlight::new(
-            expected,
-            graph
-                .cache_structural_gen
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
+        let flight = PageBuildFlight::new(expected, graph.cache_structural_gen.load());
         if drift {
-            // A structural move (removal or invalidation) is real drift.
-            graph
-                .cache_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            graph
-                .cache_structural_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            // A change with no name (an invalidation) is real drift.
+            graph.drift_generation_test();
         }
 
-        let outcome = graph.install_built(&flight, built);
+        let outcome = graph
+            .install_built(&flight, built)
+            .unwrap_or_else(|(_, stale)| panic!("unexpected stale pages {stale:?}"));
 
         if drift {
             assert_eq!(outcome, PageCacheInstallOutcome::GenerationDrift);

@@ -70,6 +70,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Saving or deleting a page while Tine was still reading the graph at launch
+  made it throw that work away and read the whole graph again. Only the
+  changed page is read again now (GH #543).
 - When the graph's pages could not be read, the unused-assets list offered
   every asset for trashing, including media still in use. It now reports the
   error instead.
