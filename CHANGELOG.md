@@ -70,6 +70,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- If launch indexing failed, page aliases, block-reference counts and
+  reference-only page names never appeared for that session, and the indexing
+  indicator kept polling. Launch indexing now always reports that it ended,
+  whether or not it succeeded (GH #543).
+
 - Creating the first page or journal day after reopening a graph no longer
   reads and parses every page to check the name is free (416 ms and the whole
   graph held in memory on a 10,000-page graph, now 23 ms); the check uses the
