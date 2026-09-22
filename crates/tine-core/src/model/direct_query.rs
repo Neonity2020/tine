@@ -1004,6 +1004,7 @@ impl Graph {
             Arc::new(revisions),
             reset,
             source_complete,
+            super::projection_lifetime::FullOffer::WarmOwner,
         );
     }
 

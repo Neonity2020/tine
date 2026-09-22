@@ -189,6 +189,13 @@ impl Graph {
     /// together with a full or warm payload, so a skipped snapshot would leave
     /// the rebuild latched with nothing to ride in on and every later capture
     /// refused for the lifetime of the graph.
+    ///
+    /// `offer` says who is offering. While a warm is in flight only its owner
+    /// may: a page consumer that built the cache inside the warm (an asset
+    /// listing, a whole-graph read) used to offer a full snapshot that
+    /// superseded the warm's cheap validation with a complete rebuild
+    /// (GH #543, audit R4-04). The warm offers what was installed when it
+    /// finishes ([`Graph::offer_installed_cache`]).
     pub(super) fn direct_projection_enqueue_full(
         &self,
         generation: u64,
@@ -196,8 +203,15 @@ impl Graph {
         revisions: Arc<std::collections::HashMap<PathBuf, String>>,
         force: bool,
         source_complete: bool,
+        offer: FullOffer,
     ) {
         if let Some(projection) = self.direct_projection.get() {
+            if offer == FullOffer::Consumer && projection.warm_in_flight() {
+                crate::direct_projection::projection_diag(|| {
+                    format!("full not offered at generation={generation}: a warm owns readiness")
+                });
+                return;
+            }
             // R6: a projection already READY at this generation was validated
             // from the same bytes this snapshot was parsed from; a redundant
             // snapshot would only open a NotReady window while it re-validates.
@@ -210,6 +224,35 @@ impl Graph {
                 revisions,
                 Arc::new(self.config().parse_config()),
                 source_complete,
+            );
+        }
+    }
+
+    /// Offer the installed parsed cache to the index as the warm's payload,
+    /// once the warm that owns readiness has a cache: its own build, a build
+    /// it joined, or one a consumer installed while it ran and could not
+    /// offer. The index takes an identical snapshot at one generation once
+    /// and skips one it is already ready at.
+    pub(super) fn offer_installed_cache(&self) {
+        let captured = {
+            let cache = self.cache.read().unwrap();
+            cache.as_ref().map(|pages| {
+                (
+                    self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                    Arc::clone(pages),
+                    Arc::new(self.disk_revs.read().unwrap().clone()),
+                    self.page_index_failures.read().unwrap().is_empty(),
+                )
+            })
+        };
+        if let Some((generation, pages, revisions, source_complete)) = captured {
+            self.direct_projection_enqueue_full(
+                generation,
+                pages,
+                revisions,
+                false,
+                source_complete,
+                FullOffer::WarmOwner,
             );
         }
     }
@@ -490,3 +533,13 @@ impl Graph {
 pub struct LaunchWarmAnnouncement(
     #[allow(dead_code)] Option<crate::direct_projection::WarmInFlight>,
 );
+
+/// Who offers the index a full snapshot; see
+/// [`Graph::direct_projection_enqueue_full`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FullOffer {
+    /// A page consumer that installed the parsed cache on its own account.
+    Consumer,
+    /// The warm that owns readiness, or a repair that runs with no warm.
+    WarmOwner,
+}

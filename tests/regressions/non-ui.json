@@ -5721,6 +5721,31 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 4, R4-02. load_by_path published the page's session ids with no delta and outside the cache lock; the warm then counted the page as already sent to the index, and the watcher suppressed the later delivery of the same bytes, so search and queries missed the edit for the session. Fix (shape): both load routes go through one load_exact_path, which publishes through the page-delta path unless the ready index already holds those exact bytes (then it records the ids with no delta, so opening an unchanged page moves no generation); publish_session_page_ids takes the cache write guard as proof, and a source guard pins the three session-id writers. Fail-before at 6ef32fd6: tine-agents/evidence/gh550-batch/indexing-audit-r4/verify-by-manager.log; the unchanged-open sibling fails when every open takes the delta path (tine-agents/evidence/gh550-batch/r4-fixes/necessity-held-open.log)."
+},
+{
+ "id": "REG-A-PAGE-CONSUMER-DOES-NOT-REBUILD-THE-INDEX-DURING-ITS-CHECK-543",
+ "title": "Listing assets or reading every page during the launch-time index check does not replace the check with a full index rebuild",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_page_consumer_does_not_offer_a_full_snapshot_during_a_warm",
+   "crates/tine-core/src/direct_projection_tests.rs::a_cache_installed_inside_a_cancelled_warm_is_offered_by_the_next_warm"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 4, R4-04. orphan_assets (and any whole-graph consumer) built the parsed cache during an in-flight warm, and install_built offered it as a full snapshot, which superseded the warm's cheap validation with a complete rebuild. Fix (shape): direct_projection_enqueue_full takes a FullOffer; a Consumer offer is refused while a warm is in flight, and the warm that owns readiness offers the installed cache when it has one (Graph::offer_installed_cache, from warm_page_cache_cancellable and from the warm's cache-present branch, so a cache installed inside a cancelled warm is not stranded). Fail-before at 6ef32fd6: tine-agents/evidence/gh550-batch/indexing-audit-r4/verify-by-manager.log; the cancelled-warm sibling fails without the cache-present offer (tine-agents/evidence/gh550-batch/r4-fixes/necessity-early-offer.log)."
 }
 ]
 }

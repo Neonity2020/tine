@@ -388,6 +388,7 @@ impl Graph {
             Arc::new(revs),
             false,
             source_complete,
+            projection_lifetime::FullOffer::Consumer,
         );
         Ok(PageCacheInstallOutcome::Installed)
     }
@@ -550,9 +551,13 @@ impl Graph {
             // partial cache does not own a stale rebuild: retry the inventory
             // so an unreadable page can recover without replacing the older
             // complete SQL image with an omission.
-            if projection.ready_at(generation)
-                || self.page_index_failures.read().unwrap().is_empty()
-            {
+            if projection.ready_at(generation) {
+                return Outcome::Owned;
+            }
+            if self.page_index_failures.read().unwrap().is_empty() {
+                // A consumer may have installed it inside an earlier warm and
+                // been refused the offer; this warm owns it now.
+                self.offer_installed_cache();
                 return Outcome::Owned;
             }
         }
@@ -907,7 +912,17 @@ impl Graph {
         }
     }
 
+    /// Build the parsed cache for a warm that owns readiness, and offer the
+    /// cache it ends with to the index.
     pub(super) fn warm_page_cache_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
+        let built = self.build_page_cache_cancellable(cancelled);
+        if built {
+            self.offer_installed_cache();
+        }
+        built
+    }
+
+    fn build_page_cache_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
         if cancelled() {
             return false;
         }
@@ -1402,7 +1417,14 @@ impl Graph {
         // consumer happened to build one. Readiness still needs this
         // session's inventory validated first (the projection's own rule).
         if let Some((pages, revisions)) = recovered_projection_snapshot {
-            self.direct_projection_enqueue_full(newgen, pages, revisions, false, true);
+            self.direct_projection_enqueue_full(
+                newgen,
+                pages,
+                revisions,
+                false,
+                true,
+                projection_lifetime::FullOffer::Consumer,
+            );
         } else if !queued_under_lock {
             self.direct_projection_enqueue_replace(
                 newgen,

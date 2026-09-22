@@ -10144,6 +10144,50 @@ fn a_page_opened_by_path_during_a_warm_reaches_the_index() {
     );
 }
 
+/// GH #543 (audit R4-04): a page consumer that builds the parsed cache
+/// while a warm runs (here the asset listing) does not offer the index a full
+/// snapshot, which would replace the warm's validation with a rebuild.
+#[test]
+fn a_page_consumer_does_not_offer_a_full_snapshot_during_a_warm() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("audit543-r4-asset-warm");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    graph.orphan_assets().unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let offered = projection
+        .shared
+        .pending
+        .lock()
+        .unwrap()
+        .accepted_full
+        .is_some();
+    let parses = graph.page_build_parses_test();
+    pause.release.wait();
+    warmer.join().unwrap();
+    wait_ready(&graph);
+    eprintln!("R4 asset listing: full accepted during paused warm={offered}; parses={parses}");
+    release_projection(&graph);
+    assert!(
+        !offered,
+        "an acting page consumer offered a competing full index snapshot"
+    );
+}
+
 /// GH #543 (audit R4-02 sibling): opening a page at the bytes the ready index
 /// already holds sends nothing and moves no generation. The fix for R4-02
 /// first sent every first open of a page through the delta path, so each
@@ -10182,3 +10226,45 @@ fn opening_a_page_the_index_holds_moves_no_generation() {
     assert!(ready, "opening an unchanged page left the index not ready");
 }
 
+/// GH #543 (audit R4-04 sibling): a cache a consumer installed inside a warm
+/// that was then cancelled is still offered to the index by the next warm,
+/// so readiness is not left with no producer.
+#[test]
+fn a_cache_installed_inside_a_cancelled_warm_is_offered_by_the_next_warm() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("r4-cancelled-warm-offer");
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pause = graph.pause_next_warm_validation_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        let cancel = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            graph.warm_cache_cancellable(|| cancel.load(std::sync::atomic::Ordering::Acquire))
+        })
+    };
+    pause.reached.wait();
+    graph.orphan_assets().unwrap();
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    pause.release.wait();
+    assert!(!warmer.join().unwrap(), "the first warm was cancelled");
+    assert!(
+        graph.has_parsed_cache_test(),
+        "the consumer installed the cache"
+    );
+    graph.warm_cache();
+    let ready = graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .is_ok();
+    release_projection(&graph);
+    assert!(ready, "the installed cache was never offered to the index");
+}
