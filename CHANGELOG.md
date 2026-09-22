@@ -70,6 +70,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Creating the first page or journal day after reopening a graph no longer
+  reads and parses every page to check the name is free (416 ms and the whole
+  graph held in memory on a 10,000-page graph, now 23 ms); the check uses the
+  index. During launch indexing, creation waits for the index instead of
+  starting its own pass over the whole graph (GH #543).
+
 - A named page (a restored tab, the home page, a favourite, a link) opens
   straight from its file while Tine is still indexing the graph at launch,
   instead of waiting for the index: 4 s to 1 ms on a 10,000-page graph. When

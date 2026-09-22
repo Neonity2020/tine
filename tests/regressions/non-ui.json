@@ -5304,6 +5304,34 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit IT-05. load_named resolved every named page through find_entry, which needs the graph-wide page list, so a restored tab, home page, favourite or link waited for the launch warm (3.9 s on the realistic 10k graph during a cold build). A page is now opened from the file named for it when exactly one such file exists and its effective name matches; otherwise the list is used as before. find_entry now prefers the file named for a page over one claiming its name via title::, so both paths resolve the same file; both halves proven necessary. Evidence: tine-agents/evidence/gh550-batch/it05-named-open-fail-before.log, it05-named-open-10k.md."
+},
+{
+ "id": "REG-CREATION-USES-THE-INDEX-FOR-NAME-OWNERSHIP-543",
+ "title": "Creating a page after reopening or during launch indexing does not parse the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_creating_a_page_during_the_launch_check_parses_nothing"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit IT-02. Name-only creation needs evidence that no other document owns the effective name. With no parsed cache (every clean reopen), direct_creation_proof ran repair_page_cache_once: a whole-graph parse and cache install on the save path, ahead of the launch warm when one ran (6 parses on the fixture; 10,000 parses and 416 ms on the realistic 10k graph). Evidence now comes from the ready index's effective page inventory, waiting for an in-flight launch check like other derived reads, and falls back to the parsed evidence only when no ready index answers or a parse failure is published. A name owned via title:: is still refused. Evidence: tine-agents/evidence/gh550-batch/it02-creation-fail-before.log, it02-creation-10k.md."
 }
 ]
 }

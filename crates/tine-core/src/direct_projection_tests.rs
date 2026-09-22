@@ -8905,6 +8905,88 @@ fn gh550_journal_feed_before_the_warm_keeps_a_clean_reopen_clean() {
     let _ = std::fs::remove_dir_all(database.parent().unwrap());
 }
 
+/// GH #543 (indexing audit IT-02): creating a page needs proof that no other
+/// file already owns its name. On a reopened graph there is no parsed cache,
+/// so creation parsed the whole graph on its own -- during the launch check a
+/// second whole-graph pass ahead of it, and after a clean check on the first
+/// creation of every session. The ready index holds every page's effective
+/// name, so creation now takes its proof from there (waiting for the check
+/// like any other graph-wide read) and parses nothing. The proof still
+/// refuses a name another file owns through `title::`.
+#[test]
+fn gh543_creating_a_page_during_the_launch_check_parses_nothing() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-create-during-warm");
+    std::fs::write(
+        root.join("pages/aaa claims.md"),
+        "title:: Taken\n\n- owner\n",
+    )
+    .unwrap();
+    let database = scratch("gh543-create-during-warm-db").join("projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let creator = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || {
+            let created = graph.save_page(
+                &crate::vocab::markdown_page_dto("Created", "Created", "- TODO new\n").unwrap(),
+                None,
+            );
+            let taken = graph.save_page(
+                &crate::vocab::markdown_page_dto("Taken", "Taken", "- second owner\n").unwrap(),
+                None,
+            );
+            (created.map(|_| ()), taken.map(|_| ()))
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    pause.release.wait();
+    warmer.join().unwrap();
+    let (created, taken) = creator.join().unwrap();
+    wait_ready(&graph);
+
+    created.expect("a free name is created");
+    let refusal = taken.expect_err("a name another file owns is refused");
+    assert_eq!(
+        refusal.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "{refusal}"
+    );
+    assert!(!root.join("pages/Taken.md").exists());
+    assert_eq!(
+        graph.page_build_parses_test(),
+        0,
+        "creation ran its own whole-graph pass"
+    );
+    assert!(!graph.has_parsed_cache_test());
+    let todos = graph
+        .run_query_bounded("(task TODO)", 100, 1_000_000)
+        .expect("the ready projection answers")
+        .groups;
+    assert!(
+        todos
+            .iter()
+            .flat_map(|group| group.blocks.iter())
+            .any(|block| block.raw == "TODO new"),
+        "the created page is indexed"
+    );
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// GH #543 (indexing audit IT-05): opening a named page -- a restored tab, the
 /// configured home page, a favourite, a link -- waited for the whole launch
 /// check, because resolving a name went through the graph-wide page list.
