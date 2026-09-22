@@ -3307,6 +3307,12 @@ pub fn publish_graph_app_to(
 
 /// Fresh parse of every listed page: the documents the renderer will see and
 /// the `(entry, revision)` pairs the query reader must correspond to.
+///
+/// Asks the index first. Every publication then reads its queries from the
+/// index, so capturing while the index is being built would wait out the
+/// pass and parse the whole graph for a caller that may be gone by then; it
+/// answers as typed not-ready instead, which the caller retries (GH #543,
+/// audit R6-05).
 #[allow(clippy::type_complexity)]
 pub(crate) fn capture_direct_publication_sources(
     graph: &Graph,
@@ -3314,6 +3320,7 @@ pub(crate) fn capture_direct_publication_sources(
     Vec<(crate::model::PageEntry, doc::Document)>,
     Vec<(crate::model::PageEntry, String)>,
 )> {
+    graph.publication_readiness()?;
     let mut pages = Vec::new();
     let mut sources = Vec::new();
     for listed in graph.try_list_pages()? {

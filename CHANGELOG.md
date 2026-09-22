@@ -112,6 +112,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - A block pinned in the right sidebar is no longer removed at launch when
   looking it up fails; only a block that no longer exists is removed (GH #543).
 
+- Exporting query results or the graph to HTML while the index is being built
+  now waits for the index and then exports, instead of reading the whole graph
+  first or showing the wait as a failure (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).

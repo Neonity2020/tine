@@ -5922,6 +5922,34 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 6, R6-08. pruneSidebarBlocks runs at every graph load and persists what it removes, but it caught every resolve_block error as null and so deleted the pin on a transient IPC error, a stale binding or a read refused during a graph switch. Fix: an error keeps the block, and answers are acted on only if the binding has not moved while they were read. Remaining core-side sibling: a retired graph's resolve can still answer an empty result rather than an error (the with_pages f(&[]) shape); the binding check covers it here, and the indexing-owner redesign owns the core shape. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r6/RECEIPT-indexing-audit-r6-frontend-probes.log and tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-08.log (3 tests)."
+},
+{
+ "id": "REG-PUBLISHING-DURING-INDEXING-WAITS-AND-PARSES-NOTHING-543",
+ "title": "Exporting or publishing while the index is being built waits for the index and then completes, without parsing the whole graph first or showing the wait as a failure",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests_gh543_parse_passes.rs::a_query_export_plan_during_indexing_is_typed_not_ready_and_parses_nothing",
+   "src-tauri/src/command_error.rs::ret2_query_execution_reaches_the_wire_through_one_encoder",
+   "src/components/QueryExportDialog.test.tsx::waits for the index and then shows the plan",
+   "src/components/QueryExportDialog.test.tsx::an export confirmed while the index catches up waits and then exports",
+   "src/components/Settings.publishZero.test.tsx::waits for the index, then exports"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 6, R6-05 (I-20). Measured before the fix: a query-export plan asked for during a warm waited out the whole pass on its backend thread and then parsed every page (6 of 6 in the test), even if the dialog had been closed; a source mismatch came back as untyped prose, which the dialog showed as a refusal nothing retried. Fix, one seam per layer: capture_direct_publication_sources (shared by publish_html, publish_graph_to, publish_graph_app_to, plan_query_publication and publish_query) asks the index first and answers typed not-ready while it is working; the source-mismatch refusal is the same typed not-ready; CommandError::from(io::Error) unwraps an IO-carried QueryExecutionError into the one query wire, so every command that carries one keeps it. The dialog's plan and export and the Settings HTML export wait through runQueryWhenCurrent and say they are waiting. Fail-before: tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-05-core.log, necessity-r6-05-tauri.log, necessity-r6-05-frontend.log (3 tests)."
 }
 ]
 }

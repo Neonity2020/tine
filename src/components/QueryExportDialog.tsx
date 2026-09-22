@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createResource, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { backend, QueryUnavailableError } from "../backend";
+import { backend, OperationCancelledError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
+import { runQueryWhenCurrent } from "../queryReadiness";
 import { queryExportRequest, closeQueryExport, openSettings, pushToast } from "../ui";
 import { registerTransientLayer } from "../transientLayers";
 import type { QueryPublicationPlan, QueryPublicationRequest } from "../types";
@@ -50,13 +51,27 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
   // failure names the limit and offers the setting in one click.
   const [overBudget, setOverBudget] = createSignal(false);
 
+  // A plan asked for while the index is being built is answered as typed
+  // not-ready. It waits and plans again once the index is ready, rather than
+  // showing the wait as a refusal nothing retries (GH #543, audit R6-05).
+  const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
+  let disposed = false;
+  onCleanup(() => {
+    disposed = true;
+  });
   const [planResource] = createResource(
     () => plannedName(),
     async (forName): Promise<QueryPublicationPlan | { refused: string }> => {
       if (!forName.trim()) return { refused: "Give the export a name." };
       try {
-        return await backend().publishQueryPlan({ ...props.request, name: forName, folder: null });
+        return await runQueryWhenCurrent(
+          () => backend().publishQueryPlan({ ...props.request, name: forName, folder: null }),
+          () => !disposed && plannedName() === forName,
+          setIndexPending,
+        );
       } catch (e) {
+        // A superseded plan belongs to a name the dialog no longer shows.
+        if (e instanceof OperationCancelledError) return { refused: "" };
         return { refused: String((e as Error)?.message ?? e) };
       }
     },
@@ -108,14 +123,16 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
     setFailure(null);
     setOverBudget(false);
     try {
-      const outcome = await backend().publishQuery(
-        {
-          ...props.request,
-          name: plannedName(),
-          folder: f,
-          replace: p.exists && destination() === "replace",
-        },
-        p.fingerprint,
+      const request = {
+        ...props.request,
+        name: plannedName(),
+        folder: f,
+        replace: p.exists && destination() === "replace",
+      };
+      const outcome = await runQueryWhenCurrent(
+        () => backend().publishQuery(request, p.fingerprint),
+        () => !disposed,
+        setIndexPending,
       );
       closeQueryExport();
       pushToast(
@@ -135,6 +152,7 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
         );
       }
     } catch (e) {
+      if (e instanceof OperationCancelledError) return;
       setFailure(String((e as Error)?.message ?? e));
       setOverBudget(
         e instanceof QueryUnavailableError && e.reasonCode === QUERY_EXPORT_BUDGET_REASON,
@@ -193,7 +211,9 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
             {(message) => <div class="query-export-refused" role="alert">{message()}</div>}
           </Show>
           <Show when={planResource.loading && !planned()}>
-            <div class="query-export-note">Resolving pages…</div>
+            <div class="query-export-note">
+              {indexPending() ? "Waiting for the index to be ready…" : "Resolving pages…"}
+            </div>
           </Show>
 
           <Show when={planned()}>
@@ -292,7 +312,7 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
             Cancel
           </button>
           <button class="export-btn-primary" disabled={!canExport()} onClick={() => void doExport()}>
-            {busy() ? "Exporting…" : "Export"}
+            {busy() ? (indexPending() ? "Waiting for the index…" : "Exporting…") : "Export"}
           </button>
         </div>
       </div>

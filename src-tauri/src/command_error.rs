@@ -291,6 +291,15 @@ impl From<std::io::Error> for CommandError {
         {
             return Self::json(error);
         }
+        // A query execution outcome carried through an IO result keeps its
+        // typed wire, so the frontend can retry a not-ready read instead of
+        // showing it as a failure (GH #543, audit R6-05).
+        if let Some(query) = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<tine_core::query::QueryExecutionError>())
+        {
+            return Self::from(*query);
+        }
         Self::Io {
             message: error.to_string(),
         }
@@ -656,6 +665,19 @@ mod tests {
                 wire,
                 "the Direct producer's payload",
             );
+            // GH #543 (audit R6-05): a publication carries the same outcome
+            // inside its IO result; it must arrive as the same payload, or
+            // the export dialog shows a wait for the index as a refusal.
+            for carried in [
+                std::io::Error::other(error),
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, error),
+            ] {
+                assert_eq!(
+                    tauri::ipc::InvokeError::from(CommandError::from(carried)).0,
+                    wire,
+                    "an IO-carried query outcome's payload",
+                );
+            }
         }
     }
 }

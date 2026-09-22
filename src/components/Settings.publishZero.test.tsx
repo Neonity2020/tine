@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
 import { closeSettings, openSettings } from "../ui";
-import { backend } from "../backend";
+import { backend, QueryNotReadyError } from "../backend";
 
 // "Export graph to HTML" publishes the public-page capability: only pages
 // carrying `public:: true` are exported, as in Logseq. A graph with none
@@ -51,4 +51,33 @@ describe("Settings → Graph → Export graph to HTML (GH #560)", () => {
     expect(root.textContent).not.toContain("public:: true");
     dispose();
   });
+});
+
+// GH #543, audit R6-05: publication reads its queries from the index, so an
+// export asked for while the index is being built waits for it and then
+// exports, rather than reporting the wait as a failure.
+describe("Settings → Graph → Export graph to HTML while indexing (GH #543)", () => {
+  it("waits for the index, then exports", async () => {
+    let ready = false;
+    vi.spyOn(backend(), "publishHtml").mockImplementation(async () => {
+      if (!ready) throw new QueryNotReadyError("indexing");
+      return ["/mock/graph/publish", 2];
+    });
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <Settings />, root);
+    try {
+      openSettings("graph");
+      await tick();
+      [...root.querySelectorAll("button")]
+        .find((candidate) => candidate.textContent?.includes("Export graph to HTML"))!
+        .click();
+      await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index"));
+      expect(root.textContent).not.toContain("Failed");
+      ready = true;
+      await vi.waitFor(() => expect(root.textContent).toContain("Exported 2 pages"), { timeout: 3_000 });
+    } finally {
+      dispose();
+    }
+  }, 10_000);
 });

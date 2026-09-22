@@ -626,3 +626,94 @@ fn a_consumer_whole_graph_parse_shows_on_the_progress_bar() {
     );
     assert_eq!(after, None, "the bar stuck after the parse");
 }
+
+/// GH #543 (audit R6-05): a query-export plan asked for while the index is
+/// being built answers with the typed not-ready error, which the dialog
+/// retries, and it asks before it captures the graph, so a retry does not
+/// parse every page. It used to parse the whole graph and then fail with
+/// untyped prose the dialog showed as a permanent refusal.
+#[test]
+fn a_query_export_plan_during_indexing_is_typed_not_ready_and_parses_nothing() {
+    let dir = scratch("audit543-r6-export-plan");
+    for index in 0..6 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- TODO task\n").unwrap();
+    }
+    let database = dir.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&dir);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(5))
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    let graph = Arc::new(Graph::open(&dir));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warmer = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let request = crate::publish::query_export::QueryPublicationRequest {
+        query: "(task TODO)".into(),
+        advanced: false,
+        simple_dialect: None,
+        current_page: None,
+        view: None,
+        host_block_id: None,
+        host_properties: Vec::new(),
+        name: "todo".into(),
+        folder: None,
+        replace: false,
+        asset_budget_bytes: None,
+        app_bundle: None,
+    };
+    let planner = {
+        let graph = Arc::clone(&graph);
+        let request = request.clone();
+        std::thread::spawn(move || {
+            GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
+            let during = crate::publish::plan_query_publication(&graph, &request);
+            (during, GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get))
+        })
+    };
+    let started = std::time::Instant::now();
+    while !planner.is_finished() && started.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let answered_during_pass = planner.is_finished();
+    pause.release.wait();
+    warmer.join().unwrap();
+    let (during, parses) = planner.join().unwrap();
+    let after = crate::publish::plan_query_publication(&graph, &request);
+    crate::direct_projection::release_projection(&graph);
+    let typed = match &during {
+        Err(crate::publish::query_export::QueryPublicationError::Io(error)) => error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::query::QueryExecutionError>())
+            .cloned(),
+        _ => None,
+    };
+    eprintln!(
+        "R6-05 plan during indexing: answered_during_pass={answered_during_pass} typed={typed:?} parses={parses} after_ok={}",
+        after.is_ok()
+    );
+    assert!(
+        answered_during_pass,
+        "a plan during indexing waited for the whole pass"
+    );
+    assert!(
+        matches!(typed, Some(crate::query::QueryExecutionError::NotReady(_))),
+        "a plan during indexing was not typed not-ready: {during:?}"
+    );
+    assert_eq!(
+        parses, 0,
+        "a plan refused for indexing parsed the graph first"
+    );
+    assert!(
+        after.is_ok(),
+        "the plan failed after indexing finished: {after:?}"
+    );
+}

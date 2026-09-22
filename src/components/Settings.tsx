@@ -129,8 +129,10 @@ import { flushAll } from "../store";
 import {
   backend,
   isTauri,
+  OperationCancelledError,
   type BackupInfo,
 } from "../backend";
+import { runQueryWhenCurrent } from "../queryReadiness";
 import type { AssetInfo, TrashStats, JournalFile, PageEntry } from "../types";
 import { ConflictFileRow } from "./JournalConflictFileRow";
 import { formatJournal } from "../journal";
@@ -315,10 +317,20 @@ export function Settings(): JSX.Element {
     });
   };
   const [publishMsg, setPublishMsg] = createSignal("");
+  let publishDisposed = false;
+  onCleanup(() => {
+    publishDisposed = true;
+  });
   const doPublish = async () => {
     setPublishMsg("Exporting…");
     try {
-      const [dir, n] = await backend().publishHtml();
+      // Publication reads its queries from the index; while the index is
+      // being built it waits for it rather than failing (GH #543, audit R6-05).
+      const [dir, n] = await runQueryWhenCurrent(
+        () => backend().publishHtml(),
+        () => !publishDisposed,
+        (pending) => setPublishMsg(pending ? "Waiting for the index to be ready…" : "Exporting…"),
+      );
       // A zero is a successful export of nothing, which reads as a broken
       // button (GH #560). Publication is the public-page capability, so say so.
       setPublishMsg(
@@ -327,6 +339,7 @@ export function Settings(): JSX.Element {
           : `Exported ${n} pages to ${dir}`,
       );
     } catch (e) {
+      if (e instanceof OperationCancelledError) return;
       setPublishMsg(`Failed: ${String(e)}`);
     }
   };

@@ -456,6 +456,19 @@ impl Graph {
         })
     }
 
+    /// Whether a publication may capture its sources now: typed not-ready,
+    /// wrapped in the IO error publication returns, while the index is being
+    /// built or is catching up. The command boundary unwraps it into the same
+    /// `query-not-ready` wire every query read uses.
+    pub(crate) fn publication_readiness(&self) -> io::Result<()> {
+        match self.direct_projection_progress() {
+            Some(crate::direct_projection::ProjectionProgress::Working(reason)) => Err(
+                io::Error::other(crate::query::QueryExecutionError::NotReady(reason)),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// Bind the static publisher's captured source documents to one main image.
     /// A byte/config mismatch is local to this explicit publication command;
     /// ordinary live reads never wait for this correspondence.
@@ -477,9 +490,13 @@ impl Graph {
                 crate::direct_projection::RegistrySensitivity::Required,
                 |job| {
                     if !job.publication_sources_match(sources, &self.config().parse_config())? {
+                        // The index has not caught up with the captured files:
+                        // the same retryable not-ready as any query read.
                         return Ok(Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
-                            "The graph is still updating. Try publishing again shortly.",
+                            crate::query::QueryExecutionError::NotReady(
+                                crate::query::QueryReadinessReason::PendingEdits,
+                            ),
                         )));
                     }
                     let registry = self.direct_lowering_registry(true, job)?;

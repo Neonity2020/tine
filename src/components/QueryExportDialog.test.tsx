@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { QueryExportDialog, QUERY_EXPORT_BUDGET_REASON } from "./QueryExportDialog";
-import { backend, QueryUnavailableError } from "../backend";
+import { backend, QueryNotReadyError, QueryUnavailableError } from "../backend";
 import {
   closeQueryExport,
   closeSettings,
@@ -163,4 +163,56 @@ describe("QueryExportDialog", () => {
       dispose();
     }
   });
+});
+
+// GH #543, audit R6-05: a plan asked for while the index is being built waits
+// and plans again once it is ready, instead of showing a refusal that nothing
+// retries.
+describe("QueryExportDialog while the index is being built", () => {
+  it("waits for the index and then shows the plan", async () => {
+    let ready = false;
+    const planCall = vi.spyOn(backend(), "publishQueryPlan").mockImplementation(async () => {
+      if (!ready) throw new QueryNotReadyError("indexing");
+      return plan();
+    });
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <QueryExportDialog />, root);
+    try {
+      openQueryExport(request);
+      await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index to be ready"));
+      expect(root.querySelector(".query-export-refused")).toBeNull();
+      ready = true;
+      await vi.waitFor(() => expect(root.textContent).toContain("Tasks"), { timeout: 3_000 });
+      expect(planCall.mock.calls.length).toBeGreaterThan(1);
+      expect(root.querySelector(".query-export-refused")).toBeNull();
+    } finally {
+      dispose();
+    }
+  }, 10_000);
+
+  it("an export confirmed while the index catches up waits and then exports", async () => {
+    vi.spyOn(backend(), "publishQueryPlan").mockResolvedValue(plan({ anchor: "page" }));
+    let ready = false;
+    const publish = vi.spyOn(backend(), "publishQuery").mockImplementation(async () => {
+      if (!ready) throw new QueryNotReadyError("pending_edits");
+      return { path: "/graph/published-queries/open-tasks", pages: 2, retired: null, warnings: [] };
+    });
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <QueryExportDialog />, root);
+    try {
+      openQueryExport(request);
+      await vi.waitFor(() => expect(root.textContent).toContain("Tasks"));
+      const exportButton = [...root.querySelectorAll("button")].find((b) => b.textContent === "Export")!;
+      exportButton.click();
+      await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index"));
+      expect(root.querySelector(".query-export-failure, [role=alert]")).toBeNull();
+      ready = true;
+      await vi.waitFor(() => expect(queryExportRequest()).toBeNull(), { timeout: 3_000 });
+      expect(publish.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      dispose();
+    }
+  }, 10_000);
 });
