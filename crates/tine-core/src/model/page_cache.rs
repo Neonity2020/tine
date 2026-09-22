@@ -287,11 +287,12 @@ impl Graph {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             // Real drift: a change with no name, which no reparse can follow.
-            let _cache = self.cache.write().unwrap();
-            self.cache_structural_gen
-                .record(graph_drift::StructuralChange::Unnamed);
-            self.cache_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            let cache = self.cache.write().unwrap();
+            self.move_cache_generation(
+                &cache,
+                Some(graph_drift::StructuralChange::Unnamed),
+                graph_drift::IndexEffect::Sent,
+            );
         }
         let PageCacheBuild {
             pages: built,
@@ -1061,11 +1062,12 @@ impl Graph {
     /// There is no page to check the move against, so it counts as structural.
     #[cfg(test)]
     pub(crate) fn drift_generation_test(&self) {
-        let _cache = self.cache.write().unwrap();
-        self.cache_structural_gen
-            .record(graph_drift::StructuralChange::Unnamed);
-        self.cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let cache = self.cache.write().unwrap();
+        self.move_cache_generation(
+            &cache,
+            Some(graph_drift::StructuralChange::Unnamed),
+            graph_drift::IndexEffect::Sent,
+        );
     }
 
     /// The walk inventory as the warm sees it, parsing nothing.
@@ -1139,10 +1141,11 @@ impl Graph {
                                                  // a reader that loads the new gen then reads the cache sees None (and
                                                  // rebuilds from disk) rather than the stale pre-invalidation content — same
                                                  // gen-after-content ordering as cache_upsert.
-        self.cache_structural_gen
-            .record(graph_drift::StructuralChange::Unnamed);
-        self.cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.move_cache_generation(
+            &guard,
+            Some(graph_drift::StructuralChange::Unnamed),
+            graph_drift::IndexEffect::Sent,
+        );
         drop(guard);
     }
 
@@ -1254,10 +1257,7 @@ impl Graph {
         // (Bumping FIRST left a window where the gen was new but the doc still old.)
         // The bump is unconditional — even on a cold cache (no slot to update) — so
         // a concurrent lock-free with_pages build still detects the race and retries.
-        let newgen = self
-            .cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1;
+        let newgen = self.move_cache_generation(&guard, None, graph_drift::IndexEffect::Sent);
         if bounded_foreground
             && cache_built
             && !identity_changed
@@ -1592,8 +1592,9 @@ impl Graph {
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
-        self.cache_structural_gen
-            .record(if removed_entries.is_empty() {
+        let newgen = self.move_cache_generation(
+            &guard,
+            Some(if removed_entries.is_empty() {
                 graph_drift::StructuralChange::Unnamed
             } else {
                 graph_drift::StructuralChange::Removed(
@@ -1602,11 +1603,9 @@ impl Graph {
                         .map(|entry| entry.path.clone())
                         .collect(),
                 )
-            });
-        let newgen = self
-            .cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1;
+            }),
+            graph_drift::IndexEffect::Sent,
+        );
         if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() =
                 Some(Arc::new(build_effective_identity_index(
@@ -1664,14 +1663,13 @@ impl Graph {
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
-        self.cache_structural_gen
-            .record(graph_drift::StructuralChange::Removed(vec![entry
+        let newgen = self.move_cache_generation(
+            &guard,
+            Some(graph_drift::StructuralChange::Removed(vec![entry
                 .path
-                .clone()]));
-        let newgen = self
-            .cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1;
+                .clone()])),
+            graph_drift::IndexEffect::Sent,
+        );
         if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() =
                 Some(Arc::new(build_effective_identity_index(

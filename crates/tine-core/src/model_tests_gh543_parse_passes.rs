@@ -3,6 +3,82 @@
 
 use super::*;
 
+/// GH #543 (audit R4-03): one page failing to parse in a warm SQL session
+/// (no parsed cache) does not send the page listing into a whole-graph
+/// parse. The watcher's failure moved the generation without telling the
+/// index, which then never became ready again, so every indexed read fell
+/// back to parsing.
+#[test]
+fn a_failed_page_in_a_warm_sql_session_does_not_parse_the_graph() {
+    let dir = scratch("audit543-r4-warm-failure-list");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let database = dir.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&dir);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(Duration::from_secs(5))
+            .unwrap();
+        crate::direct_projection::release_projection(&graph);
+    }
+    let graph = Graph::open(&dir);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    assert!(!graph.has_parsed_cache_test());
+    let failed = dir.join("pages/p0.md");
+    fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
+    assert!(graph.sync_file_checked(&failed).is_err());
+    GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
+    let listed = graph.list_pages().len();
+    let parses = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+    let ready = graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .is_ok();
+    crate::direct_projection::release_projection(&graph);
+    eprintln!("R4 warm failure listing: listed={listed} parses={parses} ready={ready}");
+    assert!(ready, "a watcher failure left the index not ready");
+    assert_eq!(listed, 7);
+    assert!(
+        parses <= 1,
+        "a warm SQL-only session reparsed healthy siblings"
+    );
+}
+
+/// GH #543 (audit R4-03): repeated listings with one failed page parse
+/// that page at most once between changes.
+#[test]
+fn repeated_listings_with_a_failed_page_parse_it_at_most_once() {
+    let dir = scratch("audit543-r4-repeat-failure");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    let failed = dir.join("pages/p0.md");
+    fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
+    assert!(graph.sync_file_checked(&failed).is_err());
+    GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
+    for _ in 0..4 {
+        assert_eq!(graph.list_pages().len(), 7);
+    }
+    let parses = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+    graph.detach_direct_projection(Duration::from_secs(5));
+    eprintln!("R4 repeated failure: four unchanged listings parsed={parses}");
+    assert!(parses <= 1, "each request reparsed the same failed bytes");
+}
+
 /// GH #543 (audit R3-07): a watcher failure recorded while a complete
 /// capture was running is newer than that capture; installing the capture
 /// must not erase it and declare the index ready.
@@ -453,6 +529,19 @@ fn model_sources_matching(needle: &str) -> Vec<String> {
     }
     sites.sort();
     sites
+}
+
+/// GH #543 (I-13, audit R4-03): `cache_gen` moves in one place,
+/// `Graph::move_cache_generation` (model/graph_drift.rs), which makes every
+/// mover say how the index hears about the move. Two watcher paths moved it
+/// on their own and told the index nothing, and it stayed not ready.
+#[test]
+fn the_cache_generation_moves_through_one_front_door() {
+    assert_eq!(
+        model_sources_matching("cache_gen.fetch_add("),
+        vec!["graph_drift.rs".to_owned()],
+        "move cache_gen only through Graph::move_cache_generation (model/graph_drift.rs)"
+    );
 }
 
 /// GH #543 (audit R4-02): a session id record claims the index was sent

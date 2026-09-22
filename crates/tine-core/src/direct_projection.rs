@@ -238,6 +238,11 @@ struct PendingProjection {
     /// query fell back to parsing (GH #543).
     accepted_full: Option<(u64, std::sync::Weak<Vec<(PageEntry, Arc<Document>)>>)>,
     rebuild: bool,
+    /// Set by `mark_stale`: the image may no longer describe the pages, so
+    /// `advance_generation` must not carry readiness past it. Cleared when a
+    /// full snapshot or warm validation, which re-derive the page set, is
+    /// accepted.
+    stale: bool,
     deltas: BTreeMap<String, (u64, PageDelta)>,
     latest_generation: u64,
     stop: bool,
@@ -1212,6 +1217,7 @@ impl DirectProjection {
         });
         pending.deltas.clear();
         pending.latest_generation = generation;
+        pending.stale = false;
 
         // A complete parsed snapshot owns readiness from here. A validation
         // still in flight is superseded and its waiter is released.
@@ -1310,6 +1316,7 @@ impl DirectProjection {
             parse_config,
         });
         pending.latest_generation = generation;
+        pending.stale = false;
         self.shared.changed.notify_all();
         projection_diag(|| {
             format!(
@@ -1529,7 +1536,36 @@ impl DirectProjection {
         self.shared.changed.notify_one();
     }
 
+    /// The graph moved to `generation` without changing anything this index
+    /// holds: a page became unreadable, or readable again before its delta,
+    /// and its rows stay as they are, as a warm keeps a retained page's. An
+    /// index ready at the previous generation is ready at this one; one with
+    /// work queued publishes readiness at the latest generation when the work
+    /// drains. Without this the index stayed not-ready with nothing coming,
+    /// and every indexed read fell back to parsing the graph (GH #543, audit
+    /// R4-03).
+    pub(crate) fn advance_generation(&self, generation: u64) {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.stale {
+            return;
+        }
+        pending.latest_generation = pending.latest_generation.max(generation);
+        if !pending.has_work()
+            && !pending.rebuild
+            && !self.shared.worker_busy.load(Ordering::Acquire)
+            && self.shared.ready.load(Ordering::Acquire)
+            && self.shared.validated.load(Ordering::Acquire)
+        {
+            self.shared
+                .ready_generation
+                .store(pending.latest_generation, Ordering::Release);
+        }
+        drop(pending);
+        self.shared.changed.notify_all();
+    }
+
     pub(crate) fn mark_stale(&self) {
+        self.shared.pending.lock().unwrap().stale = true;
         self.shared.ready.store(false, Ordering::Release);
         // Source-oriented navigation waits for reconciliation; live queries
         // can still read the complete committed image.
@@ -3224,16 +3260,18 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     .map(|outcome| (pending.warm_attempt, outcome));
             }
         }
-        if !pending.rebuild
-            && !pending.has_work()
-            && pending.latest_generation == latest_generation
-            && shared.validated.load(Ordering::Acquire)
-        {
+        // Nothing queued means every generation since this turn began moved
+        // without work for the index (`advance_generation`): work is always
+        // queued with the generation it moves to, and a turn takes only what
+        // was queued before it began. So the turn's image is the image of the
+        // latest generation.
+        if !pending.rebuild && !pending.has_work() && shared.validated.load(Ordering::Acquire) {
+            let ready_generation = pending.latest_generation.max(latest_generation);
             shared
                 .ready_generation
-                .store(latest_generation, Ordering::Release);
+                .store(ready_generation, Ordering::Release);
             shared.ready.store(true, Ordering::Release);
-            projection_diag(|| format!("ready at generation={latest_generation}"));
+            projection_diag(|| format!("ready at generation={ready_generation}"));
         }
         drop(pending);
         shared.changed.notify_all();

@@ -801,6 +801,7 @@ impl Graph {
 
     pub(super) fn record_watcher_identity_failure(&self, path: &Path) {
         let failure = self.rel_path(path);
+        let projection = self.direct_projection.get();
         let cache = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         let mut failures = failures_guard.clone();
@@ -809,12 +810,11 @@ impl Graph {
             failures.sort();
             failures.dedup();
         }
-        self.cache_structural_gen
-            .record(graph_drift::StructuralChange::Reread(path.to_path_buf()));
-        let generation = self
-            .cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1;
+        let generation = self.move_cache_generation(
+            &cache,
+            Some(graph_drift::StructuralChange::Reread(path.to_path_buf())),
+            graph_drift::IndexEffect::Unchanged(projection.as_ref()),
+        );
         let next = match cache.as_ref() {
             Some(pages) => Some(Arc::new(build_effective_identity_index(
                 generation,
@@ -851,6 +851,7 @@ impl Graph {
     }
 
     pub(super) fn clear_watcher_identity_failure_after_reconciliation(&self, entry: &PageEntry) {
+        let projection = self.direct_projection.get();
         let cache = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         if !failures_guard
@@ -861,12 +862,11 @@ impl Graph {
         }
         let mut failures = failures_guard.clone();
         failures.retain(|failure| failure != &entry.rel_path);
-        self.cache_structural_gen
-            .record(graph_drift::StructuralChange::Reread(entry.path.clone()));
-        let generation = self
-            .cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1;
+        let generation = self.move_cache_generation(
+            &cache,
+            Some(graph_drift::StructuralChange::Reread(entry.path.clone())),
+            graph_drift::IndexEffect::Unchanged(projection.as_ref()),
+        );
         let next = match cache.as_ref() {
             Some(pages) => Arc::new(build_effective_identity_index(
                 generation,

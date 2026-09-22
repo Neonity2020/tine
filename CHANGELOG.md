@@ -78,6 +78,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   search; before, opening it could leave the index claiming the page's current
   content without ever receiving it (GH #543).
 
+- When one page cannot be read, the page list and search no longer re-parse
+  the whole graph each time, and the search index no longer stays "not ready"
+  until the next restart (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).

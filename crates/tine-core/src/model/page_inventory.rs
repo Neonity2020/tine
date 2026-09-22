@@ -24,163 +24,92 @@ impl Graph {
                 return Ok(entries.clone());
             }
         }
-        // R6: a ready projection already holds the effective inventory; the
-        // whole-graph parse below is the not-ready fallback.
-        if let Some((generation, entries)) = self.direct_projection_page_inventory() {
-            *self.page_list_cache.write().unwrap() = Some((generation, entries.clone()));
-            return Ok(entries);
-        }
-        // Cold inventory used to run its own whole-graph parse, independently
-        // of the page-build flight used by templates, queries and background
-        // warm-up. On first open those passes competed for every core and for
-        // storage, starving the three-page journal feed (GH #550). Join the
-        // existing generation-scoped flight instead.
-        //
-        // Except after a known parse failure. `publish_warm_page_inventory`
-        // deliberately leaves the memo absent then, so that the next listing
-        // revalidates the failed path from disk; the flight answers from the
-        // parsed cache, which still holds the page as it was before it became
-        // unreadable, so joining it here would republish exactly the stale
-        // entry that mechanism exists to drop. Cold open has no failures, so
-        // it keeps the shared flight.
+        // One base inventory: the ready index's, or else the shared page-build
+        // flight's. Cold inventory used to run its own whole-graph parse,
+        // competing with the flight for every core and for storage and
+        // starving the journal feed (GH #550).
         //
         // A graph whose text cannot be read, or a display read on a retired
         // graph, lists nothing for display and is an error to an acting
         // caller; neither answer is memoized, so it cannot outlive its cause.
-        let entries = if self.page_index_failures.read().unwrap().is_empty() {
-            match self.page_snapshot(!exact) {
+        let base = match self.direct_projection_page_inventory() {
+            Some((_, entries)) => entries,
+            None => match self.page_snapshot(!exact) {
                 Ok(Some(pages)) => pages.iter().map(|(entry, _)| entry.clone()).collect(),
                 Ok(None) => return Ok(Vec::new()),
                 Err(error) if exact => return Err(error),
                 Err(_) => return Ok(Vec::new()),
-            }
-        } else if let Some(entries) = self.cached_inventory_with_failures_revalidated(generation) {
-            entries
+            },
+        };
+        let failures = self.page_index_failures.read().unwrap().clone();
+        let entries = if failures.is_empty() {
+            base
         } else {
-            match self.exact_page_inventory_from_disk() {
-                Some(entries) => entries,
-                None => {
-                    return Err(io::Error::other(
-                        "the graph's page folders could not be read",
-                    ))
-                }
+            match self.with_failed_paths_revalidated(base, &failures) {
+                Ok(entries) => entries,
+                Err(error) if exact => return Err(error),
+                Err(_) => return Ok(Vec::new()),
             }
         };
-        if self.answer_is_complete() {
+        if self.answer_is_complete()
+            && self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation
+        {
             *self.page_list_cache.write().unwrap() = Some((generation, entries.clone()));
         }
         Ok(entries)
     }
 
-    /// The listing after a known parse failure, from the parsed cache: its
-    /// healthy entries, with every failed path read and parsed again on its
-    /// own. The cache is current for every page the watcher reconciled; only
-    /// a failed path can hold a stale entry, so only a failed path is
-    /// revalidated: one that still fails to read or parse is left out, one
-    /// that is gone is left out, and one that now parses is listed as it is
-    /// now.
+    /// `base` after known parse failures: its entries for healthy pages,
+    /// with every failed path read and parsed again on its own. Both bases
+    /// still hold a failed page as it was before it failed, and only a failed
+    /// path can be stale, so only a failed path is revalidated: one that
+    /// still fails to read or parse is left out, one that is gone is left
+    /// out, and one that now parses is listed as it is now. An error when
+    /// the graph text scope itself could not be read.
     ///
-    /// `None` -- take the exact whole-graph listing -- when there is no parsed
-    /// cache, a failure names the scope rather than a file, or the generation
-    /// moved. Re-reading every page on each watcher delivery of one failing
-    /// file was a whole-graph parse per event at 10k pages (GH #543, indexing
-    /// audits IT-07, and R3-04 for a file that reads but does not parse).
-    fn cached_inventory_with_failures_revalidated(
+    /// This replaced a whole-graph read and parse taken whenever a failure
+    /// was recorded and no parsed cache existed, as in every warm SQL
+    /// session: one unreadable file cost a 10k-page parse per listing
+    /// (GH #543, indexing audits IT-07, R3-04 and R4-03).
+    fn with_failed_paths_revalidated(
         &self,
-        generation: u64,
-    ) -> Option<Vec<PageEntry>> {
-        let pages = self.cache.read().unwrap().clone()?;
-        let failures = self.page_index_failures.read().unwrap().clone();
-        let permit = self.admit_retained_graph_text_writer().ok()?;
+        base: Vec<PageEntry>,
+        failures: &[String],
+    ) -> io::Result<Vec<PageEntry>> {
+        if let Some(scope) = failures
+            .iter()
+            .find(|failure| failure.starts_with("graph-text-scope:"))
+        {
+            return Err(io::Error::other(scope.clone()));
+        }
+        let permit = self.admit_retained_graph_text_writer()?;
         let mut recovered = Vec::new();
-        for failure in &failures {
+        for failure in failures {
             // A failure is a graph-relative path only when it names a file;
-            // scope and skip reasons ("<path>: <why>") do not.
+            // skip reasons ("<path>: <why>") name no file and list nothing.
             let path = self.root.join(failure);
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                // Gone: nothing to list.
+            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
                 continue;
-            };
-            if !meta.is_file() {
-                return None;
             }
             let Ok(Some((content, _))) =
                 self.graph_text_read_optional_text_with_identity(&permit, &path)
             else {
                 continue;
             };
-            let entry = self.graph_text_entry_for_path(&path).ok()??;
+            let Ok(Some(entry)) = self.graph_text_entry_for_path(&path) else {
+                continue;
+            };
             if let Ok((entry, _, _)) = parse_exact_page(self, &entry, &content) {
                 recovered.push(entry);
             }
         }
         let failed = failures.iter().map(String::as_str).collect::<HashSet<_>>();
-        let mut entries = pages
-            .iter()
-            .filter(|(entry, _)| !failed.contains(entry.rel_path.as_str()))
-            .map(|(entry, _)| entry.clone())
+        let mut entries = base
+            .into_iter()
+            .filter(|entry| !failed.contains(entry.rel_path.as_str()))
             .collect::<Vec<_>>();
         entries.extend(recovered);
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(entries)
-    }
-
-    /// Read and parse every graph-text file, exactly as it is on disk right
-    /// now, and republish the parse failures found on the way.
-    ///
-    /// This is the expensive path. It exists for one case: a file whose parse
-    /// failed under the watcher must be revalidated from its bytes rather than
-    /// answered from a cache that predates the failure. `None` means the graph
-    /// text scope itself could not be read; the caller then lists nothing, and
-    /// the reason is left in `page_index_failures`.
-    fn exact_page_inventory_from_disk(&self) -> Option<Vec<PageEntry>> {
-        if self.skip_display_parse() {
-            return None;
-        }
-        let built = self.admit_retained_graph_text_writer().and_then(|permit| {
-            let (entries, skipped) = self.graph_text_entries_and_skipped(&permit)?;
-            let limits = graph_text_inventory_limits();
-            let mut raw_bytes = 0_u64;
-            let mut effective = Vec::with_capacity(entries.len());
-            let mut failures = skipped;
-            for entry in entries {
-                let loaded = self.graph_text_read_optional_text_with_identity(&permit, &entry.path);
-                let parsed = match loaded {
-                    Ok(Some((content, _))) => {
-                        raw_bytes = raw_bytes
-                            .checked_add(usize_to_u64(content.len())?)
-                            .ok_or_else(|| {
-                                graph_text_inventory_limit_error("aggregate text bytes")
-                            })?;
-                        if raw_bytes > limits.retained_content_bytes {
-                            return Err(graph_text_inventory_limit_error("aggregate text bytes"));
-                        }
-                        parse_exact_page(self, &entry, &content)
-                    }
-                    Ok(None) => {
-                        failures.push(format!(
-                            "{}: disappeared during graph text listing",
-                            entry.rel_path
-                        ));
-                        continue;
-                    }
-                    Err(error) => Err(error),
-                };
-                match parsed {
-                    Ok((entry, _, _)) => effective.push(entry),
-                    Err(_) => failures.push(entry.rel_path),
-                }
-            }
-            *self.page_index_failures.write().unwrap() = failures;
-            Ok(effective)
-        });
-        match built {
-            Ok(entries) => Some(entries),
-            Err(error) => {
-                *self.page_index_failures.write().unwrap() =
-                    vec![format!("graph-text-scope: {error}")];
-                None
-            }
-        }
+        Ok(entries)
     }
 
     /// Publish the exact physical/effective page inventory already represented by

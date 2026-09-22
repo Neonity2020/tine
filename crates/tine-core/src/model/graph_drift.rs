@@ -66,9 +66,14 @@ impl StructuralGeneration {
         self.counter.load(Ordering::Acquire)
     }
 
-    /// Record one change. The caller holds the cache write lock and bumps
-    /// `cache_gen` after this, as every page-set mover does.
-    pub(super) fn record(&self, change: StructuralChange) {
+    /// Entries the per-path map holds now.
+    #[cfg(test)]
+    pub(super) fn logged_paths_test(&self) -> usize {
+        self.log.lock().unwrap().paths.len()
+    }
+
+    /// Record one change; only [`Graph::move_cache_generation`] calls this.
+    fn record(&self, change: StructuralChange) {
         let mut log = self.log.lock().unwrap();
         let at = self.counter.fetch_add(1, Ordering::AcqRel) + 1;
         match change {
@@ -175,7 +180,42 @@ impl GraphDrift {
         )
     }
 }
+
+/// What one move of the cache generation does to the SQL index.
+pub(super) enum IndexEffect<'a> {
+    /// The mover sends the index a page delta, a delete or a stale mark for
+    /// this move once it has released the cache lock.
+    Sent,
+    /// The move changes nothing the index describes, such as a page becoming
+    /// unreadable (its last good content stays served) or recovering. The
+    /// index is told the new generation directly: nothing else would ever
+    /// reach it, and an index left behind the generation is not ready, so
+    /// every indexed read fell back to parsing the graph (GH #543, audit
+    /// R4-03). The projection is fetched before the cache lock is taken.
+    Unchanged(Option<&'a Arc<crate::direct_projection::DirectProjection>>),
+}
+
 impl Graph {
+    /// The one place `cache_gen` moves. The caller holds the cache write lock
+    /// and has published the change the move stands for; `change` names a
+    /// page-set change that no page publication describes, and `effect`
+    /// states how the index hears about the move. Returns the new generation.
+    pub(super) fn move_cache_generation(
+        &self,
+        _cache: &std::sync::RwLockWriteGuard<'_, Option<Arc<Vec<(PageEntry, Arc<Document>)>>>>,
+        change: Option<StructuralChange>,
+        effect: IndexEffect<'_>,
+    ) -> u64 {
+        if let Some(change) = change {
+            self.cache_structural_gen.record(change);
+        }
+        let generation = self.cache_gen.fetch_add(1, Ordering::Release) + 1;
+        if let IndexEffect::Unchanged(Some(projection)) = effect {
+            projection.advance_generation(generation);
+        }
+        generation
+    }
+
     /// Publish the runtime ids of a page read or written now, stamped with
     /// the event sequence so a pass can tell whether it read the page before
     /// or after this publication.
