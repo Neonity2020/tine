@@ -4904,7 +4904,7 @@ fn install_built_publishes_only_at_its_exact_generation() {
         let permit = graph.admit_retained_graph_text_writer().unwrap();
         let expected = graph.cache_generation();
         let built = graph.load_all_pages_with_permit(&permit);
-        let flight = PageBuildFlight::new(expected, graph.cache_structural_gen.load());
+        let flight = PageBuildFlight::new(expected, graph.cache_structural_gen.begin_pass());
         if drift {
             // A change with no name (an invalidation) is real drift.
             graph.drift_generation_test();

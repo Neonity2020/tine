@@ -85,6 +85,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - Opening a page while the search index was being checked no longer starts a
   second, full rebuild of the index (GH #543).
 
+- Performance: the record of pages changed during indexing no longer grows
+  without bound over a long session (GH #543).
+
 - Exporting, printing, or renaming/deleting on a graph whose files cannot be
   read now reports that, instead of exporting an empty site or saying the page
   does not exist (GH #543).

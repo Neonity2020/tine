@@ -118,13 +118,16 @@ pub(super) struct PageBuildFlight {
     /// `cache_structural_gen` at the claim, before anything was read: with
     /// the parsed revisions, it tells a harmless generation move from real
     /// drift at installation.
-    pub(super) expected_structural: u64,
+    pub(super) expected_structural: super::graph_drift::PassWatermark,
     outcome: std::sync::Mutex<Option<PageBuildOutcome>>,
     completed: std::sync::Condvar,
 }
 
 impl PageBuildFlight {
-    pub(super) fn new(expected_generation: u64, expected_structural: u64) -> Self {
+    pub(super) fn new(
+        expected_generation: u64,
+        expected_structural: super::graph_drift::PassWatermark,
+    ) -> Self {
         Self {
             expected_generation,
             expected_structural,

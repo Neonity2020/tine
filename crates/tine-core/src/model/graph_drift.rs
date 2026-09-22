@@ -36,32 +36,93 @@ enum PathEvent {
 /// notes the sequence before it reads a page; an event with a higher number
 /// happened after that read, and one with a lower number did not.
 ///
-/// The latest event per path is kept, never evicted: a pass that has been
-/// reading for a while must still be able to name every change it missed, or
-/// it would discard its work (GH #543, audit R3-03). The map grows with the
-/// distinct paths removed or reread in a session, a fraction of the page
-/// cache it serves.
+/// The latest event per path is kept while a pass that started before it
+/// runs: a pass that has been reading for a while must still be able to name
+/// every change it missed, or it would discard its work (GH #543, audit
+/// R3-03). An event no running pass started before is dropped, so the map
+/// holds the paths changed during the passes in flight, not every path
+/// changed in the session (audit R4-P1). A pass registers its start with
+/// [`StructuralGeneration::begin_pass`].
 pub(super) struct StructuralGeneration {
     counter: AtomicU64,
-    log: std::sync::Mutex<StructuralLog>,
+    log: Arc<std::sync::Mutex<StructuralLog>>,
 }
 
-#[derive(Default)]
+/// The map is pruned when it reaches this size, and again whenever it
+/// doubles after that, so pruning costs O(1) per event amortized.
+const PRUNE_FLOOR: usize = 256;
+
 struct StructuralLog {
     /// Sequence of the latest unnamed change; 0 when there has been none.
     unnamed_at: u64,
     paths: HashMap<PathBuf, (u64, PathEvent)>,
+    /// The start of each running pass, with how many passes started there.
+    passes: std::collections::BTreeMap<u64, usize>,
+    prune_at: usize,
+}
+
+impl StructuralLog {
+    fn prune(&mut self) {
+        // No running pass can need an event at or before the earliest start:
+        // each judges a path against a read no earlier than its own start.
+        let floor = self.passes.keys().next().copied().unwrap_or(u64::MAX);
+        self.paths.retain(|_, (at, _)| *at > floor);
+        self.prune_at = (self.paths.len() * 2).max(PRUNE_FLOOR);
+    }
+}
+
+/// A running pass's start in the structural sequence. Events after it are
+/// kept until the pass drops this.
+pub(super) struct PassWatermark {
+    at: u64,
+    log: Arc<std::sync::Mutex<StructuralLog>>,
+}
+
+impl PassWatermark {
+    pub(super) fn at(&self) -> u64 {
+        self.at
+    }
+}
+
+impl Drop for PassWatermark {
+    fn drop(&mut self) {
+        let mut log = self.log.lock().unwrap();
+        if let std::collections::btree_map::Entry::Occupied(mut passes) = log.passes.entry(self.at)
+        {
+            *passes.get_mut() -= 1;
+            if *passes.get() == 0 {
+                passes.remove();
+            }
+        }
+    }
 }
 
 impl StructuralGeneration {
     pub(super) fn new() -> Self {
         Self {
             counter: AtomicU64::new(0),
-            log: std::sync::Mutex::new(StructuralLog::default()),
+            log: Arc::new(std::sync::Mutex::new(StructuralLog {
+                unnamed_at: 0,
+                paths: HashMap::new(),
+                passes: std::collections::BTreeMap::new(),
+                prune_at: PRUNE_FLOOR,
+            })),
         }
     }
 
-    /// The sequence so far. A pass notes it before it reads.
+    /// Start a pass: the sequence so far, noted before the pass reads, and
+    /// kept registered until the pass is done.
+    pub(super) fn begin_pass(&self) -> PassWatermark {
+        let mut log = self.log.lock().unwrap();
+        let at = self.counter.load(Ordering::Acquire);
+        *log.passes.entry(at).or_default() += 1;
+        PassWatermark {
+            at,
+            log: Arc::clone(&self.log),
+        }
+    }
+
+    /// The sequence so far, for a running pass that reads a page again.
     pub(super) fn load(&self) -> u64 {
         self.counter.load(Ordering::Acquire)
     }
@@ -86,6 +147,9 @@ impl StructuralGeneration {
                 log.paths.insert(path, (at, PathEvent::Reread));
             }
             StructuralChange::Unnamed => log.unnamed_at = at,
+        }
+        if log.paths.len() >= log.prune_at {
+            log.prune();
         }
     }
 

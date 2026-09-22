@@ -93,7 +93,10 @@ fn a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure() {
         .attach_direct_projection(dir.join("private/projection.sqlite"))
         .unwrap();
     let permit = graph.admit_retained_graph_text_writer().unwrap();
-    let flight = PageBuildFlight::new(graph.cache_generation(), graph.cache_structural_gen.load());
+    let flight = PageBuildFlight::new(
+        graph.cache_generation(),
+        graph.cache_structural_gen.begin_pass(),
+    );
     let built = graph.load_all_pages_with_permit(&permit);
     fs::write(&failed, [0xff, 0xfe, 0xfd]).unwrap();
     assert!(graph.sync_file_checked(&failed).is_err());
@@ -395,7 +398,10 @@ fn gh543_cold_parse_reparses_a_page_edited_after_it_read_it() {
     fs::write(dir.join("pages/Other.md"), "- other\n").unwrap();
     let graph = Graph::open(&dir);
     let permit = graph.admit_retained_graph_text_writer().unwrap();
-    let flight = PageBuildFlight::new(graph.cache_generation(), graph.cache_structural_gen.load());
+    let flight = PageBuildFlight::new(
+        graph.cache_generation(),
+        graph.cache_structural_gen.begin_pass(),
+    );
     let built = graph.load_all_pages_with_permit(&permit);
     let path = dir.join("pages/Existing.md");
     let entry = graph.entry_for_path(&path).unwrap();
@@ -560,6 +566,35 @@ fn session_page_ids_have_three_writers() {
             "projection_lifetime.rs".to_owned(),
         ],
         "publish page ids only through Graph::publish_session_page_ids (model/graph_drift.rs)"
+    );
+}
+
+/// GH #543 (audit R4-P1): the per-path event log keeps what a running pass
+/// may still need and drops the rest. It used to keep every path removed or
+/// found unreadable for the life of the session.
+#[test]
+fn the_structural_event_log_keeps_only_what_running_passes_need() {
+    let dir = scratch("r4-p1-event-log");
+    let graph = Graph::open(&dir);
+    for index in 0..300 {
+        let path = dir.join(format!("pages/bad{index}.md"));
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(graph.sync_file_checked(&path).is_err());
+    }
+    let idle = graph.cache_structural_gen.logged_paths_test();
+    let pass = graph.cache_structural_gen.begin_pass();
+    for index in 300..600 {
+        let path = dir.join(format!("pages/bad{index}.md"));
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(graph.sync_file_checked(&path).is_err());
+    }
+    let running = graph.cache_structural_gen.logged_paths_test();
+    drop(pass);
+    eprintln!("R4-P1 event log: idle={idle} during a pass={running}");
+    assert!(idle < 256, "with no pass running the log kept {idle} paths");
+    assert!(
+        running >= 300,
+        "a running pass lost events after its start: {running}"
     );
 }
 

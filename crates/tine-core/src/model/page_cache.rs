@@ -152,7 +152,7 @@ impl Graph {
         let (completed, structural) = {
             let cache = self.cache.read().unwrap();
             let current_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            let structural = self.cache_structural_gen.load();
+            let structural = self.cache_structural_gen.begin_pass();
             let completed = if current_generation != expected_generation {
                 Some(PageBuildOutcome::GenerationDrift)
             } else if cache.is_some() {
@@ -318,7 +318,7 @@ impl Graph {
         let mut guard = self.cache.write().unwrap();
         let read_at = graph_drift::PassReadAt {
             generation: flight.expected_generation,
-            structural: flight.expected_structural,
+            structural: flight.expected_structural.at(),
             reread: &reread,
         };
         let Some(drift) =
@@ -589,7 +589,8 @@ impl Graph {
         let Ok(permit) = self.admit_retained_graph_text_writer() else {
             return Outcome::Unavailable;
         };
-        let structural = self.cache_structural_gen.load();
+        let pass = self.cache_structural_gen.begin_pass();
+        let structural = pass.at();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
             return Outcome::Unavailable;
