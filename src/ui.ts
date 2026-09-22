@@ -1888,14 +1888,22 @@ export function removeDeletedBlocksFromSidebar(uuids: ReadonlySet<string>) {
 }
 
 /** Drop restored block items whose block can't be resolved (its in-memory uuid
- *  changed across the restart). Page items are left untouched. */
+ *  changed across the restart). Page items are left untouched.
+ *
+ *  Only the current binding's definitive "no such block" removes an item. A
+ *  failed read (a transient IPC error, a stale binding, a read refused during
+ *  a graph switch) says nothing about the block, and the removal is persisted,
+ *  so treating it as "gone" deleted the user's pin for good (GH #543, audit
+ *  R6-08). */
 export async function pruneSidebarBlocks(): Promise<void> {
   const blocks = rightSidebar().filter((i): i is SidebarBlock => i.kind === "block");
   if (!blocks.length) return;
-  const resolved = await Promise.all(
-    blocks.map((b) => backend().resolveBlock(b.uuid).catch(() => null))
+  const binding = graphBinding();
+  const alive = await Promise.all(
+    blocks.map((b) => backend().resolveBlock(b.uuid).then((block) => Boolean(block), () => true))
   );
-  const dead = new Set(blocks.filter((_, i) => !resolved[i]).map((b) => b.uuid));
+  if (graphBinding() !== binding) return;
+  const dead = new Set(blocks.filter((_, i) => !alive[i]).map((b) => b.uuid));
   if (dead.size) {
     setRightSidebar(rightSidebar().filter((i) => i.kind !== "block" || !dead.has(i.uuid)));
   }

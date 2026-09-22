@@ -5895,6 +5895,33 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 6, R6-06 (I-20). Both references panels keyed their resource and their ownership check on the page name alone. The main pane happens to remount them on a rebind, but the right sidebar never does, so after a rename, a backup restore or a journal-format change it kept the old binding's rows, and a late pre-rebind answer could land. Fix (shape, at the shared seam): createReferenceFetcher's read is a ReferenceRead of page name, graph binding and render epoch; both panels key their resource on it and the fetcher owns a read only while all three still match, so the panels are correct wherever they are mounted. Siblings reviewed: inline page/block previews and block embeds key on the render epoch, which every rebind also bumps; query blocks and QueryBuilder already scope by epoch and binding. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r6/RECEIPT-indexing-audit-r6-frontend-probes.log and tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-06.log."
+},
+{
+ "id": "REG-A-FAILED-LOOKUP-NEVER-UNPINS-A-SIDEBAR-BLOCK-543",
+ "title": "A block pinned in the right sidebar is removed at launch only when the open graph says it no longer exists, never because looking it up failed",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/pruneSidebarBlocks.test.ts::keeps a restored block when resolving it is refused for indexing",
+   "src/pruneSidebarBlocks.test.ts::keeps a restored block when resolving it fails outright",
+   "src/pruneSidebarBlocks.test.ts::does not act on answers from a binding that has since moved",
+   "src/pruneSidebarBlocks.test.ts::still removes a block the current binding says is gone"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 6, R6-08. pruneSidebarBlocks runs at every graph load and persists what it removes, but it caught every resolve_block error as null and so deleted the pin on a transient IPC error, a stale binding or a read refused during a graph switch. Fix: an error keeps the block, and answers are acted on only if the binding has not moved while they were read. Remaining core-side sibling: a retired graph's resolve can still answer an empty result rather than an error (the with_pages f(&[]) shape); the binding check covers it here, and the indexing-owner redesign owns the core shape. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r6/RECEIPT-indexing-audit-r6-frontend-probes.log and tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-08.log (3 tests)."
 }
 ]
 }
