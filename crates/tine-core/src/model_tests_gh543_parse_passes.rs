@@ -35,6 +35,37 @@ fn a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure() {
     );
 }
 
+/// GH #543 (audit R3-04): revalidating one readable page that failed to
+/// parse re-reads that page only, not every page in the graph.
+#[test]
+fn a_page_that_fails_to_parse_does_not_reparse_its_healthy_siblings() {
+    let dir = scratch("audit543-r3-readable-parse-failure");
+    for index in 0..8 {
+        fs::write(dir.join(format!("pages/p{index}.md")), "- original\n").unwrap();
+    }
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(5))
+        .unwrap();
+    let failed = dir.join("pages/p0.md");
+    fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
+    assert!(graph.sync_file_checked(&failed).is_err());
+    GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
+    let listed = graph.list_pages().len();
+    let parses = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+    graph.detach_direct_projection(Duration::from_secs(5));
+    eprintln!("R3 readable parse failure: listed={listed} parses={parses}");
+    assert_eq!(listed, 7);
+    assert!(
+        parses <= 1,
+        "a readable failed page reparsed all healthy siblings"
+    );
+}
+
 /// GH #543 (audit R3-01): a page deleted and recreated while the cold pass
 /// ran is re-read on its own; the rest of the pass is kept.
 #[test]

@@ -73,17 +73,18 @@ impl Graph {
     }
 
     /// The listing after a known parse failure, from the parsed cache: its
-    /// healthy entries, minus every failed path, whose bytes are re-read to
-    /// confirm they still fail. The cache is current for every page the
-    /// watcher reconciled; only a failed path can hold a stale entry, and
-    /// that is exactly what the listing must drop.
+    /// healthy entries, with every failed path read and parsed again on its
+    /// own. The cache is current for every page the watcher reconciled; only
+    /// a failed path can hold a stale entry, so only a failed path is
+    /// revalidated: one that still fails to read or parse is left out, one
+    /// that is gone is left out, and one that now parses is listed as it is
+    /// now.
     ///
     /// `None` -- take the exact whole-graph listing -- when there is no parsed
-    /// cache, a failure is not a readable-failing file (it now reads, is gone,
-    /// or names the scope), or the generation moved. Re-reading every page
-    /// on each watcher delivery of one still-unreadable file was a
-    /// whole-graph parse per event at 10k pages (GH #543, indexing audit
-    /// IT-07).
+    /// cache, a failure names the scope rather than a file, or the generation
+    /// moved. Re-reading every page on each watcher delivery of one failing
+    /// file was a whole-graph parse per event at 10k pages (GH #543, indexing
+    /// audits IT-07, and R3-04 for a file that reads but does not parse).
     fn cached_inventory_with_failures_revalidated(
         &self,
         generation: u64,
@@ -91,26 +92,35 @@ impl Graph {
         let pages = self.cache.read().unwrap().clone()?;
         let failures = self.page_index_failures.read().unwrap().clone();
         let permit = self.admit_retained_graph_text_writer().ok()?;
+        let mut recovered = Vec::new();
         for failure in &failures {
             // A failure is a graph-relative path only when it names a file;
             // scope and skip reasons ("<path>: <why>") do not.
             let path = self.root.join(failure);
-            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                // Gone: nothing to list.
+                continue;
+            };
+            if !meta.is_file() {
                 return None;
             }
-            if self
-                .graph_text_read_optional_text_with_identity(&permit, &path)
-                .is_ok()
-            {
-                return None;
+            let Ok(Some((content, _))) =
+                self.graph_text_read_optional_text_with_identity(&permit, &path)
+            else {
+                continue;
+            };
+            let entry = self.graph_text_entry_for_path(&path).ok()??;
+            if let Ok((entry, _, _)) = parse_exact_page(self, &entry, &content) {
+                recovered.push(entry);
             }
         }
         let failed = failures.iter().map(String::as_str).collect::<HashSet<_>>();
-        let entries = pages
+        let mut entries = pages
             .iter()
             .filter(|(entry, _)| !failed.contains(entry.rel_path.as_str()))
             .map(|(entry, _)| entry.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        entries.extend(recovered);
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(entries)
     }
 

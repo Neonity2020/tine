@@ -109,7 +109,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   rebuild it twice in a row (GH #543).
 - While one page file could not be read (for example a file still arriving
   from a sync service), every page listing re-read and parsed the whole graph.
-  Only the unreadable file is re-checked now (GH #543).
+  Only the unreadable file is re-checked now, and a file that can be read but
+  not parsed no longer makes the listing parse every other page (GH #543).
 - Switching graphs, or changing a setting that reloads the graph (preferred
   file format, default home page, journal title format, restoring a backup),
   while that graph was still indexing could make Tine parse the whole old
