@@ -94,6 +94,22 @@ fn audited_write_guard_rejects_import_alias_and_constructor_evasions() {
     }
 }
 
+#[test]
+fn a_test_child_file_folds_in_as_test_code() {
+    // `commands/capture_quick_switch_tests.rs` is declared
+    // `#[cfg(test)] mod capture_quick_switch_tests;`: guards that strip test
+    // items must not read its tests as production owners.
+    let marker = "fn a_capture_query_on_a_retired_graph_is_answered_by_its_replacement";
+    let whole = rust_module_source("commands.rs");
+    assert!(
+        whole.contains(marker),
+        "the folded module lost its test child"
+    );
+    assert!(!without_cfg_test_items(&whole).contains(marker));
+    assert!(!rust_module_production_source("commands.rs").contains(marker));
+    assert!(without_cfg_test_items(&whole).contains("fn capture_quick_switch_for"));
+}
+
 /// Every `.rs` file of the module whose root file is `root`: the root first,
 /// then everything below its sibling directory (`commands.rs` + `commands/**`),
 /// in path order.
@@ -127,9 +143,49 @@ fn rust_module_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 pub(crate) fn rust_module_source_at(root: &std::path::Path) -> String {
     rust_module_paths(root)
         .into_iter()
-        .map(|path| std::fs::read_to_string(path).expect("module source is readable"))
+        .map(|path| {
+            let source = std::fs::read_to_string(&path).expect("module source is readable");
+            if !is_cfg_test_child(&path) {
+                return source;
+            }
+            // Fold a test-only child file in as the `#[cfg(test)]` block it
+            // is, indented so its own closing braces cannot end the block
+            // early: `without_cfg_test_items` then removes it like an inline
+            // test module.
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            let body = source
+                .split('\n')
+                .map(|line| {
+                    if line.is_empty() {
+                        String::new()
+                    } else {
+                        format!("    {line}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("#[cfg(test)]\nmod {stem} {{\n{body}\n}}")
+        })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether `path` is a child module file its parent declares as
+/// `#[cfg(test)] mod name;` — test code a seam cut moved out of the parent.
+fn is_cfg_test_child(path: &std::path::Path) -> bool {
+    let (Some(directory), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return false;
+    };
+    let declaration = format!("mod {};", stem.to_string_lossy());
+    [directory.with_extension("rs"), directory.join("mod.rs")]
+        .iter()
+        .filter_map(|parent| std::fs::read_to_string(parent).ok())
+        .any(|parent| {
+            let lines: Vec<&str> = parent.lines().map(str::trim).collect();
+            lines
+                .windows(2)
+                .any(|pair| pair[0] == "#[cfg(test)]" && pair[1] == declaration)
+        })
 }
 
 fn source_dir() -> std::path::PathBuf {
@@ -147,6 +203,7 @@ pub(crate) fn rust_module_source(file: &str) -> String {
 pub(crate) fn rust_module_production_source(file: &str) -> String {
     rust_module_paths(&source_dir().join(file))
         .into_iter()
+        .filter(|path| !is_cfg_test_child(path))
         .map(|path| {
             without_cfg_test_items(
                 &std::fs::read_to_string(path).expect("module source is readable"),

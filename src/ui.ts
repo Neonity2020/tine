@@ -356,12 +356,17 @@ export const [journalConflicts, setJournalConflicts] = createSignal<JournalConfl
  *  kept here only until this day had a surface of its own. The Settings list
  *  stays as the fallback, exactly as Backups does for sync copies. */
 export async function refreshJournalConflicts(): Promise<void> {
+  // The listing walks journals/ off the main thread, so overlapping refreshes
+  // can answer out of order; only the newest may publish (GH #543, R6-02).
+  const generation = ++journalConflictRefreshGeneration;
   try {
-    setJournalConflicts(await backend().listJournalConflicts());
+    const conflicts = await backend().listJournalConflicts();
+    if (generation === journalConflictRefreshGeneration) setJournalConflicts(conflicts);
   } catch {
     /* best-effort */
   }
 }
+let journalConflictRefreshGeneration = 0;
 
 // --- sync-tool conflict copies (Syncthing/Dropbox `*.sync-conflict-*` files).
 // Excluded from the page list; surfaced here so the user can review + merge them

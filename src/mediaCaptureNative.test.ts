@@ -37,8 +37,8 @@ describe("Android voice-recording bounds", () => {
     expect(source).toMatch(/listFiles\(\)[\s\S]*startsWith\("tine_memo_"\)[\s\S]*forEach \{ it\.delete\(\) \}/);
 
     const commands = rustModuleSource("src-tauri/src/commands.rs");
-    expect(commands).toMatch(/pub\(crate\) fn import_native_capture/);
-    expect(commands).toMatch(/import_asset_file\(&mut capture, &name, max_bytes\)/);
+    expect(commands).toMatch(/pub\(crate\) async fn import_native_capture/);
+    expect(commands).toMatch(/import_asset_file\(&mut capture, name, max_bytes\)/);
     const bridge = readFileSync("src-tauri/src/android_media.rs", "utf8");
     const result = bridge.slice(
       bridge.indexOf("struct MediaCaptureResult"),

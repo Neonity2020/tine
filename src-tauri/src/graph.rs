@@ -773,7 +773,15 @@ pub(crate) async fn open_graph_window(
     {
         let id = state.next_window.fetch_add(1, Ordering::Relaxed);
         let label = format!("graph-{id}");
-        let result = load_graph_for_label(path, &app, &label, &state)?;
+        // Off the async runtime, like `load_graph`: opening a graph walks it.
+        let worker_app = app.clone();
+        let worker_label = label.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let state = worker_app.state::<AppState>();
+            load_graph_for_label(path, &worker_app, &worker_label, &state)
+        })
+        .await
+        .map_err(crate::command_error::CommandError::worker)??;
         if let LoadGraphResult::Loaded { ref meta, .. } = result {
             let name = Path::new(&meta.root)
                 .file_name()

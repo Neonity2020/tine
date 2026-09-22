@@ -5950,6 +5950,33 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 6, R6-05 (I-20). Measured before the fix: a query-export plan asked for during a warm waited out the whole pass on its backend thread and then parsed every page (6 of 6 in the test), even if the dialog had been closed; a source mismatch came back as untyped prose, which the dialog showed as a refusal nothing retried. Fix, one seam per layer: capture_direct_publication_sources (shared by publish_html, publish_graph_to, publish_graph_app_to, plan_query_publication and publish_query) asks the index first and answers typed not-ready while it is working; the source-mismatch refusal is the same typed not-ready; CommandError::from(io::Error) unwraps an IO-carried QueryExecutionError into the one query wire, so every command that carries one keeps it. The dialog's plan and export and the Settings HTML export wait through runQueryWhenCurrent and say they are waiting. Fail-before: tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-05-core.log, necessity-r6-05-tauri.log, necessity-r6-05-frontend.log (3 tests)."
+},
+{
+ "id": "REG-NO-COMMAND-FREEZES-THE-APP-DURING-INDEXING-543",
+ "title": "No command freezes every window while the graph is being indexed: Quick Capture suggestions, a journal title-format change, graph-wide listings and large asset work run off the main thread",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/backend_command_parity.rs::every_sync_command_says_why_it_may_run_on_the_main_thread",
+   "src-tauri/src/backend_command_parity.rs::async_commands_open_graphs_inside_spawn_blocking",
+   "src-tauri/src/commands/capture_quick_switch_tests.rs::a_capture_query_on_a_retired_graph_is_answered_by_its_replacement",
+   "src/refreshJournalConflicts.test.ts::keeps the newest refresh's answer when an older one finishes last"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 6, R6-02 and R6-07. A sync #[tauri::command] runs on the main thread and freezes every window until it returns. capture_quick_switch waited out the whole index pass there (wait_for_derived_read) and, on a graph a refresh had just retired, parsed that graph; set_journal_title_format waited for the storage transition lane and up to 15 s for the index worker to stop. Fourteen commands became async + spawn_blocking (capture_quick_switch, set_journal_title_format, list_journal_conflicts, list_journal_filename_migrations, graph_source_files, set_backup_keep, asset_trash_stats, empty_asset_trash, import_asset, import_native_capture, read_asset, read_local_image, list_installed_plugins, list_spellcheck_dictionaries); open_graph_window and restore_backup no longer open or refresh a graph inline on a runtime worker. Shape: state::refresh_graph is async, so no sync command can reach it; capture reads go through display_read. Guard: every remaining sync command is listed in SYNC_COMMANDS with the reason it is bounded, and the listing is exact both ways. refreshJournalConflicts keeps only the newest answer, since the listing now answers out of order. Fixed a vacuous sibling: a_display_read_on_a_retired_graph_is_answered_by_its_replacement measured its wait after joining the 200 ms binder thread. Fail-before: tine-agents/evidence/gh550-batch/r6-fixes/necessity-r6-02-tauri.log (14 unlisted sync commands, open_graph_window, capture answered by the retired graph in 2.9 ms), necessity-r6-02-frontend.log."
 }
 ]
 }

@@ -699,7 +699,7 @@ mod tests {
         // whole packet exists to make unwritable.
         assert_eq!(
             (site_count, site_fingerprint),
-            (241, 12_396_874_377_099_507_444),
+            (241, 6_215_336_380_717_418_217),
             "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
              sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
              genuinely moved, changed family, appeared or disappeared. Diff these against \
@@ -904,21 +904,180 @@ mod tests {
         false
     }
 
-    /// Commands that read every page file must not run on the main thread: a
-    /// sync `#[tauri::command]` does, and blocks every other command until it
-    /// finishes (GH #332 measured 10-16 s at startup on a large Windows graph).
+    /// Why each remaining sync command may run on the main thread. A sync
+    /// `#[tauri::command]` runs there and freezes every window until it returns
+    /// (GH #332 measured 10-16 s; GH #543 R6-02 waited out a whole index
+    /// pass). Anything that walks the graph, waits on the index, a lane or a
+    /// subprocess, or reads a file the call did not size is `async` +
+    /// `spawn_blocking` instead (exemplar: `conflict_queue` in commands.rs).
+    const SYNC_COMMANDS: &[(&str, &str)] = {
+        const CONFIG: &str =
+            "one config.edn write; fire-and-forget callers rely on main-thread order";
+        const APP_FILE: &str =
+            "one small app-private file; bursty callers rely on main-thread order";
+        const ONE_FILE: &str = "stats, reads, moves or opens one named file";
+        const PAYLOAD: &str = "writes the bytes this call carried";
+        const STATE: &str = "atomics, a registry read or a channel send";
+        const PURE: &str = "no filesystem work beyond a bounded app-private read";
+        &[
+            ("app_architecture", PURE),
+            ("app_platform", PURE),
+            ("apply_spellcheck", STATE),
+            ("approve_external_assets", ONE_FILE),
+            ("cancel_graph_verification", STATE),
+            ("capture_frontend_ready", STATE),
+            ("capture_graph_binding", STATE),
+            ("capture_target", STATE),
+            ("clear_diagnostics", PURE),
+            ("close_graph_window", STATE),
+            ("copy_image_to_clipboard", PAYLOAD),
+            (
+                "create_graph",
+                "writes a fixed-size demo scaffold into a new folder",
+            ),
+            ("debug_info", PURE),
+            ("debug_log", PURE),
+            ("default_graph_parent", ONE_FILE),
+            (
+                "detect_media_editor",
+                "stats a fixed list of install locations",
+            ),
+            ("diagnostic_frontend_event", PURE),
+            ("diagnostic_ipc_event", PURE),
+            ("diagnostic_report", PURE),
+            ("diagnostic_session_active", PURE),
+            ("edit_asset_external", ONE_FILE),
+            ("forget_known_graph", APP_FILE),
+            ("get_app_bool", APP_FILE),
+            ("get_app_string", APP_FILE),
+            ("get_backup_keep", APP_FILE),
+            ("get_capture_enter_files", APP_FILE),
+            ("get_link_first_match", APP_FILE),
+            ("get_smooth_scroll", APP_FILE),
+            ("get_watch_mode", APP_FILE),
+            ("gpu_env", PURE),
+            ("guide_pages", PURE),
+            ("indexing_progress", STATE),
+            ("inspect_graph_access", ONE_FILE),
+            ("install_plugin", PAYLOAD),
+            ("list_known_graphs", APP_FILE),
+            ("load_conflict_capsules", APP_FILE),
+            ("load_notices", APP_FILE),
+            ("load_plugin_registry_cache", APP_FILE),
+            ("load_session", APP_FILE),
+            ("load_workspaces", APP_FILE),
+            ("open_asset", ONE_FILE),
+            ("open_external", STATE),
+            ("read_custom_css", ONE_FILE),
+            ("read_highlights", ONE_FILE),
+            ("read_journal_file", ONE_FILE),
+            ("read_plugin_entry", ONE_FILE),
+            ("read_text_file", "one CSV/TSV file, capped at 10 MiB"),
+            ("rescan_graph_now", STATE),
+            ("retire_conflict_capsule", APP_FILE),
+            ("reveal_known_graph", STATE),
+            ("rollback_pdf_area_image", ONE_FILE),
+            ("save_asset", PAYLOAD),
+            ("save_notices", APP_FILE),
+            ("save_pdf_area_image", PAYLOAD),
+            ("save_session", APP_FILE),
+            ("save_workspaces", APP_FILE),
+            ("set_app_bool", APP_FILE),
+            ("set_app_string", APP_FILE),
+            ("set_capture_enter_files", APP_FILE),
+            ("set_default_home", CONFIG),
+            ("set_default_journal_template", CONFIG),
+            ("set_doc_mode_enter_for_new_block", CONFIG),
+            ("set_favorites", CONFIG),
+            ("set_favorites_page", CONFIG),
+            ("set_guide_announced", CONFIG),
+            ("set_link_first_match", APP_FILE),
+            ("set_logical_outdenting", CONFIG),
+            ("set_plugin_enabled", APP_FILE),
+            ("set_preferred_format", CONFIG),
+            ("set_preferred_workflow", CONFIG),
+            ("set_show_brackets", CONFIG),
+            ("set_smooth_scroll", APP_FILE),
+            ("set_start_of_week", CONFIG),
+            ("set_timetracking_enabled", CONFIG),
+            ("set_watch_mode", APP_FILE),
+            ("store_conflict_capsule", APP_FILE),
+            ("store_plugin_registry_cache", APP_FILE),
+            ("stream_asset_path", ONE_FILE),
+            ("take_data_home_fallback_notice", STATE),
+            ("take_identifier_migration_notice", STATE),
+            ("tine_open_devtools", STATE),
+            (
+                "tine_quit",
+                "exits; the exit drain is bounded by EXIT_DRAIN_BUDGET",
+            ),
+            ("trash_asset", ONE_FILE),
+            ("trash_sync_conflict", ONE_FILE),
+            ("uninstall_plugin", ONE_FILE),
+            ("verify_plugin_registry", PURE),
+            ("warm_done", STATE),
+            ("watcher_latency_recent", PURE),
+        ]
+    };
+
+    /// `(name, is async, body)` for every `#[tauri::command]` in `src-tauri/src`.
+    fn every_command() -> Vec<(String, bool, String)> {
+        let mut out = Vec::new();
+        for (_, source) in crate::test_support::rust_module_sources() {
+            let source = crate::test_support::without_cfg_test_items(&source);
+            for (name, body) in tauri_command_bodies(&source) {
+                let head = &source[..source.find(&body).unwrap()];
+                let head = &head[head.rfind("#[tauri::command]").unwrap()..];
+                let signature = &head[..head.find(&format!("fn {name}")).unwrap()];
+                let is_async = signature.split_whitespace().any(|word| word == "async");
+                out.push((name, is_async, body));
+            }
+        }
+        assert!(
+            out.len() > 150,
+            "the command scan found only {} commands -- the scanner broke, not the code",
+            out.len()
+        );
+        out
+    }
+
     #[test]
-    fn whole_graph_conflict_listings_are_async() {
-        let commands = crate::test_support::rust_module_production_source("commands.rs");
-        for name in [
-            "list_sync_conflicts",
-            "list_vcs_marker_conflicts",
-            "conflict_queue",
-        ] {
+    fn every_sync_command_says_why_it_may_run_on_the_main_thread() {
+        let sync: BTreeSet<String> = every_command()
+            .into_iter()
+            .filter(|(_, is_async, _)| !is_async)
+            .map(|(name, _, _)| name)
+            .collect();
+        let listed: BTreeSet<String> = SYNC_COMMANDS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        let unlisted: Vec<&String> = sync.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "these sync #[tauri::command]s run on the main thread and freeze every window \
+             until they return. Make each `async` + `spawn_blocking` (exemplar: \
+             conflict_queue in commands.rs), or add it to SYNC_COMMANDS with the reason \
+             it is bounded (GH #543, R6-02): {unlisted:?}"
+        );
+        let stale: Vec<&String> = listed.difference(&sync).collect();
+        assert!(
+            stale.is_empty(),
+            "SYNC_COMMANDS lists commands that are no longer sync commands: {stale:?}"
+        );
+    }
+
+    /// An async command runs on a runtime worker; its blocking work belongs in
+    /// `spawn_blocking` (`open_graph_window` once opened a graph inline).
+    #[test]
+    fn async_commands_open_graphs_inside_spawn_blocking() {
+        for (name, is_async, body) in every_command() {
+            let Some(call) = body.find("load_graph_for_label(") else {
+                continue;
+            };
             assert!(
-                commands.contains(&format!("pub(crate) async fn {name}(")),
-                "{name} reads every page file; keep it `async` + `spawn_blocking` \
-                 (exemplar: conflict_queue in commands.rs)"
+                is_async && body[..call].contains("spawn_blocking("),
+                "{name} opens a graph outside spawn_blocking; exemplar: load_graph in graph.rs"
             );
         }
     }

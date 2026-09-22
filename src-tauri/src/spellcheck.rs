@@ -135,11 +135,15 @@ fn discover_dictionaries() -> Vec<String> {
 /// Installed spell-check dictionary codes (e.g. ["cs_CZ", "en_GB", "en_US"]). Empty
 /// on non-Linux (those webviews use the OS checker, which the frontend handles by
 /// falling back to a free-text language field).
+///
+/// Async: the listing waits on an `enchant-lsmod` subprocess.
 #[tauri::command]
-pub(crate) fn list_spellcheck_dictionaries() -> Vec<String> {
+pub(crate) async fn list_spellcheck_dictionaries() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
-        discover_dictionaries()
+        tauri::async_runtime::spawn_blocking(discover_dictionaries)
+            .await
+            .unwrap_or_default()
     }
     #[cfg(not(target_os = "linux"))]
     {

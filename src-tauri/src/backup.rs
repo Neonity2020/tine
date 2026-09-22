@@ -456,8 +456,9 @@ pub(crate) fn get_backup_keep(app: tauri::AppHandle) -> usize {
     backup_keep(&app)
 }
 
+/// Async: lowering the cap deletes whole-graph snapshot copies.
 #[tauri::command]
-pub(crate) fn set_backup_keep(
+pub(crate) async fn set_backup_keep(
     keep: usize,
     app: tauri::AppHandle,
     state: GraphContext<'_>,
@@ -467,12 +468,15 @@ pub(crate) fn set_backup_keep(
         json["backup_keep"] = serde_json::json!(keep);
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
-    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
-    let graph = slot.graph();
-    if let Some(base) = backup_base(&app, &graph) {
-        prune_backups(&base, keep);
-    }
-    Ok(())
+    let graph = slot_for_context(&state)?.graph();
+    drop(state);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(base) = backup_base(&app, &graph) {
+            prune_backups(&base, keep);
+        }
+    })
+    .await
+    .map_err(crate::command_error::CommandError::worker)
 }
 
 /// The backup directory for the currently-open graph (`<app-data>/backups/<id>`).
@@ -600,7 +604,8 @@ pub(crate) async fn restore_backup(
     })
     .await
     .map_err(crate::command_error::CommandError::worker)??;
-    crate::state::refresh_graph(&state).map_err(crate::command_error::CommandError::from)
+    let (app, label, _) = crate::state::owned_graph_context(state)?;
+    crate::state::refresh_graph(app, label).await
 }
 
 fn restore_from_backup_source(

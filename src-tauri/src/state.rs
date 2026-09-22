@@ -159,7 +159,7 @@ impl GraphSlot {
     /// assignment, not the particular in-memory `Graph` instance. Minting a new
     /// generation here made every later command from that window stale after a
     /// config refresh, including autosaves.
-    fn refreshed(graph: Graph, old: &GraphSlot) -> Self {
+    pub(crate) fn refreshed(graph: Graph, old: &GraphSlot) -> Self {
         let graph_meta = graph.meta();
         Self {
             graph: Arc::new(graph),
@@ -474,10 +474,34 @@ pub(crate) fn display_read<T>(
     binding_generation: u64,
     read: impl Fn(&Graph) -> T,
 ) -> Result<T, CommandError> {
+    display_read_from(
+        || slot_for_bound_window(state, window, Some(binding_generation)),
+        read,
+    )
+}
+
+/// [`display_read`] for Quick Capture, whose graph is the one it was bound to
+/// rather than its own window's.
+pub(crate) fn capture_display_read<T>(
+    state: &AppState,
+    caller: &str,
+    binding_generation: Option<u64>,
+    read: impl Fn(&Graph) -> T,
+) -> Result<T, CommandError> {
+    display_read_from(
+        || capture_quick_switch_slot(state, caller, binding_generation),
+        read,
+    )
+}
+
+fn display_read_from<T>(
+    slot: impl Fn() -> Result<Arc<GraphSlot>, CommandError>,
+    read: impl Fn(&Graph) -> T,
+) -> Result<T, CommandError> {
     // A refresh retires the old graph before it binds the replacement; the
     // bound limits the wait if that bind never comes.
     for _ in 0..500 {
-        let graph = slot_for_bound_window(state, window, Some(binding_generation))?.graph();
+        let graph = slot()?.graph();
         if let Some(answer) = graph.display_read(|| read(&graph)) {
             return Ok(answer);
         }
@@ -552,15 +576,20 @@ pub(crate) enum RefreshOutcome {
     Deferred,
 }
 
-pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), CommandError> {
-    let label = ctx.window.label().to_string();
-    refresh_graph_for_label(
-        &ctx.state,
-        ctx.window.app_handle(),
-        &label,
-        RefreshLaneWait::Block,
-    )
-    .map(|_| ())
+/// Reopen a window's graph for a command. Async so that no sync command can
+/// call it: a refresh waits for the storage transition lane, walks the graph
+/// and waits up to 15 s for the index worker to stop, and a sync command does
+/// all of that on the main thread, freezing every window (GH #543, R6-02).
+pub(crate) async fn refresh_graph(
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<(), CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        refresh_graph_for_label(&state, &app, &label, RefreshLaneWait::Block).map(|_| ())
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Re-read configuration for one window's graph without a `GraphContext`.
@@ -747,6 +776,7 @@ mod tests {
     /// resolve the graph for another accessor.
     const DIRECT_GRAPH_ACCESS: &[&str] = &[
         // The accessors themselves, graph binding, and app plumbing.
+        "capture_display_read",
         "capture_quick_switch_slot",
         "display_read",
         "drain_concord_ledgers_for_exit",
@@ -772,9 +802,10 @@ mod tests {
         "copy_guide_into_bound_graph",
         "create_graph_verification",
         "delete_page",
+        "empty_asset_trash",
         "finish_direct_cross_page_move",
         "import_asset",
-        "import_native_capture",
+        "import_native_capture_blocking",
         "merge_pages",
         "open_pdf",
         "present_conflict_override",
@@ -827,7 +858,6 @@ mod tests {
         "live_save_conflict_diff",
         // Reads of named files or of state that never parses the page set.
         "asset_trash_stats",
-        "capture_quick_switch_for",
         "graph_source_files",
         "indexing_progress",
         "list_backups",
@@ -1294,10 +1324,11 @@ mod tests {
                 .collect::<Vec<_>>()
         })
         .unwrap();
+        let elapsed = started.elapsed();
         binder.join().unwrap();
         assert_eq!(names, vec!["Alpha".to_owned()]);
         assert!(
-            started.elapsed() >= Duration::from_millis(200),
+            elapsed >= Duration::from_millis(200),
             "the retired graph must not answer by parsing itself; the replacement answers"
         );
         let _ = std::fs::remove_dir_all(base);

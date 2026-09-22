@@ -4,9 +4,8 @@ use crate::debug::diag;
 #[cfg(desktop)]
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
-    capture_quick_switch_slot, display_read, owned_graph_context, refresh_graph,
-    slot_for_bound_window, slot_for_context, with_filesystem_graph, with_trash_graph, AppState,
-    GraphContext,
+    capture_display_read, display_read, owned_graph_context, refresh_graph, slot_for_bound_window,
+    slot_for_context, with_filesystem_graph, with_trash_graph, AppState, GraphContext,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -380,23 +379,28 @@ pub(crate) struct GraphSourceFile {
 /// format by extension, returns graph-root-relative paths sorted for stable
 /// output. Read-only and local — the panel makes no network calls.
 #[tauri::command]
-pub(crate) fn graph_source_files(
+pub(crate) async fn graph_source_files(
     include_journals: bool,
     state: GraphContext<'_>,
 ) -> Result<Vec<GraphSourceFile>, CommandError> {
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-    with_filesystem_graph(&state, |g| {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let g = slot_for_bound_window(&state, &label, Some(binding_generation))?.graph();
         let mut out: Vec<GraphSourceFile> = Vec::new();
         let mut roots = vec![g.pages_path()];
         if include_journals {
             roots.push(g.journals_path());
         }
         for root in roots {
-            collect_graph_text(g, &root, MAX_FILE_BYTES, &mut out);
+            collect_graph_text(&g, &root, MAX_FILE_BYTES, &mut out);
         }
         out.sort_by(|a, b| a.rel.cmp(&b.rel));
         Ok(out)
     })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 mod direct_save_helpers;
@@ -1426,13 +1430,13 @@ pub(crate) fn set_preferred_format(
 /// Set the graph's `:journal/page-title-format` (journal display-title format,
 /// e.g. "MMM do, yyyy"). Display-only — does not rename journal files.
 #[tauri::command]
-pub(crate) fn set_journal_title_format(
+pub(crate) async fn set_journal_title_format(
     format: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
     slot_for_context(&state)?.apply_config_write(|g| g.set_journal_page_title_format(&format))?;
-    refresh_graph(&state)?; // pick up the new format + migrate any title-named journals
-    Ok(())
+    let (app, label, _) = owned_graph_context(state)?;
+    refresh_graph(app, label).await // pick up the new format + migrate any title-named journals
 }
 
 #[tauri::command]
@@ -1489,139 +1493,38 @@ fn capture_quick_switch_for(
     query: &str,
     limit: usize,
 ) -> Result<Vec<PageEntry>, CommandError> {
-    let slot = capture_quick_switch_slot(state, caller, binding_generation)?;
-    Ok(slot.graph().quick_switch(query, limit.min(8)))
+    capture_display_read(state, caller, binding_generation, |graph| {
+        graph.quick_switch(query, limit.min(8))
+    })
 }
 
 /// The sole graph-backed capability exposed to Quick Capture. It is deliberately
 /// not a `GraphContext` command: capture may ask for bounded page/tag candidates
 /// but cannot save, delete, trash, or invoke any other graph command.
+///
+/// Async for the same reason as `quick_switch`: while the graph is being
+/// indexed the page list waits for the index (GH #543, R6-02).
 #[tauri::command]
-pub(crate) fn capture_quick_switch(
+pub(crate) async fn capture_quick_switch(
     query: String,
     limit: usize,
     binding_generation: Option<u64>,
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Vec<PageEntry>, CommandError> {
-    capture_quick_switch_for(&state, window.label(), binding_generation, &query, limit)
+    let app = window.app_handle().clone();
+    let caller = window.label().to_string();
+    drop((window, state));
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        capture_quick_switch_for(&state, &caller, binding_generation, &query, limit)
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 #[cfg(test)]
-mod capture_quick_switch_tests {
-    use super::*;
-    use crate::state::{slot_for_bound_window, GraphRegistry, GraphSlot};
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::{Mutex, RwLock};
-    use tine_core::model::Graph;
-
-    fn state_with_selected_graph() -> (AppState, PathBuf) {
-        let base = std::env::temp_dir().join(format!(
-            "tine-capture-quick-switch-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let selected = base.join("selected");
-        let other = base.join("other");
-        for (root, page) in [
-            (&selected, "Selected Capture Target"),
-            (&other, "Other Target"),
-        ] {
-            std::fs::create_dir_all(root.join("pages")).unwrap();
-            std::fs::create_dir_all(root.join("journals")).unwrap();
-            std::fs::write(root.join("pages").join(format!("{page}.md")), "- fixture\n").unwrap();
-        }
-        let state = AppState {
-            graphs: RwLock::new(GraphRegistry::default()),
-            storage_supervisor:
-                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
-            watch_ctl: Mutex::new(None),
-            last_focused: Mutex::new(Some("main".into())),
-            capture_graph: Mutex::new(Default::default()),
-            #[cfg(desktop)]
-            next_window: AtomicU64::new(2),
-        };
-        let selected_slot = Arc::new(GraphSlot::new(Graph::open(&selected), selected.clone()));
-        let generation = selected_slot.binding_generation;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind("main".into(), selected_slot)
-            .unwrap();
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(
-                "other".into(),
-                Arc::new(GraphSlot::new(Graph::open(&other), other)),
-            )
-            .unwrap();
-        state.bind_capture_graph("main".into(), generation);
-        (state, base)
-    }
-
-    #[test]
-    fn returns_candidates_from_the_selected_capture_graph() {
-        let (state, base) = state_with_selected_graph();
-        let generation = state.capture_graph_binding().unwrap().binding_generation;
-        let result =
-            capture_quick_switch_for(&state, "capture", Some(generation), "Selected Capture", 8)
-                .unwrap();
-        assert!(result
-            .iter()
-            .any(|page| page.name == "Selected Capture Target"));
-        assert!(!result.iter().any(|page| page.name == "Other Target"));
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn rejects_a_stale_capture_binding_generation() {
-        let (state, base) = state_with_selected_graph();
-        let generation = state.capture_graph_binding().unwrap().binding_generation;
-        assert_eq!(
-            capture_quick_switch_for(&state, "capture", Some(generation + 1), "Selected", 8)
-                .unwrap_err()
-                .to_string(),
-            "stale-graph-binding"
-        );
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn rejects_non_capture_callers() {
-        let (state, base) = state_with_selected_graph();
-        let generation = state.capture_graph_binding().unwrap().binding_generation;
-        assert_eq!(
-            capture_quick_switch_for(&state, "main", Some(generation), "Selected", 8)
-                .unwrap_err()
-                .to_string(),
-            "capture quick switch is only available to quick capture"
-        );
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn capture_binding_never_grants_generic_graphcontext_mutation_access() {
-        let (state, base) = state_with_selected_graph();
-        let generation = state.capture_graph_binding().unwrap().binding_generation;
-        // `save_page` and other mutations resolve through GraphContext, which
-        // uses this normal window-slot path and therefore has no capture fallback.
-        assert_eq!(
-            slot_for_bound_window(&state, "capture", Some(generation))
-                .err()
-                .unwrap()
-                .to_string(),
-            "no graph loaded for window capture"
-        );
-        std::fs::remove_dir_all(base).unwrap();
-    }
-}
+mod capture_quick_switch_tests;
 
 #[tauri::command]
 pub(crate) async fn list_templates(
@@ -1736,7 +1639,7 @@ pub(crate) async fn preview_block(
 }
 
 #[tauri::command]
-pub(crate) fn read_asset(
+pub(crate) async fn read_asset(
     name: String,
     max_bytes: Option<u64>,
     state: GraphContext<'_>,
@@ -1744,8 +1647,10 @@ pub(crate) fn read_asset(
     // Return RAW bytes (not a JSON number[]), so a multi-MB PDF/image isn't
     // serialized element-by-element and re-parsed on the JS side — the frontend
     // receives an ArrayBuffer directly.
-    let window_label = state.window.label().to_string();
-    let (bytes, path) = with_filesystem_graph(&state, |g| {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let g = slot_for_bound_window(&state, &label, Some(binding_generation))?.graph();
         let path = g.asset_file_for_read(&name).map_err(CommandError::from)?;
         let bytes = max_bytes
             .map_or_else(
@@ -1753,11 +1658,12 @@ pub(crate) fn read_asset(
                 |limit| g.read_asset_limited(&name, limit),
             )
             .map_err(CommandError::from)?;
-        Ok((bytes, path))
-    })?;
-    crate::watcher::note_asset_read(&window_label, &path);
-    crate::state::poke_watcher(&state.state);
-    Ok(tauri::ipc::Response::new(bytes))
+        crate::watcher::note_asset_read(&label, &path);
+        crate::state::poke_watcher(&state);
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Validate one graph media file and return its top-level asset name for the
@@ -1861,7 +1767,16 @@ pub(crate) fn tine_open_devtools(window: tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-pub(crate) fn read_local_image(
+pub(crate) async fn read_local_image(
+    path: String,
+    app: tauri::AppHandle,
+) -> Result<tauri::ipc::Response, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || read_local_image_blocking(path, app))
+        .await
+        .map_err(CommandError::worker)?
+}
+
+fn read_local_image_blocking(
     path: String,
     app: tauri::AppHandle,
 ) -> Result<tauri::ipc::Response, CommandError> {
@@ -1898,37 +1813,55 @@ pub(crate) fn read_local_image(
 }
 
 #[tauri::command]
-pub(crate) fn import_asset(
+pub(crate) async fn import_asset(
     path: String,
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<String, CommandError> {
-    let window_label = state.window.label().to_string();
-    with_filesystem_graph(&state, |g| {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let g = slot_for_bound_window(&state, &label, Some(binding_generation))?.graph();
         let stored = g
             .import_asset(std::path::Path::new(&path), name.as_deref())
             .map_err(CommandError::from)?;
-        crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
+        crate::watcher::note_asset_self_write(&label, &g.assets_path().join(&stored));
         Ok(stored)
     })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Import a bounded Android photo or voice memo by native cache-file capability.
 /// Media never crosses Kotlin/WebView/Rust as base64; Rust streams the open file
 /// into the graph and removes the temp only after the durable asset commit.
 #[tauri::command]
-pub(crate) fn import_native_capture(
+pub(crate) async fn import_native_capture(
     path: String,
     name: String,
-    app: tauri::AppHandle,
     state: GraphContext<'_>,
+) -> Result<String, CommandError> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        import_native_capture_blocking(&path, &name, &app, &label, binding_generation)
+    })
+    .await
+    .map_err(CommandError::worker)?
+}
+
+fn import_native_capture_blocking(
+    path: &str,
+    name: &str,
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
 ) -> Result<String, CommandError> {
     use cap_std::{ambient_authority, fs::Dir};
     use tauri::Manager;
 
     const MAX_PHOTO_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_RECORDING_BYTES: u64 = 32 * 1024 * 1024;
-    let source = std::path::Path::new(&path);
+    let source = std::path::Path::new(path);
     let filename = source
         .file_name()
         .and_then(|value| value.to_str())
@@ -1978,12 +1911,12 @@ pub(crate) fn import_native_capture(
         )));
     }
     let mut capture = capture.into_std();
-    let window_label = state.window.label().to_string();
-    let stored = with_filesystem_graph(&state, |graph| {
+    let slot = slot_for_bound_window(&app.state::<AppState>(), label, Some(binding_generation))?;
+    let stored = slot.with_filesystem_graph(|graph| {
         let stored = graph
-            .import_asset_file(&mut capture, &name, max_bytes)
+            .import_asset_file(&mut capture, name, max_bytes)
             .map_err(CommandError::from)?;
-        crate::watcher::note_asset_self_write(&window_label, &graph.assets_path().join(&stored));
+        crate::watcher::note_asset_self_write(label, &graph.assets_path().join(&stored));
         Ok(stored)
     })?;
     // The graph asset is authoritative now. Cleanup failure is harmless cache
@@ -2217,27 +2150,47 @@ pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), C
 
 /// Count + total bytes in the recoverable asset trash.
 #[tauri::command]
-pub(crate) fn asset_trash_stats(
+pub(crate) async fn asset_trash_stats(
     state: GraphContext<'_>,
 ) -> Result<tine_core::model::TrashStats, CommandError> {
-    with_filesystem_graph(&state, |g| Ok(g.asset_trash_stats()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| Ok(g.asset_trash_stats()))
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Permanently delete everything in the asset trash; returns files removed.
 #[tauri::command]
-pub(crate) fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, CommandError> {
-    with_trash_graph(&state, |g| {
-        g.empty_asset_trash().map_err(CommandError::from)
+pub(crate) async fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, CommandError> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_trash_graph(|g| g.empty_asset_trash().map_err(CommandError::from))
     })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Journal days that resolve to more than one file (e.g. a date-stem file plus a
-/// title-named one) — for the user to reconcile.
+/// title-named one) — for the user to reconcile. Walks `journals/`, and runs at
+/// every graph open, while the graph is being indexed.
 #[tauri::command]
-pub(crate) fn list_journal_conflicts(
+pub(crate) async fn list_journal_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::JournalConflict>, CommandError> {
-    with_filesystem_graph(&state, |g| Ok(g.journal_conflicts()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| Ok(g.journal_conflicts()))
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Concord L0 reload-on-focus fallback: ask the watcher for ONE full stat-diff
@@ -2258,10 +2211,17 @@ pub(crate) fn rescan_graph_now(state: tauri::State<'_, AppState>) -> u64 {
 /// would get. Concord invariant 4 (write-shyness): opening a graph used to
 /// perform these renames silently; it now only proposes them here.
 #[tauri::command]
-pub(crate) fn list_journal_filename_migrations(
+pub(crate) async fn list_journal_filename_migrations(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::JournalFilenameMigration>, CommandError> {
-    with_filesystem_graph(&state, |g| Ok(g.journal_filename_migrations()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| Ok(g.journal_filename_migrations()))
+    })
+    .await
+    .map_err(CommandError::worker)?
 }
 
 /// Apply the proposed journal renames, on the user's explicit request. Takes the

@@ -499,12 +499,19 @@ pub(crate) fn uninstall_plugin(
     Ok(())
 }
 
+/// Async: it reads and hashes every installed plugin's wasm.
 #[tauri::command]
-pub(crate) fn list_installed_plugins(app: tauri::AppHandle) -> Vec<InstalledPlugin> {
-    let Ok(root) = plugins_dir(&app) else {
+pub(crate) async fn list_installed_plugins(app: tauri::AppHandle) -> Vec<InstalledPlugin> {
+    tauri::async_runtime::spawn_blocking(move || installed_plugins(&app))
+        .await
+        .unwrap_or_default()
+}
+
+fn installed_plugins(app: &tauri::AppHandle) -> Vec<InstalledPlugin> {
+    let Ok(root) = plugins_dir(app) else {
         return Vec::new();
     };
-    let states = plugin_states(&app);
+    let states = plugin_states(app);
     let mut installed = Vec::new();
     let Ok(ids) = std::fs::read_dir(root) else {
         return installed;
