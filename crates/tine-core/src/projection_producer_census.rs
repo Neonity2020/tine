@@ -980,8 +980,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "fs.create_dir_all",
             1,
         ),
+        // 2026-09-22: GH #543 (design v4 stage 4) moved the writer lease's
+        // lock-file open into its own module, unchanged.
         (
-            "crates/tine-core/src/direct_projection.rs",
+            "crates/tine-core/src/direct_projection_lease.rs",
             "open.create",
             1,
         ),

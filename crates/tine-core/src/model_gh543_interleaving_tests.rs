@@ -1187,3 +1187,74 @@ fn gh543_an_unlistable_graph_backs_the_owner_off() {
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(database);
 }
+
+/// GH #543 (design v4 stage 4, R6-03): a second writer for the same index --
+/// switching back to a graph whose previous writer is still finishing --
+/// waits for the lease instead of giving the session's index up. Nothing is
+/// coming meanwhile, so the owner settles and reads answer from the pages;
+/// once the first writer lets go the index comes back.
+#[test]
+fn gh543_a_writer_waiting_for_an_in_process_lease_takes_it_when_released() {
+    let root = scratch("gh543-lease-in-process");
+    write_pages(&root, 4);
+    let database = root.join("private/projection.sqlite");
+    let first = Graph::open(&root);
+    first.attach_direct_projection(database.clone()).unwrap();
+    first.warm_cache();
+    first
+        .wait_for_direct_projection_for_test(Duration::from_secs(10))
+        .unwrap();
+    let second = Arc::new(Graph::open(&root));
+    second.attach_direct_projection(database).unwrap();
+    let owner = OwnerRun::start(&second);
+    assert!(
+        owner.wait_settled(Duration::from_secs(10)),
+        "the owner waited for an index whose lease another writer holds"
+    );
+    let names = crate::query::real_page_names(&*second);
+    assert!(names.contains_key("p1"), "a read answered {names:?}");
+    // Past the backoff's 1 s and 2 s retries: the next one would be at 7 s,
+    // so an index back within 2 s of the release was handed the lease.
+    std::thread::sleep(Duration::from_millis(3200));
+    assert!(first.detach_direct_projection(Duration::from_secs(5)));
+    assert!(
+        owner.wait_ready(Duration::from_secs(2)),
+        "the index did not come back as soon as the first writer released the lease"
+    );
+    owner.stop();
+    crate::direct_projection::release_projection(&second);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// GH #543 (design v4 stage 4): a lease held outside this process -- another
+/// Tine instance on the same graph -- is retried on a backoff, not given up.
+#[test]
+fn gh543_a_lease_held_by_another_process_is_retried() {
+    use fs2::FileExt as _;
+    let root = scratch("gh543-lease-external");
+    write_pages(&root, 4);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(database.with_extension("sqlite.writer.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let owner = OwnerRun::start(&graph);
+    assert!(
+        owner.wait_settled(Duration::from_secs(10)),
+        "the owner waited for an index another process holds"
+    );
+    fs2::FileExt::unlock(&lock).unwrap();
+    drop(lock);
+    assert!(
+        owner.wait_ready(Duration::from_secs(10)),
+        "the index never came back after the other process let the lease go"
+    );
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(root);
+}

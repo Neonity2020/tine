@@ -6090,6 +6090,24 @@
   "failBefore": "proven"
  },
  "notes": "Design v4 stage 3. These readers had no retry path, so while the launch pass was running they fell back to parsing every page (6 of 6 in the fixture). They now go through indexed_read, which waits while index work is coming (IndexWait::WhileComing); the bounded reference path used by a caller that can retry keeps its bounded wait. Fail-before: tine-agents/evidence/gh550-batch/stage3/necessity-readers-wait.log."
+},
+{
+ "id": "REG-A-BUSY-INDEX-LEASE-IS-WAITED-FOR-NOT-GIVEN-UP-543",
+ "title": "A graph whose index database another writer still holds indexes once that writer lets go, instead of running the rest of the session without an index",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_writer_waiting_for_an_in_process_lease_takes_it_when_released", "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_lease_held_by_another_process_is_retried", "src-tauri/src/state.rs::a_graph_switch_detaches_the_displaced_graphs_index_writer"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Design v4 stage 4 (R6-03). The worker tried the writer lease once and went terminal, so a quick switch back to a graph whose old writer had not yet exited, or a second instance, left the session with no index. It now waits: for an in-process holder it retries the moment that holder releases (a registry of writers per database path, changed under one lock with the lease), for another process on a 1 s doubling backoff capped at 30 min. While it waits nothing is coming (IndexNeed::LeaseWait), so readers take their ordinary route. Switching a window to a different graph now detaches the displaced graph's writer at once. Fail-before: tine-agents/evidence/gh550-batch/stage4/necessity-lease-retry.log."
 }
 ]
 }

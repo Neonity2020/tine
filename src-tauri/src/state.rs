@@ -226,6 +226,20 @@ impl GraphRegistry {
                 old.background_cancelled
                     .store(true, std::sync::atomic::Ordering::Release);
                 old.graph().retire();
+                // Stop the displaced index writer now, not when the last
+                // reference to its graph drops: it holds the database's lease,
+                // which a switch back needs (GH #543). Off this thread, which
+                // holds the registry lock.
+                let displaced = old.graph();
+                std::thread::spawn(move || {
+                    if !displaced.detach_direct_projection(Duration::from_secs(15)) {
+                        crate::debug::diag(
+                            "Direct Files projection worker of a displaced graph did not stop \
+                             within 15 s"
+                                .to_string(),
+                        );
+                    }
+                });
             }
             self.by_root.remove(&old.root_key);
         }
@@ -1249,6 +1263,38 @@ mod tests {
                 binding_generation: 18,
             })
         );
+    }
+
+    /// GH #543 (R6-03): switching a window to another graph detaches the
+    /// displaced graph's index writer, so its lease is released at once and
+    /// a switch back can index instead of waiting for the old graph to drop.
+    #[test]
+    fn a_graph_switch_detaches_the_displaced_graphs_index_writer() {
+        let base =
+            std::env::temp_dir().join(format!("tine-switch-detach-{}", uuid::Uuid::new_v4()));
+        let first = graph(&base.join("a"));
+        let second = graph(&base.join("b"));
+        first
+            .graph()
+            .attach_direct_projection(base.join("index/projection.sqlite"))
+            .unwrap();
+        let mut registry = GraphRegistry::default();
+        registry.bind("main".into(), Arc::clone(&first)).unwrap();
+        registry.bind("main".into(), Arc::clone(&second)).unwrap();
+        let (wake, _woken) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        while first
+            .graph()
+            .observe_direct_projection_commits(wake.clone())
+            .is_some()
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the displaced graph kept its index writer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

@@ -70,6 +70,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Switching to another graph and back quickly, or opening a graph that another
+  Tine instance is still indexing, no longer leaves search and queries without
+  an index for the rest of the session. Tine now waits for the other writer to
+  finish and then indexes (GH #543).
+
 - While Tine checks the search index after opening a graph, looking up a
   block's page, listing page names, or finding references no longer parses the
   whole graph beside that check; they wait for it instead (GH #543).

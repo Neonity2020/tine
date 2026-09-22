@@ -11,6 +11,10 @@ pub(crate) enum IndexNeed {
     SettingUp,
     /// The worker is gone for good. Nothing enqueued is ever taken.
     Terminal,
+    /// Another writer holds the index database's lease. The worker takes it
+    /// when that writer lets go (or on a backoff when it is another process);
+    /// nothing is coming meanwhile, so readers take their ordinary route.
+    LeaseWait,
     /// A full snapshot or a warm validation is queued or being applied.
     InHand,
     /// Only a complete parsed snapshot can make the index ready: there is no
@@ -34,6 +38,8 @@ pub(crate) enum IndexNeed {
 pub(super) fn index_need(shared: &ProjectionShared, pending: &PendingProjection) -> IndexNeed {
     if pending.stop || !shared.worker_available.load(Ordering::Acquire) {
         IndexNeed::Terminal
+    } else if pending.lease_wait {
+        IndexNeed::LeaseWait
     } else if !pending.set_up {
         IndexNeed::SettingUp
     } else if pending.full.is_some() || pending.warm.is_some() || pending.building {
@@ -101,7 +107,7 @@ pub(super) fn index_work_coming(shared: &ProjectionShared, pending: &PendingProj
     }
     let need = index_need(shared, pending);
     match need {
-        IndexNeed::Terminal => false,
+        IndexNeed::Terminal | IndexNeed::LeaseWait => false,
         IndexNeed::SettingUp | IndexNeed::InHand => true,
         IndexNeed::Validate | IndexNeed::Fresh if !backing_off(pending) => true,
         _ => {

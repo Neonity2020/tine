@@ -784,7 +784,8 @@ impl Graph {
         // every page again (GH #543, R6-04).
         match projection.wait_index_need(cancelled) {
             crate::direct_projection::IndexNeed::Fresh => return Outcome::Retry,
-            crate::direct_projection::IndexNeed::Terminal => return Outcome::Unavailable,
+            crate::direct_projection::IndexNeed::Terminal
+            | crate::direct_projection::IndexNeed::LeaseWait => return Outcome::Unavailable,
             crate::direct_projection::IndexNeed::SettingUp => return Outcome::Cancelled,
             _ => {}
         }

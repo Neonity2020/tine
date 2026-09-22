@@ -24,6 +24,8 @@ use tine_storage::sqlite::{
 };
 use uuid::Uuid;
 
+#[path = "direct_projection_lease.rs"]
+mod lease;
 #[path = "direct_projection_owner.rs"]
 mod owner;
 use owner::{backing_off, index_need, note_unsettled};
@@ -305,6 +307,9 @@ struct PendingProjection {
     unsettled_passes: u32,
     /// No owner pass starts before this instant; see [`note_unsettled`].
     retry_after: Option<std::time::Instant>,
+    /// The worker is waiting for another writer to release the database's
+    /// writer lease; see [`lease::take_writer_lease`].
+    lease_wait: bool,
 }
 
 impl PendingProjection {
@@ -1264,6 +1269,7 @@ impl DirectProjection {
             }
             if cancelled()
                 || pending.stop
+                || pending.lease_wait
                 || !self.shared.worker_available.load(Ordering::Acquire)
                 || self.shared.worker_failed.load(Ordering::Acquire)
                 || pending.latest_generation > generation
@@ -2263,8 +2269,9 @@ impl DirectProjection {
     /// The order of the tests is the order of authority.
     ///
     /// * `worker_available` is stored `false` exactly where the worker thread
-    ///   gives up for good — no parent directory, an unopenable database, a
-    ///   writer lease another instance owns, or a `stop` turn. Nothing this
+    ///   gives up for good — no parent directory, an unopenable database, or
+    ///   a `stop` turn. A writer waiting for the lease reads the same way
+    ///   while it waits, but takes its queue once it has the lease. Nothing this
     ///   graph enqueues afterwards is ever taken, so retrying is endless by
     ///   construction and the caller owes a bounded error instead.
     /// * A queued turn is progress even when the LAST turn failed:
@@ -2280,7 +2287,12 @@ impl DirectProjection {
             return ProjectionProgress::Ready;
         }
         let pending = self.shared.pending.lock().unwrap();
-        if pending.stop || !self.shared.worker_available.load(Ordering::Acquire) {
+        // A writer waiting for the lease takes nothing meanwhile: the
+        // caller takes today's route, as for a stopped one (GH #543).
+        if pending.stop
+            || pending.lease_wait
+            || !self.shared.worker_available.load(Ordering::Acquire)
+        {
             return ProjectionProgress::Stopped;
         }
         // With an owner registered, whole-graph work the index needs is the
@@ -2660,31 +2672,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         shared.changed.notify_all();
         return;
     }
-    let lease_path = shared.path.with_extension("sqlite.writer.lock");
-    let lease = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lease_path)
-        .and_then(|file| {
-            file.try_lock_exclusive()?;
-            Ok(file)
-        }) {
-        Ok(lease) => lease,
-        Err(error) => {
-            eprintln!(
-                "[tine] Direct Files SQLite projection unavailable; another graph instance owns it or its lease cannot be opened: {error}"
-            );
-            shared.worker_available.store(false, Ordering::Release);
-            shared.changed.notify_all();
-            return;
-        }
+    // Waits, retrying, while another writer holds the lease; `None` only
+    // when this projection is closed meanwhile.
+    let Some(_lease) = lease::take_writer_lease(&shared) else {
+        shared.worker_available.store(false, Ordering::Release);
+        shared.changed.notify_all();
+        return;
     };
-    // The lock file is app-private disposable state. Retain its exclusive lock
-    // for the complete writer lifetime so another Graph instance cannot replace
-    // this database's facts behind a locally-ready generation watermark.
-    let _lease = lease;
     let publication_directory =
         projection_publication_names(&shared.path).and_then(|(parent, _, destination)| {
             let directory = Dir::open_ambient_dir(&parent, ambient_authority())
