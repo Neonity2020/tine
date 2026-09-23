@@ -41,7 +41,9 @@ if (!release) {
   try {
     const notesPath = path.join(temporary, "notes.md");
     const fallback = "Download an installer for your platform below. Windows and Linux ship both x64 and ARM64 builds (match your CPU). Windows users who prefer no installer can grab the portable `Tine_*-portable.zip` for their architecture. Windows builds are currently unsigned, so Windows may show a warning on first launch. The macOS build is signed and notarized. On macOS, if Tine repeatedly asks to access Documents, see the workaround in the README.";
-    fs.writeFileSync(notesPath, `${releaseNotes(root, version)}\n\n---\n\n${fallback}\n`);
+    // GitHub release body only; the updater manifest's notes stay desktop-only.
+    const ios = "**iPhone / iPad:** join the public beta on [TestFlight](https://testflight.apple.com/join/rpGGpTVW). A TestFlight build is published for most releases; it may lag this one by a few days.";
+    fs.writeFileSync(notesPath, `${ios}\n\n${releaseNotes(root, version)}\n\n---\n\n${fallback}\n`);
     gh("release", "create", tag, "--draft", "--title", `Tine ${tag}`, "--notes-file", notesPath);
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });

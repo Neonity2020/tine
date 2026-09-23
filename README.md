@@ -66,6 +66,8 @@ it:
 - **Windows** — run the **`.exe`** installer; if SmartScreen appears, click **More info → Run
   anyway**. Prefer no installer? Grab the portable **`Tine_*_x64-portable.zip`**, unzip, and run
   `Tine.exe` — it needs the WebView2 runtime, which is preinstalled on Windows 10/11.
+- **iPhone / iPad** — join the public beta on **[TestFlight](https://testflight.apple.com/join/rpGGpTVW)** (install Apple's TestFlight
+  app, then open the link). There is no App Store listing yet.
 
 (Want to hack on Tine instead? Build from source — see [Build & run](#build--run).)
 
@@ -321,7 +323,7 @@ compatibility; see [the user overview](https://tine.page/plugins.html) and
 **Planned / under evaluation:** graph view.
 
 **Mobile:** Tine has a **native Android build** (Tauri v2) as of 0.4.0 — it opens and edits your real
-Logseq graph on the phone over your own sync, alongside the Logseq mobile app. iOS is being scoped.
+Logseq graph on the phone over your own sync, alongside the Logseq mobile app. An **iOS beta** is available through [TestFlight](https://testflight.apple.com/join/rpGGpTVW).
 
 **Under discussion, not promised:** built-in git integration.
 

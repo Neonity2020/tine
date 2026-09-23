@@ -48,6 +48,7 @@ Tine 是一款大纲笔记软件，外观和操作体验与 [Logseq](https://log
 - **Linux** —— **AppImage** 无需安装，可在任何发行版上运行：先执行 `chmod +x Tine_*.AppImage`，然后启动它。也可使用 **`.deb`**（Debian/Ubuntu）或 **`.rpm`**（Fedora/openSUSE）。
 - **macOS** —— 打开 **`.dmg`**；首次启动时 macOS 会提示“*身份不明的开发者*”，请**右键点按应用 → 打开**（仅需一次），之后即可正常打开。若 Tine 随后**每次启动都反复请求访问“文稿”文件夹**，请参阅下方的[解决办法](#macos-repeated-documents-permission-prompt)。
 - **Windows** —— 运行 **`.exe`** 安装程序；如果出现 SmartScreen 提示，请点击**更多信息 → 仍要运行**。若不想安装，也可以下载便携版 **`Tine_*_x64-portable.zip`**，解压后直接运行 `Tine.exe`。Tine 需要 WebView2 运行时，而 Windows 10/11 已预装该运行时。
+- **iPhone / iPad** —— 通过 **[TestFlight](https://testflight.apple.com/join/rpGGpTVW)** 加入公开测试版（先安装 Apple 的 TestFlight 应用，再打开该链接）。目前尚未上架 App Store。
 
 （想参与 Tine 开发？请从源码构建——参见[构建与运行](#build--run)。）
 
@@ -215,7 +216,7 @@ Tine 是由一位维护者独立维护的项目，采用一种不同寻常的贡
 
 **计划中 / 评估中：**图谱视图。
 
-**移动端：**自 0.4.0 起，Tine 已提供**原生 Android 构建**（Tauri v2）——可通过你自行选择的同步方式，在手机上打开和编辑真实的 Logseq 图谱，并与 Logseq 移动端配合使用。iOS 版本正在规划中。
+**移动端：**自 0.4.0 起，Tine 已提供**原生 Android 构建**（Tauri v2）——可通过你自行选择的同步方式，在手机上打开和编辑真实的 Logseq 图谱，并与 Logseq 移动端配合使用。**iOS 测试版**已可通过 [TestFlight](https://testflight.apple.com/join/rpGGpTVW) 获取。
 
 **新增——权限受限的插件（0.6）：**Tine 现在提供实验性的原生插件 API，支持受限的 WebAssembly 扩展和不含代码的令牌主题。软件包默认禁用，必须声明明确权限，并通过宿主提供的命令、装饰、设置和写入保护运行；插件无法直接获得 DOM、文件系统或网络访问权限。这并不兼容 Logseq 或 Obsidian 的插件 API。参见[用户概览](https://tine.page/plugins.html)和[开发者指南](docs/plugins/README.md)。
 
