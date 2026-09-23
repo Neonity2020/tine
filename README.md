@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>A fast, local, Logseq-compatible outliner.</b><br>
-  Reads and writes the <i>same</i> markdown graph as Logseq — swap between the two on the same files.
+  Reads and writes the <i>same</i> Markdown graph as Logseq — swap between the two on the same files.
 </p>
 
 <p align="center">
@@ -36,7 +36,7 @@ Tine is a desktop outliner built to look and feel like [Logseq](https://logseq.c
 much faster. It operates directly on the standard Logseq graph layout —
 `journals/`, `pages/`, `assets/`, and `logseq/config.edn` — so you can point it at the graph you
 already use and keep editing in either app (one at a time). Files are written back in
-Logseq-compatible markdown, so there's **no import/export step and no lock-in**.
+Logseq-compatible Markdown, so there's **no import/export step and no lock-in**.
 
 **Why build it?** Logseq's UI is Electron + DataScript with heavy re-rendering, and it gets
 sluggish on large graphs. Tine is a ground-up rewrite: a small native shell (Tauri/WebKitGTK), a
@@ -108,7 +108,7 @@ raw speed. (Comparisons are against current Logseq desktop core, no plugins.)
 - **⚡ Global quick-capture** — bind `tine --capture` to a desktop hotkey and a small always-on-top
   box pops from *any* app with the full editor, filing a bullet to today's journal.
 - **🔁 Carry unfinished tasks forward** to today (last 7 / 30 / 365 days, or a configurable N).
-- **▦ Sheets** — recursive grids, markdown databases, typed field tables, formula columns + filters with a visual builder, task/tag boards, aggregates, colors, and CSV import over plain bullets.
+- **▦ Sheets** — recursive grids, Markdown databases, typed field tables, formula columns + filters with a visual builder, task/tag boards, aggregates, colors, and CSV import over plain bullets.
 - **📖 In-app Guide** — Help → Guide opens bundled, read-only how-to pages beside your own
   graph, and **Copy the guide into your graph** creates an editable, interlinked
   `tine-guide/…` sandbox without touching the originals.
@@ -281,8 +281,8 @@ file a good report, are in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
 **New — Sheets (2-D grids + databases):** render a block's children as a recursive,
 editable TreeSheets-style grid, field table, or board — while everything stays plain
-Logseq markdown/org (see [FEATURES.md](docs/FEATURES.md#sheets-2-d-grids)). It includes
-typed schemas, query-driven tables, task/tag boards, grouping, aggregates, markdown table
+Logseq Markdown/Org (see [FEATURES.md](docs/FEATURES.md#sheets-2-d-grids)). It includes
+typed schemas, query-driven tables, task/tag boards, grouping, aggregates, Markdown table
 conversion, computed columns with a visual formula builder, filters, and CSV/TSV import.
 
 **New — Split view:** panes with their own tabs/history, TreeSheets-style pane and seam
