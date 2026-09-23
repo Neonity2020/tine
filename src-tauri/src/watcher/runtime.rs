@@ -354,6 +354,18 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         }) {
                             current.pending_observation_epoch = None;
                         }
+                        if !Arc::ptr_eq(&current.graph, &slot_graph) {
+                            // A reopen (a restore, a config change) replaced
+                            // the graph: it read the files itself, and its
+                            // owner indexes them. Diffing the old graph's
+                            // stamps against them re-synced every file a
+                            // restore rewrote, identical bytes included
+                            // (GH #543, audit R11-05). Take the new graph's
+                            // baseline instead, as for a new window.
+                            current.baseline = false;
+                            current.snap.clear();
+                            current.transition_skipped = false;
+                        }
                         current.graph = slot_graph;
                         if asset_root.as_ref() != current.assets.active_root() {
                             current.assets = asset_root
@@ -609,17 +621,30 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             // text. Observe only their metadata here and emit one
             // assets-relative cache-invalidation batch; this lane never calls
             // Graph reconciliation.
+            // A root the OS refused to watch sends no events, so it is polled
+            // like poll mode until a watch succeeds, and a root that becomes
+            // watched is diffed once against what it held while unwatched.
+            // Both only emitted an error before: nothing in or under it,
+            // configuration included, was seen until the next rescan (GH
+            // #543, audit R11-04).
+            let unwatched =
+                |root: &Path| !inotify || !watched.iter().any(|dir| root.starts_with(dir));
+            let handed_over = |root: &Path| newly_watched.iter().any(|dir| root.starts_with(dir));
+            for (label, graph) in graphs.iter() {
+                if unwatched(&graph.root) || handed_over(&graph.root) {
+                    config_recheck.insert(label.clone());
+                }
+            }
             for (label, graph) in graphs.iter_mut() {
-                let watch_handoff = newly_watched
-                    .iter()
-                    .any(|root| graph.assets.root.starts_with(root));
+                let assets_handed_over = handed_over(&graph.assets.root);
+                let assets_polled = unwatched(&graph.assets.root);
                 let changed = reconcile_asset_observation(
                     label,
                     &mut graph.assets,
                     &asset_paths,
                     &asset_full_paths,
-                    event_need_full || notify_error || watch_handoff,
-                    !inotify,
+                    event_need_full || notify_error || assets_handed_over,
+                    assets_polled,
                 );
                 if !changed.is_empty() {
                     if crate::debug::debug_enabled() {
@@ -660,8 +685,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     unclassified_paths_for_graph(&full_paths, &graph.graph);
                 let mut owned = pending_for_graph(&paths, &graph.graph);
                 owned.extend(exact_owned);
+                let polled = unwatched(&graph.root);
                 let need_full = event_need_full
-                    || !inotify
+                    || polled
+                    || handed_over(&graph.root)
                     || !full_owned.is_empty()
                     || retry_due
                     || graph.transition_skipped;
@@ -697,13 +724,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if need_full || !owned.is_empty() {
                     attempted = true;
                     let reconcile_started = Instant::now();
-                    let (changes, conflicts_dirty, used_full, errors) = reconcile_pending(
-                        &graph.graph,
-                        &mut graph.snap,
-                        &owned,
-                        need_full,
-                        !inotify,
-                    );
+                    let (changes, conflicts_dirty, used_full, errors) =
+                        reconcile_pending(&graph.graph, &mut graph.snap, &owned, need_full, polled);
                     let pages = changes.len();
                     if emit_as_bulk(pages) {
                         // One epoch, one notification: the frontend answers with
@@ -724,7 +746,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     if pages > 0 || !errors.is_empty() {
                         record_latency_receipt(latency_receipt(
                             label,
-                            inotify,
+                            !polled,
                             pages,
                             owned.len(),
                             // The branch actually taken — a burst-escalated

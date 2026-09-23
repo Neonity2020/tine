@@ -15,6 +15,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   shows progress, and stops promptly when Tine closes; the unreadable page
   stays searchable until it can be read again. External changes to many pages
   at once likewise index in steps that closing can interrupt (GH #543).
+- A setting changed while Tine is reopening the graph (restoring a backup, or
+  after a `config.edn` change) is no longer lost; before, a favorite added
+  then could disappear and be removed from `config.edn` at the next star
+  toggle (GH #543).
+- A graph the system refuses to watch (for example at Linux's inotify watch
+  limit with a second large graph open) is now checked for outside changes,
+  including `config.edn`, every few seconds, and caught up once watching
+  works (GH #543).
+- Restoring a backup no longer makes the file watcher re-read every restored
+  file on top of re-indexing them (GH #543).
 - After switching graphs, the previous graph's conflict banners and favourites
   order no longer show on the new graph while it loads (GH #543).
 - Changing `:hidden` (or another setting that reopens the graph) in

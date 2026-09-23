@@ -425,9 +425,12 @@ const UNWATCHED_ROOT_RETRY: Duration = Duration::from_secs(3);
 /// is healthy — and then the failing graph stays invisible to external changes
 /// until the healthy one happens to change, which on a quiet graph is never.
 ///
-/// So bound the wait whenever a desired root is unwatched. (Direct Files
-/// data-safety audit 2026-08-09, finding 16, in its reachable form: the blindness
-/// is not permanent and there IS a poll fallback, but only when EVERY root fails.)
+/// So bound the wait whenever a desired root is unwatched. Each such cycle
+/// polls the unwatched root (a full diff and a configuration check) and retries
+/// its watch; the cycle that watch succeeds diffs it once more, for what
+/// changed in between. (Direct Files data-safety audit 2026-08-09, finding 16;
+/// GH #543, audit R11-04: the bounded wait only retried the watch, and nothing
+/// diffed the unwatched root.)
 fn inotify_cycle_wait(retry_wait: Option<Duration>, unwatched_root: bool) -> Option<Duration> {
     match (retry_wait, unwatched_root) {
         (Some(wait), true) => Some(wait.min(UNWATCHED_ROOT_RETRY)),

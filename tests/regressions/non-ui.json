@@ -6837,6 +6837,82 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 11, R11-01 (decision DK4). An incomplete snapshot (one unreadable page) was never built fresh: the owner re-lowered the whole graph in place as one repair turn, ~4x slower per page than a staged build (10k pages: 74 s) and unstoppable (close waited 71 s). Fix: one lowering loop, lower_in_batches, for the fresh build, its carried pages, the in-place repair and queued deltas; it commits in batches, checks the stop flag between them and reports progress. A fresh build carries the unreadable pages by re-lowering them from the rows the old image stored (raw block text + tree + preamble), with their stored source revision, so they are re-read once readable. 10k scale: turn 74.0 s -> 16.8 s, close 71.3 s -> 6.6 ms. Fail-before: both model tests fail on 08dbc570 (evidence gh550-batch/indexing-audit-r11/necessity-R11-01.txt)."
+},
+{
+ "id": "REG-A-SETTING-CHANGED-DURING-A-REOPEN-IS-KEPT-543",
+ "title": "A setting changed while the graph is being reopened (a restore, a config reopen) is served by the reopened graph and not lost",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/state.rs::a_settings_write_during_a_reopen_reaches_the_replacement",
+   "src-tauri/src/state.rs::every_graph_handover_serves_the_config_on_disk"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-03. A reopen opens its replacement graph from config.edn, then swaps it in; a settings command (or the watcher) that arrived in between took the change into the slot being replaced, so the replacement served the older value and nothing asked again. After a restore the frontend's forceRefresh load answered AlreadyCurrent with that stale meta and re-seeded favorites without the new one; favorites are written as a whole list, so the next toggle removed it from disk. Fix: state::serve_disk_config at every hand-over (reopen swap, open bind, AlreadyCurrent) takes a settings change in and emits graph-config-changed, or spawns the one decider for a graph-reaching change. Fail-before: the hand-over guard fails without the calls; backend state per the auditor probe (evidence gh550-batch/indexing-audit-r11/necessity-R11-03.txt)."
+},
+{
+ "id": "REG-AN-UNWATCHED-GRAPH-ROOT-IS-POLLED-543",
+ "title": "Changes to a graph the system refuses to watch (inotify limit) are still seen, and caught up once watching succeeds",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "linux",
+  "macos",
+  "windows"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/watcher/tests.rs::an_unwatched_root_is_polled_and_diffed_when_watched"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-04. A per-root watch() failure (typically fs.inotify.max_user_watches with a second large graph) emitted graph-watch-error and left the root out of `watched`, but the cycle still ran in event mode for it: no full diff, no configuration check, only a watch retry every 3 s; and the cycle the watch finally succeeded did not diff what changed meanwhile. Fix: a root no watched directory holds is polled like poll mode (full diff, poll observation, config recheck), assets under it too, and a newly watched root is diffed once. Proof is structural (the loop needs an AppHandle); evidence gh550-batch/indexing-audit-r11/necessity-R11-04-05.txt."
+},
+{
+ "id": "REG-A-RESTORE-DOES-NOT-RESYNC-EVERY-RESTORED-FILE-543",
+ "title": "After a restore or config reopen, the watcher does not re-sync every file the reopened graph already read",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/watcher/tests.rs::a_reopened_graph_is_diffed_against_its_own_baseline",
+   "src-tauri/src/watcher/tests.rs::the_watcher_rebaselines_a_replaced_graph"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-05 (R10-13 residual). The same-root watcher entry kept the old graph's stamp baseline across a reopen, so the carried full diff reported every file a restore rewrote (200/200 for byte-identical copies) into the new graph via sync_file_checked, overlapping the new graph's own owner pass. Fix: when the slot hands the watcher a different Graph for the root, the watcher takes that graph's baseline. Evidence gh550-batch/indexing-audit-r11/necessity-R11-04-05.txt."
 }
 ]
 }

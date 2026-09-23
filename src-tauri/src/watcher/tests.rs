@@ -2452,3 +2452,106 @@ fn the_watcher_reconciles_a_graph_only_under_its_transition_lane() {
         "a skipped graph must carry a full diff to the next cycle"
     );
 }
+
+/// GH #543, audit R11-05: a reopen replaces the window's `Graph`, and the new
+/// graph read the files itself. Diffing it against the old graph's stamps
+/// re-synced every file a restore rewrote, byte-identical ones included (200
+/// of 200 here); against its own baseline there is nothing to sync. The
+/// runtime takes that baseline when the slot's graph changes (guard below).
+#[test]
+fn a_reopened_graph_is_diffed_against_its_own_baseline() {
+    let temp = TempGraph::new("r11-reopen-baseline");
+    for i in 0..200 {
+        temp.write(&format!("pages/p{i}.md"), &format!("- a{i}\n"));
+    }
+    let old = Graph::open(&temp.root);
+    let mut old_snap = collect_graph_text_files(&old).files;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    for i in 0..200 {
+        // A restore copies the backup in: new file, same bytes, new mtime.
+        let path = temp.path(&format!("pages/p{i}.md"));
+        let copy = path.with_extension("md.restore");
+        std::fs::write(&copy, format!("- a{i}\n")).unwrap();
+        std::fs::rename(&copy, &path).unwrap();
+    }
+    let reopened = Graph::open(&temp.root);
+    let (stale, _, _) = full_diff_reconcile(
+        &reopened,
+        &mut old_snap,
+        collect_graph_text_files(&reopened).files,
+    );
+    assert_eq!(
+        stale.len(),
+        200,
+        "precondition: the old baseline sees every copy"
+    );
+    let mut own_snap = collect_graph_text_files(&reopened).files;
+    let (changes, _, errors) = full_diff_reconcile(
+        &reopened,
+        &mut own_snap,
+        collect_graph_text_files(&reopened).files,
+    );
+    assert!(
+        changes.is_empty() && errors.is_empty(),
+        "{changes:?} {errors:?}"
+    );
+}
+
+/// GH #543, audit R11-05: when the slot hands the watcher a different `Graph`
+/// for the same root, the watcher takes that graph's baseline.
+#[test]
+fn the_watcher_rebaselines_a_replaced_graph() {
+    let runtime = include_str!("runtime.rs");
+    let reuse = &runtime[runtime
+        .find("Some(current) if current.root == root =>")
+        .expect("the same-root reuse arm")..];
+    let reuse = &reuse[..reuse
+        .find("current.graph = slot_graph;")
+        .expect("the arm installs")];
+    assert!(
+        reuse.contains("!Arc::ptr_eq(&current.graph, &slot_graph)")
+            && reuse.contains("current.baseline = false;")
+            && reuse.contains("current.snap.clear();"),
+        "a replaced graph must be diffed against its own baseline, not the old graph's"
+    );
+}
+
+/// GH #543, audit R11-04: "who notices changes to a graph root the OS is not
+/// watching?" The cycle does: a root outside `watched` is polled like poll
+/// mode (a full diff, a poll observation and a configuration check) until its
+/// watch succeeds, and the cycle it succeeds diffs it once more. A per-root
+/// `watch()` failure used to emit an error and nothing else, so changes to
+/// that graph, and to its `config.edn`, stayed unseen.
+#[test]
+fn an_unwatched_root_is_polled_and_diffed_when_watched() {
+    let runtime = include_str!("runtime.rs");
+    let rule = &runtime[runtime
+        .find("let unwatched =")
+        .expect("the per-root unwatched rule")..];
+    let rule = &rule[..rule.find(';').unwrap()];
+    assert!(
+        rule.contains("!inotify")
+            && rule.contains("!watched")
+            && rule.contains("root.starts_with(dir)"),
+        "a root is unwatched when no watched directory holds it"
+    );
+    let need_full = &runtime[runtime
+        .find("let need_full = event_need_full")
+        .expect("need_full")..];
+    let need_full = &need_full[..need_full.find(';').unwrap()];
+    assert!(
+        need_full.contains("polled") && need_full.contains("handed_over(&graph.root)"),
+        "an unwatched root must diff in full, and a newly watched one once"
+    );
+    assert!(
+        runtime.contains("&owned, need_full, polled)"),
+        "an unwatched root publishes a poll observation"
+    );
+    let recheck = &runtime[runtime
+        .find("if unwatched(&graph.root) || handed_over(&graph.root) {")
+        .expect("unwatched roots are rechecked")..];
+    assert!(
+        recheck[..recheck.find('}').unwrap()].contains("config_recheck.insert(label.clone());"),
+        "an unwatched root's configuration is checked every cycle"
+    );
+}
