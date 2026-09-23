@@ -122,7 +122,9 @@ h3 { font-size: 1.12rem; letter-spacing: -.01em; }
 .hero-shot {
   margin: clamp(2.4rem, 5vw, 3.6rem) auto 0; max-width: var(--maxw); padding: 0 1rem;
 }
-.hero-shot img {
+.hero-shot figcaption { text-align: center; color: var(--ink-faint); font-size: .9rem; margin-top: .8rem; }
+.hero-shot video { display: block; background: var(--bg-tint); }
+.hero-shot img, .hero-shot video {
   width: 100%; border-radius: var(--radius); border: 1px solid var(--line);
   box-shadow: var(--shadow-lg);
 }
