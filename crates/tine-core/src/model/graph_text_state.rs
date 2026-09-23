@@ -129,8 +129,22 @@ pub enum GraphTextExactFeedPathClass {
     Excluded,
     /// The exact path may affect retained file/resource evidence.
     RetainedFile,
-    /// `logseq/config.edn` changes always require a fresh Graph instance.
+    /// `logseq/config.edn`: not graph text. The watcher's configuration queue
+    /// decides how far a change reaches (`ConfigReach`); only a graph-reach
+    /// change installs a fresh Graph instance.
     Configuration,
+}
+
+/// What a watched path can change in a graph's text inventory; see
+/// `Graph::graph_text_watch_reach`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphTextWatchReach {
+    /// Nothing this graph indexes lives at or under the path.
+    Nothing,
+    /// At most the one file at the path.
+    File,
+    /// Graph text may live under the path, so only a full diff is exact.
+    Subtree,
 }
 
 #[derive(Clone, Debug)]

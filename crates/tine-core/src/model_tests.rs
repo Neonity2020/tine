@@ -11001,73 +11001,6 @@ fn copy_directory_tree(from: &Path, to: &Path) {
     }
 }
 
-/// The watcher's routing predicates must admit exactly what discovery
-/// admits, plus conflict copies (which are never cached as pages but must
-/// still refresh the conflicts panel). GH #268 was the gap between the two.
-#[test]
-fn watch_predicates_track_the_same_scope_discovery_walks() {
-    let dir = scratch("watch-predicate-scope");
-    fs::create_dir_all(dir.join("Archive/Deep")).unwrap();
-    fs::create_dir_all(dir.join("assets")).unwrap();
-    fs::create_dir_all(dir.join(".hidden")).unwrap();
-    fs::write(dir.join("pages/Page.md"), b"- p\n").unwrap();
-    fs::write(dir.join("top.md"), b"- t\n").unwrap();
-    fs::write(dir.join("Archive/Deep/deep.org"), b"* d\n").unwrap();
-    let graph = Graph::open(&dir);
-
-    for relative in [
-        "pages/Page.md",
-        "journals/2026_08_06.md",
-        "top.md",
-        "Archive/Deep/deep.org",
-        // Not present on disk: the predicate is lexical on purpose, so a
-        // deletion routes through exactly the same test as a creation.
-        "Archive/Gone.md",
-        // A Syncthing conflict copy is not eligible text, but its arrival
-        // still has to reach the conflicts panel.
-        "pages/Page.sync-conflict-20260806-101500-ABCDEFG.md",
-    ] {
-        assert!(
-            graph.graph_text_watch_relevant(&dir.join(relative)),
-            "{relative} must be routed to its graph"
-        );
-    }
-
-    for relative in [
-        "assets/image.md",
-        ".hidden/skip.md",
-        "logseq/bak/old.md",
-        "pages/notes.txt",
-        "pages",
-    ] {
-        assert!(
-            !graph.graph_text_watch_relevant(&dir.join(relative)),
-            "{relative} must not be routed as graph text"
-        );
-    }
-    assert!(
-        !graph.graph_text_watch_relevant(Path::new("/elsewhere/pages/Other.md")),
-        "a path outside the graph root belongs to another graph, or none"
-    );
-
-    // Unclassified paths (directory moves) force a full scan, but only where
-    // eligible text could live.
-    for relative in ["pages/Moved", "Archive", "top.md"] {
-        assert!(
-            graph.graph_text_watch_could_contain(&dir.join(relative)),
-            "{relative} could contain graph text"
-        );
-    }
-    for relative in ["assets", "assets/pictures", ".git/objects", "logseq/bak"] {
-        assert!(
-            !graph.graph_text_watch_could_contain(&dir.join(relative)),
-            "{relative} is excluded -- a move there must not rescan the graph"
-        );
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn graph_text_byte_verification_uses_real_nested_sources_without_mutation() {
     let dir = scratch("graph-text-byte-verification");
@@ -15964,6 +15897,9 @@ mod gh543_parse_passes;
 
 #[path = "model_gh543_interleaving_tests.rs"]
 mod gh543_interleaving;
+
+#[path = "model_watch_reach_tests.rs"]
+mod watch_reach;
 
 #[path = "model_gh543_lifecycle_tests.rs"]
 mod gh543_lifecycle;

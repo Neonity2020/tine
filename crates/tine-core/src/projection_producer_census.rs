@@ -1580,9 +1580,20 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // functions (`reconcile_page_order`, `settle_unseeded_deltas`) unchanged
     // from direct_projection.rs to direct_projection/page_order.rs: three
     // `source_delta` reads and one page-order apply change file, nothing else.
+    // 2026-09-23: GH #543 (audit R9-01/R9-02) `full_repair_delta` replaces
+    // `full_sources_match` and `apply_incomplete_full`: the same one
+    // read-only `source_delta` call, one fewer source-revision literal, and
+    // `ContentDigest` / `PhysicalGraphProjectionSourceDelta` named as types
+    // for the sent-source ledger. No storage write crossing, schema or
+    // dependency pin changes.
+    // 2026-09-23: GH #543 (file-size budget B1) moves the repair functions
+    // (`full_repair_delta`, `validate_warm`, `apply_full_repair`,
+    // `apply_warm_repair`) unchanged from direct_projection.rs to
+    // direct_projection/repair.rs: two `source_delta` reads change file,
+    // nothing else.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "e325a18ccea31f41a8ebee351966b9a6e52c210c21b3b949b2e910d1ab7609ac",
+        "288ba72a8400437fe477c7be81fe40398e213fa07268a9bba197aa574263a585",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -2076,5 +2087,87 @@ fn comments_that_cite_a_test_name_a_test_that_exists() {
          (invariant I-11: code does not lie about itself). Write the guard, or cite the \
          one that really covers the claim. Offenders:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// "Does Tine already hold these bytes of this page" has one answer:
+/// `Graph::page_revision_current` asks every store (parsed cache, served
+/// session record, index) through one rule, and the index's part is
+/// `DirectProjection::holds_source_revision`, which reads what this session
+/// SENT before the stored image. Each extra producer so far trusted one store
+/// for another and lost an edit or republished unchanged bytes (GH #543,
+/// audits R8-02, R9-02, R9-03). `image_holds_source_revision` is the narrower
+/// question "do the stored rows carry these exact bytes", which only a
+/// publication of ids without a delta may ask. A new call site is a new
+/// producer: route it through `page_revision_current` (exemplar:
+/// `model/sync_file.rs`) instead of pinning it here.
+#[test]
+fn page_currency_has_one_producer() {
+    let files = production_rust();
+    let names = [
+        "page_revision_current",
+        "index_has_revision",
+        "holds_source_revision",
+        "image_holds_source_revision",
+    ];
+    let mut sites = Vec::new();
+    for file in files {
+        for name in names {
+            let uses = identifier_occurrences(&file.code, &format!("{name}("))
+                - identifier_occurrences(&file.code, &format!("fn {name}("));
+            if uses != 0 {
+                sites.push(format!("{} {name} {uses}", file.relative));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            "crates/tine-core/src/direct_projection/derived_reads.rs image_holds_source_revision 1",
+            "crates/tine-core/src/model/graph_drift.rs holds_source_revision 1",
+            "crates/tine-core/src/model/graph_drift.rs image_holds_source_revision 1",
+            "crates/tine-core/src/model/graph_drift.rs index_has_revision 1",
+            "crates/tine-core/src/model/sync_file.rs index_has_revision 1",
+            "crates/tine-core/src/model/sync_file.rs page_revision_current 2",
+        ],
+        "page currency gained a producer; see this test's doc comment"
+    );
+}
+
+/// "What can a watcher event at this path change?" has one answer:
+/// `Graph::graph_text_watch_reach`. The batch queue (full diff or exact path)
+/// and the platform callback (invalidate the guarded identity index or not)
+/// each used to answer it with their own rules, and both read a gone path or
+/// the configuration file as "maybe a directory of pages", so every settings
+/// change diffed the whole graph and every rename-away dropped the identity
+/// index (GH #543, audit R9-05, R9-06). A third decider is a new place for
+/// that to drift: call `graph_text_watch_reach` (exemplar:
+/// `src-tauri/src/watcher/runtime.rs`, `graph_text_observation`) instead of
+/// pinning a new site here.
+#[test]
+fn watch_reach_has_one_producer() {
+    let mut sites = Vec::new();
+    for file in production_rust() {
+        for name in [
+            "graph_text_watch_reach",
+            "graph_text_index_holds_files_under",
+        ] {
+            let uses = identifier_occurrences(&file.code, &format!("{name}("))
+                - identifier_occurrences(&file.code, &format!("fn {name}("));
+            if uses != 0 {
+                sites.push(format!("{} {name} {uses}", file.relative));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            "crates/tine-core/src/model/write_receipts.rs graph_text_index_holds_files_under 1",
+            "src-tauri/src/watcher.rs graph_text_watch_reach 1",
+            "src-tauri/src/watcher/runtime.rs graph_text_watch_reach 1",
+        ],
+        "watch reach gained a decider; see this test's doc comment"
     );
 }

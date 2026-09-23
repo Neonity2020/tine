@@ -65,14 +65,69 @@ impl Graph {
         self.graph_text_scope.should_descend(&slash_path(relative))
     }
 
-    /// Ownership test for an event path whose file-or-directory nature we do not
-    /// know — a directory move, or a kind the watcher cannot classify. Such an
-    /// event forces a full diff for the owning graph, so the only question is
-    /// whether anything eligible could live *at or under* the path. Excluded
-    /// trees (`assets/`, `node_modules/`, dot-directories, `logseq/bak/`) answer
-    /// no, which is what keeps an image drop from rescanning the graph.
-    pub fn graph_text_watch_could_contain(&self, path: &Path) -> bool {
-        self.graph_text_watch_relevant(path) || self.graph_text_watch_descend(path)
+    /// What an event at `path` can change in this graph's text inventory.
+    ///
+    /// This is the one answer both watcher deciders use — the batch queue
+    /// choosing between an exact path and a full diff, and the callback
+    /// choosing whether to invalidate the guarded identity index — so that
+    /// they cannot disagree about a path (GH #543, audit R9-05/R9-06).
+    ///
+    /// - Excluded trees (`assets/`, `node_modules/`, dot-directories,
+    ///   `logseq/bak/`) reach nothing, which keeps an image drop from
+    ///   rescanning the graph.
+    /// - `logseq/config.edn` reaches nothing here: configuration is not graph
+    ///   text and has its own queue, which decides how far a change reaches.
+    /// - A path that exists answers by what it is.
+    /// - A path that is gone — the old name of a rename — is a subtree only
+    ///   when the current identity index holds a file under it, or there is
+    ///   no current index to ask. Assuming a subtree whenever the old name is
+    ///   gone turned an editor's atomic save of any non-page file into a full
+    ///   diff of the graph and a rebuilt identity index.
+    pub fn graph_text_watch_reach(&self, path: &Path) -> GraphTextWatchReach {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return GraphTextWatchReach::Nothing;
+        };
+        let relative = slash_path(relative);
+        if relative.is_empty() {
+            return GraphTextWatchReach::Subtree;
+        }
+        if is_config_file_path(&self.root, path) {
+            return GraphTextWatchReach::Nothing;
+        }
+        let file = if self.graph_text_watch_relevant(path) {
+            GraphTextWatchReach::File
+        } else {
+            GraphTextWatchReach::Nothing
+        };
+        if !self.graph_text_scope.should_descend(&relative) {
+            return file;
+        }
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => GraphTextWatchReach::Subtree,
+            Ok(_) => file,
+            Err(_) => match self.graph_text_index_holds_files_under(&relative) {
+                Some(false) => file,
+                Some(true) | None => GraphTextWatchReach::Subtree,
+            },
+        }
+    }
+
+    /// Whether the current guarded identity index holds a file strictly under
+    /// `relative`; `None` when there is no current index to ask. Never builds
+    /// or rebuilds the index.
+    fn graph_text_index_holds_files_under(&self, relative: &str) -> Option<bool> {
+        let state = self.guarded_graph_text_identity.read().unwrap();
+        if state.invalidated {
+            return None;
+        }
+        let index = state.index.as_ref()?;
+        let prefix = format!("{relative}/");
+        Some(
+            index
+                .file_resource_by_exact_relative
+                .keys()
+                .any(|held| held.starts_with(&prefix)),
+        )
     }
 
     /// Record that Tine just wrote content with rev `rev` to `path`, so the file

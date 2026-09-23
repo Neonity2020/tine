@@ -239,10 +239,64 @@ impl DirectProjection {
         self.ready_at(generation).then_some(pages)
     }
 
-    /// Whether the image, ready at `generation`, holds the page at `rel` at
-    /// exactly `revision` (a [`projection_source_revision`]: content and
-    /// parse configuration).
-    pub(crate) fn holds_source_revision(&self, generation: u64, rel: &str, revision: &str) -> bool {
+    /// Whether the index holds, or has been sent, content `revision` of the
+    /// page at graph-relative `rel` under the parse configuration
+    /// `digest`: what this session sent answers first, then the stored image
+    /// when it is ready at `generation`. This is the one answer to "does the
+    /// index have these bytes"; see [`SentSources`].
+    pub(crate) fn holds_source_revision(
+        &self,
+        generation: u64,
+        rel: &str,
+        revision: &str,
+        digest: &tine_storage::ContentDigest,
+    ) -> bool {
+        let sent = self
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .sent_carries(rel, revision, digest);
+        sent.unwrap_or_else(|| {
+            self.image_holds_source_revision(
+                generation,
+                rel,
+                &projection_source_revision(revision, digest.clone()),
+            )
+        })
+    }
+
+    /// Whether the index, ready at `generation`, already holds exactly this
+    /// snapshot: every page at its revision under `digest`, and no other.
+    /// Readiness alone does not say so; the parsed cache and the index can
+    /// disagree at one generation (GH #543, audits R8-02, R9-14).
+    pub(crate) fn holds_exactly(
+        &self,
+        generation: u64,
+        pages: &[(PageEntry, Arc<Document>)],
+        revisions: &std::collections::HashMap<std::path::PathBuf, String>,
+        digest: &tine_storage::ContentDigest,
+    ) -> bool {
+        self.ready_at(generation)
+            && self
+                .shared
+                .pending
+                .lock()
+                .unwrap()
+                .sent_is(pages, revisions, digest)
+    }
+
+    /// Whether the stored image, ready at `generation`, holds the page at
+    /// `rel` at exactly `revision` (a [`projection_source_revision`]: content
+    /// and parse configuration). Unlike [`Self::holds_source_revision`] this
+    /// is about the rows themselves, so their block ids are the ones a parse
+    /// of those bytes gives.
+    pub(crate) fn image_holds_source_revision(
+        &self,
+        generation: u64,
+        rel: &str,
+        revision: &str,
+    ) -> bool {
         let Some(_reader) = self.shared_reader_at(generation) else {
             return false;
         };

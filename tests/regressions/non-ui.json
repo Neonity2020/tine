@@ -1836,10 +1836,10 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "src-tauri/src/watcher.rs::graph_wide_external_paths_are_routed_like_discovery_routes_them",
-     "src-tauri/src/watcher.rs::snapshot_covers_exactly_what_discovery_covers",
-     "src-tauri/src/watcher.rs::unclassified_paths_force_a_full_scan_only_where_pages_could_live",
-     "crates/tine-core/src/model.rs::watch_predicates_track_the_same_scope_discovery_walks"
+     "src-tauri/src/watcher/tests.rs::graph_wide_external_paths_are_routed_like_discovery_routes_them",
+     "src-tauri/src/watcher/tests.rs::snapshot_covers_exactly_what_discovery_covers",
+     "src-tauri/src/watcher/tests.rs::unclassified_paths_force_a_full_scan_only_where_pages_could_live",
+     "crates/tine-core/src/model_watch_reach_tests.rs::watch_predicates_track_the_same_scope_discovery_walks"
     ],
     "scenario": "direct-markdown.external-change-graph-wide",
     "failBefore": "proven"
@@ -1865,10 +1865,10 @@
    "status": "released",
    "coverage": {
     "tests": [
-     "src-tauri/src/watcher.rs::quiet_poll_cycles_publish_an_exact_empty_observation",
-     "src-tauri/src/watcher.rs::a_poll_cycle_reports_what_it_actually_observed",
-     "src-tauri/src/watcher.rs::an_incomplete_poll_scan_publishes_uncertainty",
-     "src-tauri/src/watcher.rs::an_unreadable_directory_makes_the_scan_report_itself_incomplete"
+     "src-tauri/src/watcher/tests.rs::quiet_poll_cycles_publish_an_exact_empty_observation",
+     "src-tauri/src/watcher/tests.rs::a_poll_cycle_reports_what_it_actually_observed",
+     "src-tauri/src/watcher/tests.rs::an_incomplete_poll_scan_publishes_uncertainty",
+     "src-tauri/src/watcher/tests.rs::an_unreadable_directory_makes_the_scan_report_itself_incomplete"
     ],
     "scenario": "direct-markdown.poll-mode-save-latency",
     "failBefore": "proven"
@@ -3043,14 +3043,14 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "src-tauri/src/watcher.rs::tests::windows_exact_page_events_stay_incremental_through_the_pending_queue",
-     "src-tauri/src/watcher.rs::tests::windows_unicode_event_reconciles_and_releases_new_page_creation",
-     "src-tauri/src/watcher.rs::tests::windows_tine_owned_create_echoes_do_not_block_following_pages_or_journals",
-     "src-tauri/src/watcher.rs::tests::windows_external_replacement_of_tine_publication_keeps_creation_blocked",
+     "src-tauri/src/watcher/tests.rs::windows_exact_page_events_stay_incremental_through_the_pending_queue",
+     "src-tauri/src/watcher/tests.rs::windows_unicode_event_reconciles_and_releases_new_page_creation",
+     "src-tauri/src/watcher/tests.rs::windows_tine_owned_create_echoes_do_not_block_following_pages_or_journals",
+     "src-tauri/src/watcher/tests.rs::windows_external_replacement_of_tine_publication_keeps_creation_blocked",
      "crates/tine-core/src/model.rs::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt",
      "crates/tine-core/src/model.rs::tests::windows_ambiguous_callback_cannot_interrupt_inflight_direct_creation",
      "crates/tine-core/src/model.rs::tests::windows_direct_publication_receipt_requires_revision_and_file_identity",
-     "src-tauri/src/watcher.rs::tests::atomic_page_save_temp_events_stay_incremental",
+     "src-tauri/src/watcher/tests.rs::atomic_page_save_temp_events_stay_incremental",
      "crates/tine-core/src/model.rs::tests::direct_creation_round_trips_a_chinese_page_name",
      "crates/tine-core/src/model_alias_admission_tests.rs::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
      "crates/tine-core/src/model.rs::tests::external_semantic_owner_creator_wins_before_creation_publication"
@@ -3541,7 +3541,7 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "src-tauri/src/watcher.rs::tests::recognizes_every_tine_temp_shape_that_lands_in_the_live_graph"
+     "src-tauri/src/watcher/tests.rs::recognizes_every_tine_temp_shape_that_lands_in_the_live_graph"
     ],
     "scenario": null,
     "failBefore": "proven"
@@ -6247,7 +6247,7 @@
  "layer": "integration",
  "status": "covered",
  "coverage": {
-  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_an_acting_read_does_not_hide_a_missed_external_edit", "src-tauri/src/watcher.rs::incremental_create_is_identified_as_inventory_change"],
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_an_acting_read_does_not_hide_a_missed_external_edit", "src-tauri/src/watcher/tests.rs::incremental_create_is_identified_as_inventory_change"],
   "scenario": null,
   "failBefore": "proven"
  },
@@ -6342,6 +6342,78 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 8, R8-10. Settings' export retry checked only that the dialog was open, so a switch during the wait exported the newly bound graph. Fix: the retry is bound to graphBinding() at the click. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-10-export.log."
+},
+{
+ "id": "REG-PAGE-CURRENCY-ASKS-EVERY-STORE-543",
+ "title": "Opening or re-reading a page is not re-indexed when Tine already holds its bytes, and an edit is never skipped because one store still holds older bytes",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_bytes_the_launch_build_carries_are_current_before_it_is_ready", "crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_bytes_only_the_index_holds_are_current", "crates/tine-core/src/projection_producer_census.rs::page_currency_has_one_producer"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-02 and R9-03 (R8-02 regression). Page currency had several producers, each trusting one store for another. Fix: page_revision_current asks every store with an opinion (parsed cache, served session record, index) and requires all of them to hold the revision; the index answers from what this session sent (queued and drained deltas, then the last full or warm inventory) before the stored image. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C1-page-currency.txt."
+},
+{
+ "id": "REG-A-RECOVERED-PAGE-IS-ONE-INDEX-UPDATE-543",
+ "title": "A page recovered from a snapshot reaches the index as one update, with or without an index owner",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_a_recovered_page_is_one_update"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-04. cache_upsert had a dead recovered-snapshot branch that queued nothing without an owner. Fix: the branch is gone; every upsert calls enqueue_replace under the lock. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C1-page-currency.txt."
+},
+{
+ "id": "REG-A-SNAPSHOT-REPAIRS-ONLY-WHAT-DIFFERS-543",
+ "title": "One page edited while Tine was closed re-indexes that page at launch, not the whole graph, and search stays available meanwhile",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_a_snapshot_over_a_healthy_image_repairs_only_what_differs", "crates/tine-core/src/direct_projection_tests.rs::same_config_inventory_preserves_jobs_but_changed_config_cancels_them"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-01. A full snapshot over a healthy image rebuilt from scratch whenever any page differed. Fix: full_repair_delta lowers only the pages the image differs by (an unread page keeps its rows); a fresh build only when a rebuild is owed, the image is absent or damaged, or the parse configuration changed. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C2-whole-rebuild.txt."
+},
+{
+ "id": "REG-A-SETTINGS-CHANGE-DOES-NOT-RESCAN-THE-GRAPH-543",
+ "title": "Changing a setting (which rewrites config.edn) or renaming a page away does not make the file watcher rescan the whole graph or drop the page-identity index",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src-tauri/src/watcher/tests.rs::a_config_write_reaches_only_the_configuration_queue", "crates/tine-core/src/model_tests.rs::a_gone_path_is_a_subtree_only_if_the_index_holds_a_file_under_it", "crates/tine-core/src/projection_producer_census.rs::watch_reach_has_one_producer"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-05 and R9-06. Both watcher deciders read a gone path, or config.edn, as maybe a directory of pages. Fix: one answer, Graph::graph_text_watch_reach, used by the batch queue and the callback: configuration reaches only its own queue, and a gone path is a subtree only when the current identity index holds a file under it (or there is no current index). Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C2-watcher.txt."
 }
 ]
 }

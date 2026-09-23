@@ -124,6 +124,55 @@ impl PageDelta {
             PageDelta::Replace { entry, .. } | PageDelta::Delete { entry } => entry,
         }
     }
+
+    /// Whether this delta leaves the page at `revision` under `digest`.
+    fn carries(&self, revision: &str, digest: &tine_storage::ContentDigest) -> bool {
+        match self {
+            PageDelta::Replace {
+                revision: sent,
+                parse_config,
+                ..
+            } => sent == revision && parse_config.digest() == *digest,
+            PageDelta::Delete { .. } => false,
+        }
+    }
+}
+
+/// What this session has handed the index, so "does the index hold these
+/// bytes" has one answer while a build, a validation or a delta is still on
+/// its way. Readiness is a whole-graph claim and says nothing about one page;
+/// answering from it alone judged an unchanged delivery during the launch
+/// build to be new, and published it (GH #543, audit R9-02).
+///
+/// A later send for a page overrides an earlier one, and a complete inventory
+/// (a full snapshot or a warm validation) replaces everything sent before it:
+/// a full takes the queue with it, and a warm's walk read the disk after
+/// every delta already drained. Deltas still queued are read from the queue
+/// itself, which the worker applies after either.
+#[derive(Default)]
+struct SentSources {
+    inventory: Option<SentInventory>,
+    /// Deltas the worker has drained since the inventory: `None` is a delete.
+    pages: HashMap<String, Option<(String, tine_storage::ContentDigest)>>,
+}
+
+/// A complete inventory: each page's content revision, by graph-relative
+/// path, and the parse configuration it was sent under.
+struct SentInventory {
+    revisions: HashMap<String, String>,
+    digest: tine_storage::ContentDigest,
+}
+
+impl SentInventory {
+    fn carries(
+        &self,
+        rel: &str,
+        revision: &str,
+        digest: &tine_storage::ContentDigest,
+    ) -> Option<bool> {
+        let sent = self.revisions.get(rel)?;
+        Some(sent == revision && self.digest == *digest)
+    }
 }
 
 /// A queued whole-graph snapshot and the config it must be lowered under. The
@@ -142,7 +191,7 @@ struct PendingFull {
     /// Sources that exist but could not be read, listed or parsed for this
     /// snapshot, as graph-relative paths: a page, or a directory whose pages
     /// all count as unread (`""` is the whole graph). Over a healthy image
-    /// they keep their stored rows (see `apply_incomplete_full`).
+    /// they keep their stored rows (see `apply_full_repair`).
     retained: Vec<String>,
 }
 
@@ -277,6 +326,9 @@ struct PendingProjection {
     unplaced: BTreeMap<String, (u64, PageDelta)>,
     /// R6 warm validation queued for the worker.
     warm: Option<PendingWarm>,
+    /// Every page source this session has handed the index; see
+    /// [`SentSources`].
+    sent: SentSources,
     /// R6: the worker's verdict on the last warm validation.
     /// R6: the decided warm's verdict, KEYED BY THE ATTEMPT that asked for
     /// it. One unkeyed slot let a warm that was descheduled before reading it
@@ -336,8 +388,71 @@ impl PendingProjection {
                 self.page_order.remove(&key);
             }
         }
+        let sent = match &delta {
+            PageDelta::Replace {
+                revision,
+                parse_config,
+                ..
+            } => Some((revision.clone(), parse_config.digest())),
+            PageDelta::Delete { .. } => None,
+        };
+        self.sent.pages.insert(key.clone(), sent);
         self.deltas.insert(key, (generation, delta));
         self.latest_generation = self.latest_generation.max(generation);
+    }
+
+    /// Whether what this session sent the index is exactly `pages`: every
+    /// page at its revision under `digest`, and no other page. Only a
+    /// complete inventory sent this session can say so.
+    fn sent_is(
+        &self,
+        pages: &[(PageEntry, Arc<Document>)],
+        revisions: &HashMap<PathBuf, String>,
+        digest: &tine_storage::ContentDigest,
+    ) -> bool {
+        let Some(inventory) = self.sent.inventory.as_ref() else {
+            return false;
+        };
+        let mut held = inventory.revisions.len();
+        for (rel, sent) in &self.sent.pages {
+            match (inventory.revisions.contains_key(rel), sent.is_some()) {
+                (false, true) => held += 1,
+                (true, false) => held -= 1,
+                _ => {}
+            }
+        }
+        for rel in self.deltas.keys().chain(self.unplaced.keys()) {
+            if !self.sent.pages.contains_key(rel) {
+                return false;
+            }
+        }
+        held == pages.len()
+            && pages.iter().all(|(entry, _)| {
+                revisions.get(&entry.path).is_some_and(|revision| {
+                    self.sent_carries(&entry.rel_path, revision, digest) == Some(true)
+                })
+            })
+    }
+
+    /// Whether the index holds, or has been sent, `revision` of the page at
+    /// `rel` under `digest`; `None` when this session sent it nothing about
+    /// that page, so only the stored image can answer. See [`SentSources`].
+    fn sent_carries(
+        &self,
+        rel: &str,
+        revision: &str,
+        digest: &tine_storage::ContentDigest,
+    ) -> Option<bool> {
+        if let Some((_, delta)) = self.deltas.get(rel).or_else(|| self.unplaced.get(rel)) {
+            return Some(delta.carries(revision, digest));
+        }
+        if let Some(sent) = self.sent.pages.get(rel) {
+            return Some(
+                sent.as_ref()
+                    .is_some_and(|(sent, sent_digest)| sent == revision && sent_digest == digest),
+            );
+        }
+        self.sent.inventory.as_ref()?.carries(rel, revision, digest)
     }
 
     /// Seed the queue's page order from a complete inventory (a full snapshot
@@ -551,6 +666,9 @@ struct ProjectionShared {
     after_fresh_build_batch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_fresh_publication: Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
+    /// From-scratch builds this index has started.
+    #[cfg(test)]
+    fresh_builds: AtomicU64,
     #[cfg(test)]
     after_fresh_publication: Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
     #[cfg(test)]
@@ -1044,6 +1162,8 @@ impl DirectProjection {
             #[cfg(test)]
             before_fresh_publication: Mutex::new(None),
             #[cfg(test)]
+            fresh_builds: AtomicU64::new(0),
+            #[cfg(test)]
             after_fresh_publication: Mutex::new(None),
             #[cfg(test)]
             before_shared_reader_admission: Mutex::new(None),
@@ -1193,6 +1313,18 @@ impl DirectProjection {
             return true;
         }
         pending.accepted_full = Some((generation, Arc::downgrade(&pages)));
+        pending.sent = SentSources {
+            inventory: Some(SentInventory {
+                revisions: pages
+                    .iter()
+                    .filter_map(|(entry, _)| {
+                        Some((entry.rel_path.clone(), revisions.get(&entry.path)?.clone()))
+                    })
+                    .collect(),
+                digest: parse_config.digest(),
+            }),
+            pages: HashMap::new(),
+        };
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
@@ -2479,6 +2611,28 @@ impl DirectProjection {
         self.shared.projection_health_checks.load(Ordering::Relaxed)
     }
 
+    /// From-scratch builds this index has started.
+    #[cfg(test)]
+    pub(crate) fn fresh_builds_test(&self) -> u64 {
+        self.shared.fresh_builds.load(Ordering::SeqCst)
+    }
+
+    /// Hold the next fresh build just before it publishes: the first barrier
+    /// releases when it arrives, the second lets it go on.
+    #[cfg(test)]
+    pub(crate) fn hold_fresh_publication_test(
+        &self,
+    ) -> Arc<(std::sync::Barrier, std::sync::Barrier)> {
+        let pair = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let held = Arc::clone(&pair);
+        *self.shared.before_fresh_publication.lock().unwrap() = Some(Box::new(move || {
+            held.0.wait();
+            held.1.wait();
+            Ok(())
+        }));
+        pair
+    }
+
     /// R3: refuse new jobs, interrupt the active ones and wait for their slots
     /// before the worker is told to stop, so no snapshot outlives the
     /// projection that admitted it. Idempotent — `stop` and a closed admission
@@ -2828,14 +2982,16 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         } else {
             writer_slot.is_some()
         };
-        let reuse_full = full.as_ref().is_some_and(|full| {
-            !rebuild
-                && !requires_full_rebuild
-                && existing_image_healthy
-                && full_sources_match(writer_slot.as_ref().expect("healthy writer"), full)
-        });
-        let fresh_build = had_full && !reuse_full;
-        let registry_reset = fresh_build || had_warm;
+        // A full snapshot over a healthy image lowers only the pages it
+        // differs by. Rebuilding from scratch whenever any page differed
+        // turned one edit made while Tine was closed, met by an escalated
+        // launch validation, into re-lowering the whole graph with search
+        // withdrawn meanwhile (GH #543, audit R9-01). Only a rebuild owed, or
+        // an image that is absent or damaged, starts from scratch. An
+        // incomplete snapshot never does: it would erase the rows of every
+        // page it could not read. A changed parse configuration differs on
+        // every page, so it is a fresh build, which also cancels the open
+        // query jobs before it publishes.
         let config_changed = registry_config.as_ref().is_some_and(|config| {
             shared
                 .committed_registry
@@ -2844,6 +3000,19 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 .as_ref()
                 .is_some_and(|owner| owner.config.digest() != config.digest())
         });
+        let full_repair = full.as_ref().and_then(|full| {
+            let repairable = existing_image_healthy
+                && (!full.source_complete || !rebuild && !requires_full_rebuild && !config_changed);
+            repairable
+                .then(|| full_repair_delta(writer_slot.as_ref().expect("healthy writer"), full))
+                .and_then(Result::ok)
+        });
+        let fresh_build = had_full && full_repair.is_none();
+        let registry_reset = fresh_build
+            || had_warm
+            || full_repair
+                .as_ref()
+                .is_some_and(|delta| !delta.replacements.is_empty() || !delta.deletions.is_empty());
         let touched_pages = deltas
             .values()
             .map(|(_, delta)| delta.entry().rel_path.clone())
@@ -2857,7 +3026,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     "injected turn failure".to_owned(),
                 ));
             }
-            if config_changed && !had_full {
+            if config_changed && !fresh_build {
                 let fence = shared.cancel_queued_captures(false);
                 shared.query_jobs.wait_for_drain(fence);
             }
@@ -2880,23 +3049,20 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         "fresh build has no captured page inventory".to_owned(),
                     )
                 })?;
-                if reuse_full {
+                if let Some(delta) = full_repair {
                     let database = writer_slot
                         .as_mut()
                         .ok_or(ProjectionRefusal::AwaitingFullInventory)?;
-                    // The snapshot seeded the queue's order densely; the
-                    // reused image keeps the positions it was written with.
-                    adopt_queue_order(database, &shared, &mut deltas)
-                        .map_err(ProjectionRefusal::Failed)?;
-                    apply_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?
-                } else if !full.source_complete && existing_image_healthy {
-                    apply_incomplete_full(
-                        writer_slot.as_mut().expect("healthy writer"),
-                        &shared,
-                        &full,
-                        deltas,
-                    )
-                    .map_err(ProjectionRefusal::Failed)?
+                    if delta.replacements.is_empty() && delta.deletions.is_empty() {
+                        // The snapshot seeded the queue's order densely; the
+                        // reused image keeps the positions it was written with.
+                        adopt_queue_order(database, &shared, &mut deltas)
+                            .map_err(ProjectionRefusal::Failed)?;
+                        apply_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?
+                    } else {
+                        apply_full_repair(database, &shared, &full, delta, deltas)
+                            .map_err(ProjectionRefusal::Failed)?
+                    }
                 } else {
                     let (database, applied) = build_and_publish_fresh_projection(
                         &shared,
@@ -3210,26 +3376,6 @@ fn projection_image_is_healthy(
     database.validate_schema().is_ok() && database.quick_check().is_ok()
 }
 
-fn full_sources_match(database: &PhysicalGraphProjectionDatabase, full: &PendingFull) -> bool {
-    if !full.source_complete {
-        return false;
-    }
-    let config_digest = full.parse_config.digest();
-    let mut sources = Vec::with_capacity(full.pages.len());
-    for (entry, _) in full.pages.iter() {
-        let Some(revision) = full.revisions.get(&entry.path) else {
-            return false;
-        };
-        sources.push(PhysicalGraphProjectionSourceRevision {
-            path: entry.rel_path.clone(),
-            revision: projection_source_revision(revision, config_digest),
-        });
-    }
-    database
-        .source_delta(&sources)
-        .is_ok_and(|delta| delta.replacements.is_empty() && delta.deletions.is_empty())
-}
-
 fn open_existing_projection_database(
     shared: &ProjectionShared,
 ) -> Option<PhysicalGraphProjectionDatabase> {
@@ -3348,6 +3494,8 @@ fn build_and_publish_fresh_projection(
     inventory: &[String],
 ) -> Result<(PhysicalGraphProjectionDatabase, AppliedTurn), FreshBuildError> {
     const BUILD_BATCH: usize = 32;
+    #[cfg(test)]
+    shared.fresh_builds.fetch_add(1, Ordering::SeqCst);
 
     let (parent, stage_name, destination_name) =
         projection_publication_names(&shared.path).map_err(FreshBuildError::Failed)?;
@@ -3584,192 +3732,6 @@ struct AppliedTurn {
     warm_outcome: Option<WarmOutcome>,
 }
 
-/// R6 warm validation inside one worker turn: compare the walk inventory's
-/// exact revisions with `direct_source_revisions`, delete what the walk no
-/// longer has, and name what must be relowered. Nothing here parses.
-fn validate_warm(
-    database: &PhysicalGraphProjectionDatabase,
-    warm: &PendingWarm,
-) -> Result<WarmOutcome, String> {
-    let config_digest = warm.parse_config.digest();
-    let sources = warm
-        .sources
-        .iter()
-        .map(|(entry, revision)| PhysicalGraphProjectionSourceRevision {
-            path: entry.rel_path.clone(),
-            revision: projection_source_revision(revision, config_digest),
-        })
-        .collect::<Vec<_>>();
-    let mut source_delta = database
-        .source_delta(&sources)
-        .map_err(|error| error.to_string())?;
-    if !warm.retained.is_empty() {
-        // A page whose bytes could not be read is absent from `sources`, so
-        // `source_delta` names it a deletion — and warm validation would drop
-        // the rows of a page that still exists (GH #543). An unreadable page
-        // keeps its previous rows AND its previous stored revision, so the
-        // next warm names it a replacement and re-reads it once the read
-        // succeeds. In-scope scenarios: a transient disk error, and a
-        // Windows/macOS sharing violation while another process holds the file.
-        let retained = warm
-            .retained
-            .iter()
-            .map(|entry| entry.rel_path.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        source_delta.deletions.retain(|id| !retained.contains(id));
-    }
-    if !warm.published.is_empty() {
-        let published = warm
-            .published
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        source_delta.deletions.retain(|id| !published.contains(id));
-        source_delta
-            .replacements
-            .retain(|id| !published.contains(id));
-    }
-    if source_delta.replacements.is_empty() && source_delta.deletions.is_empty() {
-        return Ok(WarmOutcome::Clean);
-    }
-    let walk = warm.sources.len() + warm.retained.len();
-    let changed = source_delta.replacements.len() + source_delta.deletions.len();
-    // A page the walk could not read keeps its stored rows through the
-    // repair, as it does through a clean validation and a full snapshot
-    // (`apply_incomplete_full`): asking for a full parse instead gains
-    // nothing, because that parse cannot read the page either.
-    if changed * WARM_REPAIR_MAX_SHARE_DIVISOR > walk {
-        return Ok(WarmOutcome::FreshBuildRequired);
-    }
-    Ok(WarmOutcome::Changed {
-        replacements: source_delta.replacements,
-        deletions: source_delta.deletions,
-    })
-}
-
-/// A parsed snapshot that is missing pages it could not read or parse,
-/// offered over a healthy image. Replacing the image would turn each such
-/// absence into a deletion, and refusing it left the index unready for the
-/// session: nothing else produces a complete snapshot while the page stays
-/// unreadable, and a page that recovers without changing produces no event
-/// at all (GH #543). So bring every page the snapshot did read current, and
-/// keep the stored rows, and the stored revision, of every page in
-/// `retained`, exactly as the warm validation does for a page it cannot
-/// read. A retained page that later changes arrives as an ordinary update.
-/// In-scope scenarios: a transient disk error, a sharing violation while
-/// another process holds the file, and a page whose parse fails.
-fn apply_incomplete_full(
-    database: &mut PhysicalGraphProjectionDatabase,
-    shared: &ProjectionShared,
-    full: &PendingFull,
-    mut deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<AppliedTurn, String> {
-    let config_digest = full.parse_config.digest();
-    let mut sources = Vec::with_capacity(full.pages.len());
-    let mut documents = HashMap::with_capacity(full.pages.len());
-    for (entry, document) in full.pages.iter() {
-        let revision = full
-            .revisions
-            .get(&entry.path)
-            .ok_or_else(|| format!("snapshot has no revision for {}", entry.rel_path))?;
-        sources.push(PhysicalGraphProjectionSourceRevision {
-            path: entry.rel_path.clone(),
-            revision: projection_source_revision(revision, config_digest),
-        });
-        documents.insert(entry.rel_path.as_str(), (entry, document, revision));
-    }
-    let mut source_delta = database
-        .source_delta(&sources)
-        .map_err(|error| error.to_string())?;
-    // A page under an unreadable directory is as unread as an unreadable
-    // page: deleting its rows would empty the index for as long as the
-    // directory stays unreadable, and publish that as ready.
-    let unread = |path: &str| {
-        full.retained.iter().any(|retained| {
-            retained.is_empty()
-                || path == retained
-                || path
-                    .strip_prefix(retained.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
-    };
-    source_delta.deletions.retain(|path| !unread(path));
-    let replacements = source_delta
-        .replacements
-        .iter()
-        .map(|path| {
-            let (entry, document, revision) = documents
-                .get(path.as_str())
-                .ok_or_else(|| format!("snapshot has no page {path}"))?;
-            Ok(((*entry).clone(), Arc::clone(document), (*revision).clone()))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    projection_diag(|| {
-        format!(
-            "incomplete full: keeping the rows under {} unread source(s)",
-            full.retained.len()
-        )
-    });
-    let order = apply_warm_repair(
-        database,
-        shared,
-        WarmRepair {
-            replacements,
-            deletions: source_delta.deletions,
-        },
-        &full.parse_config,
-    )?;
-    shared
-        .pending
-        .lock()
-        .unwrap()
-        .adopt_order(&order, &mut deltas);
-    apply_deltas(database, deltas)
-}
-
-/// Apply a `WarmRepair` in one transaction and reconcile every stored page's
-/// position to the queue's order (the walk, then pages this session created),
-/// restricted to the pages the image holds afterwards. Returns that order.
-fn apply_warm_repair(
-    database: &mut PhysicalGraphProjectionDatabase,
-    shared: &ProjectionShared,
-    repair: WarmRepair,
-    parse_config: &Arc<ParseConfig>,
-) -> Result<Vec<String>, String> {
-    let mut deltas = BTreeMap::new();
-    for (entry, document, revision) in repair.replacements {
-        deltas.insert(
-            entry.rel_path.clone(),
-            (
-                0,
-                PageDelta::Replace {
-                    entry,
-                    document,
-                    revision,
-                    parse_config: Arc::clone(parse_config),
-                    page_position: None,
-                },
-            ),
-        );
-    }
-    let lowered = lower_deltas(deltas)?;
-    let mut change = lowered.change;
-    change.deletions = repair.deletions;
-    projection_diag(|| {
-        format!(
-            "warm repair: relowering {} page(s), deleting {}",
-            change.replacements.len(),
-            change.deletions.len()
-        )
-    });
-    reconcile_page_order(
-        database,
-        shared,
-        &change,
-        &lowered.revisions,
-        &lowered.aliases,
-    )
-}
-
 fn apply_deltas(
     database: &mut PhysicalGraphProjectionDatabase,
     deltas: BTreeMap<String, (u64, PageDelta)>,
@@ -3880,9 +3842,11 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
 pub(crate) mod derived_reads;
 mod lowering;
 mod page_order;
+mod repair;
 mod warm_queue;
 pub(crate) use lowering::*;
 use page_order::{adopt_queue_order, reconcile_page_order, settle_unseeded_deltas};
+use repair::{apply_full_repair, apply_warm_repair, full_repair_delta, validate_warm};
 pub(crate) use warm_queue::WarmRefusal;
 #[cfg(test)]
 #[path = "direct_projection_tests.rs"]

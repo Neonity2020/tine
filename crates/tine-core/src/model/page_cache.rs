@@ -1673,44 +1673,26 @@ impl Graph {
             );
         }
         let page_inventory_complete = resulting_failures.is_empty();
-        // A partial parsed snapshot may have left a healthy older SQL image in
-        // AwaitingFullInventory. When the last unreadable page is reconciled,
-        // this cache already is the normal complete parsed-snapshot producer:
-        // publish that captured Arc and its exact revisions instead of sending
-        // a delta the worker must refuse while it still owes a full inventory.
-        //
-        // While a warm owns readiness the snapshot would be refused (audit
-        // R4-04), so the page goes to the index as its ordinary delta, queued
-        // under the lock like any other; the warm's inventory carries the
-        // rest (audit R5-01).
-        let warm_owns_readiness = projection
-            .as_ref()
-            .is_some_and(|projection| projection.coming());
-        let recovered_projection_snapshot =
-            (cache_built && failures_changed && page_inventory_complete && !warm_owns_readiness)
-                .then(|| {
-                    (
-                        Arc::clone(guard.as_ref().expect("a built cache has pages")),
-                        Arc::new(self.disk_revs.read().unwrap().clone()),
-                    )
-                });
+        // A page that recovers from unreadable travels as its own update,
+        // like any other: completeness is the index owner's to restore (with
+        // no owner, the next read's repair). A complete snapshot offered from
+        // here as well was a second decider, never taken while an owner
+        // existed and a whole-index build without one (GH #543, audit R9-04).
         *failures_guard = resulting_failures;
         // The update is queued before the new generation can be observed. A
         // warm that reads this generation keeps its inventory and leaves this
         // page to its update (audit IT-03); queued after the lock, the warm
         // could publish readiness at this generation with the page's old
         // rows, and an answer cached at it would outlive the update.
-        let queued_under_lock = recovered_projection_snapshot.is_none()
-            && projection.as_ref().is_some_and(|projection| {
-                projection.enqueue_replace(
-                    newgen,
-                    evict_entry.clone(),
-                    Arc::clone(&evict_doc),
-                    projection_revision.clone(),
-                    Arc::new(self.config().parse_config()),
-                );
-                true
-            });
+        if let Some(projection) = projection.as_ref() {
+            projection.enqueue_replace(
+                newgen,
+                evict_entry.clone(),
+                Arc::clone(&evict_doc),
+                projection_revision,
+                Arc::new(self.config().parse_config()),
+            );
+        }
         drop(failures_guard);
         drop(guard);
         #[cfg(test)]
@@ -1791,43 +1773,6 @@ impl Graph {
             newgen,
             scoped,
         );
-        // R6: the projection receives the delta whether or not a parsed cache
-        // exists. A warm session has no cache at all, so gating the delta on
-        // it would leave every save unprojected until some whole-graph
-        // consumer happened to build one. Readiness still needs this
-        // session's inventory validated first (the projection's own rule).
-        if let Some((pages, revisions)) = recovered_projection_snapshot {
-            let outcome = self.direct_projection_enqueue_full(
-                newgen,
-                pages,
-                revisions,
-                false,
-                true,
-                projection_lifetime::FullOffer::Consumer,
-            );
-            // A warm that began after the lock was released, or a newer
-            // queue, refuses the snapshot; the page's own update is still
-            // owed (audit R5-01).
-            if matches!(
-                outcome,
-                projection_lifetime::FullOfferOutcome::RefusedDuringWarm
-                    | projection_lifetime::FullOfferOutcome::Outdated
-            ) {
-                self.direct_projection_enqueue_replace(
-                    newgen,
-                    evict_entry,
-                    evict_doc,
-                    projection_revision,
-                );
-            }
-        } else if !queued_under_lock {
-            self.direct_projection_enqueue_replace(
-                newgen,
-                evict_entry,
-                evict_doc,
-                projection_revision,
-            );
-        }
     }
 
     /// See `cache_upsert`. When `scoped`, evict only derived entries the edited

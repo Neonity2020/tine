@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- A page edited while Tine was closed is re-indexed on its own at the next
+  launch, instead of the whole graph being re-indexed with search unavailable
+  meanwhile (GH #543).
+- Changing a setting, or renaming a page away from outside Tine, no longer
+  makes the file watcher rescan the whole graph or rebuild its page-identity
+  index (GH #543).
+- Opening a page Tine has already indexed no longer queues it for indexing
+  again, and an edit is never skipped because one of Tine's stores still held
+  the older text (GH #543).
 - Refreshing the conflict badge and overview now reads the graph's conflict
   copies and version-control markers once, instead of three separate listings
   that each rescanned the graph (GH #543).

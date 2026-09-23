@@ -226,10 +226,19 @@ impl Graph {
             });
             return FullOfferOutcome::RefusedDuringWarm;
         }
-        // R6: a projection already READY at this generation was validated
-        // from the same bytes this snapshot was parsed from; a redundant
-        // snapshot would only open a NotReady window while it re-validates.
-        if !force && projection.ready_at(generation) {
+        // R6: a snapshot of exactly what the ready index holds would only
+        // open a NotReady window while it re-validates. Readiness alone is
+        // not that: the parsed cache and the index can disagree at one
+        // generation, and a snapshot refused on readiness left the pages it
+        // carried out of the index (GH #543, audits R8-02, R9-14).
+        if !force
+            && projection.holds_exactly(
+                generation,
+                &pages,
+                &revisions,
+                &self.config().parse_config().digest(),
+            )
+        {
             return FullOfferOutcome::AlreadyCurrent;
         }
         let retained = if source_complete {
@@ -300,24 +309,6 @@ impl Graph {
             source_complete,
             FullOffer::WarmOwner,
         )
-    }
-
-    pub(super) fn direct_projection_enqueue_replace(
-        &self,
-        generation: u64,
-        entry: PageEntry,
-        document: Arc<Document>,
-        revision: String,
-    ) {
-        if let Some(projection) = self.direct_projection.get() {
-            projection.enqueue_replace(
-                generation,
-                entry,
-                document,
-                revision,
-                Arc::new(self.config().parse_config()),
-            );
-        }
     }
 
     /// The ONE way a mutation that changes the page SET tells the index what it

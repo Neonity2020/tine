@@ -422,3 +422,223 @@ fn gh543_an_acting_read_does_not_hide_a_missed_external_edit() {
         "the rescan after an acting read left the index stale"
     );
 }
+
+fn settle_index(graph: &Graph) {
+    let projection = graph.direct_projection_test().unwrap();
+    projection.wait_drained_test();
+    let started = Instant::now();
+    while !graph.direct_projection_ready_test() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Rewrite `path` with the bytes it already has, as a sync tool or an editor
+/// does, and deliver it: the name of the page reported changed, and whether
+/// the delivery moved the generation.
+fn redeliver(graph: &Graph, path: &Path, bytes: &[u8]) -> (Option<String>, bool) {
+    fs::write(path, bytes).unwrap();
+    let before = graph.cache_generation();
+    let delivered = graph
+        .sync_file_checked(path)
+        .unwrap()
+        .map(|entry| entry.name);
+    (delivered, graph.cache_generation() != before)
+}
+
+/// While the launch build is still lowering the parsed snapshot, the index
+/// has been SENT every page's bytes though it is not ready. A delivery of
+/// bytes the snapshot carries is no change; one of other bytes is, and a
+/// delivery of bytes a queued edit has since replaced is one too (GH #543,
+/// audit R9-02).
+#[test]
+fn gh543_bytes_the_launch_build_carries_are_current_before_it_is_ready() {
+    let root = scratch("gh543-currency-during-build");
+    ring_pages(&root, 12);
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let held = graph
+        .direct_projection_test()
+        .unwrap()
+        .hold_fresh_publication_test();
+    let owner = TestOwner::start(&graph);
+    held.0.wait();
+    assert!(!graph.direct_projection_ready_test());
+
+    let same = root.join("pages/p3.md");
+    let same_bytes = fs::read(&same).unwrap();
+    let unchanged = redeliver(&graph, &same, &same_bytes);
+
+    let edited = root.join("pages/p4.md");
+    let original = fs::read(&edited).unwrap();
+    fs::write(&edited, "- edited during the build [[p5]]\n").unwrap();
+    let changed = graph
+        .sync_file_checked(&edited)
+        .unwrap()
+        .map(|entry| entry.name);
+    let reverted = redeliver(&graph, &edited, &original);
+
+    held.1.wait();
+    assert!(
+        owner.wait_ready(Duration::from_secs(10)),
+        "{}",
+        index_state(&graph)
+    );
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        unchanged,
+        (None, false),
+        "bytes the build carries were published again"
+    );
+    assert_eq!(
+        changed.as_deref(),
+        Some("p4"),
+        "an edit during the build was not published"
+    );
+    assert_eq!(
+        reverted,
+        (Some("p4".to_owned()), true),
+        "bytes a queued edit replaced were taken as current"
+    );
+}
+
+/// A session served from the index alone (no parsed cache) whose index holds
+/// a page's bytes publishes nothing for a delivery of those bytes, though
+/// this session never opened the page (GH #543, audit R9-03).
+#[test]
+fn gh543_bytes_only_the_index_holds_are_current() {
+    let root = scratch("gh543-currency-index-only");
+    ring_pages(&root, 12);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let owner = TestOwner::start(&graph);
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    settle_index(&graph);
+    assert!(!graph.has_parsed_cache_test());
+    let path = root.join("pages/p3.md");
+    let bytes = fs::read(&path).unwrap();
+    let unchanged = redeliver(&graph, &path, &bytes);
+    fs::write(&path, "- edited outside Tine [[p4]]\n").unwrap();
+    let changed = graph
+        .sync_file_checked(&path)
+        .unwrap()
+        .map(|entry| entry.name);
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        unchanged,
+        (None, false),
+        "bytes the index holds were published again"
+    );
+    assert_eq!(
+        changed.as_deref(),
+        Some("p3"),
+        "an external edit was not published"
+    );
+}
+
+/// One page edited while Tine was closed, met by a launch validation that is
+/// abandoned mid-walk: the escalated pass offers a complete snapshot that
+/// differs from the stored image by that page, and the index lowers that
+/// page, not the whole graph (GH #543, audit R9-01).
+#[test]
+fn gh543_a_snapshot_over_a_healthy_image_repairs_only_what_differs() {
+    let root = scratch("gh543-full-repairs-one-page");
+    ring_pages(&root, 12);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    fs::write(root.join("pages/p5.md"), "- edited while closed [[p6]]\n").unwrap();
+    fs::remove_file(root.join("pages/p7.md")).unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let owner = TestOwner::start(&graph);
+    pause.reached.wait();
+    graph.drift_generation_test();
+    pause.release.wait();
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(
+        owner.wait_ready(Duration::from_secs(10)),
+        "{}",
+        index_state(&graph)
+    );
+    settle_index(&graph);
+    let builds = graph.direct_projection_test().unwrap().fresh_builds_test();
+    let edited = graph
+        .run_query("\"edited while closed\"")
+        .map(|groups| groups.len());
+    let deleted = graph.run_query("\"t7\"").map(|groups| groups.len());
+    let state = index_state(&graph);
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        builds, 0,
+        "a one-page difference rebuilt the whole index: {state}"
+    );
+    assert_eq!(edited.ok(), Some(1), "the edited page is not searchable");
+    assert_eq!(
+        deleted.ok(),
+        Some(0),
+        "the deleted page is still searchable"
+    );
+}
+
+/// A page that recovers from unreadable travels as its own update, with or
+/// without an index owner, and never rebuilds the index from scratch
+/// (GH #543, audit R9-04).
+#[test]
+fn gh543_a_recovered_page_is_one_update() {
+    for with_owner in [true, false] {
+        let root = scratch("gh543-recovered-page-update");
+        ring_pages(&root, 12);
+        let bad = root.join("pages/bad.md");
+        fs::write(&bad, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
+        let graph = Arc::new(Graph::open(&root));
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        let owner = with_owner.then(|| TestOwner::start(&graph));
+        match &owner {
+            Some(owner) => {
+                assert!(owner.wait_settled(Duration::from_secs(10)));
+                assert!(owner.wait_ready(Duration::from_secs(10)));
+            }
+            None => graph.warm_cache(),
+        }
+        settle_index(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let builds_before = projection.fresh_builds_test();
+        fs::write(&bad, "- recovered [[p1]]\n").unwrap();
+        let delivered = graph
+            .sync_file_checked(&bad)
+            .unwrap()
+            .map(|entry| entry.name);
+        settle_index(&graph);
+        let builds = projection.fresh_builds_test() - builds_before;
+        let found = graph.run_query("\"recovered\"").map(|groups| groups.len());
+        let state = index_state(&graph);
+        if let Some(owner) = owner {
+            owner.stop();
+        }
+        crate::direct_projection::release_projection(&graph);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(delivered.as_deref(), Some("bad"), "with_owner={with_owner}");
+        assert_eq!(
+            builds, 0,
+            "with_owner={with_owner}: a recovered page rebuilt the index: {state}"
+        );
+        assert_eq!(
+            found.ok(),
+            Some(1),
+            "with_owner={with_owner}: not searchable: {state}"
+        );
+    }
+}

@@ -105,6 +105,16 @@ impl DirectProjection {
         // still held (GH #543).
         pending.seed_page_order(walk_order.iter().map(String::as_str));
         pending.place_unseeded_deltas();
+        pending.sent = SentSources {
+            inventory: Some(SentInventory {
+                revisions: sources
+                    .iter()
+                    .map(|(entry, revision)| (entry.rel_path.clone(), revision.clone()))
+                    .collect(),
+                digest: parse_config.digest(),
+            }),
+            pages: HashMap::new(),
+        };
         pending.warm_outcome = None;
         pending.warm_attempt += 1;
         let attempt = pending.warm_attempt;

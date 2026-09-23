@@ -243,7 +243,7 @@
       "coverage": {
         "tests": [
           "scripts/e2e-external-assets.mjs",
-          "src-tauri/src/watcher.rs::external_asset_alias_events_refresh_replacement_and_deletion"
+          "src-tauri/src/watcher/tests.rs::external_asset_alias_events_refresh_replacement_and_deletion"
         ],
         "scenario": "external-assets-lexical-watch-alias",
         "failBefore": "proven"
@@ -712,7 +712,7 @@
       "coverage": {
         "tests": [
           "crates/tine-core/tests/graph.rs::resolve_sync_conflict_merges_and_trashes",
-          "src-tauri/src/watcher.rs::unset_watch_mode_prefers_native_events_on_every_platform",
+          "src-tauri/src/watcher/tests.rs::unset_watch_mode_prefers_native_events_on_every_platform",
           "src/components/ConflictResolution.test.tsx",
           "src/components/ConflictQueueBadge.test.tsx",
           "scripts/e2e-concord-sync-copy.mjs"

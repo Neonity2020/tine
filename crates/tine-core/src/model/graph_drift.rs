@@ -336,14 +336,21 @@ impl Graph {
     }
 
     /// Whether `revision` of `path` is already everywhere a reconcile would
-    /// put it, so a delivery of those bytes may publish nothing: the parsed
-    /// cache reflects it (with no parsed cache, the session record written by
-    /// every publication stands in for it) and the index has it too. The
-    /// cache alone is not enough: a whole-graph read installs the revisions it
-    /// parsed without sending them to the index (its snapshot is refused
-    /// while the index is current or a warm owns readiness), and the watcher
-    /// that took the parsed cache for the index left an external edit out of
-    /// search and queries for the session (GH #543, audit R8-02). The caller
+    /// put it, so a delivery of those bytes may publish nothing.
+    ///
+    /// Three stores can hold a page's bytes: the parsed cache (its recorded
+    /// disk revision), this session's served record (the ids every
+    /// publication writes), and the index (what it holds or was sent). Every
+    /// store with an opinion about the page must hold `revision`, and at
+    /// least one must. With a parsed cache, a page it lacks is an opinion
+    /// ("not these bytes"); a store that knows nothing of the page abstains.
+    ///
+    /// One rule for all three, because each earlier rule trusted one store
+    /// for another: the parsed cache for the index left an external edit out
+    /// of search for the session (GH #543, audit R8-02); readiness for the
+    /// index published unchanged bytes during the launch build (R9-02); and
+    /// the parsed cache for "a page this session served" published unchanged
+    /// bytes whenever the app ran from the index alone (R9-03). The caller
     /// passes the cache state it holds the lock for.
     pub(super) fn page_revision_current(
         &self,
@@ -351,42 +358,45 @@ impl Graph {
         path: &Path,
         revision: &str,
     ) -> bool {
-        let published = self.session_published(path, revision);
-        let cached = self
+        let recorded = self
             .disk_revs
             .read()
             .unwrap()
             .get(path)
-            .is_some_and(|known| known == revision)
-            || (cache_is_none && published);
-        cached && (published || self.index_has_revision(path, revision))
+            .map(|known| known == revision);
+        let cache = if cache_is_none {
+            recorded
+        } else {
+            Some(recorded.unwrap_or(false))
+        };
+        let config = self.config().parse_config().digest();
+        let served = self
+            .session_page_ids
+            .read()
+            .unwrap()
+            .get(path)
+            .map(|ids| ids.revision == revision && ids.config == config);
+        let index = self
+            .direct_projection
+            .get()
+            .map(|_| self.index_has_revision(path, revision));
+        let opinions = [cache, served, index];
+        opinions.contains(&Some(true)) && !opinions.contains(&Some(false))
     }
 
-    /// Whether the index has `revision` of `path` or was sent it: no index is
-    /// attached, this session published those bytes under the current parse
-    /// configuration, or the ready image holds them.
+    /// Whether the index holds, or was sent, `revision` of `path` under the
+    /// current parse configuration; true when no index is attached. See
+    /// [`crate::direct_projection::DirectProjection::holds_source_revision`].
     pub(super) fn index_has_revision(&self, path: &Path, revision: &str) -> bool {
         let Some(projection) = self.direct_projection.get() else {
             return true;
         };
-        self.session_published(path, revision)
-            || projection.holds_source_revision(
-                self.cache_gen.load(Ordering::Acquire),
-                &self.rel_path(path),
-                &crate::direct_projection::projection_source_revision(
-                    revision,
-                    self.config().parse_config().digest(),
-                ),
-            )
-    }
-
-    fn session_published(&self, path: &Path, revision: &str) -> bool {
-        let config = self.config().parse_config().digest();
-        self.session_page_ids
-            .read()
-            .unwrap()
-            .get(path)
-            .is_some_and(|ids| ids.revision == revision && ids.config == config)
+        projection.holds_source_revision(
+            self.cache_gen.load(Ordering::Acquire),
+            &self.rel_path(path),
+            revision,
+            &self.config().parse_config().digest(),
+        )
     }
 
     /// Publish the ids of a page opened at bytes the ready index already
@@ -408,7 +418,7 @@ impl Graph {
         };
         let config = self.config().parse_config().digest();
         let generation = self.cache_gen.load(Ordering::Acquire);
-        if !projection.holds_source_revision(
+        if !projection.image_holds_source_revision(
             generation,
             &self.rel_path(path),
             &crate::direct_projection::projection_source_revision(revision, config),

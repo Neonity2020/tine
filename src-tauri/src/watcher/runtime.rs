@@ -84,8 +84,9 @@ pub(super) fn graph_text_observation(
                 | EventKind::Modify(ModifyKind::Metadata(_))
                 | EventKind::Remove(RemoveKind::File)
         );
-    let rename_event = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
-    let rename_has_file_witness = rename_event
+    // A rename pair whose surviving side is a file moved a file: the old name
+    // needs no index to answer for it.
+    let rename_has_file_witness = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
         && event
             .paths
             .iter()
@@ -109,10 +110,9 @@ pub(super) fn graph_text_observation(
         };
         match class {
             GraphTextExactFeedPathClass::Excluded => continue,
-            GraphTextExactFeedPathClass::Configuration => {
-                observation.uncertain = true;
-                break;
-            }
+            // Configuration is not graph text; its own queue decides how far a
+            // change reaches (GH #543, audit R9-05).
+            GraphTextExactFeedPathClass::Configuration => continue,
             GraphTextExactFeedPathClass::RetainedFile => {}
             _ => {
                 observation.uncertain = true;
@@ -136,23 +136,31 @@ pub(super) fn graph_text_observation(
             if is_page_file_path(path) {
                 observation.exact_paths.push(path.clone());
             }
-        } else if rename_event {
-            if !rename_has_file_witness {
-                if descendants_excluded {
-                    continue;
-                }
-                observation.uncertain = true;
-                break;
-            }
+        } else if rename_has_file_witness {
             if is_page_file_path(path) {
                 observation.exact_paths.push(path.clone());
             }
         } else {
-            if descendants_excluded {
-                continue;
+            // A rename without that witness, or a kind that did not say file or
+            // directory (such as `Remove(Any)`): the old name no longer exists
+            // to ask. `graph_text_watch_reach` answers from the current identity
+            // index, and is the same answer the batch queue uses (GH #543,
+            // audit R9-06).
+            match graph.graph_text_watch_reach(path) {
+                GraphTextWatchReach::Nothing => continue,
+                GraphTextWatchReach::File => {
+                    if is_page_file_path(path) {
+                        observation.exact_paths.push(path.clone());
+                    }
+                }
+                GraphTextWatchReach::Subtree => {
+                    if descendants_excluded {
+                        continue;
+                    }
+                    observation.uncertain = true;
+                    break;
+                }
             }
-            observation.uncertain = true;
-            break;
         }
     }
 
@@ -613,8 +621,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     graph.baseline = true;
                 }
                 let retry_due = graph.retry.take_due(Instant::now());
-                let owned = pending_for_graph(&paths, &graph.graph);
-                let full_owned = full_scan_owner_for_graph(&full_paths, &graph.graph);
+                let (full_owned, exact_owned) =
+                    unclassified_paths_for_graph(&full_paths, &graph.graph);
+                let mut owned = pending_for_graph(&paths, &graph.graph);
+                owned.extend(exact_owned);
                 let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
                 let mut cycle_failed = false;
                 let mut attempted = false;
