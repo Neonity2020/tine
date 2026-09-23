@@ -420,7 +420,11 @@ SQL-only reopen is not offered to the index: a full capture is taken only when
 a fresh image is owed. A whole-graph derived read (page inventory, aliases,
 icons, journal days, block-ref counts) with no parsed cache waits while a survey,
 a turn in progress, or an edit queued on a validated image is coming, and
-parses the graph only when none is. Once the app replaces a graph (a switch or
+parses the graph only when none is. Every such read asks through
+`Graph::indexed_or_fallback`: when the index leaves its answer to an installed
+parsed cache, the cache is read right after that decision, and a cache a
+rename, merge or delete discarded in between sends the read back to the index,
+which waits for that change's delta rather than parse. Once the app replaces a graph (a switch or
 a refresh) it retires it, only after every step that can fail, so a failed
 refresh leaves the bound graph serving: a display read still running on it (page list,
 aliases, icons, journal days, block-ref counts, templates, backlink filters)

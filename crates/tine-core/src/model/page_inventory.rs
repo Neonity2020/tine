@@ -39,9 +39,12 @@ impl Graph {
         // A graph whose text cannot be read, or a display read on a retired
         // graph, lists nothing for display and is an error to an acting
         // caller; neither answer is memoized, so it cannot outlive its cause.
-        let base = match self.direct_projection_page_inventory() {
-            Some((_, entries)) => entries,
-            None => match self.page_snapshot(!exact) {
+        let base = match self.indexed_or_fallback(|| self.direct_projection_page_inventory()) {
+            Ok((_, entries)) => entries,
+            Err(PageFallback::Cache(pages)) => {
+                pages.iter().map(|(entry, _)| entry.clone()).collect()
+            }
+            Err(PageFallback::Parse) => match self.page_snapshot(!exact) {
                 Ok(Some(pages)) => pages.iter().map(|(entry, _)| entry.clone()).collect(),
                 Ok(None) => return Ok(Vec::new()),
                 Err(error) if exact => return Err(error),
@@ -208,7 +211,13 @@ impl Graph {
                 return ReferencedPageNames::answer(*digest, names, known);
             }
         }
-        if let Some(names) = self.direct_projection_referenced_page_names() {
+        let indexed = self.indexed_or_fallback(|| self.direct_projection_referenced_page_names());
+        if let Err(PageFallback::Cache(pages)) = &indexed {
+            let names = referenced_page_names_from_snapshot(pages);
+            let digest = referenced_names_digest(&names);
+            return ReferencedPageNames::answer(digest, &names, known);
+        }
+        if let Ok(names) = indexed {
             let digest = referenced_names_digest(&names);
             let answer = ReferencedPageNames::answer(digest, &names, known);
             // Only a read that still matches the generation we keyed on may be

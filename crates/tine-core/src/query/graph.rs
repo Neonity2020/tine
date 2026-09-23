@@ -6,6 +6,29 @@ use crate::config::Config;
 use crate::doc::Document;
 use crate::vocab::{PageEntry, PageKind, RefGroup, ReferenceCandidatePages, ReferenceKind};
 
+/// How to answer a read the index declined; see `Graph::indexed_or_fallback`.
+pub(crate) enum PageFallback {
+    /// The parsed cache the index left the answer to.
+    Cache(Arc<Vec<(PageEntry, Arc<Document>)>>),
+    /// The index could not answer and had no cache to leave it to: the
+    /// caller's parser route, which reads a cache installed meanwhile or
+    /// builds one.
+    Parse,
+}
+
+impl PageFallback {
+    pub(crate) fn with_pages<G: QueryGraph + ?Sized, T>(
+        self,
+        graph: &G,
+        f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T,
+    ) -> T {
+        match self {
+            Self::Cache(pages) => f(pages.as_slice()),
+            Self::Parse => graph.with_pages(f),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) trait QueryGraph {
     fn indexed_derived_pages(
@@ -15,6 +38,14 @@ pub(crate) trait QueryGraph {
         None
     }
     fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T;
+    /// Ask the index with `indexed`, and say how to answer if it declines;
+    /// see `Graph::indexed_or_fallback`.
+    fn indexed_or_fallback<T>(
+        &self,
+        mut indexed: impl FnMut() -> Option<T>,
+    ) -> Result<T, PageFallback> {
+        indexed().ok_or(PageFallback::Parse)
+    }
     fn page_aliases(&self) -> Vec<(String, String)>;
     fn block_page_hint(&self, uuid: &str) -> Option<String>;
     fn reference_candidate_pages(
@@ -82,6 +113,12 @@ impl<G: QueryGraph> QueryGraph for Arc<G> {
     }
     fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
         (**self).with_pages(f)
+    }
+    fn indexed_or_fallback<T>(
+        &self,
+        indexed: impl FnMut() -> Option<T>,
+    ) -> Result<T, PageFallback> {
+        (**self).indexed_or_fallback(indexed)
     }
 
     fn page_aliases(&self) -> Vec<(String, String)> {

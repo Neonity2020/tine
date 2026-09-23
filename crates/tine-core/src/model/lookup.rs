@@ -222,10 +222,11 @@ impl Graph {
     /// icon appear in the result. On-demand (e.g. a `{{namespace}}` macro), not at
     /// index time.
     pub fn page_icons(&self, names: &[String]) -> std::collections::HashMap<String, String> {
-        if let Some(icons) = self.indexed_page_icons(names) {
-            return icons;
-        }
-        let (mut icons_by_name, real_page_names) = self.with_pages(|pages| {
+        let fallback = match self.indexed_or_fallback(|| self.indexed_page_icons(names)) {
+            Ok(icons) => return icons,
+            Err(fallback) => fallback,
+        };
+        let (mut icons_by_name, real_page_names) = fallback.with_pages(self, |pages| {
             let mut icons = std::collections::HashMap::new();
             let mut real = std::collections::HashSet::new();
             for (entry, doc) in pages {
@@ -298,10 +299,12 @@ impl Graph {
     }
 
     pub(crate) fn page_aliases_with_owners(&self) -> Vec<(String, String, String)> {
-        if let Some(aliases) = self.direct_projection_page_aliases_with_owners() {
-            return aliases;
+        match self.indexed_or_fallback(|| self.direct_projection_page_aliases_with_owners()) {
+            Ok(aliases) => aliases,
+            Err(fallback) => {
+                fallback.with_pages(self, crate::query::page_aliases_with_owners_from_pages)
+            }
         }
-        crate::query::page_aliases_with_owners(self)
     }
 
     /// The page that owns a block UUID / UUID-valued `id::`, selected from the
@@ -309,9 +312,11 @@ impl Graph {
     /// still verify parser evidence, and unsupported/stale projection state
     /// falls back to an exact parser scan.
     pub fn block_page_hint(&self, uuid: &str) -> Option<String> {
-        if let Some(hint) = self.direct_projection_block_page_hint(uuid) {
-            return hint;
-        }
+        let fallback =
+            match self.indexed_or_fallback(|| self.direct_projection_block_page_hint(uuid)) {
+                Ok(hint) => return hint,
+                Err(fallback) => fallback,
+            };
         fn walk_idx(
             blocks: &[DocBlock],
             name: &str,
@@ -329,7 +334,7 @@ impl Graph {
                 walk_idx(&b.children, name, m);
             }
         }
-        let map = self.with_pages(|pages| {
+        let map = fallback.with_pages(self, |pages| {
             let mut m = std::collections::HashMap::new();
             for (entry, doc) in pages {
                 walk_idx(&doc.roots, &entry.name, &mut m);
@@ -354,27 +359,31 @@ impl Graph {
         self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        if let Some((pages, blocks, page_owners)) = self
-            .direct_projection_reference_candidate_pages(
+        let indexed = self.indexed_or_fallback(|| {
+            self.direct_projection_reference_candidate_pages(
                 names_norm,
                 self_page,
                 kind,
                 crate::query::candidate::CandidateMode::Exhaustive,
                 super::direct_query::IndexWait::WhileComing,
             )
-        {
-            // R6: the inventory is the projection's (memoized), never a reason
-            // to build the whole parsed graph.
-            let full_page_count = self.list_pages().len();
-            return ReferenceCandidatePages {
-                pages,
-                blocks,
-                page_owners,
-                indexed: true,
-                full_page_count,
-            };
-        }
-        let pages = self.with_pages(|pages| pages.iter().cloned().collect::<Vec<_>>());
+        });
+        let fallback = match indexed {
+            Ok((pages, blocks, page_owners)) => {
+                // R6: the inventory is the projection's (memoized), never a reason
+                // to build the whole parsed graph.
+                let full_page_count = self.list_pages().len();
+                return ReferenceCandidatePages {
+                    pages,
+                    blocks,
+                    page_owners,
+                    indexed: true,
+                    full_page_count,
+                };
+            }
+            Err(fallback) => fallback,
+        };
+        let pages = fallback.with_pages(self, |pages| pages.to_vec());
         ReferenceCandidatePages {
             full_page_count: pages.len(),
             pages,
@@ -455,10 +464,12 @@ impl Graph {
     /// The exact-generation SQLite projection is the ready route; its parser
     /// fallback is used only while that disposable projection is unavailable.
     pub fn block_ref_counts(&self) -> io::Result<Arc<std::collections::HashMap<String, usize>>> {
-        if let Some(counts) = self.direct_projection_block_ref_counts() {
-            return Ok(Arc::new(counts));
-        }
-        let map = self.with_pages(|pages| -> io::Result<_> {
+        let fallback = match self.indexed_or_fallback(|| self.direct_projection_block_ref_counts())
+        {
+            Ok(counts) => return Ok(Arc::new(counts)),
+            Err(fallback) => fallback,
+        };
+        let map = fallback.with_pages(self, |pages| -> io::Result<_> {
             let mut counts = std::collections::HashMap::new();
             for (_entry, doc) in pages {
                 for (id, count) in document_block_ref_counts(doc)? {

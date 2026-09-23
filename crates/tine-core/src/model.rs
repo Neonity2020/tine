@@ -88,6 +88,7 @@ pub use crate::filesystem_durability::{
 };
 use projection_fs::*;
 mod trash;
+pub(crate) use crate::query::graph::PageFallback;
 use asset_files::*;
 use asset_refs::*;
 use asset_reserve::*;

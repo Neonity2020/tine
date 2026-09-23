@@ -581,21 +581,23 @@ impl Graph {
                 generation,
                 identity_index,
             },
-            DirectCreationEvidence::Cold => match self.indexed_creation_evidence() {
-                Some(evidence) => evidence,
-                // Asking the index waited for the launch survey, which may
-                // have installed parsed evidence since (GH #543).
-                None => match self.direct_creation_evidence()? {
-                    DirectCreationEvidence::Cold => {
-                        let outcome = self.repair_page_cache_once(permit);
-                        if !outcome.installed() {
-                            return Err(outcome.creation_error());
+            DirectCreationEvidence::Cold => {
+                match self.indexed_or_fallback(|| self.indexed_creation_evidence()) {
+                    Ok(evidence) => evidence,
+                    // Asking the index waited for the launch survey, which may
+                    // have installed parsed evidence since (GH #543).
+                    Err(_) => match self.direct_creation_evidence()? {
+                        DirectCreationEvidence::Cold => {
+                            let outcome = self.repair_page_cache_once(permit);
+                            if !outcome.installed() {
+                                return Err(outcome.creation_error());
+                            }
+                            self.direct_creation_evidence()?
                         }
-                        self.direct_creation_evidence()?
-                    }
-                    warm => warm,
-                },
-            },
+                        warm => warm,
+                    },
+                }
+            }
         };
         let DirectCreationEvidence::Warm {
             generation,

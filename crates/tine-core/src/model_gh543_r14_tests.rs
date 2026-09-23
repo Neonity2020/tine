@@ -364,3 +364,195 @@ fn gh543_a_page_deleted_while_closed_leaves_the_cached_page_list() {
         "the page list still lists a page deleted while Tine was closed: {state}"
     );
 }
+
+/// Seed 3012 of the long interleaving run: a derived read declined in favour
+/// of an installed parsed cache, a rename discarded that cache before the
+/// reader read it, and the reader parsed the whole graph although the index
+/// was about to answer. The decision and the read of its evidence were apart.
+#[test]
+fn gh543_a_cache_discarded_after_a_read_chose_it_costs_no_parse() {
+    let root = r10_scratch("cache-decline");
+    r10_pages(&root, 3);
+    fs::write(root.join("pages/aliased.md"), "alias:: nick\n\n- held\n").unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let owner = R10Owner::start(&graph);
+    assert!(owner.wait_settled(Duration::from_secs(20)));
+    assert!(owner.wait_ready(Duration::from_secs(20)));
+    super::gh543_r10::r10_settle(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+
+    // An acting whole-graph read installs the parsed cache beside the index.
+    graph
+        .try_with_pages(|pages| assert_eq!(pages.len(), 4))
+        .unwrap();
+    assert!(
+        graph.has_parsed_cache_test(),
+        "precondition: a parsed cache"
+    );
+    let baseline = graph.consumer_page_parses_test();
+
+    // Hold the next index turn mid-apply, so work is coming and the index
+    // is not ready at the graph's generation.
+    let (held_tx, held) = std::sync::mpsc::channel::<()>();
+    let (release_turn, turn_released) = std::sync::mpsc::channel::<()>();
+    projection.after_next_lowering_batch_test(Box::new(move || {
+        let _ = held_tx.send(());
+        let _ = turn_released.recv_timeout(Duration::from_secs(30));
+    }));
+    let edited = root.join("pages/p0.md");
+    fs::write(&edited, "- TODO edited [[p1]]\n").unwrap();
+    graph.sync_file_checked(&edited).unwrap();
+    held.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(
+        graph.has_parsed_cache_test(),
+        "precondition: the edit kept the cache"
+    );
+
+    // An alias read leaves its answer to the cache and pauses there.
+    let decline = graph.pause_next_cache_decline_test();
+    let reader = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.page_aliases())
+    };
+    decline.reached.wait();
+
+    // A rename discards the cache before the alias read reads it.
+    graph.rename_page("p2", "renamed").unwrap();
+    assert!(
+        !graph.has_parsed_cache_test(),
+        "precondition: the rename discarded the cache"
+    );
+    release_turn.send(()).unwrap();
+    decline.release.wait();
+    let aliases = reader.join().unwrap();
+
+    assert!(
+        aliases
+            .iter()
+            .any(|(alias, page)| alias == "nick" && page == "aliased"),
+        "{aliases:?}"
+    );
+    assert_eq!(
+        graph.consumer_page_parses_test() - baseline,
+        0,
+        "the alias read parsed the graph though the index was about to answer"
+    );
+    drop(projection);
+    r10_finish(root, graph, owner);
+}
+
+/// GH #543 (I-13): a read that falls back from the index to the parsed pages
+/// asks through `Graph::indexed_or_fallback`, which reads the cache a decline
+/// named right after the decision and sends a read whose cache was discarded
+/// back to the index. A fallback of its own re-reads the cache later and
+/// parses the whole graph when a rename discarded it in between (long-run
+/// seed 3012). The wrapper set is derived: every function that calls
+/// `self.indexed_read(`, and every function forwarding one's `Option` as its
+/// own. Imitate `Graph::journal_content_days` in `model/journals.rs`.
+#[test]
+fn index_fallbacks_go_through_indexed_or_fallback() {
+    fn sources(dir: &Path, out: &mut Vec<(String, Vec<String>)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if name.ends_with(".rs") && !name.contains("test") {
+                let text = fs::read_to_string(&path).unwrap();
+                out.push((name, text.lines().map(str::to_owned).collect()));
+            }
+        }
+    }
+    /// The function around line `at`: its name, whether it forwards an
+    /// `Option`, and whether it is test-only.
+    fn enclosing(lines: &[String], at: usize) -> (String, bool, bool) {
+        for start in (0..=at).rev() {
+            let line = &lines[start];
+            let Some(index) = line.find("fn ") else {
+                continue;
+            };
+            let name: String = line[index + 3..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let rest = &line[index + 3 + name.len()..];
+            if name.is_empty() || !(rest.starts_with('(') || rest.starts_with('<')) {
+                continue;
+            }
+            let signature = lines[start..(start + 8).min(lines.len())].join(" ");
+            let signature = signature.split('{').next().unwrap_or_default();
+            let test_only = lines[start.saturating_sub(3)..start]
+                .iter()
+                .any(|line| line.contains("#[cfg(test)]"));
+            return (name, signature.contains("-> Option<"), test_only);
+        }
+        (String::new(), false, false)
+    }
+    fn calls(line: &str, name: &str) -> bool {
+        (line.contains(&format!(".{name}(")) || line.contains(&format!("::{name}(")))
+            && !line.contains(&format!("fn {name}"))
+    }
+    // A bounded wait never declines for a cache: its fallback is the
+    // converted `reference_candidate_pages`.
+    const EXEMPT: &[(&str, &str)] = &[(
+        "reference_candidate_pages_indexed",
+        "direct_projection_reference_candidate_pages",
+    )];
+
+    let mut files = Vec::new();
+    sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let mut wrappers = std::collections::BTreeSet::new();
+    for (_, lines) in &files {
+        for (at, line) in lines.iter().enumerate() {
+            if line.contains("self.indexed_read(") {
+                wrappers.insert(enclosing(lines, at).0);
+            }
+        }
+    }
+    let mut violations = Vec::new();
+    loop {
+        let known = wrappers.len();
+        violations.clear();
+        for (file, lines) in &files {
+            for (at, line) in lines.iter().enumerate() {
+                for name in wrappers.clone() {
+                    if !calls(line, &name) {
+                        continue;
+                    }
+                    let context = lines[at.saturating_sub(3)..=at].join(" ");
+                    if context.contains("indexed_or_fallback") {
+                        continue;
+                    }
+                    let (caller, forwards, test_only) = enclosing(lines, at);
+                    if test_only || EXEMPT.contains(&(caller.as_str(), name.as_str())) {
+                        continue;
+                    }
+                    if forwards {
+                        wrappers.insert(caller);
+                    } else {
+                        violations.push(format!("{file}:{} {caller} calls {name}", at + 1));
+                    }
+                }
+            }
+        }
+        if wrappers.len() == known {
+            break;
+        }
+    }
+    assert!(
+        wrappers.contains("indexed_derived_pages")
+            && wrappers.contains("indexed_creation_evidence"),
+        "the census found no wrappers: {wrappers:?}"
+    );
+    assert!(
+        violations.is_empty(),
+        "a fallback from the index must ask through Graph::indexed_or_fallback (I-13); \
+         imitate Graph::journal_content_days: {violations:?}"
+    );
+}

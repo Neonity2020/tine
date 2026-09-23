@@ -1388,6 +1388,15 @@ impl Graph {
         pause
     }
 
+    /// Pause the next derived read that leaves its answer to the parsed
+    /// cache, after that decision and before its caller reads the cache.
+    #[cfg(test)]
+    pub(crate) fn pause_next_cache_decline_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.cache_decline_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
     /// Pause the next derived read after it has taken its generation, before
     /// it waits for the index.
     #[cfg(test)]

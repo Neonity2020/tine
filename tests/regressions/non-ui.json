@@ -7499,6 +7499,31 @@
   "failBefore": "proven"
  },
  "notes": "GH #543, seen as a full-suite-only failure of a_listing_overtaken_by_an_edit_reads_the_index_instead_of_parsing. progress_at read readiness before taking the queue lock under which the worker publishes it, so a turn ending in between read as 'not ready, nothing queued' = Stale, which a query reports as ReadFailed. Readiness is now read under the lock. Fail-before tine-agents/evidence/gh550-batch/reconciler/progress-publish-race-fail-before.log (3/3)."
+},
+{
+ "id": "REG-CACHE-DECLINE-DISCARD-543",
+ "title": "A page renamed right after a publish does not make the page list, aliases or search read the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_a_cache_discarded_after_a_read_chose_it_costs_no_parse",
+   "crates/tine-core/src/model_gh543_r14_tests.rs::index_fallbacks_go_through_indexed_or_fallback"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543, long interleaving run seed 3012 (1 in ~4,500 seed runs). A derived read declined in favour of an installed parsed cache; a rename discarded the cache before the reader read it, and the reader parsed the whole graph although the discard had queued its delta. Every index fallback now asks through Graph::indexed_or_fallback, which reads the named cache at once and sends a read whose cache vanished back to the index; a derived source guard pins every fallback to it. Fail-before tine-agents/evidence/gh550-batch/reconciler/cache-decline-discard-fail-before.log (3/3, 4 consumer parses)."
 }
 ]
 }

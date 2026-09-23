@@ -408,6 +408,22 @@ impl Graph {
                 // (GH #543).
                 let current = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
                 if cached || current == generation {
+                    if cached {
+                        Self::note_cache_decline();
+                    }
+                    #[cfg(test)]
+                    if cached {
+                        let pause = self
+                            .page_build_test
+                            .cache_decline_pause
+                            .lock()
+                            .unwrap()
+                            .take();
+                        if let Some(pause) = pause {
+                            pause.reached.wait();
+                            pause.release.wait();
+                        }
+                    }
                     return None;
                 }
                 generation = current;

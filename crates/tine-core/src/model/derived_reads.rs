@@ -1,6 +1,7 @@
 //! The readiness boundary for launch-time SQL answers.
 use super::*;
 use crate::direct_projection::{derived_reads::DerivedSelection, DirectProjection};
+use crate::query::graph::PageFallback;
 use std::collections::HashMap;
 
 /// Whether this thread is serving a display read, and whether retirement cut
@@ -16,6 +17,9 @@ thread_local! {
     static DISPLAY_READ: std::cell::Cell<DisplayRead> = const { std::cell::Cell::new(DisplayRead::Off) };
     /// Set while this thread runs an index owner; see [`OwnerThread`].
     static INDEX_OWNER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set when this thread's last derived read declined because a parsed
+    /// cache answers instead; see [`Graph::indexed_or_fallback`].
+    static CACHE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Marks the current thread as running an index owner for its lifetime.
@@ -110,6 +114,44 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn open_page_during_next_derived_read_test(&self, path: Option<PathBuf>) {
         *self.page_build_test.derived_read_open_once.lock().unwrap() = path;
+    }
+
+    /// Record that this thread's derived read is leaving its answer to the
+    /// installed parsed cache.
+    pub(super) fn note_cache_decline() {
+        CACHE_DECLINED.with(|declined| declined.set(true));
+    }
+
+    /// Ask the index with `indexed`; when it declines, say how the caller
+    /// answers instead. Every read that falls back from the index to the
+    /// parsed pages goes through here.
+    ///
+    /// A decline can mean "the parsed cache answers now" (an acting read
+    /// installed one while the index was mid-turn). That decision and the
+    /// caller's read of the cache were apart: a rename, merge or delete that
+    /// discarded the cache in between left the caller no cache, and it parsed
+    /// the whole graph although the discard had just queued its delta and
+    /// the index was about to answer (GH #543, long-run seed 3012). Here the
+    /// cache is read right after the decision, and a cache discarded
+    /// meanwhile sends the read back to the index, which waits for that
+    /// delta. Each retry follows a discard, so three bound it.
+    pub(crate) fn indexed_or_fallback<T>(
+        &self,
+        mut indexed: impl FnMut() -> Option<T>,
+    ) -> Result<T, PageFallback> {
+        for _ in 0..3 {
+            CACHE_DECLINED.with(|declined| declined.set(false));
+            if let Some(answer) = indexed() {
+                return Ok(answer);
+            }
+            if !CACHE_DECLINED.with(|declined| declined.replace(false)) {
+                return Err(PageFallback::Parse);
+            }
+            if let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) {
+                return Err(PageFallback::Cache(pages));
+            }
+        }
+        Err(PageFallback::Parse)
     }
 
     fn derived_reader(&self) -> Option<(Arc<DirectProjection>, u64)> {

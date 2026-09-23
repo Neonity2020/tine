@@ -351,11 +351,14 @@ impl Graph {
         max_values: usize,
         max_bytes: usize,
     ) -> (Vec<(String, Vec<String>)>, bool) {
-        if let Some(result) = self.direct_projection_property_facets(false, max_values, max_bytes) {
-            return result;
-        }
+        let fallback = match self.indexed_or_fallback(|| {
+            self.direct_projection_property_facets(false, max_values, max_bytes)
+        }) {
+            Ok(result) => return result,
+            Err(fallback) => fallback,
+        };
         self.direct_projection_note_fallback_read();
-        crate::query::property_facets_bounded(self, max_values, max_bytes)
+        crate::query::property_facets_bounded_over(self, fallback, max_values, max_bytes)
     }
 
     pub fn autocomplete_property_facets_bounded(
@@ -363,11 +366,16 @@ impl Graph {
         max_items: usize,
         max_bytes: usize,
     ) -> (Vec<(String, Vec<String>)>, bool) {
-        if let Some(result) = self.direct_projection_property_facets(true, max_items, max_bytes) {
-            return result;
-        }
+        let fallback = match self.indexed_or_fallback(|| {
+            self.direct_projection_property_facets(true, max_items, max_bytes)
+        }) {
+            Ok(result) => return result,
+            Err(fallback) => fallback,
+        };
         self.direct_projection_note_fallback_read();
-        crate::query::autocomplete_property_facets_bounded(self, max_items, max_bytes)
+        crate::query::autocomplete_property_facets_bounded_over(
+            self, fallback, max_items, max_bytes,
+        )
     }
 
     // ---- Assets & PDF highlights ----

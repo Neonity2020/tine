@@ -184,8 +184,23 @@ pub fn property_facets_bounded(
     max_values: usize,
     max_bytes: usize,
 ) -> (Vec<(String, Vec<String>)>, bool) {
+    property_facets_bounded_over(
+        graph,
+        crate::query::graph::PageFallback::Parse,
+        max_values,
+        max_bytes,
+    )
+}
+
+/// [`property_facets_bounded`] over the pages an index decline named.
+pub(crate) fn property_facets_bounded_over(
+    graph: &impl QueryGraph,
+    pages: crate::query::graph::PageFallback,
+    max_values: usize,
+    max_bytes: usize,
+) -> (Vec<(String, Vec<String>)>, bool) {
     let mut accumulator = PropertyFacetAccumulator::query_builder(max_values, max_bytes);
-    graph.with_pages(|pages| {
+    pages.with_pages(graph, |pages| {
         for (_entry, doc) in pages {
             walk(&doc.roots, &mut |b| {
                 for (k, v) in b.properties() {
@@ -240,12 +255,28 @@ pub fn autocomplete_property_facets_bounded<G: QueryGraph>(
     max_items: usize,
     max_bytes: usize,
 ) -> (Vec<(String, Vec<String>)>, bool) {
+    autocomplete_property_facets_bounded_over(
+        graph,
+        crate::query::graph::PageFallback::Parse,
+        max_items,
+        max_bytes,
+    )
+}
+
+/// [`autocomplete_property_facets_bounded`] over the pages an index decline
+/// named.
+pub(crate) fn autocomplete_property_facets_bounded_over<G: QueryGraph>(
+    graph: &G,
+    pages: crate::query::graph::PageFallback,
+    max_items: usize,
+    max_bytes: usize,
+) -> (Vec<(String, Vec<String>)>, bool) {
     let mut accumulator = PropertyFacetAccumulator::autocomplete(
         &graph.config().block_hidden_properties,
         max_items,
         max_bytes,
     );
-    graph.with_pages(|pages| {
+    pages.with_pages(graph, |pages| {
         for (entry, doc) in pages {
             let is_org = Format::from_path(std::path::Path::new(&entry.rel_path)) == Format::Org;
             for (key, value) in page_properties(doc.pre_block.as_deref(), is_org) {

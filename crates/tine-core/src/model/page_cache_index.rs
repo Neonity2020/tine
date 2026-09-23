@@ -181,6 +181,9 @@ pub(super) struct PageBuildTestState {
     pub(super) before_settle: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) derived_read_wait: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) after_parsed_cache_discard: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause one derived read that the parsed cache answered instead of the
+    /// index, after that decision and before the caller reads the cache.
+    pub(super) cache_decline_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// Pause one page publication right after it releases the cache lock,
     /// with its new generation observable, before it returns.
     pub(super) upsert_published_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,

@@ -19,7 +19,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   holding contradictory rows is rebuilt once instead of retrying forever. A
   page deleted while Tine was closed now leaves the page list once the launch
   check confirms it, and a query asked the moment the index becomes ready no
-  longer reports the index as unreadable. Query
+  longer reports the index as unreadable. Renaming, merging or deleting a page
+  right after a publish or an asset listing no longer makes the page list,
+  aliases or search read the whole graph. Query
   results now list pages in file-path order, so a page created this session
   takes its place instead of appearing last (GH #543).
 - A query block, the query export dialog, or a publish waiting for the index

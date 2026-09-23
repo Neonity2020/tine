@@ -57,10 +57,11 @@ impl Graph {
     /// least one block with a non-empty, non-property line. Drives the calendar
     /// picker's empty/non-empty day marking. Served from the cache.
     pub fn journal_content_days(&self) -> Vec<i64> {
-        if let Some(days) = self.indexed_journal_content_days() {
-            return days;
-        }
-        self.with_pages(|pages| {
+        let fallback = match self.indexed_or_fallback(|| self.indexed_journal_content_days()) {
+            Ok(days) => return days,
+            Err(fallback) => fallback,
+        };
+        fallback.with_pages(self, |pages| {
             pages
                 .iter()
                 .filter(|(e, _)| e.kind == PageKind::Journal)

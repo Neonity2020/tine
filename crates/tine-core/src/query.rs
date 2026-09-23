@@ -524,18 +524,22 @@ thread_local! {
 /// remains the semantic authority; this helper performs no disk I/O or parsing.
 fn with_candidate_pages<G: QueryGraph, T>(
     graph: &G,
-    candidates: Option<Vec<(PageEntry, std::sync::Arc<Document>)>>,
+    candidates: CandidatePages,
     f: impl FnOnce(&[(PageEntry, std::sync::Arc<Document>)]) -> T,
 ) -> T {
     match candidates {
-        Some(pages) => f(&pages),
-        None => graph.with_pages(f),
+        Ok(pages) => f(&pages),
+        Err(fallback) => fallback.with_pages(graph, f),
     }
 }
 
+/// An index's exact candidate pages, or how to answer without them.
+type CandidatePages =
+    Result<Vec<(PageEntry, std::sync::Arc<Document>)>, crate::query::graph::PageFallback>;
+
 fn collect_bounded_candidates<G: QueryGraph>(
     graph: &G,
-    candidate_pages: Option<Vec<(PageEntry, std::sync::Arc<Document>)>>,
+    candidate_pages: CandidatePages,
     mut keep: impl FnMut(&DocBlock) -> bool,
     mut keep_page_properties: impl FnMut(&PageEntry, &str) -> Option<BlockDto>,
     exclude: Option<&str>,
@@ -721,6 +725,9 @@ pub fn page_aliases<G: QueryGraph>(graph: &G) -> Vec<(String, String)> {
     })
 }
 
+/// The parser oracle for the alias rows; the product reads them through
+/// `Graph::page_aliases_with_owners`, which asks the index first.
+#[cfg(test)]
 pub(crate) fn page_aliases_with_owners<G: QueryGraph>(graph: &G) -> Vec<(String, String, String)> {
     graph.with_pages(page_aliases_with_owners_from_pages)
 }
@@ -817,10 +824,11 @@ pub(crate) struct BacklinkFilterScope {
 }
 
 pub(crate) fn real_page_names<G: QueryGraph>(graph: &G) -> RealPageNames {
-    if let Some(indexed) = graph.reference_real_page_names() {
-        return indexed;
-    }
-    graph.with_pages(|pages| {
+    let fallback = match graph.indexed_or_fallback(|| graph.reference_real_page_names()) {
+        Ok(indexed) => return indexed,
+        Err(fallback) => fallback,
+    };
+    fallback.with_pages(graph, |pages| {
         let mut real = RealPageNames::new();
         for (entry, _) in pages {
             let key = refs::page_key(&entry.name);
@@ -1641,9 +1649,11 @@ pub fn block_referrers<G: QueryGraph>(graph: &G, uuid: &str) -> Vec<RefGroup> {
     }
     collect_bounded_candidates(
         graph,
-        graph
-            .indexed_derived_pages(DerivedSelection::Referrers(u))
-            .or_else(|| graph.direct_projection_block_referrer_candidate_pages(u)),
+        graph.indexed_or_fallback(|| {
+            graph
+                .indexed_derived_pages(DerivedSelection::Referrers(u))
+                .or_else(|| graph.direct_projection_block_referrer_candidate_pages(u))
+        }),
         |b| b.projection().block_refs.iter().any(|r| r == u),
         |_, _| None,
         None,
@@ -1671,9 +1681,11 @@ pub fn block_referrers_bounded<G: QueryGraph>(
     }
     collect_bounded_candidates(
         graph,
-        graph
-            .indexed_derived_pages(DerivedSelection::Referrers(u))
-            .or_else(|| graph.direct_projection_block_referrer_candidate_pages(u)),
+        graph.indexed_or_fallback(|| {
+            graph
+                .indexed_derived_pages(DerivedSelection::Referrers(u))
+                .or_else(|| graph.direct_projection_block_referrer_candidate_pages(u))
+        }),
         |b| b.projection().block_refs.iter().any(|r| r == u),
         |_, _| None,
         None,
@@ -3375,7 +3387,7 @@ pub fn search_cancellable<G: QueryGraph>(
 pub fn templates<G: QueryGraph>(graph: &G) -> Vec<TemplateDto> {
     with_candidate_pages(
         graph,
-        graph.indexed_derived_pages(DerivedSelection::Templates),
+        graph.indexed_or_fallback(|| graph.indexed_derived_pages(DerivedSelection::Templates)),
         |pages| {
             let mut out: Vec<TemplateDto> = Vec::new();
             for (entry, doc) in pages {
@@ -3532,9 +3544,10 @@ pub fn resolve_block<G: QueryGraph>(graph: &G, uuid: &str) -> Option<RefGroup> {
     // pages or the session locator; only an unavailable index needs the legacy
     // whole-graph fallback.
     let ids = [uuid.to_owned()];
-    let candidates = graph.indexed_derived_pages(DerivedSelection::Resolve(&ids));
+    let candidates =
+        graph.indexed_or_fallback(|| graph.indexed_derived_pages(DerivedSelection::Resolve(&ids)));
     let hint = candidates
-        .is_none()
+        .is_err()
         .then(|| graph.block_page_hint(uuid))
         .flatten();
     with_candidate_pages(graph, candidates, |pages| {
@@ -3618,10 +3631,11 @@ pub fn resolve_blocks_bounded<G: QueryGraph>(
     // uuid index); unhinted ids go straight to the whole-graph fallback.
     let mut by_page: HashMap<String, Vec<&str>> = HashMap::new();
     let mut unhinted: Vec<&str> = Vec::new();
-    let candidates = graph.indexed_derived_pages(DerivedSelection::Resolve(uuids));
+    let candidates =
+        graph.indexed_or_fallback(|| graph.indexed_derived_pages(DerivedSelection::Resolve(uuids)));
     for &id in &distinct {
         match candidates
-            .is_none()
+            .is_err()
             .then(|| graph.block_page_hint(id))
             .flatten()
         {
@@ -3755,9 +3769,10 @@ pub fn preview_block_with_budget<G: QueryGraph>(
     let max_nodes = max_nodes.max(1);
     let max_bytes = max_bytes.max(1);
     let ids = [uuid.to_owned()];
-    let candidates = graph.indexed_derived_pages(DerivedSelection::Preview(&ids));
+    let candidates =
+        graph.indexed_or_fallback(|| graph.indexed_derived_pages(DerivedSelection::Preview(&ids)));
     let hint = candidates
-        .is_none()
+        .is_err()
         .then(|| graph.block_page_hint(uuid))
         .flatten();
     with_candidate_pages(graph, candidates, |pages| {

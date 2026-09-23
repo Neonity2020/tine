@@ -13,6 +13,12 @@ impl QueryGraph for Graph {
     fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
         Graph::with_pages(self, f)
     }
+    fn indexed_or_fallback<T>(
+        &self,
+        indexed: impl FnMut() -> Option<T>,
+    ) -> Result<T, PageFallback> {
+        Graph::indexed_or_fallback(self, indexed)
+    }
 
     fn page_aliases(&self) -> Vec<(String, String)> {
         Graph::page_aliases(self)
