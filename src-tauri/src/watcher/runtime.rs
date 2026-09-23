@@ -209,6 +209,9 @@ pub(super) struct WatchedGraph {
     /// successfully. It survives retry cycles and is acknowledged only after
     /// the matching graph batch succeeds.
     pub(super) pending_observation_epoch: Option<GraphTextExternalObservationTicket>,
+    /// A cycle skipped this graph because its storage transition lane was
+    /// held; the paths it drained are gone, so the next cycle diffs in full.
+    pub(super) transition_skipped: bool,
 }
 
 fn asset_root_for_slot(app: &tauri::AppHandle, slot: &GraphSlot) -> Option<PathBuf> {
@@ -273,6 +276,7 @@ pub(super) fn route_drained_direct_frontiers(
                         last_reconcile_error: None,
                         retry: RetrySchedule::default(),
                         pending_observation_epoch: None,
+                        transition_skipped: false,
                     },
                 );
             }
@@ -321,8 +325,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         // Last surfaced `watch()` failure per graph root, so a root that keeps
         // failing reports once instead of every cycle.
         let mut watch_failures: HashMap<PathBuf, String> = HashMap::new();
+        // Last surfaced failure to create the OS watcher, so a retry loop
+        // reports once.
+        let mut watcher_failure: Option<String> = None;
         loop {
-            let inotify = watch_mode(&app) != "poll";
+            let wants_inotify = watch_mode(&app) != "poll";
             let entries = app.state::<AppState>().graphs.read().unwrap().entries();
             let live: HashSet<String> = entries.iter().map(|(label, _)| label.clone()).collect();
             query_images.retain(|label, _| live.contains(label));
@@ -370,6 +377,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 last_reconcile_error: None,
                                 retry: RetrySchedule::default(),
                                 pending_observation_epoch: None,
+                                transition_skipped: false,
                             },
                         );
                     }
@@ -402,13 +410,13 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
 
             // Bring the OS watcher in line with the current mode + graph roots.
             let mut newly_watched = HashSet::new();
-            if inotify {
+            if wants_inotify {
                 if watcher.is_none() {
                     let txc = tx.clone();
                     let pendingc = pending.clone();
                     let appc = app.clone();
                     let rootsc = watched_roots.clone();
-                    watcher =
+                    let created =
                         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                             // A repository's own churn is not a graph change.
                             // Dropped here, before the app-state lock, the graph
@@ -433,8 +441,31 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 }
                             }
                             let _ = txc.send(());
-                        })
-                        .ok();
+                        });
+                    watcher = match created {
+                        Ok(created) => {
+                            watcher_failure = None;
+                            Some(created)
+                        }
+                        Err(error) => {
+                            // No OS watcher (for example at the inotify
+                            // instance limit): this cycle polls instead, and
+                            // the next one tries again. Swallowing the error
+                            // left every external change, and every graph
+                            // configuration change, unseen for the session
+                            // (GH #543, audit R10-07).
+                            let message = format!(
+                                "file watching is unavailable ({error}); checking for changes by polling"
+                            );
+                            if watcher_failure.as_ref() != Some(&message) {
+                                for (label, _) in watch_labels.iter() {
+                                    let _ = app.emit_to(label, "graph-watch-error", &message);
+                                }
+                                watcher_failure = Some(message);
+                            }
+                            None
+                        }
+                    };
                     watched.clear();
                 }
                 if let Some(w) = watcher.as_mut() {
@@ -477,6 +508,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 watched.clear();
                 watch_failures.clear();
             }
+            // Events come from the OS watcher only while there is one;
+            // otherwise this cycle is a poll, whatever the setting says.
+            let inotify = wants_inotify && watcher.is_some();
             watch_failures.retain(|dir, _| desired.contains(dir));
 
             // --- reconcile (identical in both modes) ---
@@ -598,6 +632,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         app.emit_to(label, "asset-changed", AssetChangedBatch { paths: changed });
                 }
             }
+            let mut transition_deferred = false;
             for (label, graph) in graphs.iter_mut() {
                 if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
                     if graph
@@ -625,7 +660,38 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     unclassified_paths_for_graph(&full_paths, &graph.graph);
                 let mut owned = pending_for_graph(&paths, &graph.graph);
                 owned.extend(exact_owned);
-                let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
+                let need_full = event_need_full
+                    || !inotify
+                    || !full_owned.is_empty()
+                    || retry_due
+                    || graph.transition_skipped;
+                // Nothing is reconciled into a graph while a load or reopen
+                // holds its root's transition lane: a restore rewrites the
+                // tree under it, and lowering those files into the graph it
+                // is about to retire doubled the work and kept the retiring
+                // projection worker busy past its detach bound (GH #543,
+                // audit R10-13). Never wait for the lane here -- that would
+                // stall every graph behind one -- carry a full diff instead.
+                let lane = app
+                    .state::<AppState>()
+                    .storage_supervisor
+                    .transition_lane(&graph.root);
+                let _transition = if need_full || !owned.is_empty() {
+                    match lane.try_lock() {
+                        Ok(guard) => Some(guard),
+                        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                            Some(poisoned.into_inner())
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            graph.transition_skipped = true;
+                            transition_deferred = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                graph.transition_skipped = false;
                 let mut cycle_failed = false;
                 let mut attempted = false;
                 if need_full || !owned.is_empty() {
@@ -708,8 +774,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 &config_paths,
                 event_need_full || notify_error || !inotify,
                 &mut config_recheck,
-            ) {
-                // A deferral means the lane was busy, not that the change went
+            ) || transition_deferred
+            {
+                // A deferral (of a configuration change or of a graph's
+                // reconcile) means the lane was busy, not that the change went
                 // away. Wake again; the 200 ms coalescing sleep below bounds
                 // how fast this can retry while a transition holds the lane.
                 let _ = tx.send(());

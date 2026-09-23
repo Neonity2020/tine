@@ -324,9 +324,9 @@ export function changeJournalTitleFormat(fmt: string) {
   setJournalTitleFormat(next);
   bumpGraphEpoch(); // immediate: re-render open journal titles with the new format
   // The backend writes config.edn; the format reaches the graph, so the
-  // watcher reopens it and announces `graph-rebound` (applyGraphReopened),
+  // backend reopens it once and announces `graph-rebound` (applyGraphReopened),
   // which rebinds and repaints against the reopened graph. No journal file is
-  // renamed (GH #543, audit R9-15b).
+  // renamed (GH #543, audits R9-15b and R10-07).
   void backend()
     .setJournalTitleFormat(next)
     .catch(() => {});

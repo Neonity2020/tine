@@ -1168,13 +1168,14 @@ mod tests {
     }
 
     /// GH #543 (indexing audit IT-06, R2-P1): a settings command does not
-    /// decide to reopen the graph; `Config::reach` does, inside
-    /// `GraphSlot::apply_config_write`. `refresh_graph` retires the index
-    /// worker and restarts the launch check, so a settings command that calls
-    /// it by hand restarts indexing for a toggle, and for a change that does
-    /// reach the graph the watcher reopens it as well, so indexing restarts
-    /// twice. There is no exception: `set_journal_title_format` claimed one
-    /// for a journal-file migration no refresh performs (audit R9-15b).
+    /// decide to reopen the graph; `Config::reach` does, and
+    /// `state::apply_config_write` reopens through the one config decider
+    /// (`take_in_config_change`, audit R10-07). `refresh_graph` retires the
+    /// index worker and restarts the launch check, so a settings command that
+    /// calls it by hand restarts indexing for a toggle, and reopens a second
+    /// time for a change that reaches the graph. There is no exception:
+    /// `set_journal_title_format` claimed one for a journal-file migration no
+    /// refresh performs (audit R9-15b).
     #[test]
     fn settings_commands_leave_reopening_to_the_config_reach() {
         let reopening = commands_that_reopen_the_graph();

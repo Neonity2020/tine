@@ -6710,6 +6710,106 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 audit R10-11. The bar restarted its follower (and its show-after grace) on every render-epoch bump, so a typography or journal-title change hid a showing bar for about a second. Fix: the follower is keyed on graphBinding. Fail-before: the component test fails on HEAD's IndexingProgressBar.tsx (2 followers after a repaint)."
+},
+{
+ "id": "REG-A-GRAPH-REACHING-SETTING-TAKES-EFFECT-WITHOUT-A-WATCHER-543",
+ "title": "A settings change that reaches the graph is taken in by the command itself, once, even without a live file watcher",
+ "family": "config-live-reload",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/state.rs::a_settings_write_decides_its_own_reopen",
+   "src-tauri/src/state.rs::a_settings_write_takes_its_change_in_through_the_one_decider",
+   "src-tauri/src/state.rs::a_missing_os_watcher_is_reported_and_polled_around"
+  ],
+  "scenario": null,
+  "failBefore": "structural"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-07 (class: a command's completion delegated to a best-effort observer). After R9-15b the journal-title-format change relied on the watcher, and a failed recommended_watcher() was swallowed. Now state::apply_config_write (the only command path; GraphSlot::apply_config_write is private) reopens through take_in_config_change, the one decider the watcher also uses, re-decided under the transition lane so one change reopens once; a failed OS watcher emits graph-watch-error and the cycle polls. Substitute evidence: the app-bound path needs an AppHandle (no tauri test runtime), so the decider is tested app-free and the wiring by source guards; the pre-fix code lacks both wires."
+},
+{
+ "id": "REG-AN-OUTSIDE-PAGE-DELETE-RESCANS-ONE-PATH-543",
+ "title": "An external delete or rename-away of a page file is one exact path, not a whole-graph rescan",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_watch_reach_tests.rs::a_gone_path_is_answered_by_the_parsed_cache_or_the_index_inventory",
+   "src-tauri/src/watcher/tests.rs::ambiguous_windows_event_kinds_take_the_exact_path_arm_unless_pages_went"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-08 (class C2b: one watch reach). A gone path's reach needed the guarded identity index, which is usually absent, so every external delete ran a whole-graph stat walk and revoked conflict authority. graph_text_watch_reach now answers from the identity index, else the index's page inventory, else a complete parsed cache, else lexically by page extension. Fail-before: both core branches and the watcher boundary (evidence gh550-batch/indexing-audit-r10/necessity-R10-08.txt)."
+},
+{
+ "id": "REG-A-REFUSED-GRAPH-SLOT-IS-RETIRED-543",
+ "title": "A graph the window registry refuses to bind is retired, and a restore whose window moved on reports success",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/state.rs::a_refresh_does_not_swap_over_a_window_that_moved_on",
+   "src-tauri/src/state.rs::a_slot_the_registry_refuses_is_retired"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-12 (class: a slot handed to the registry is bound or retired, never dropped). swap_refreshed's refusal dropped a reopened graph with its projection attached and failed a restore that had succeeded on disk; bind's overlap refusal dropped the same way. Both now retire the refused slot. Fail-before: evidence gh550-batch/indexing-audit-r10/necessity-R10-12.txt."
+},
+{
+ "id": "REG-NO-RECONCILE-INTO-A-GRAPH-MID-TRANSITION-543",
+ "title": "The watcher does not reconcile files into a graph while its load or reopen holds the transition lane",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/watcher/tests.rs::the_watcher_reconciles_a_graph_only_under_its_transition_lane"
+  ],
+  "scenario": null,
+  "failBefore": "structural"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-13 (PLAUSIBLE, fixed by rule). During a restore's rewrite the watcher lowered the restored files into the graph about to be retired. The reconcile loop now try-locks the root's transition lane, skips the graph when it is held and carries a full diff to the next cycle. Substitute evidence: the runtime loop needs an AppHandle, so a source guard pins the order and the never-wait rule; not reproduced on a 10k graph."
 }
 ]
 }

@@ -2149,10 +2149,7 @@ fn page_currency_has_one_producer() {
 fn watch_reach_has_one_producer() {
     let mut sites = Vec::new();
     for file in production_rust() {
-        for name in [
-            "graph_text_watch_reach",
-            "graph_text_index_holds_files_under",
-        ] {
+        for name in ["graph_text_watch_reach", "gone_path_holds_files_under"] {
             let uses = identifier_occurrences(&file.code, &format!("{name}("))
                 - identifier_occurrences(&file.code, &format!("fn {name}("));
             if uses != 0 {
@@ -2164,7 +2161,7 @@ fn watch_reach_has_one_producer() {
     assert_eq!(
         sites,
         [
-            "crates/tine-core/src/model/write_receipts.rs graph_text_index_holds_files_under 1",
+            "crates/tine-core/src/model/write_receipts.rs gone_path_holds_files_under 1",
             "src-tauri/src/watcher.rs graph_text_watch_reach 1",
             "src-tauri/src/watcher/runtime.rs graph_text_watch_reach 1",
         ],

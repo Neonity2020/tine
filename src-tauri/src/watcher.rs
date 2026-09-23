@@ -1,7 +1,5 @@
 use crate::settings::{settings_path, update_settings};
-use crate::state::{
-    refresh_graph_for_config_change, slot_for_window, AppState, GraphSlot, RefreshOutcome,
-};
+use crate::state::{take_in_config_change, AppState, GraphSlot, RefreshLaneWait, RefreshOutcome};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1405,8 +1403,9 @@ fn reconcile_pending(
     }
 }
 
-/// Re-read `logseq/config.edn` for the graphs an event named, and refresh any
-/// whose configuration actually moved.
+/// Re-read `logseq/config.edn` for the graphs an event named, and take in any
+/// change through [`take_in_config_change`], the decider a settings command
+/// uses too.
 ///
 /// A separate pass rather than a branch inside the reconcile loops, because
 /// configuration is not graph text: never in `GraphTextScope`, never
@@ -1432,50 +1431,12 @@ fn refresh_changed_configs(
             continue;
         }
         recheck.remove(label);
-        let Ok(slot) = slot_for_window(&state, label) else {
-            continue;
-        };
-        // The graph knows which bytes its configuration was taken from, so
-        // Tine's own settings write (already taken in) and a redelivery of
-        // identical bytes cost nothing here. Anything it has not taken in --
-        // including an outside change folded into Tine's own write, or an
-        // outside revert to the bytes it was opened with -- differs.
-        let disk = tine_core::model::config_file_description(root);
-        if slot.graph().served_config_description() == disk {
-            continue;
-        }
-        let before = slot.graph_meta();
-        // A change to settings only is taken in by this graph; reopening it
-        // would restart indexing for an edit to, say, favorites (GH #543).
-        match slot.take_in_config() {
-            tine_core::config::ConfigReach::Unchanged => continue,
-            tine_core::config::ConfigReach::Settings => {
-                let after = slot.graph_meta();
-                if after != before {
-                    let _ = app.emit_to(label, "graph-config-changed", after);
-                }
-                continue;
-            }
-            tine_core::config::ConfigReach::Graph => {}
-        }
-        drop(slot);
-        match refresh_graph_for_config_change(&state, app, label) {
+        match take_in_config_change(&state, app, label, RefreshLaneWait::TryOnce) {
             Ok(RefreshOutcome::Deferred) => {
                 recheck.insert(label.clone());
                 deferred = true;
             }
-            Ok(RefreshOutcome::Refreshed) => {
-                let Ok(slot) = slot_for_window(&state, label) else {
-                    continue;
-                };
-                let after = slot.graph_meta();
-                // A rewrite that changed no setting we surface -- Logseq
-                // touching an unrelated key, Syncthing redelivering identical
-                // bytes with a new mtime -- announces nothing.
-                if after != before {
-                    let _ = app.emit_to(label, "graph-config-changed", after);
-                }
-            }
+            Ok(RefreshOutcome::Refreshed | RefreshOutcome::Current) => {}
             Err(message) => {
                 // Not silent: until this succeeds the window is serving stale
                 // configuration, which is exactly the failure this whole pass

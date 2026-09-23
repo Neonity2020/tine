@@ -42,9 +42,19 @@ byte-identity gate is therefore **mandatory, not an optimization**.
 `Graph::served_config_description()` is a digest of the bytes the served
 configuration was taken from: the bytes the instance was opened with, then
 whatever `Graph::take_in_config` last took in. `model::config_file_description(root)`
-digests what is on disk now. The watcher does nothing when they are equal, and
-otherwise asks `take_in_config`, whose `ConfigReach` decides: `Unchanged` and
-`Settings` are taken in by the running graph, `Graph` reopens it.
+digests what is on disk now. One decider, `state::take_in_config_change`, acts
+on them: nothing when they are equal, and otherwise it asks `take_in_config`,
+whose `ConfigReach` decides: `Unchanged` and `Settings` are taken in by the
+running graph, `Graph` reopens it. It asks again under the storage transition
+lane, on the graph bound then, so a second caller for the same change finds it
+taken in: one change, one reopen.
+
+Both the watcher and every settings command call it. A settings command goes
+through `state::apply_config_write` (the only way a command writes
+configuration; `GraphSlot::apply_config_write` is private to `state.rs`), which
+calls the decider off the main thread when its write left a change the graph
+must reopen for. The command does not leave that to the watcher, which may not
+be running (GH #543, audit R10-07).
 
 `Graph::write_config` is therefore the single funnel every setter publishes
 through, and it takes in what it wrote, so a star toggled in the sidebar costs
@@ -55,8 +65,9 @@ reopens, and an outside revert to the opening bytes still reads as a change.
 missed one of those.)
 
 Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`,
-`config::tests::the_watcher_gate_matches_disk_only_when_disk_was_taken_in`
-and `config::tests::only_the_graph_s_own_config_edn_is_recognized_as_configuration`.
+`config::tests::the_watcher_gate_matches_disk_only_when_disk_was_taken_in`,
+`config::tests::only_the_graph_s_own_config_edn_is_recognized_as_configuration`
+and `state::tests::a_settings_write_decides_its_own_reopen`.
 
 ## 4. What reaches the frontend
 
@@ -79,6 +90,7 @@ config-derived frontend state.
 |---|---|---|
 | Storage transition lane busy | `RefreshOutcome::Deferred`; the window is remembered in `config_recheck` and retried next cycle | Blocking the watcher thread would stall reconciliation for **every** graph behind one graph's load or storage promotion. The file is still on disk, so nothing is lost by waiting |
 | Kernel rescan, notify error, or poll mode | Every graph re-checks | Those cycles carry no usable paths; poll mode has none at all. One file read and one digest per graph, against a stat scan already being paid |
+| No OS watcher can be created | `graph-watch-error` is emitted once, and each cycle polls until one can | A swallowed creation error left every external change, and every outside configuration change, unseen for the session (GH #543, audit R10-07) |
 | Refresh fails | `graph-watch-error` is emitted | Until it succeeds the window serves stale configuration, which is the failure this whole mechanism exists to prevent. Not silent |
 | Journal filename migrations | **Never** run on a refresh | Concord invariant 4: a refresh re-reads configuration, it does not rewrite the tree. An outside config edit must not rename the user's files as a side effect |
 

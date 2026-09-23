@@ -1331,7 +1331,7 @@ pub(crate) fn set_favorites(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_favorites(&names))
+    crate::state::apply_config_write(&state, |g| g.set_favorites(&names))
 }
 
 #[tauri::command]
@@ -1339,7 +1339,7 @@ pub(crate) fn set_favorites_page(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_favorites_page(&name))
+    crate::state::apply_config_write(&state, |g| g.set_favorites_page(&name))
 }
 
 #[tauri::command]
@@ -1347,8 +1347,7 @@ pub(crate) fn set_default_home(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?
-        .apply_config_write(|graph| graph.set_default_home_page(name.as_deref()))
+    crate::state::apply_config_write(&state, |graph| graph.set_default_home_page(name.as_deref()))
 }
 
 #[tauri::command]
@@ -1356,7 +1355,7 @@ pub(crate) fn set_preferred_workflow(
     workflow: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_preferred_workflow(&workflow))
+    crate::state::apply_config_write(&state, |g| g.set_preferred_workflow(&workflow))
 }
 
 #[tauri::command]
@@ -1364,7 +1363,7 @@ pub(crate) fn set_timetracking_enabled(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_timetracking_enabled(enabled))
+    crate::state::apply_config_write(&state, |g| g.set_timetracking_enabled(enabled))
 }
 
 #[tauri::command]
@@ -1372,7 +1371,7 @@ pub(crate) fn set_show_brackets(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_show_brackets(enabled))
+    crate::state::apply_config_write(&state, |g| g.set_show_brackets(enabled))
 }
 
 #[tauri::command]
@@ -1380,7 +1379,7 @@ pub(crate) fn set_doc_mode_enter_for_new_block(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_doc_mode_enter_for_new_block(enabled))
+    crate::state::apply_config_write(&state, |g| g.set_doc_mode_enter_for_new_block(enabled))
 }
 
 #[tauri::command]
@@ -1388,7 +1387,7 @@ pub(crate) fn set_logical_outdenting(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_logical_outdenting(enabled))
+    crate::state::apply_config_write(&state, |g| g.set_logical_outdenting(enabled))
 }
 
 #[tauri::command]
@@ -1396,7 +1395,7 @@ pub(crate) fn set_guide_announced(
     announced: bool,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_guide_announced(announced))
+    crate::state::apply_config_write(&state, |g| g.set_guide_announced(announced))
 }
 
 #[tauri::command]
@@ -1404,13 +1403,12 @@ pub(crate) fn set_default_journal_template(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?
-        .apply_config_write(|g| g.set_default_journal_template(name.as_deref()))
+    crate::state::apply_config_write(&state, |g| g.set_default_journal_template(name.as_deref()))
 }
 
 #[tauri::command]
 pub(crate) fn set_start_of_week(n: u32, state: GraphContext<'_>) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_start_of_week(n))
+    crate::state::apply_config_write(&state, |g| g.set_start_of_week(n))
 }
 
 /// Set the graph's `:preferred-format` for new pages/journals ("md" or "org").
@@ -1424,20 +1422,20 @@ pub(crate) fn set_preferred_format(
     } else {
         tine_core::model::Format::Md
     };
-    slot_for_context(&state)?.apply_config_write(|g| g.set_preferred_format(fmt))
+    crate::state::apply_config_write(&state, |g| g.set_preferred_format(fmt))
 }
 
 /// Set the graph's `:journal/page-title-format` (journal display-title format,
 /// e.g. "MMM do, yyyy"). Display-only — does not rename journal files. Like
-/// every setting that reaches the graph, the watcher reopens it
-/// (`Config::reach`) and announces `graph-rebound`; reopening here as well
-/// restarted indexing twice (GH #543, audit R9-15b).
+/// every setting that reaches the graph (`Config::reach`),
+/// `apply_config_write` reopens it once and announces `graph-rebound`
+/// (GH #543, audits R9-15b and R10-07).
 #[tauri::command]
 pub(crate) fn set_journal_title_format(
     format: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_journal_page_title_format(&format))
+    crate::state::apply_config_write(&state, |g| g.set_journal_page_title_format(&format))
 }
 
 #[tauri::command]

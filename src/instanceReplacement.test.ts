@@ -542,8 +542,9 @@ describe("replacing a loaded instance (GH #304)", () => {
     await backend().setGuideAnnounced(true);
     await backend().setPreferredFormat("org");
     await backend().setDefaultHome("Home");
-    // Reaches the graph, but the watcher reopens it and announces that itself
-    // (graph-reopened); the command's return is not a rebind (R9-15b).
+    // Reaches the graph, but the backend reopens it off the main thread and
+    // announces that itself (graph-rebound); the command's return is not a
+    // rebind (R9-15b, R10-07).
     await backend().setJournalTitleFormat("yyyy-MM-dd");
 
     expect(graphBinding()).toBe(before);

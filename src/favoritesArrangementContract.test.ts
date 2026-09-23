@@ -27,6 +27,7 @@ const layout = readFileSync("src/favoritesLayout.ts", "utf8");
 const store = readFileSync("src/favoritesStore.ts", "utf8");
 const sidebar = readFileSync("src/components/Sidebar.tsx", "utf8");
 const watcher = rustModuleSource("src-tauri/src/watcher.rs");
+const configState = rustModuleSource("src-tauri/src/state.rs");
 const model = modelModuleSource();
 const graph = readFileSync("src/graph.ts", "utf8");
 
@@ -100,13 +101,18 @@ describe("config live-reload contract matches the source", () => {
     expect(funnelStart).toBeGreaterThan(-1);
     const funnel = model.slice(funnelStart, model.indexOf("\n    }\n", funnelStart));
     expect(funnel).toMatch(/\batomic_update\(path, &CONFIG_LOCK\b/);
-    expect(watcher).toContain("slot.graph().served_config_description() == disk");
+    // The one decider (watcher and settings commands alike) gates on it.
+    expect(reload).toContain("One decider, `state::take_in_config_change`");
+    expect(configState).toMatch(
+      /fn config_pending\(&self\) -> bool \{\s*self\.graph\.served_config_description\(\)\s*!= tine_core::model::config_file_description\(&self\.root_key\)/
+    );
+    expect(configState).toContain("if !slot.config_pending() {");
   });
 
   it("keeps GraphMeta comparable, which is what suppresses a no-op announcement", () => {
     expect(reload).toContain("`GraphMeta` derives `PartialEq`");
     expect(model).toContain("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\npub struct GraphMeta");
-    expect(watcher).toContain("if after != before {");
+    expect(configState).toContain("if after != before {");
   });
 
   it("keeps ONE producer of config-derived frontend state", () => {
@@ -118,13 +124,12 @@ describe("config live-reload contract matches the source", () => {
 
   it("never blocks the watcher thread on the storage transition lane", () => {
     expect(reload).toContain("RefreshOutcome::Deferred");
-    // The watcher reopens only through the config-change entry, which never
-    // waits on the lane (GH #543, audit R9-13).
-    expect(watcher).toContain("refresh_graph_for_config_change(&state, app, label)");
-    const state = readFileSync("src-tauri/src/state.rs", "utf8");
-    expect(state).toContain(
-      "refresh_graph_for_label(state, app, label, RefreshLaneWait::TryOnce, || Ok(()))?"
+    // The watcher reopens only through the config decider, and asks it
+    // never to wait on the lane (GH #543, audits R9-13 and R10-07).
+    expect(watcher).toContain(
+      "take_in_config_change(&state, app, label, RefreshLaneWait::TryOnce)"
     );
+    const state = readFileSync("src-tauri/src/state.rs", "utf8");
     expect(state).toContain(
       "RefreshLaneWait::TryOnce => match transition_gate.try_lock()"
     );

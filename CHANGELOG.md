@@ -92,6 +92,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Deleting or renaming a page outside Tine (another editor, Syncthing, a
+  file manager) no longer makes Tine rescan the whole graph folder. Only a
+  removed folder that held pages still does (GH #543).
+- Changing a setting that affects the whole graph, such as the journal
+  title format, now takes effect even when Tine cannot watch the graph
+  folder. Tine also reports when it cannot watch the folder and checks for
+  outside changes by polling instead of missing them silently (GH #543).
+- Restoring a backup while another graph is being opened in the same window
+  no longer reports the restore as failed. The graph Tine prepared for that
+  window no longer keeps running in the background (GH #543).
+- Restoring a backup no longer processes the restored pages twice while the
+  graph reopens (GH #543).
 - A query with a very long `(or …)` or `(and …)` list (about a thousand terms)
   now answers. It used to fail, and each failure rebuilt the whole search
   index again, over and over while the query was on screen (GH #543).

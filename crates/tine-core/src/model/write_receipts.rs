@@ -79,10 +79,13 @@ impl Graph {
     ///   text and has its own queue, which decides how far a change reaches.
     /// - A path that exists answers by what it is.
     /// - A path that is gone — the old name of a rename — is a subtree only
-    ///   when the current identity index holds a file under it, or there is
-    ///   no current index to ask. Assuming a subtree whenever the old name is
-    ///   gone turned an editor's atomic save of any non-page file into a full
-    ///   diff of the graph and a rebuilt identity index.
+    ///   when something that knows the graph's files holds one under it
+    ///   ([`Self::gone_path_holds_files_under`]), or, when nothing can say, it
+    ///   was not named like a page. Assuming a subtree whenever the old name
+    ///   is gone turned an editor's atomic save of any non-page file into a
+    ///   full diff of the graph and a rebuilt identity index, and asking only
+    ///   the identity index (which only a page create or move builds) did so
+    ///   for every external delete (GH #543, audit R10-08).
     pub fn graph_text_watch_reach(&self, path: &Path) -> GraphTextWatchReach {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return GraphTextWatchReach::Nothing;
@@ -105,28 +108,49 @@ impl Graph {
         match std::fs::metadata(path) {
             Ok(metadata) if metadata.is_dir() => GraphTextWatchReach::Subtree,
             Ok(_) => file,
-            Err(_) => match self.graph_text_index_holds_files_under(&relative) {
+            Err(_) => match self.gone_path_holds_files_under(&relative) {
                 Some(false) => file,
-                Some(true) | None => GraphTextWatchReach::Subtree,
+                Some(true) => GraphTextWatchReach::Subtree,
+                None if text_extension_from_path(path).is_some() => file,
+                None => GraphTextWatchReach::Subtree,
             },
         }
     }
 
-    /// Whether the current guarded identity index holds a file strictly under
-    /// `relative`; `None` when there is no current index to ask. Never builds
-    /// or rebuilds the index.
-    fn graph_text_index_holds_files_under(&self, relative: &str) -> Option<bool> {
-        let state = self.guarded_graph_text_identity.read().unwrap();
-        if state.invalidated {
+    /// Whether a gone path held graph files strictly under it, asked of
+    /// whatever knows the graph's files without reading the disk: the current
+    /// guarded identity index, the search index's complete page inventory,
+    /// then a parsed cache that read every page. `None` when none of them can
+    /// say. Builds nothing.
+    fn gone_path_holds_files_under(&self, relative: &str) -> Option<bool> {
+        let prefix = format!("{relative}/");
+        {
+            let state = self.guarded_graph_text_identity.read().unwrap();
+            if let Some(index) = state.index.as_ref().filter(|_| !state.invalidated) {
+                return Some(
+                    index
+                        .file_resource_by_exact_relative
+                        .keys()
+                        .any(|held| held.starts_with(&prefix)),
+                );
+            }
+        }
+        if let Some(held) = self
+            .direct_projection
+            .get()
+            .and_then(|projection| projection.holds_pages_under(&prefix))
+        {
+            return Some(held);
+        }
+        let cache = self.cache.read().unwrap();
+        let pages = cache.as_ref()?;
+        if !self.page_index_failures.read().unwrap().is_empty() {
             return None;
         }
-        let index = state.index.as_ref()?;
-        let prefix = format!("{relative}/");
         Some(
-            index
-                .file_resource_by_exact_relative
-                .keys()
-                .any(|held| held.starts_with(&prefix)),
+            pages
+                .iter()
+                .any(|(entry, _)| entry.rel_path.starts_with(&prefix)),
         )
     }
 

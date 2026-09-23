@@ -1580,6 +1580,23 @@ impl DirectProjection {
         self.shared.changed.notify_all();
     }
 
+    /// Whether the index's complete page inventory holds a page whose
+    /// graph-relative path starts with `prefix` (a directory path ending in
+    /// `/`); `None` before a full snapshot or warm walk has given it one.
+    pub(crate) fn holds_pages_under(&self, prefix: &str) -> Option<bool> {
+        let pending = self.shared.pending.lock().unwrap();
+        if !pending.order_seeded {
+            return None;
+        }
+        Some(
+            pending
+                .page_order
+                .range(prefix.to_owned()..)
+                .next()
+                .is_some_and(|(held, _)| held.starts_with(prefix)),
+        )
+    }
+
     pub(crate) fn mark_stale(&self) {
         self.shared.pending.lock().unwrap().stale = true;
         self.shared.ready.store(false, Ordering::Release);

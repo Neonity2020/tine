@@ -1425,10 +1425,10 @@ export function mockBackend(): Backend {
     async setPreferredFormat(): Promise<void> {
       // Taken in place: the real backend keeps the Graph (GH #543).
     },
-    // This setting reaches the graph in the real backend: the watcher reopens
-    // it, installing a FRESH Graph with an empty editor-activation registry,
-    // and announces that as `graph-rebound` -- not the command's return
-    // (GH #543, audit R9-15b). Not a no-op even here: a mock that silently
+    // This setting reaches the graph in the real backend: the command's config
+    // write reopens it off the main thread, installing a FRESH Graph with an
+    // empty editor-activation registry, and announces that as `graph-rebound`
+    // -- not the command's return (GH #543, audits R9-15b and R10-07). Not a no-op even here: a mock that silently
     // omits a contract lets every test that uses it prove the wrong thing.
     // (GH #254 increment 3, round 15.)
     async setJournalTitleFormat(): Promise<void> {

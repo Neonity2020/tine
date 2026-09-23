@@ -1127,6 +1127,7 @@ fn drained_frontier_routes_to_a_same_root_replacement_instance() {
             last_reconcile_error: Some("retired retry".to_owned()),
             retry: RetrySchedule::default(),
             pending_observation_epoch: Some(old_ticket),
+            transition_skipped: false,
         },
     )]);
 
@@ -1491,14 +1492,17 @@ fn legacy_uncertain_graph_root_events_block_creation_until_reconciliation() {
 /// entire graph. With an active sync client that is every save.
 ///
 /// Create/Modify are resolvable (the path still exists) and must now take
-/// the exact-path arm. `Remove(Any)` must stay uncertain: the entry is gone,
-/// so we cannot prove it was a file rather than a directory of pages.
+/// the exact-path arm. For `Remove(Any)` the entry is gone, so the graph's
+/// own inventory answers whether it held pages: a removed page file is one
+/// exact path, and only a removed directory of pages is uncertain (GH #543,
+/// audit R10-08).
 #[test]
-fn ambiguous_windows_event_kinds_take_the_exact_path_arm_except_removal() {
+fn ambiguous_windows_event_kinds_take_the_exact_path_arm_unless_pages_went() {
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
 
     let graph_dir = TempGraph::new("windows-any-kinds");
     graph_dir.write("pages/Anchor.md", "- anchor\n");
+    graph_dir.write("pages/Folder/Inner.md", "- inner\n");
     let graph = Graph::open(&graph_dir.root);
     warm_direct_graph(&graph);
 
@@ -1539,17 +1543,35 @@ fn ambiguous_windows_event_kinds_take_the_exact_path_arm_except_removal() {
         "an ambiguous event on a directory is not provably a page file"
     );
 
-    // Removal stays conservative: the path is gone, so its kind is unknowable.
+    // A removed page file is one exact path: the graph held no pages under it.
     std::fs::remove_file(&path).unwrap();
     let removed = graph_text_observation(
         &graph,
         &graph_dir.root,
-        Some(&event(EventKind::Remove(RemoveKind::Any), vec![path])),
+        Some(&event(
+            EventKind::Remove(RemoveKind::Any),
+            vec![path.clone()],
+        )),
     );
     assert!(
-        removed.uncertain,
-        "Remove(Any) must stay uncertain -- a removed directory of pages must not be \
-         mistaken for a non-page path"
+        !removed.uncertain,
+        "a removed page file must not poison the whole index"
+    );
+    assert_eq!(removed.exact_paths, vec![path]);
+
+    // A removed directory of pages stays uncertain: every page under it went.
+    std::fs::remove_dir_all(graph_dir.path("pages/Folder")).unwrap();
+    let folder = graph_text_observation(
+        &graph,
+        &graph_dir.root,
+        Some(&event(
+            EventKind::Remove(RemoveKind::Any),
+            vec![graph_dir.path("pages/Folder")],
+        )),
+    );
+    assert!(
+        folder.uncertain,
+        "Remove(Any) of a directory of pages must not be mistaken for one path"
     );
 }
 
@@ -2402,4 +2424,31 @@ fn recognizes_every_tine_temp_shape_that_lands_in_the_live_graph() {
             "{foreign} must NOT read as a Tine atomic temp"
         );
     }
+}
+
+/// GH #543, audit R10-13: the watcher reconciles a graph only while it holds
+/// that root's storage transition lane, and never waits for it. A restore
+/// rewrites the tree under the lane; reconciling those files into the graph
+/// the restore is about to retire doubled the work and kept its projection
+/// worker busy past the detach bound. Waiting would stall every graph.
+#[test]
+fn the_watcher_reconciles_a_graph_only_under_its_transition_lane() {
+    let runtime = include_str!("runtime.rs");
+    let lane = runtime
+        .find("transition_lane(&graph.root)")
+        .expect("the reconcile loop takes the root's transition lane");
+    let reconcile = runtime
+        .find("reconcile_pending(\n")
+        .or_else(|| runtime.find("reconcile_pending("))
+        .expect("the reconcile loop reconciles");
+    assert!(lane < reconcile, "the lane is taken before the reconcile");
+    let between = &runtime[lane..reconcile];
+    assert!(
+        between.contains("lane.try_lock()") && !between.contains("lane.lock()"),
+        "the watcher must try the lane, never wait on it"
+    );
+    assert!(
+        between.contains("graph.transition_skipped = true;"),
+        "a skipped graph must carry a full diff to the next cycle"
+    );
 }

@@ -133,7 +133,11 @@ impl GraphSlot {
     /// command's. Reopening retires the index worker and starts the launch
     /// check again, which on a first launch threw away the whole index build
     /// for a toggle (GH #543, IT-06 and R2-P1).
-    pub(crate) fn apply_config_write(
+    ///
+    /// Private to this module: a command reaches it through the free
+    /// [`apply_config_write`], which also reopens the graph for a change that
+    /// reaches it.
+    fn apply_config_write(
         &self,
         write: impl FnOnce(&Graph) -> std::io::Result<()>,
     ) -> Result<(), CommandError> {
@@ -141,6 +145,14 @@ impl GraphSlot {
         // The core took the change in as far as it reaches (`write_config`).
         *self.graph_meta.write().unwrap() = self.graph.meta();
         Ok(())
+    }
+
+    /// Whether `config.edn` holds bytes this graph has not taken in: a change
+    /// that reaches the graph, which only a reopen takes in, or an outside
+    /// edit nothing has read yet.
+    pub(crate) fn config_pending(&self) -> bool {
+        self.graph.served_config_description()
+            != tine_core::model::config_file_description(&self.root_key)
     }
 
     /// Take in `config.edn` as far as the change reaches settings, and give
@@ -211,11 +223,13 @@ impl GraphRegistry {
             if owner != &window
                 && (root.starts_with(&slot.root_key) || slot.root_key.starts_with(root))
             {
-                return Err(CommandError::prose(format!(
+                let refused = CommandError::prose(format!(
                     "graph {} overlaps graph {} already owned by window {owner}",
                     slot.root_key.display(),
                     root.display()
-                )));
+                ));
+                retire_slot(&slot);
+                return Err(refused);
             }
         }
         if let Some(old) = self.by_window.insert(window.clone(), slot.clone()) {
@@ -236,6 +250,12 @@ impl GraphRegistry {
     /// moved on meanwhile keeps its graph: whatever replaced `expected`
     /// already retired it, and binding the refresh over it would reopen the
     /// old root in a window that has left it.
+    ///
+    /// A slot handed to the registry is bound or retired, never dropped: a
+    /// refused slot already has its projection attached, and dropping it
+    /// unretired left that worker holding the projection's writer lease
+    /// (GH #543, audit R10-12). `bind` does the same for a slot it refuses,
+    /// and retires the slot it displaces.
     pub(crate) fn swap_refreshed(
         &mut self,
         window: &str,
@@ -252,7 +272,10 @@ impl GraphRegistry {
                 *current = slot;
                 true
             }
-            _ => false,
+            _ => {
+                retire_slot(&slot);
+                false
+            }
         }
     }
 
@@ -590,7 +613,41 @@ pub(crate) enum RefreshLaneWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshOutcome {
     Refreshed,
+    /// Nothing to reopen: the graph already serves what is on disk.
+    Current,
     Deferred,
+}
+
+/// Write `config.edn` for a settings command and take the change in.
+///
+/// The one way a command writes configuration. How far the change reaches is
+/// [`tine_core::config::Config::reach`]'s answer, never the command's: a
+/// settings change is taken in by the bound graph, and one that reaches the
+/// graph is taken in by [`take_in_config_change`], the same decider the
+/// watcher uses. The command does not leave that to the watcher, which may
+/// not be running: a failed OS watcher left a journal-title-format change
+/// untaken for the session (GH #543, audit R10-07). The reopen runs off the
+/// main thread; the window learns of it from `graph-rebound`. If the watcher
+/// sees the write too, whichever takes the lane second finds the graph
+/// current, so one change reopens once.
+pub(crate) fn apply_config_write(
+    ctx: &GraphContext<'_>,
+    write: impl FnOnce(&Graph) -> std::io::Result<()>,
+) -> Result<(), CommandError> {
+    let slot = slot_for_context(ctx)?;
+    slot.apply_config_write(write)?;
+    if slot.config_pending() {
+        let app = ctx.window.app_handle().clone();
+        let label = ctx.window.label().to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            if let Err(error) = take_in_config_change(&state, &app, &label, RefreshLaneWait::Block)
+            {
+                let _ = app.emit_to(&label, "graph-watch-error", error.to_string());
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Rewrite a window's graph on disk and reopen it, for a command. Async so
@@ -612,43 +669,102 @@ pub(crate) async fn refresh_graph(
 ) -> Result<(), CommandError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        refresh_graph_for_label(&state, &app, &label, RefreshLaneWait::Block, rewrite).map(|_| ())
+        refresh_graph_for_label(&state, &app, &label, RefreshLaneWait::Block, |_| {
+            rewrite().map(|()| true)
+        })
+        .map(|_| ())
     })
     .await
     .map_err(CommandError::worker)?
 }
 
-/// Reopen a window's graph because its configuration changed on disk, and tell
-/// the window its graph was rebound.
+/// How far a configuration change on disk reaches, for a bound graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigTakeIn {
+    /// The graph serves what is on disk, or took the change in itself.
+    Current,
+    /// Only a new `Graph` can take the change in.
+    Reopen,
+}
+
+/// Take in what `config.edn` holds as far as this graph can: the decision
+/// behind [`take_in_config_change`], without an app so it is testable.
+pub(crate) fn take_in_config_now(slot: &GraphSlot) -> ConfigTakeIn {
+    // The graph knows which bytes its configuration was taken from, so
+    // Tine's own settings write (already taken in) and a redelivery of
+    // identical bytes cost nothing here. Anything it has not taken in --
+    // including an outside change folded into Tine's own write, or an
+    // outside revert to the bytes it was opened with -- differs.
+    if !slot.config_pending() {
+        return ConfigTakeIn::Current;
+    }
+    // A change to settings only is taken in by this graph; reopening it
+    // would restart indexing for an edit to, say, favorites (GH #543).
+    match slot.take_in_config() {
+        tine_core::config::ConfigReach::Unchanged | tine_core::config::ConfigReach::Settings => {
+            ConfigTakeIn::Current
+        }
+        tine_core::config::ConfigReach::Graph => ConfigTakeIn::Reopen,
+    }
+}
+
+/// Take a window's configuration change in, reopening its graph when the
+/// change reaches the graph, and tell the window what changed. The one
+/// decider for both a settings command ([`apply_config_write`]) and the
+/// watcher (GH #543, audit R10-07).
+///
+/// The decision is made again under the transition lane, on the graph bound
+/// then, so a second caller for the same change finds it taken in.
 ///
 /// A reopen replaces the `Graph` the window's in-flight results and page
-/// inventory belong to. A command that reopens it is announced by the frontend
-/// when the command returns (`REBINDING_COMMANDS`, pinned by
-/// `commands_that_reopen_the_graph`); the watcher has no caller to return to,
-/// so it announces its own reopen here. Without it a `:hidden` change left All
-/// Pages and page links on the old page set (GH #543, audit R9-13).
-/// `refresh_graph_for_label` is private to this module so these two entries
-/// are the only ways to reopen a graph.
-pub(crate) fn refresh_graph_for_config_change(
+/// inventory belong to, so it is announced as `graph-rebound`; without it a
+/// `:hidden` change left All Pages and page links on the old page set (GH
+/// #543, audit R9-13). A changed setting is announced as
+/// `graph-config-changed`. `refresh_graph_for_label` is private to this module
+/// so this and [`refresh_graph`] are the only ways to reopen a graph.
+pub(crate) fn take_in_config_change(
     state: &AppState,
     app: &tauri::AppHandle,
     label: &str,
+    wait: RefreshLaneWait,
 ) -> Result<RefreshOutcome, CommandError> {
-    let outcome = refresh_graph_for_label(state, app, label, RefreshLaneWait::TryOnce, || Ok(()))?;
+    let slot = slot_for_window(state, label)?;
+    let before = slot.graph_meta();
+    // Outside the lane first: the watcher asks on every poll cycle, and a
+    // graph that is current must not contend for (or defer on) the lane.
+    let outcome = if take_in_config_now(&slot) == ConfigTakeIn::Current {
+        RefreshOutcome::Current
+    } else {
+        drop(slot);
+        refresh_graph_for_label(state, app, label, wait, |bound| {
+            Ok(take_in_config_now(bound) == ConfigTakeIn::Reopen)
+        })?
+    };
     if outcome == RefreshOutcome::Refreshed {
         let _ = app.emit_to(label, "graph-rebound", ());
+    }
+    if outcome != RefreshOutcome::Deferred {
+        let after = slot_for_window(state, label)?.graph_meta();
+        // A rewrite that changed no setting we surface -- Logseq touching an
+        // unrelated key, Syncthing redelivering identical bytes with a new
+        // mtime -- announces nothing.
+        if after != before {
+            let _ = app.emit_to(label, "graph-config-changed", after);
+        }
     }
     Ok(outcome)
 }
 
-/// Re-read configuration for one window's graph without a `GraphContext`:
-/// the shared body of [`refresh_graph`] and [`refresh_graph_for_config_change`].
+/// Reopen one window's graph without a `GraphContext`: the shared body of
+/// [`refresh_graph`] and [`take_in_config_change`]. `decide` runs under the
+/// transition lane on the graph bound then, and says whether to reopen it; a
+/// command's rewrite happens inside it.
 fn refresh_graph_for_label(
     state: &AppState,
     app: &tauri::AppHandle,
     label: &str,
     wait: RefreshLaneWait,
-    rewrite: impl FnOnce() -> Result<(), CommandError>,
+    decide: impl FnOnce(&GraphSlot) -> Result<bool, CommandError>,
 ) -> Result<RefreshOutcome, CommandError> {
     let label = label.to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
@@ -669,7 +785,9 @@ fn refresh_graph_for_label(
             "graph changed while refresh waited for its transition lane",
         ));
     }
-    rewrite()?;
+    if !decide(&old)? {
+        return Ok(RefreshOutcome::Current);
+    }
     let approved = crate::settings::approved_external_assets(app, &old.root_key);
     let services = crate::graph::direct_files_service_paths(app, &old.root_key);
     let prepared = prepare_legacy_refresh(&old, approved.as_deref(), services)?;
@@ -684,9 +802,9 @@ fn refresh_graph_for_label(
         .unwrap()
         .swap_refreshed(&label, &old, Arc::clone(&replacement))
     {
-        return Err(CommandError::graph(
-            "graph changed while its configuration refresh was running",
-        ));
+        // The window closed or moved to another graph meanwhile. What the
+        // caller asked for is done on disk; there is nothing left to reopen.
+        return Ok(RefreshOutcome::Current);
     }
     crate::graph::warm_cache_async(app.clone(), label, replacement, warm)?;
     poke_watcher(state);
@@ -775,7 +893,9 @@ mod tests {
         let lane = entry
             .find("transition_gate.lock()")
             .expect("refresh takes the lane");
-        let rewrite = entry.find("rewrite()?").expect("refresh runs the rewrite");
+        let rewrite = entry
+            .find("decide(&old)?")
+            .expect("refresh runs the decision");
         let reopen = entry
             .find("prepare_legacy_refresh(")
             .expect("refresh reopens");
@@ -853,10 +973,141 @@ mod tests {
         let switched = graph(&b);
         registry.bind("main".into(), Arc::clone(&switched)).unwrap();
         let refreshed = Arc::new(GraphSlot::refreshed(Graph::open(&a), &old));
-        assert!(!registry.swap_refreshed("main", &old, refreshed));
+        assert!(!registry.swap_refreshed("main", &old, Arc::clone(&refreshed)));
         assert!(Arc::ptr_eq(&registry.slot("main").unwrap(), &switched));
         assert_eq!(registry.owner(&b).as_deref(), Some("main"));
+        // GH #543, audit R10-12: the reopened graph nothing binds is retired,
+        // as a closed window's is, not dropped with its projection attached.
+        assert!(
+            refreshed.graph().is_retired(),
+            "a reopened graph no window binds was left serving"
+        );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// GH #543, audit R10-12: a slot `bind` refuses (its root overlaps one
+    /// another window owns) is retired, not dropped with its projection
+    /// attached.
+    #[test]
+    fn a_slot_the_registry_refuses_is_retired() {
+        let base =
+            std::env::temp_dir().join(format!("gh543-refused-bind-{}", uuid::Uuid::new_v4()));
+        let mut registry = GraphRegistry::default();
+        let owner = graph(&base);
+        registry.bind("main".into(), Arc::clone(&owner)).unwrap();
+        let nested = graph(&base.join("nested"));
+        assert!(registry.bind("second".into(), Arc::clone(&nested)).is_err());
+        assert!(
+            nested.graph().is_retired(),
+            "a refused slot was left serving"
+        );
+        assert!(!owner.graph().is_retired());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// GH #543, audit R10-07: a settings write that reaches the graph is
+    /// taken in by a reopen the write itself asks for, not by whichever
+    /// watcher happens to be running. The decision is app-free: the write
+    /// leaves the graph owing a reopen, the reopened graph owes nothing, and
+    /// a change that reaches only settings is taken in without one.
+    #[test]
+    fn a_settings_write_decides_its_own_reopen() {
+        let root =
+            std::env::temp_dir().join(format!("gh543-config-take-in-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        let slot = GraphSlot::new(Graph::open_checked(&root).unwrap(), root.clone());
+        assert_eq!(take_in_config_now(&slot), ConfigTakeIn::Current);
+
+        slot.apply_config_write(|g| g.set_show_brackets(false))
+            .unwrap();
+        assert!(!slot.graph_meta().show_brackets);
+        assert_eq!(
+            take_in_config_now(&slot),
+            ConfigTakeIn::Current,
+            "a settings-only change reopened the graph"
+        );
+
+        slot.apply_config_write(|g| g.set_journal_page_title_format("yyyy-MM-dd"))
+            .unwrap();
+        assert!(slot.config_pending(), "the write left nothing to take in");
+        assert_eq!(take_in_config_now(&slot), ConfigTakeIn::Reopen);
+        assert_eq!(
+            take_in_config_now(&slot),
+            ConfigTakeIn::Reopen,
+            "asking again must not hide the pending reopen"
+        );
+
+        let prepared = prepare_legacy_refresh(
+            &slot,
+            None,
+            crate::graph::DirectFilesServicePaths {
+                projection: Ok(root.join("private/projection.sqlite")),
+                concord_ledger: None,
+            },
+        )
+        .unwrap();
+        let reopened = prepared.commit(&slot);
+        assert_eq!(
+            reopened.graph_meta().journal_page_title_format,
+            "yyyy-MM-dd"
+        );
+        assert_eq!(
+            take_in_config_now(&reopened),
+            ConfigTakeIn::Current,
+            "a second caller for the same change would reopen again"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// GH #543, audit R10-07: the command front door reopens through the one
+    /// config decider, and no command can write configuration past it
+    /// (`GraphSlot::apply_config_write` is private to this module). The
+    /// watcher asks the same decider.
+    #[test]
+    fn a_settings_write_takes_its_change_in_through_the_one_decider() {
+        let state = include_str!("state.rs");
+        let front = &state[state
+            .find("\npub(crate) fn apply_config_write(")
+            .expect("settings front door")..];
+        let front = &front[..front.find("\n}\n").expect("front door ends")];
+        assert!(
+            front.contains("config_pending()") && front.contains("take_in_config_change("),
+            "a settings write that reaches the graph must reopen it itself"
+        );
+        assert!(
+            state.contains("\n    fn apply_config_write("),
+            "GraphSlot::apply_config_write must stay private to state.rs"
+        );
+        let watcher = crate::test_support::rust_module_production_source("watcher.rs");
+        assert!(
+            watcher.contains("take_in_config_change(&state, app, label, RefreshLaneWait::TryOnce)")
+        );
+        assert!(
+            !watcher.contains(".take_in_config()"),
+            "the watcher decides a config change itself again; ask take_in_config_change"
+        );
+    }
+
+    /// GH #543, audit R10-07: a failure to create the OS watcher is surfaced
+    /// and the cycle polls instead. It was `.ok()`-ed away, and nothing
+    /// external was seen for the session.
+    #[test]
+    fn a_missing_os_watcher_is_reported_and_polled_around() {
+        let runtime = include_str!("watcher/runtime.rs");
+        let created = &runtime[runtime
+            .find("notify::recommended_watcher(")
+            .expect("watcher creation")..];
+        let created = &created[..created.find("watched.clear();").expect("creation ends")];
+        assert!(
+            created.contains("Err(error)") && created.contains("\"graph-watch-error\""),
+            "a failed watcher creation must be surfaced"
+        );
+        assert!(
+            runtime.contains("let inotify = wants_inotify && watcher.is_some();"),
+            "a cycle without an OS watcher must poll"
+        );
     }
 
     /// Every function that takes a window's graph without [`display_read`].
@@ -874,8 +1125,8 @@ mod tests {
         "load_graph_for_label",
         "print_error",
         "refresh_capture_graph_binding",
-        "refresh_changed_configs",
         "refresh_graph_for_label",
+        "take_in_config_change",
         "respond",
         "run",
         "slot_for_bound_window",
@@ -917,19 +1168,6 @@ mod tests {
         "save_session",
         "save_workspaces",
         "set_backup_keep",
-        "set_default_home",
-        "set_default_journal_template",
-        "set_doc_mode_enter_for_new_block",
-        "set_favorites",
-        "set_favorites_page",
-        "set_guide_announced",
-        "set_journal_title_format",
-        "set_logical_outdenting",
-        "set_preferred_format",
-        "set_preferred_workflow",
-        "set_show_brackets",
-        "set_start_of_week",
-        "set_timetracking_enabled",
         "trash_journal_file",
         "write_highlights",
         "write_pdf_view_state",
