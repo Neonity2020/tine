@@ -218,6 +218,28 @@ fn join_within(
 
 /// The settled checks: readiness at the current generation, and the index
 /// answering what a fresh parse of the disk answers.
+/// A session's whole-graph work is bounded: no consumer parsed the graph
+/// beside a live index (acting reads excepted), and the owner ran a bounded
+/// number of passes -- a pass that settles nothing and repeats at once spun
+/// millions of times a second (audit R7-02).
+fn check_session_work(
+    graph: &Graph,
+    acting_parses: usize,
+    steps: usize,
+    findings: &mut Vec<String>,
+) {
+    let parses = graph.consumer_page_parses_test() - acting_parses;
+    if parses > 0 {
+        findings.push(format!(
+            "{parses} consumer parse(s) while the projection was alive"
+        ));
+    }
+    let passes = graph.owner_passes_test();
+    if passes > 8 + 2 * steps {
+        findings.push(format!("the owner ran {passes} passes in {steps} steps"));
+    }
+}
+
 fn check_settled(root: &Path, graph: &Graph, findings: &mut Vec<String>) {
     let started = Instant::now();
     while !graph.direct_projection_ready_test() {
@@ -335,6 +357,9 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
     let mut session = Session::open(&root, &database);
     // Files an external writer changed without the watcher reporting them.
     let mut missed = Vec::<PathBuf>::new();
+    // Parses made by whole-graph acting reads, which parse by design.
+    let mut acting_parses = 0usize;
+    let mut session_steps = 0usize;
 
     for step in 0..steps {
         std::thread::sleep(Duration::from_millis(rng.below(6)));
@@ -457,15 +482,32 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
             }
             // The watcher's rescan after an uncertain event: an uncertain
             // observation, then the reconcile of every changed path.
-            80..=92 => watcher_reconcile(&graph, true, missed.drain(..).collect()),
+            80..=85 => watcher_reconcile(&graph, true, missed.drain(..).collect()),
+            // Delete a page that has no file: one that exists only through
+            // references (audit R7-01).
+            86..=88 => {
+                let ghost = format!("g{}", rng.below(3));
+                graph
+                    .delete_page(&ghost, PageKind::Page)
+                    .map_err(|e| e.to_string())
+            }
+            // A whole-graph acting read (publish, orphan assets, the Guide
+            // copy): it parses the graph by design and installs the parsed
+            // cache beside the index (audit R7-02).
+            89..=92 => {
+                let before = graph.consumer_page_parses_test();
+                let read = graph
+                    .try_with_pages(|pages| pages.len())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                acting_parses += graph.consumer_page_parses_test() - before;
+                read
+            }
             // Restart: quiesce, release the lease, reopen on the same database.
             93..=99 => {
-                let parses = graph.consumer_page_parses_test();
-                if parses > 0 {
-                    findings.push(format!(
-                        "step {step}: {parses} consumer parse(s) while the projection was alive"
-                    ));
-                }
+                check_session_work(&graph, acting_parses, session_steps, &mut findings);
+                acting_parses = 0;
+                session_steps = 0;
                 drop(graph);
                 if !session.quiesce(&mut findings) {
                     break;
@@ -482,6 +524,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
         // An operation may be refused (a stale base, a name clash); what
         // matters is that the index converges on whatever the disk holds.
         step_done.store(true, Ordering::Relaxed);
+        session_steps += 1;
         if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
             eprintln!(
                 "  -> {outcome:?} parses={}",
@@ -497,12 +540,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
     }
     if session.quiesce(&mut findings) {
         check_settled(&root, &graph, &mut findings);
-        let parses = graph.consumer_page_parses_test();
-        if parses > 0 {
-            findings.push(format!(
-                "{parses} consumer parse(s) while the projection was alive"
-            ));
-        }
+        check_session_work(&graph, acting_parses, session_steps, &mut findings);
         drop(graph);
         session.close(&mut findings);
         let _ = fs::remove_dir_all(&root);
