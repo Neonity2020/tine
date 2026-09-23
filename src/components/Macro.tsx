@@ -333,14 +333,21 @@ export function QueryMacro(props: {
   // which used to render "No results" plus a "why empty?" that opened onto an
   // empty panel (2026-09-11, a fresh query while the projection recovered).
   const [parsePending, setParsePending] = createSignal<QueryNotReadyError | null>(null);
+  // A removed block's parse is nobody's: its request never changes, so
+  // without this the retry polled `query_parse` for as long as the index
+  // stayed not ready (GH #543, audit R12-06).
+  let disposed = false;
+  onCleanup(() => {
+    disposed = true;
+  });
   const [parsedSnapshot] = createResource(parseRequest, async (request) => {
     setParsePending(null);
     return {
       request,
       reading: await runQueryWhenCurrent(
         () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
-        () => parseRequest() === request,
-        (error) => { if (parseRequest() === request) setParsePending(error); },
+        () => !disposed && parseRequest() === request,
+        (error) => { if (!disposed && parseRequest() === request) setParsePending(error); },
       ),
     };
   });
@@ -609,7 +616,7 @@ export function QueryMacro(props: {
       try {
         const fresh = await runQueryWhenCurrent(
           () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
-          () => graphEpoch() === epochAtStart && doc.byId[props.blockId!]?.raw === rawAtStart,
+          () => !disposed && graphEpoch() === epochAtStart && doc.byId[props.blockId!]?.raw === rawAtStart,
         );
         const rebased = { ...fresh.view };
         for (const key of ["view", "sort", "group_by", "columns", "aggregates", "sample"] as const) {

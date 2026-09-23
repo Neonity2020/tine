@@ -1,4 +1,5 @@
 import { OperationCancelledError, QueryNotReadyError } from "./backend";
+import { graphBinding } from "./persistence";
 
 export interface QueryReadinessOwner {
   signal: AbortSignal;
@@ -48,11 +49,20 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
  * retry reuses THAT gate rather than growing a second cancellation policy
  * beside it. Readiness policy stays in `runQueryWhenReady` and is not
  * duplicated, and nothing here is mode-specific. */
+/**
+ * A read also belongs to the graph it was asked of: `isCurrent` holds only
+ * while the binding it started on does. That half is the same for every
+ * caller, so it lives here; each caller's `isCurrent` still owns the other
+ * half, its own disposal and supersession. A caller that forgot the binding
+ * kept retrying into the next graph (GH #543, audit R12-06).
+ */
 export function runQueryWhenCurrent<T>(
   load: () => Promise<T>,
-  isCurrent: () => boolean,
+  callerIsCurrent: () => boolean,
   onPending: (error: QueryNotReadyError | null) => void = () => {},
 ): Promise<T> {
+  const binding = graphBinding();
+  const isCurrent = () => graphBinding() === binding && callerIsCurrent();
   // The FIRST attempt is eager. `runQueryWhenReady` defers every attempt by a
   // microtask so a synchronous abort can win the race, which is right for a
   // resource that owns an `AbortController` — but an imperative caller has no
