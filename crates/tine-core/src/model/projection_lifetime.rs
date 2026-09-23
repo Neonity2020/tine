@@ -426,7 +426,8 @@ impl Graph {
                     // launch, behind a slow disk -- lands on a validated image and
                     // readiness follows. Parsing the graph instead reads every page
                     // to answer what one delta settles. Before validation the edit
-                    // waits for an inventory, so it is not by itself coming.
+                    // may lower, but readiness waits for the inventory that
+                    // validates the image, so it is not by itself coming.
                     ProjectionProgress::Working(Reason::PendingEdits) => projection.validated(),
                     _ => false,
                 }
@@ -612,7 +613,7 @@ pub(super) enum FullOfferOutcome {
     NoIndex,
     /// The index takes it.
     Queued,
-    /// The index is already current at this generation.
+    /// The index holds exactly this snapshot at this generation.
     AlreadyCurrent,
     /// A page consumer offered while index work is coming.
     RefusedDuringWarm,

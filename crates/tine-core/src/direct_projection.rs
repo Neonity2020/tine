@@ -1237,9 +1237,12 @@ impl DirectProjection {
         self.shared.worker_available.load(Ordering::Acquire)
     }
 
-    /// Whether this session has validated the image. Queued edits lower only
-    /// onto a validated image; before that they wait for a complete inventory
-    /// (`AwaitingFullInventory`), so they are not by themselves coming.
+    /// Whether this session has validated the image (a full snapshot or a
+    /// clean warm was accepted). A queued edit may lower onto an image the
+    /// session has not validated, but readiness is never published over one:
+    /// `index_need` answers `Validate` until this is set. So a pending edit on
+    /// an unvalidated image is not by itself coming (GH #543, audit R9-14;
+    /// pinned by `gh543_an_edit_on_a_reopened_image_does_not_make_it_ready_before_validation`).
     pub(crate) fn validated(&self) -> bool {
         self.shared.validated.load(Ordering::Acquire)
     }

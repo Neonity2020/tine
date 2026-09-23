@@ -866,3 +866,51 @@ fn a_listing_overtaken_by_an_edit_reads_the_index_instead_of_parsing() {
     assert_eq!(listed.len(), 8);
     assert_eq!(parses, 0, "an overtaken listing parsed {parses} pages");
 }
+
+/// An edit may lower onto the image a session reopened, but that image does
+/// not answer for the graph until a warm or full inventory validates it:
+/// readiness waits for validation (`index_need` reports `Validate`). This is
+/// why a pending edit on an unvalidated image is not by itself "coming"
+/// (`projection_lifetime.rs`, derived-read wait; GH #543 audit R9-14).
+#[test]
+fn gh543_an_edit_on_a_reopened_image_does_not_make_it_ready_before_validation() {
+    let dir = scratch("gh543-edit-before-validation");
+    for index in 0..3 {
+        fs::write(
+            dir.join("pages").join(format!("Page{index}.md")),
+            format!("- page {index}\n"),
+        )
+        .unwrap();
+    }
+    let database = dir.join("private/projection.sqlite");
+    {
+        let first = Graph::open(&dir);
+        first.attach_direct_projection(database.clone()).unwrap();
+        first.warm_cache();
+        assert!(first
+            .wait_for_direct_projection_for_test(Duration::from_secs(30))
+            .is_ok());
+        crate::direct_projection::release_projection(&first);
+    }
+    let graph = Graph::open(&dir);
+    graph.attach_direct_projection(database).unwrap();
+    let entry = graph.entry_for_path(&dir.join("pages/Page0.md")).unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    page.blocks[0].raw = "edited before the warm".into();
+    graph.save_page(&page, page.rev.as_deref()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(projection.wait_drained_test(), "the edit's turn ran");
+    let (need, _) = projection.index_need_now();
+    let ready_before = graph.direct_projection_ready_test();
+    graph.warm_cache();
+    let ready_after = graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(30))
+        .is_ok();
+    graph.detach_direct_projection(Duration::from_secs(5));
+    assert_eq!(need, crate::direct_projection::IndexNeed::Validate);
+    assert!(!ready_before, "an unvalidated image was published as ready");
+    assert!(
+        ready_after,
+        "the warm validates the image and readiness follows"
+    );
+}
