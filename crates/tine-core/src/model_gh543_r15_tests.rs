@@ -712,3 +712,172 @@ fn index_answers_are_asked_at_a_waited_generation() {
          (I-13, R15-07); imitate Graph::direct_projection_real_page_names: {violations:?}"
     );
 }
+
+/// GH #543 acceptance probe on a real-shaped graph: the launch, reopen and
+/// ordinary edits cost no whole-graph parse outside the index's own passes.
+/// It works on a copy, so the source graph is never written, and prints
+/// counts and durations only, never content.
+///
+/// ```text
+/// TINE_GH543_PROBE_GRAPH=~/research/logseq-anonymized \
+///   cargo test --release -p tine-core gh543_real_graph_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real graph named by TINE_GH543_PROBE_GRAPH"]
+fn gh543_real_graph_probe() {
+    let Ok(source) = std::env::var("TINE_GH543_PROBE_GRAPH") else {
+        panic!("set TINE_GH543_PROBE_GRAPH to a graph directory");
+    };
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    let root = r10_scratch("real-graph-probe");
+    fs::remove_dir_all(&root).unwrap();
+    copy(std::path::Path::new(&source), &root);
+    let database = r10_scratch("real-graph-probe-db").join("projection.sqlite");
+    let bound = Duration::from_secs(600);
+
+    struct Phase<'a> {
+        graph: &'a Graph,
+        started: Instant,
+        builds: usize,
+        consumer: usize,
+        fresh: u64,
+    }
+    impl<'a> Phase<'a> {
+        fn begin(graph: &'a Graph) -> Self {
+            Self {
+                graph,
+                started: Instant::now(),
+                builds: graph.page_build_parses_test(),
+                consumer: graph.consumer_page_parses_test(),
+                fresh: graph
+                    .direct_projection_test()
+                    .map_or(0, |projection| projection.fresh_builds_test()),
+            }
+        }
+        fn end(self, label: &str) -> (usize, u64) {
+            let consumer = self.graph.consumer_page_parses_test() - self.consumer;
+            let fresh = self
+                .graph
+                .direct_projection_test()
+                .map_or(0, |projection| projection.fresh_builds_test())
+                - self.fresh;
+            eprintln!(
+                "GH543PROBE {label}: ms={} whole_graph_parses={} consumer_page_parses={consumer} fresh_builds={fresh}",
+                self.started.elapsed().as_millis(),
+                self.graph.page_build_parses_test() - self.builds,
+            );
+            (consumer, fresh)
+        }
+    }
+    let launch = |label: &str| {
+        let graph = Arc::new(Graph::open(&root));
+        let phase_started = Instant::now();
+        graph.attach_direct_projection(database.clone()).unwrap();
+        let owner = R10Owner::start(&graph);
+        assert!(
+            owner.wait_settled(bound) && owner.wait_ready(bound),
+            "{label} never ready"
+        );
+        r10_settle(&graph);
+        eprintln!(
+            "GH543PROBE {label}: ready_ms={} pages={} whole_graph_parses={} consumer_page_parses={} fresh_builds={}",
+            phase_started.elapsed().as_millis(),
+            graph.list_pages().len(),
+            graph.page_build_parses_test(),
+            graph.consumer_page_parses_test(),
+            graph.direct_projection_test().unwrap().fresh_builds_test(),
+        );
+        (graph, owner)
+    };
+    let reads = |graph: &Graph, label: &str| {
+        let phase = Phase::begin(graph);
+        let _ = graph.list_pages();
+        let _ = graph.page_aliases();
+        let _ = graph.search("the", 50);
+        let _ = graph.journal_content_days();
+        let (consumer, _) = phase.end(label);
+        assert_eq!(consumer, 0, "{label}: a ready index read parsed pages");
+    };
+
+    let (graph, owner) = launch("cold");
+    reads(&graph, "cold reads");
+    let pages = graph
+        .list_pages()
+        .into_iter()
+        .filter(|entry| entry.kind == PageKind::Page && !entry.name.contains('/'))
+        .collect::<Vec<_>>();
+    let target = pages[pages.len() / 2].name.clone();
+
+    let phase = Phase::begin(&graph);
+    graph
+        .rename_page(&target, &format!("{target} probe"))
+        .unwrap();
+    r10_settle(&graph);
+    reads(&graph, "reads after rename");
+    let (_, fresh) = phase.end("rename");
+    assert_eq!(fresh, 0, "a rename rebuilt the index");
+
+    let saved = pages[pages.len() / 3].name.clone();
+    let phase = Phase::begin(&graph);
+    let mut page = graph.load_named(&saved, PageKind::Page).unwrap().unwrap();
+    page.blocks = markdown_page_dto(&saved, &saved, "- probe edit\n")
+        .unwrap()
+        .blocks;
+    let base = page.rev.clone();
+    graph.save_page(&page, base.as_deref()).unwrap();
+    r10_settle(&graph);
+    reads(&graph, "reads after save");
+    let (_, fresh) = phase.end("save");
+    assert_eq!(fresh, 0, "a save rebuilt the index");
+
+    let external = pages[pages.len() / 4].path.clone();
+    let phase = Phase::begin(&graph);
+    let mut text = fs::read_to_string(&external).unwrap_or_default();
+    text.push_str("\n- probe external edit\n");
+    fs::write(&external, text).unwrap();
+    graph.sync_file_checked(&external).unwrap();
+    r10_settle(&graph);
+    reads(&graph, "reads after external edit");
+    let (_, fresh) = phase.end("external edit");
+    assert_eq!(fresh, 0, "an external edit rebuilt the index");
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    drop(graph);
+
+    // Reopen: the stored index answers after a survey; nothing rebuilds.
+    let (graph, owner) = launch("reopen");
+    assert_eq!(
+        graph.direct_projection_test().unwrap().fresh_builds_test(),
+        0
+    );
+    reads(&graph, "reopen reads");
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    drop(graph);
+
+    // One page becomes unreadable while Tine is closed.
+    let broken = pages[pages.len() / 5].path.clone();
+    fs::write(&broken, b"- \xff\xfe broken\n").unwrap();
+    let (graph, owner) = launch("reopen with an unreadable page");
+    assert_eq!(
+        graph.direct_projection_test().unwrap().fresh_builds_test(),
+        0
+    );
+    reads(&graph, "reads with an unreadable page");
+    let failures = graph.page_index_failures();
+    eprintln!("GH543PROBE unreadable recorded={}", failures.len());
+    assert_eq!(failures.len(), 1);
+    r10_finish(root, graph, owner);
+    let _ = fs::remove_dir_all(database.parent().unwrap());
+}
