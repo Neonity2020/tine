@@ -20,9 +20,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-// The root READMEs (README.md, README.zh-CN.md) are waived by `--test-only` too.
+// The root READMEs, CHANGELOG.md, CONTRIBUTING.md and website/ are waived too:
+// `--test-only` skips the build for them and `--docs-only` skips every gate.
 const EXCLUDED_FROM_BUILD_INPUTS =
-  /include_(?:str|bytes)!\s*\(\s*"([^"]*(?:docs\/|src-tauri\/gen\/schemas\/|README[^"\/]*\.md(?="))[^"]*)"/g;
+  /include_(?:str|bytes)!\s*\(\s*"([^"]*(?:docs\/|website\/|src-tauri\/gen\/schemas\/|(?:README[^"\/]*|CHANGELOG|CONTRIBUTING)\.md(?="))[^"]*)"/g;
+
+// The frontend can make the same mistake in one line: Vite bundles any file a
+// module imports (`import notes from "../CHANGELOG.md?raw"`).
+const FRONTEND_DOCS_IMPORT =
+  /(?:\bfrom\s*|\bimport\s*\(?\s*)["']([^"']*(?:\/docs\/|\/website\/|(?:README[^"'\/]*|CHANGELOG|CONTRIBUTING)\.md)[^"']*)["']/g;
+
+export function frontendDocsImports(source: string): string[] {
+  return [...source.matchAll(FRONTEND_DOCS_IMPORT)].map((match) => match[1]!);
+}
 
 /** Byte ranges of every `#[cfg(test)]`-attributed `mod … { … }` block. */
 export function testModuleRanges(source: string): [number, number][] {
@@ -61,6 +71,17 @@ function testOnlyModuleFiles(sources: Map<string, string>): Set<string> {
   return testOnly;
 }
 
+function frontendSources(dir: string, into: Map<string, string>): Map<string, string> {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) frontendSources(full, into);
+    else if (/\.(?:ts|tsx|js|mjs)$/.test(entry.name) && !/\.test\.|\.guard\./.test(entry.name)) {
+      into.set(full, fs.readFileSync(full, "utf8"));
+    }
+  }
+  return into;
+}
+
 function rustSources(dir: string, into: Map<string, string>): Map<string, string> {
   if (!fs.existsSync(dir)) return into;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -96,6 +117,33 @@ describe("docs are not a product input", () => {
 
   it("detects a production embed of the root README", () => {
     expect(productionEmbeds('const ABOUT: &str = include_str!("../../../README.md");')).toEqual(["../../../README.md"]);
+  });
+
+  it("detects production embeds of the other docs-only paths", () => {
+    expect(productionEmbeds('const C: &str = include_str!("../../../CHANGELOG.md");')).toEqual(["../../../CHANGELOG.md"]);
+    expect(productionEmbeds('const W: &str = include_str!("../../../website/index.html");')).toEqual([
+      "../../../website/index.html",
+    ]);
+  });
+
+  it("detects a frontend import of a docs-only path", () => {
+    expect(frontendDocsImports('import notes from "../CHANGELOG.md?raw";')).toEqual(["../CHANGELOG.md?raw"]);
+    expect(frontendDocsImports('const f = await import("../website/app.js");')).toEqual(["../website/app.js"]);
+    expect(frontendDocsImports('import { x } from "./docsHelpers";')).toEqual([]);
+  });
+
+  it("no frontend module imports a docs-only path", () => {
+    const frontend = frontendSources(path.join(root, "src"), new Map());
+    expect(frontend.size).toBeGreaterThan(50);
+    const offenders = [...frontend].flatMap(([file, source]) =>
+      frontendDocsImports(source).map((spec) => `${path.relative(root, file)} -> ${spec}`),
+    );
+    expect(
+      offenders,
+      "docs/, website/, root README*.md, CHANGELOG.md and CONTRIBUTING.md are integrated with " +
+        "`tine-coordination integrate --docs-only` (no gates, no build); importing one into the " +
+        "frontend would ship it unbuilt. Link to it instead (see src/components/AboutTab.tsx).",
+    ).toEqual([]);
   });
 
   it("accepts the house pattern: a contract pinned from a test module", () => {
