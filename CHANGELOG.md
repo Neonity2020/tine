@@ -92,6 +92,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- A query with a very long `(or …)` or `(and …)` list (about a thousand terms)
+  now answers. It used to fail, and each failure rebuilt the whole search
+  index again, over and over while the query was on screen (GH #543).
+
 - While Tine finished indexing a graph, a failed index update could leave it
   waiting for itself, so page lists and searches never loaded until a restart
   (GH #543).

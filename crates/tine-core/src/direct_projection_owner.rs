@@ -242,6 +242,35 @@ impl DirectProjection {
         self.shared.changed.notify_all();
     }
 
+    /// Whether a failed read found the stored image damaged: only then does
+    /// it owe a rebuild. A statement SQLite refuses on an intact image (an
+    /// expression tree too deep, any hard limit on an admitted input) fails
+    /// the same way on a freshly built one, so rebuilding for it rebuilt the
+    /// whole index on every retry of that query (GH #543, audit R10-01). The
+    /// check (schema plus `quick_check`) runs once per ready generation.
+    pub(crate) fn failed_read_found_damage(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .shared
+            .inject_image_damage
+            .swap(false, Ordering::AcqRel)
+        {
+            return true;
+        }
+        let generation = self.shared.ready_generation.load(Ordering::Acquire);
+        let mut verified = self.shared.image_verified_intact_at.lock().unwrap();
+        if *verified == Some(generation) {
+            return false;
+        }
+        let intact = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).is_ok_and(
+            |database| database.validate_schema().is_ok() && database.quick_check().is_ok(),
+        );
+        if intact {
+            *verified = Some(generation);
+        }
+        !intact
+    }
+
     /// What whole-graph work the index needs next, once the worker has
     /// opened its stored image (see [`index_need`]). Waits while it is
     /// still opening it; `SettingUp` is returned only when `cancelled`.

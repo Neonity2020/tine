@@ -700,7 +700,7 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
         statement.sql.contains(
             "b.page_id IN (SELECT pr6.page_id FROM pages pr6 \
              JOIN names prn7 ON prn7.name_id = pr6.name_id \
-             WHERE (pr6.page_id = b.page_id AND prn7.key <> '' AND prn7.key = ?3))"
+             WHERE (pr6.page_id = b.page_id AND (prn7.key <> '' AND prn7.key = ?3)))"
         ),
         "{}",
         statement.sql
@@ -829,4 +829,24 @@ fn a_prefix_range_is_half_open_and_survives_the_last_scalar_value() {
 #[test]
 fn like_escape_protects_the_three_pattern_characters() {
     assert_eq!(like_escape("100%_a\\b"), "100\\%\\_a\\\\b");
+}
+
+/// R10-01's shape: an n-ary boolean join written as `join(" OR ")` is left-deep
+/// in SQLite, one expression level per operand, and a wide admitted query then
+/// fails as a read. Every such join goes through `join_balanced` (GH #543).
+#[test]
+fn every_boolean_join_in_the_compiler_is_balanced() {
+    let source = include_str!("sql.rs");
+    let flat: Vec<_> = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("join(\" OR") || line.contains("join(\" AND"))
+        .map(|(number, line)| format!("sql.rs:{}: {}", number + 1, line.trim()))
+        .collect();
+    assert!(
+        flat.is_empty(),
+        "join n-ary AND/OR through `join_balanced` (sql.rs), never a flat \
+         `join(\" OR \")`: SQLite nests those one level per operand and refuses \
+         past 1000 (GH #543, audit R10-01): {flat:?}"
+    );
 }

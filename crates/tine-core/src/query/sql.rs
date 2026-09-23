@@ -2315,9 +2315,9 @@ impl Compiler<'_> {
                         has_parent
                     };
                 }
-                let any = parts.join(" OR ");
+                let any = join_balanced(&parts, "OR");
                 if op == CmpOp::In {
-                    format!("({any})")
+                    any
                 } else {
                     format!("({has_parent} AND NOT ({any}))")
                 }
@@ -2735,7 +2735,7 @@ impl Compiler<'_> {
                     let high = self.bind(PhysicalQueryValue::Integer(high));
                     clauses.push(format!("{column} <= {high}"));
                 }
-                return Some(format!("({})", clauses.join(" AND ")));
+                return Some(join_balanced(&clauses, "AND"));
             }
             CmpOp::Ge => (">=", true),
             CmpOp::Le => ("<=", true),
@@ -2782,14 +2782,14 @@ impl Compiler<'_> {
                     .iter()
                     .map(|item| self.name_element(item, column, normalize))
                     .collect();
-                format!("({})", parts.join(" AND "))
+                join_balanced(&parts, "AND")
             }
             Filter::Or { items } => {
                 let parts: Vec<String> = items
                     .iter()
                     .map(|item| self.name_element(item, column, normalize))
                     .collect();
-                format!("({})", parts.join(" OR "))
+                join_balanced(&parts, "OR")
             }
             Filter::Not { inner } => {
                 let inner = self.name_element(inner, column, normalize);
@@ -3206,6 +3206,30 @@ fn reads_anchor_context(filter: &Filter) -> bool {
 // Literal helpers
 // ---------------------------------------------------------------------------
 
+/// `op` over already-lowered operands as a BALANCED tree.
+///
+/// SQLite parses `a OR b OR c …` left-deep, one level per operand, and refuses
+/// a statement past 1000 levels ("Expression tree is too large"). A flat
+/// 985-term `(or …)` is 7 KB, well inside the input caps, so a left-deep join
+/// turned an admitted query into a failed read, which the dispatcher then
+/// treated as a damaged index (GH #543, audit R10-01). Grouping halves keeps
+/// the depth at log2(n). Every n-ary boolean join in this file goes through
+/// here; `every_boolean_join_in_the_compiler_is_balanced` pins that.
+fn join_balanced(parts: &[String], op: &str) -> String {
+    match parts {
+        [] => unreachable!("join_balanced needs at least one operand"),
+        [one] => one.clone(),
+        _ => {
+            let (left, right) = parts.split_at(parts.len() / 2);
+            format!(
+                "({} {op} {})",
+                join_balanced(left, op),
+                join_balanced(right, op)
+            )
+        }
+    }
+}
+
 /// `AND` over already-lowered operands, folding the two constants.
 ///
 /// **Folding is not an optimization here, it is a correctness-of-plan rule.** A
@@ -3222,7 +3246,7 @@ fn fold_and(parts: Vec<String>) -> String {
     match kept.len() {
         0 => "1".to_string(),
         1 => kept.into_iter().next().expect("one operand"),
-        _ => format!("({})", kept.join(" AND ")),
+        _ => join_balanced(&kept, "AND"),
     }
 }
 
@@ -3235,7 +3259,7 @@ fn fold_or(parts: Vec<String>) -> String {
     match kept.len() {
         0 => "0".to_string(),
         1 => kept.into_iter().next().expect("one operand"),
-        _ => format!("({})", kept.join(" OR ")),
+        _ => join_balanced(&kept, "OR"),
     }
 }
 

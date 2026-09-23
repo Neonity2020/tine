@@ -188,7 +188,8 @@ impl Graph {
             }
         };
         // Whether the repair must ERASE the disposable database before
-        // rebuilding it. A failed read owes that; an idle projection that has
+        // rebuilding it. A failed read over a damaged image owes that (the
+        // repair checks the image first); an idle projection that has
         // simply not started yet does not, and erasing it there discarded the
         // whole persisted index on every launch (GH #543).
         let reset_before_rebuild = match attempt_captured() {
@@ -905,7 +906,7 @@ impl Graph {
         self.direct_projection_repair(true);
     }
 
-    /// The repair itself. `reset` erases the disposable database first.
+    /// The repair itself. `reset`: a read failed, so a damaged image is erased.
     ///
     /// Erasing is the repair a torn or unreadable file owes, and it is never
     /// the repair an intact one owes: `reset()` drops every source stamp, so
@@ -932,9 +933,11 @@ impl Graph {
         let Some(projection) = self.direct_projection.get() else {
             return;
         };
-        if reset || projection.worker_failed() {
-            // A failed read is a damaged image. `request_rebuild` is a no-op
-            // while a fresh build already replaces it (IT-10).
+        if projection.worker_failed() || reset && projection.failed_read_found_damage() {
+            // A failed worker, or a failed read over a damaged image, owes a
+            // new image. A read refused on an intact image is that query's
+            // own answer (audit R10-01). `request_rebuild` is a no-op while a
+            // fresh build already replaces it (IT-10).
             projection.request_rebuild();
         }
         if projection.owner_registered() {

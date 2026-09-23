@@ -613,6 +613,10 @@ struct ProjectionShared {
     commit_notification: AtomicU64,
     commit_waker: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
+    /// The ready generation at which a failed read last found the stored
+    /// image intact, so a statement SQLite refuses is checked once, not on
+    /// every retry (audit R10-01).
+    image_verified_intact_at: Mutex<Option<u64>>,
     /// R3: the ONE admission/cancellation owner for database-owned query jobs
     /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
     /// drains every job before it replaces or resets the file, and `Drop`
@@ -718,6 +722,11 @@ struct ProjectionShared {
     /// future arm silently drops (M9).
     #[cfg(test)]
     inject_read_failure: AtomicBool,
+    /// The next failed-read health check finds the image damaged. An injected
+    /// read failure stands for a damaged image, which is what it was written
+    /// to exercise; a statement refused on an intact image is a real query.
+    #[cfg(test)]
+    inject_image_damage: AtomicBool,
     /// Fail the worker's next turn, as a disk error or a SQLite fault would.
     #[cfg(test)]
     inject_turn_failure: AtomicBool,
@@ -1146,6 +1155,7 @@ impl DirectProjection {
             commit_notification: AtomicU64::new(0),
             commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
+            image_verified_intact_at: Mutex::new(None),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
             committed_registry: Arc::new(Mutex::new(None)),
@@ -1190,6 +1200,8 @@ impl DirectProjection {
             build_progress: Default::default(),
             #[cfg(test)]
             inject_read_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            inject_image_damage: AtomicBool::new(false),
             #[cfg(test)]
             inject_turn_failure: AtomicBool::new(false),
             #[cfg(test)]
@@ -2570,10 +2582,22 @@ impl DirectProjection {
             .store(true, Ordering::Release);
     }
 
+    /// Refuse the next statement on an intact image, as SQLite refuses a
+    /// statement past one of its hard limits.
+    #[cfg(test)]
+    pub(crate) fn inject_next_statement_refusal(&self) {
+        self.shared
+            .inject_read_failure
+            .store(true, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_next_statement_failure(&self) {
         self.shared
             .inject_read_failure
+            .store(true, Ordering::Release);
+        self.shared
+            .inject_image_damage
             .store(true, Ordering::Release);
     }
 

@@ -6486,6 +6486,32 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 9, R9-15b. set_journal_title_format wrote config.edn and then called refresh_graph, while the watcher also reopened the graph for the same graph-reaching change; its claimed reason (a title-named journal migration) is performed by no refresh (Concord invariant 4). It now only writes; the watcher reopens once and announces graph-rebound. restore_backup rewrote the graph before taking the transition lane, so the watcher could reopen between the restore and the command's reopen; refresh_graph now runs the command's rewrite under the lane, before the reopen, so the watcher's try-once reopen defers and then finds the configuration taken in. Fail-before: at the parent commit refresh_graph_for_label runs no rewrite, restore_backup calls restore_from_backup_source before refresh_graph, and the settings guard pinned set_journal_title_format as a reopening settings command. No Tauri app mock exists, so the duplicate itself is argued from the watcher's served-config comparison (a graph-reaching write stays untaken until a reopen, state.rs a_config_refresh_keeps_queries_answering), not counted at runtime."
+},
+{
+ "id": "REG-A-WIDE-QUERY-ANSWERS-WITHOUT-A-REBUILD-543",
+ "title": "A query with a very long or/and list answers, and a failed read on an intact index never rebuilds it",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r10_tests.rs::gh543_a_query_wider_than_sqlites_expression_depth_answers",
+   "crates/tine-core/src/model_gh543_r10_tests.rs::gh543_a_read_refused_on_an_intact_image_does_not_rebuild_it",
+   "crates/tine-core/src/query/sql_tests.rs::every_boolean_join_in_the_compiler_is_balanced"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-01. The SQL compiler joined n-ary AND/OR flat, which SQLite nests one level per operand; a 985-term (or ...) (7 KB, inside the input caps) failed with 'Expression tree is too large'. The dispatcher treated every failed read as a damaged image and rebuilt the whole index, the rebuild succeeded (resetting the owner's backoff), and the query block retried NotReady forever: back-to-back whole-index rebuilds while the block was on screen. Fix: join_balanced keeps boolean depth at log2(n); a failed read requests a rebuild only when a schema check plus quick_check (once per ready generation) finds the image damaged, and otherwise answers Unavailable(ReadFailed). Fail-before: both model tests fail with either half reverted (evidence gh550-batch/indexing-audit-r10/necessity-R10-01.txt)."
 }
 ]
 }
