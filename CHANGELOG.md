@@ -105,6 +105,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - The indexing bar now shows while search waits for the index to be repaired,
   instead of disappearing while searches keep saying the index is not ready
   (GH #543).
+- With two windows open, a graph change or finished launch in one window no
+  longer makes the other window reload, rebind or stop waiting for its own
+  graph (GH #543).
+- After Tine reopens a graph because its settings changed (for example a
+  `:hidden` edit), page aliases and page links follow the reopened graph at
+  once, including when that happens during the launch (GH #543).
+- Saving pages while a large graph is still being indexed no longer queues one
+  whole-graph block-reference count and one alias read per save for when
+  indexing finishes (GH #543).
+- Opening a graph lists its pages once instead of twice (GH #543).
+- A repaint such as a typography or journal-title change no longer hides a
+  visible indexing bar for a second (GH #543).
 
 - While Tine finished indexing a graph, a failed index update could leave it
   waiting for itself, so page lists and searches never loaded until a restart

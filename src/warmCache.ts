@@ -1,5 +1,6 @@
 import { backend } from "./backend";
 import { graphEpoch } from "./ui";
+import { listenHere } from "./windowEvents";
 
 type Unlisten = () => void;
 
@@ -13,8 +14,7 @@ const defaultDeps: WarmCacheWaitDeps = {
   currentEpoch: graphEpoch,
   warmDone: () => backend().warmDone(),
   async listenWarmCacheDone(cb) {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen("warm-cache-done", () => cb());
+    return listenHere("warm-cache-done", () => cb());
   },
 };
 

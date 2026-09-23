@@ -13,9 +13,12 @@ import { readOr } from "./resourceRead";
 const countsMap = createRoot(() => {
   const [countsResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev() }),
-    async ({ epoch }) => {
+    async ({ epoch, revision }) => {
       if (!(await waitForWarmCache(epoch))) return {};
-      if (epoch !== graphEpoch()) return {};
+      // A save during the pass has already asked again: each stale waiter
+      // issuing its own whole-graph read at hand-over cost N+1 of them
+      // (GH #543, audit R10-09). Solid drops a superseded fetch's value.
+      if (epoch !== graphEpoch() || revision !== dataRev()) return {};
       return backend().getBlockRefCounts().catch(() => ({}) as Record<string, number>);
     }
   );

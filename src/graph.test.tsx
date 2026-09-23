@@ -102,6 +102,9 @@ async function loadHarness(
   const pushToast = vi.fn();
 
   vi.doMock("./backend", () => ({ backend: () => api }));
+  // graph.ts's own page-list reads, one per request: the shared memo across
+  // readers (src/pageList.ts) is pinned in launchReadsGh543.test.tsx.
+  vi.doMock("./pageList", () => ({ listGraphPages: () => api.listPages() }));
   vi.doMock("./ui", () => ({
     setGraphMeta: (next: GraphMeta | null) => { meta = next; },
     graphMeta: () => meta,

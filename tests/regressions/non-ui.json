@@ -6587,6 +6587,129 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 10, R10-04. indexing_progress decided from its own progress match, which hid the bar during a full-repair turn while readers got NotReady. It now asks the index decider (index_need) the same question readers' waits ask. Fail-before: auditor probe audit543_r10_bar_is_hidden_while_a_full_repair_runs (evidence gh550-batch/indexing-audit-r10/verify-by-manager-rust.log)."
+},
+{
+ "id": "REG-WINDOW-EVENTS-REACH-ONLY-THEIR-WINDOW-543",
+ "title": "An event addressed to one window is heard only by that window",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/windowEvents.test.ts::window-addressed events (GH #543, R10-05)"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 audit R10-05. Tauri delivers an emit_to(label) event to every JS listener registered with target Any, so graph-changed, graph-rebound, warm-cache-done and seven other window-scoped events reached every window. Shape: listenHere (src/windowEvents.ts) registers with the window's own target; guard: a bare listen names only an allowlisted broadcast, and no Rust emit_to site uses a broadcast name. Fail-before: probe R10-F2, evidence gh550-batch/indexing-audit-r10 (frontend lane notes; probes failed on 0c4c4f52)."
+},
+{
+ "id": "REG-A-REOPENED-GRAPH-RELOADS-ITS-NAVIGATION-INDEX-543",
+ "title": "After the backend reopens a graph, aliases and page identities follow the reopened graph, also during the launch warm",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/launchReadsGh543.test.ts::re-reads the navigation index after the backend reopens the graph",
+   "src/launchReadsGh543.test.tsx::loads the navigation index when the graph is reopened during the launch warm"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 audit R10-06. graph-rebound bumped binding and epoch only; the navigation index was re-read only on dataRev/pageInventoryRev, and a reopen during the launch warm made loadAliases give up. Fix: onGraphRebound re-asks the navigation index on every rebind. Fail-before: probes R10-F4 and R10-F4b, evidence gh550-batch/indexing-audit-r10 (frontend lane notes; probes failed on 0c4c4f52)."
+},
+{
+ "id": "REG-SAVES-DURING-INDEXING-QUEUE-NO-EXTRA-WHOLE-GRAPH-READS-543",
+ "title": "Saves made while the index is coming leave at most one block-ref count and one alias read behind them",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/launchReadsGh543.test.ts::issues one block_ref_counts after the warm, not one per save made during the pass",
+   "src/launchReadsGh543.test.ts::keeps at most one page_aliases in flight while the index is coming"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 audit R10-09. blockRefCounts re-checked only the epoch after its warm wait, so every save during the pass issued its own whole-graph block_ref_counts when the warm ended; page_aliases ran once per dataRev, in parallel. Fix: the revision is re-checked after the wait; alias reads coalesce per (binding, epoch) with one re-ask. Fail-before: probes R10-F1 and R10-F3, evidence gh550-batch/indexing-audit-r10 (frontend lane notes; probes failed on 0c4c4f52)."
+},
+{
+ "id": "REG-ONE-PAGE-LIST-PER-GRAPH-OPEN-543",
+ "title": "A graph open lists its pages once; every reader shares one page-list producer",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/launchReadsGh543.test.tsx::lists the pages once per graph open",
+   "src/launchReadsGh543.test.ts::asks the backend for the page list in one place"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 audit R10-10. All Pages (pages.ts) and the navigation index (graph.ts) each called listPages, so every open and every create/delete listed the whole graph twice. Shape: listGraphPages (src/pageList.ts) memoizes one read per binding, epoch and inventory revision; guard: listPages() is called only there. Fail-before: probe R10-F5, evidence gh550-batch/indexing-audit-r10 (frontend lane notes; probes failed on 0c4c4f52)."
+},
+{
+ "id": "REG-A-REPAINT-KEEPS-THE-INDEXING-BAR-543",
+ "title": "A repaint that does not rebind the graph keeps the indexing bar's follower",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/components/IndexingProgressBar.test.tsx::keeps its follower across a repaint and replaces it on a rebind"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 audit R10-11. The bar restarted its follower (and its show-after grace) on every render-epoch bump, so a typography or journal-title change hid a showing bar for about a second. Fix: the follower is keyed on graphBinding. Fail-before: the component test fails on HEAD's IndexingProgressBar.tsx (2 followers after a repaint)."
 }
 ]
 }

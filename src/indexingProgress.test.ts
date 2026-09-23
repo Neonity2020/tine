@@ -2,19 +2,19 @@ import { describe, expect, it } from "vitest";
 import type { IndexingProgress } from "./backend";
 import { followIndexingProgress, indexingProgressLabel, type IndexingProgressDeps } from "./indexingProgress";
 
-function scripted(polls: (IndexingProgress | null)[], opts: { warmAfterPoll?: number; epochChangesAfterPoll?: number } = {}) {
+function scripted(polls: (IndexingProgress | null)[], opts: { warmAfterPoll?: number; bindingChangesAfterPoll?: number } = {}) {
   let clock = 0;
   let polled = 0;
-  let epoch = 1;
+  let binding = 1;
   let warmResolve: (ready: boolean) => void = () => {};
   const warm = new Promise<boolean>((resolve) => { warmResolve = resolve; });
   const deps: IndexingProgressDeps = {
-    epoch: () => epoch,
+    binding: () => binding,
     async progress() {
       const next = polls[Math.min(polled, polls.length - 1)];
       polled += 1;
       if (polled === opts.warmAfterPoll) warmResolve(true);
-      if (polled === opts.epochChangesAfterPoll) epoch = 2;
+      if (polled === opts.bindingChangesAfterPoll) binding = 2;
       return next;
     },
     warmDone: () => warm,
@@ -36,7 +36,7 @@ describe("indexing progress", () => {
 
   it("keeps following a build that outlives the warm and hides once it ends", async () => {
     // The warm finishes on the first poll while the fresh build runs on.
-    const { deps } = scripted([building(0), building(5000), null, building(9000), null, null], { warmAfterPoll: 1, epochChangesAfterPoll: 6 });
+    const { deps } = scripted([building(0), building(5000), null, building(9000), null, null], { warmAfterPoll: 1, bindingChangesAfterPoll: 6 });
     const published: (IndexingProgress | null)[] = [];
     await followIndexingProgress(1, (p) => published.push(p), deps);
     // One empty poll between passes does not hide it; two in a row do.
@@ -46,7 +46,7 @@ describe("indexing progress", () => {
   });
 
   it("does not flash on a graph that finishes quickly", async () => {
-    const { deps } = scripted([building(1), null, null], { warmAfterPoll: 1, epochChangesAfterPoll: 5 });
+    const { deps } = scripted([building(1), null, null], { warmAfterPoll: 1, bindingChangesAfterPoll: 5 });
     const published: (IndexingProgress | null)[] = [];
     await followIndexingProgress(1, (p) => published.push(p), deps);
     expect(published.every((p) => p === null)).toBe(true);
@@ -56,7 +56,7 @@ describe("indexing progress", () => {
     // Launch settles (warm done, two empty polls); later a damaged-index
     // repair rebuilds the whole graph without a graph switch.
     const polls = [null, null, null, null, building(100), building(200), building(300), building(400), null, null];
-    const { deps } = scripted(polls, { warmAfterPoll: 1, epochChangesAfterPoll: polls.length });
+    const { deps } = scripted(polls, { warmAfterPoll: 1, bindingChangesAfterPoll: polls.length });
     const published: (IndexingProgress | null)[] = [];
     await followIndexingProgress(1, (p) => published.push(p), deps);
     expect(published).toContainEqual(building(400));
@@ -67,12 +67,12 @@ describe("indexing progress", () => {
     const { deps, polled } = scripted([null], { warmAfterPoll: 1 });
     let sleeps = 0;
     const sleep = deps.sleep;
-    let epoch = 1;
+    let binding = 1;
     await followIndexingProgress(1, () => {}, {
       ...deps,
-      epoch: () => epoch,
+      binding: () => binding,
       hidden: () => true,
-      async sleep(ms) { sleeps += 1; if (sleeps === 10) epoch = 2; await sleep(ms); },
+      async sleep(ms) { sleeps += 1; if (sleeps === 10) binding = 2; await sleep(ms); },
     });
     // Two polls settle launch; the eight hidden sleeps after that poll nothing.
     expect(polled()).toBe(2);
@@ -91,7 +91,7 @@ describe("indexing progress", () => {
   });
 
   it("stops when another graph is opened", async () => {
-    const { deps, polled } = scripted([building(1)], { epochChangesAfterPoll: 3 });
+    const { deps, polled } = scripted([building(1)], { bindingChangesAfterPoll: 3 });
     const published: (IndexingProgress | null)[] = [];
     await followIndexingProgress(1, (p) => published.push(p), deps);
     expect(polled()).toBe(3);
@@ -104,7 +104,7 @@ describe("indexing progress without a graph", () => {
     let polls = 0;
     const published: (IndexingProgress | null)[] = [];
     await followIndexingProgress(1, (p) => published.push(p), {
-      epoch: () => 1,
+      binding: () => 1,
       async progress() { polls += 1; throw new Error("no graph"); },
       warmDone: () => new Promise(() => {}),
       now: () => 0,

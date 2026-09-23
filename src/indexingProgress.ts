@@ -1,4 +1,5 @@
 import { backend, type IndexingProgress } from "./backend";
+import { graphBinding } from "./persistence";
 import { graphEpoch } from "./ui";
 import { waitForWarmCache } from "./warmCache";
 
@@ -23,9 +24,10 @@ export function indexingProgressLabel(progress: IndexingProgress): string {
 }
 
 export interface IndexingProgressDeps {
-  epoch(): number;
+  /** The graph binding followed; the follower ends when it moves. */
+  binding(): number;
   progress(): Promise<IndexingProgress | null>;
-  warmDone(epoch: number): Promise<boolean>;
+  warmDone(): Promise<boolean>;
   now(): number;
   sleep(ms: number): Promise<void>;
   /** A hidden window skips its settled-state polls. */
@@ -33,15 +35,20 @@ export interface IndexingProgressDeps {
 }
 
 const defaultDeps: IndexingProgressDeps = {
-  epoch: graphEpoch,
+  binding: graphBinding,
   progress: () => backend().indexingProgress(),
-  warmDone: (epoch) => waitForWarmCache(epoch),
+  warmDone: () => waitForWarmCache(graphEpoch()),
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   hidden: () => typeof document !== "undefined" && document.hidden,
 };
 
-/** Follow the index work of the graph opened at `epoch` while it is open.
+/** Follow the index work of the graph bound at `binding` while it is bound.
+ *
+ * The graph BINDING, not the render epoch: a repaint (typography, the journal
+ * title format) bumps the epoch without moving the graph, and a follower
+ * keyed on it restarted with a fresh no-flash grace, hiding a showing bar
+ * for about a second (GH #543, audit R10-11).
  *
  * Launch indexing has settled once the whole-graph warm has finished AND two
  * polls in a row found nothing graph-sized running: the warm can finish
@@ -50,19 +57,19 @@ const defaultDeps: IndexingProgressDeps = {
  * cadence, because a later pass in the same session (a repair after a
  * damaged index) is just as graph-sized and moves no graph epoch (GH #543). */
 export async function followIndexingProgress(
-  epoch: number,
+  binding: number,
   publish: (progress: IndexingProgress | null) => void,
   deps: IndexingProgressDeps = defaultDeps,
   signal?: AbortSignal,
 ): Promise<void> {
   let warmed = false;
-  void deps.warmDone(epoch).then(() => { warmed = true; }, () => { warmed = true; });
+  void deps.warmDone().then(() => { warmed = true; }, () => { warmed = true; });
   let started = deps.now();
   let idlePolls = 0;
   let failedPolls = 0;
   let settled = false;
   try {
-    while (deps.epoch() === epoch && !signal?.aborted) {
+    while (deps.binding() === binding && !signal?.aborted) {
       if (settled && deps.hidden?.()) {
         await deps.sleep(WATCH_MS);
         continue;
@@ -77,7 +84,7 @@ export async function followIndexingProgress(
         failedPolls += 1;
         if (failedPolls >= 10) return;
       }
-      if (deps.epoch() !== epoch || signal?.aborted) return;
+      if (deps.binding() !== binding || signal?.aborted) return;
       if (progress && settled) {
         // A new pass: it gets the same no-flash grace as the launch one.
         settled = false;

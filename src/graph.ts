@@ -5,7 +5,7 @@ import { backend } from "./backend";
 import { graphBindingRuntime } from "./graphBindingRuntime";
 import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, resetGraphConflicts, restoreLiveSaveConflicts, conflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
-import { notifyGraphRebound } from "./modeHooks";
+import { notifyGraphRebound, onGraphRebound } from "./modeHooks";
 import { resetStore, flushAll, doc, pageByName, forgetPage, invalidateUndoForPage, reloadPageIfStillSafe } from "./store";
 import { dirtyPages, graphBinding, renameFlushFailureMessage, savingPages } from "./persistence";
 import { clearAssetBlobCache } from "./assetCache";
@@ -14,6 +14,7 @@ import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
 import { journalTitle, localDayKey, setJournalTitleFormat } from "./journal";
 import { applyTemplateVars, prepareTemplateVars } from "./editor/templateVars";
 import { waitForWarmCache } from "./warmCache";
+import { listGraphPages } from "./pageList";
 import { CUSTOM_CSS_STYLE_ID, ensureLsShimStyle } from "./lsShim";
 import { ensureThemeStyle } from "./themeGallery";
 import { isMobile, platformKind } from "./platform";
@@ -377,9 +378,39 @@ function aliasMapChanged(
   return previousKeys.some((key) => previous[key] !== next[key]);
 }
 
-/** Refresh semantic aliases after content saves. Request sequencing prevents an
- *  older same-epoch response from overwriting a newer alias edit. */
-export async function refreshAliases(): Promise<void> {
+let aliasesInFlight: { key: string; done: Promise<void> } | null = null;
+let aliasesAskedAgain = false;
+
+/** Refresh semantic aliases after content saves. One read per graph binding
+ *  and render epoch is in flight at a time: saves during it ask for one more
+ *  read when it lands, not one each. Every save during an indexing pass used
+ *  to park its own `page_aliases` on a native thread until the pass ended
+ *  (GH #543, audit R10-09). A read for another binding or epoch is never
+ *  joined, so a read parked on the old graph cannot hold up the new one. */
+export function refreshAliases(): Promise<void> {
+  const key = `${graphBinding()}\0${graphEpoch()}`;
+  if (aliasesInFlight?.key === key) {
+    aliasesAskedAgain = true;
+    return aliasesInFlight.done;
+  }
+  const flight: { key: string; done: Promise<void> } = { key, done: Promise.resolve() };
+  aliasesInFlight = flight;
+  flight.done = (async () => {
+    try {
+      do {
+        aliasesAskedAgain = false;
+        await refreshAliasesOnce();
+      } while (aliasesAskedAgain && aliasesInFlight === flight);
+    } finally {
+      if (aliasesInFlight === flight) aliasesInFlight = null;
+    }
+  })();
+  return flight.done;
+}
+
+/** One alias read. Request sequencing prevents an older same-epoch response
+ *  from overwriting a newer alias edit. */
+async function refreshAliasesOnce(): Promise<void> {
   const epoch = graphEpoch();
   const binding = graphBinding();
   bindNavigationIndex(epoch);
@@ -388,7 +419,7 @@ export async function refreshAliases(): Promise<void> {
   const result = await Promise.allSettled([backend().pageAliases()]);
   if (epoch !== graphEpoch() || navigationEpoch !== epoch) {
     if (reaskAfterRepaint(binding, () => aliasesRequestedAt, () => aliasesLoaded)) {
-      await refreshAliases();
+      aliasesAskedAgain = true;
     }
     return;
   }
@@ -422,7 +453,7 @@ export async function refreshPageIdentities(): Promise<void> {
   bindNavigationIndex(epoch);
   pageIdentitiesRequestedAt = epoch;
   const request = ++pageIdentityRequest;
-  const result = await Promise.allSettled([backend().listPages()]);
+  const result = await Promise.allSettled([listGraphPages()]);
   if (epoch !== graphEpoch() || navigationEpoch !== epoch) {
     if (reaskAfterRepaint(binding, () => pageIdentitiesRequestedAt, () => pageIdentitiesLoaded)) {
       await refreshPageIdentities();
@@ -457,6 +488,13 @@ async function loadAliases(): Promise<void> {
   if (binding !== graphBinding()) return;
   await loadNavigationIndexAfterWarm();
 }
+
+// Every rebind (a backend reopen, a restored backup) re-asks the navigation
+// index, the one binding-scoped store no resource re-reads: a reopen used to
+// keep the old graph's aliases, and one during the launch warm left the
+// index unloaded until the next save (GH #543, audit R10-06). A microtask,
+// so the binding and the render epoch have both moved when it asks.
+onGraphRebound(() => queueMicrotask(() => void loadAliases()));
 
 export async function loadNavigationIndexAfterWarm(): Promise<void> {
   await Promise.all([refreshAliases(), ensurePageIdentities(graphEpoch())]);
@@ -930,8 +968,9 @@ export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | n
  *  session, and the next settings write in Tine was based on the stale copy. */
 /** The backend reopened this graph after a `config.edn` change that reaches
  *  the graph (for example `:hidden`). Everything read from the old `Graph` is
- *  stale: in-flight results are dropped and the page set, the navigation index
- *  and what is on screen are read again (GH #543, audit R9-13). */
+ *  stale: in-flight results are dropped, and the page set and what is on
+ *  screen are read again (GH #543, audit R9-13). The navigation index is
+ *  re-read by its own rebind listener (above `loadNavigationIndexAfterWarm`). */
 export function applyGraphReopened(): void {
   notifyGraphRebound();
   bumpGraphEpoch();

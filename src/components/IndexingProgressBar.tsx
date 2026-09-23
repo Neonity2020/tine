@@ -1,5 +1,6 @@
 import { createEffect, createSignal, on, onCleanup, Show } from "solid-js";
 import type { IndexingProgress } from "../backend";
+import { graphBinding } from "../persistence";
 import { graphEpoch } from "../ui";
 import { followIndexingProgress, indexingProgressLabel } from "../indexingProgress";
 
@@ -8,16 +9,24 @@ import { followIndexingProgress, indexingProgressLabel } from "../indexingProgre
  *  The app stays usable meanwhile; this only says how long the wait is. */
 export function IndexingProgressBar() {
   const [progress, setProgress] = createSignal<IndexingProgress | null>(null);
-  createEffect(on(graphEpoch, (epoch) => {
+  // One follower per graph binding. Every rebind is followed by a render
+  // epoch bump, so the epoch is the trigger, and a repaint that leaves the
+  // binding in place keeps the running follower (audit R10-11).
+  let following: { binding: number; stop: AbortController } | null = null;
+  createEffect(on(graphEpoch, () => {
+    const binding = graphBinding();
+    if (following?.binding === binding) return;
+    following?.stop.abort();
     const stop = new AbortController();
-    onCleanup(() => stop.abort());
+    following = { binding, stop };
     void followIndexingProgress(
-      epoch,
+      binding,
       (next) => { if (!stop.signal.aborted) setProgress(next); },
       undefined,
       stop.signal,
     );
   }));
+  onCleanup(() => following?.stop.abort());
   return (
     <Show when={progress()}>
       {(current) => {

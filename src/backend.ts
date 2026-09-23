@@ -5,6 +5,7 @@
 import { createSignal } from "solid-js";
 import type { DiscardReason } from "./safeClose";
 import { notifyGraphRebound } from "./modeHooks";
+import { listenHere } from "./windowEvents";
 import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
 import type { GraphSearchConsumer, GraphSearchDisplayOptions } from "./editor/queryIr";
 import type {
@@ -1349,8 +1350,7 @@ class TauriBackend implements Backend {
     return this.call<string | null>("startup_graph_path");
   }
   async onStorageTransition(cb: (progress: StorageTransitionEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<StorageTransitionEvent>("storage-transition", (event) => cb(event.payload));
+    return listenHere<StorageTransitionEvent>("storage-transition", (event) => cb(event.payload));
   }
   captureTarget() {
     return this.call<string>("capture_target");
@@ -1918,8 +1918,7 @@ class TauriBackend implements Backend {
     return this.call<void>("trash_sync_conflict", { conflict });
   }
   async onConflictsChanged(cb: () => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen("conflicts-changed", () => cb());
+    return listenHere("conflicts-changed", () => cb());
   }
   importAsset(path: string, name?: string) {
     return this.call<string>("import_asset", { path, name });
@@ -2032,34 +2031,27 @@ class TauriBackend implements Backend {
     return this.call<void>("rollback_pdf_area_image", { pdf, page, id, stamp });
   }
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<GraphChange>("graph-changed", (e) => cb(e.payload));
+    return listenHere<GraphChange>("graph-changed", (e) => cb(e.payload));
   }
   async onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
+    return listenHere<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
   }
   async onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<AssetChangedBatch>("asset-changed", (e) => cb(e.payload));
+    return listenHere<AssetChangedBatch>("asset-changed", (e) => cb(e.payload));
   }
   async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
+    return listenHere<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
   }
   async onGraphReopened(cb: () => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen("graph-rebound", () => cb());
+    return listenHere("graph-rebound", () => cb());
   }
   async onQueryProjectionChanged(cb: () => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<number>("query-projection-changed", (event) => {
+    return listenHere<number>("query-projection-changed", (event) => {
       if (event.payload === this.bindingGeneration) cb();
     });
   }
   async onGraphWatchError(cb: (message: string) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<string>("graph-watch-error", (e) => cb(e.payload));
+    return listenHere<string>("graph-watch-error", (e) => cb(e.payload));
   }
   getBackupKeep() {
     return this.call<number>("get_backup_keep");

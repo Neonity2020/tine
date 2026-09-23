@@ -4,6 +4,7 @@ import { dataRev, graphEpoch, pageInventoryRev } from "./ui";
 import { waitForWarmCache } from "./warmCache";
 import type { PageEntry } from "./types";
 import { readOr } from "./resourceRead";
+import { listGraphPages } from "./pageList";
 
 // ONE graph-wide physical page list and reference-name list, shared by every
 // namespace + sidebar consumer. Physical entries keep paths/owners for All Pages;
@@ -30,7 +31,7 @@ const pageInventory = createRoot(() => {
   const [physicalPagesResource] = createResource(
     () => ({ epoch: graphEpoch(), inventory: pageInventoryRev() }),
     async ({ epoch, inventory }) => {
-      const pages = await backend().listPages().catch(() => [] as PageEntry[]);
+      const pages = await listGraphPages().catch(() => [] as PageEntry[]);
       return epoch === graphEpoch() && inventory === pageInventoryRev() ? pages : [];
     }
   );
