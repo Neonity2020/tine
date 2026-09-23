@@ -923,18 +923,20 @@ mod tests {
     fn the_guides_task_query_reaches_tasks_on_a_page_other_than_its_own() {
         let dir = scratch("tine-guide-task-query-is-graph-wide");
         let graph = Graph::open(&dir);
+        // RET2: a public Direct query answers from the projection or reports a
+        // typed failure, so the guide fixture attaches and initializes one
+        // exactly as the app does -- attached before the Guide is copied in,
+        // as in the app (GH #543, R8-14) -- rather than relying on a
+        // parsed-graph walk.
+        graph
+            .attach_direct_projection(dir.join("private/projection.sqlite"))
+            .expect("the disposable projection attaches");
         let workflow = copy_guide_into_graph(&graph, "Workflows/Capture and plan your day")
             .unwrap()
             .name;
         let showcase = copy_guide_into_graph(&graph, "Feature showcase")
             .unwrap()
             .name;
-        // RET2: a public Direct query answers from the projection or reports a
-        // typed failure, so the guide fixture attaches and initializes one
-        // exactly as the app does rather than relying on a parsed-graph walk.
-        graph
-            .attach_direct_projection(dir.join("private/projection.sqlite"))
-            .expect("the disposable projection attaches");
         graph.warm_cache();
 
         let result = loop {

@@ -96,7 +96,6 @@ impl Corpus {
 
     pub(crate) fn open(root: PathBuf, owns_root: bool) -> Corpus {
         let graph = Graph::open(&root);
-        graph.warm_cache();
         let projection_dir = std::env::temp_dir().join(format!(
             "tine-query-sql-projection-{}",
             root.file_name()
@@ -108,6 +107,7 @@ impl Corpus {
         graph
             .attach_direct_projection(path.clone())
             .expect("the projection worker starts");
+        graph.warm_cache();
         let started = Instant::now();
         while !graph.direct_projection_ready_test() {
             assert!(

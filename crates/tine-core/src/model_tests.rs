@@ -1027,7 +1027,10 @@ fn quick_switch_offers_each_matching_authored_alias_before_and_after_readiness()
     .unwrap();
 
     let graph = Graph::open(&dir);
-    graph.warm_cache();
+    // Attached but not warmed: the app's pre-ready state (GH #543, R8-14).
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
     let assert_suggestions = |phase: &str| {
         let w = graph.quick_switch("W", 20);
         for spelling in ["Welcome to Tine", "Welcome-To-Tine"] {
@@ -1055,9 +1058,6 @@ fn quick_switch_offers_each_matching_authored_alias_before_and_after_readiness()
     };
 
     assert_suggestions("pre-ready fallback");
-    graph
-        .attach_direct_projection(dir.join("private/projection.sqlite"))
-        .unwrap();
     graph.warm_cache();
     wait_for_direct_query_projection(&graph);
     assert_suggestions("ready projection");
@@ -1075,12 +1075,8 @@ fn quick_switch_offers_each_matching_authored_alias_before_and_after_readiness()
 /// functions in `crate::query` directly instead.
 fn ready_graph(dir: &Path) -> Graph {
     let graph = Graph::open(dir);
-    // The parsed cache FIRST, then the projection. `warm_cache` prefers the
-    // projection when one is attached and then retains no parsed graph at all
-    // (R6), and a session with no parsed cache has no per-page derived
-    // retention to speak of — so a fixture about the memo scope has to be the
-    // ordinary open-parse-project session, not the warm-reopen one.
-    graph.warm_cache();
+    // Attach FIRST, then warm: the app's order (GH #543, R8-14). The warm
+    // offers the projection its payload; nothing else does.
     graph
         .attach_direct_projection(dir.join("private/projection.sqlite"))
         .expect("the disposable projection attaches");
@@ -9095,8 +9091,16 @@ fn indexed_exhaustive_fallback_is_not_eligible_for_interactive_memo() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// An attached graph's unlinked references are the Interactive window both
+/// before its index is ready and after, at one source generation.
+///
+/// This test used to parse the graph before attaching, get the exhaustive
+/// parser answer (window + 25), and check that answer was not reused once
+/// the projection became ready. The app always attaches before its first
+/// parse, and attaching after one is now a debug assertion (GH #543,
+/// R8-14), so that exhaustive pre-attach answer no longer exists.
 #[test]
-fn indexed_unlinked_fallback_is_not_reused_after_same_generation_becomes_ready() {
+fn unlinked_refs_are_window_bounded_before_and_after_readiness() {
     let dir = scratch("bounded-unlinked-memo-readiness");
     let window = crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW;
     let match_count = window + 25;
@@ -9108,21 +9112,23 @@ fn indexed_unlinked_fallback_is_not_reused_after_same_generation_becomes_ready()
     fs::write(dir.join("pages").join("Target.md"), "- owner\n").unwrap();
 
     let g = Graph::open(&dir);
-    g.warm_cache();
+    // Attached but not yet warmed: the app's state between graph open and
+    // the index owner's first offer (GH #543, R8-14).
+    g.attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
     let generation = g.cache_generation();
     let limits = (match_count + 10, 16 * 1024 * 1024);
     let fallback = g
         .unlinked_refs_bounded_indexed("Target", limits.0, limits.1)
-        .expect("no projection keeps the established parser fallback");
-    assert_eq!(fallback.total, match_count);
+        .expect("a projection not yet ready keeps the established parser fallback");
+    assert_eq!(fallback.total, window);
     let fallback_membership = fallback
         .groups
         .iter()
         .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
         .collect::<std::collections::BTreeSet<_>>();
 
-    g.attach_direct_projection(dir.join("private/projection.sqlite"))
-        .unwrap();
+    g.warm_cache();
     wait_for_direct_query_projection(&g);
     assert_eq!(
         g.cache_generation(),
@@ -9141,8 +9147,8 @@ fn indexed_unlinked_fallback_is_not_reused_after_same_generation_becomes_ready()
         .iter()
         .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
         .collect::<std::collections::BTreeSet<_>>();
-    assert!(indexed_membership.is_subset(&fallback_membership));
-    assert_ne!(indexed_membership, fallback_membership);
+    assert_eq!(indexed_membership.len(), window);
+    assert_eq!(fallback_membership.len(), window);
 
     let _ = fs::remove_dir_all(&dir);
 }

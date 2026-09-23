@@ -26,23 +26,14 @@ impl ProjectionSlot {
         self.0.lock().unwrap().take()
     }
 
-    /// Attach `projection` unless one is attached, running `seed` while the
-    /// slot lock is still held; returns whether it attached.
-    ///
-    /// This is the one place the lock covers other work, so that a second
-    /// attach cannot slip in between the check and the seed. `seed` may only
-    /// enqueue work; it must never wait on the projection.
-    pub(super) fn attach(
-        &self,
-        projection: Arc<DirectProjection>,
-        seed: impl FnOnce(&DirectProjection),
-    ) -> bool {
+    /// Attach `projection` unless one is attached; returns whether it
+    /// attached.
+    pub(super) fn attach(&self, projection: Arc<DirectProjection>) -> bool {
         let mut slot = self.0.lock().unwrap();
         if slot.is_some() {
             return false;
         }
-        *slot = Some(Arc::clone(&projection));
-        seed(&projection);
+        *slot = Some(projection);
         true
     }
 }

@@ -7,25 +7,22 @@ use super::*;
 impl Graph {
     /// Attach Direct Files' app-private disposable SQLite projection.
     ///
-    /// This never reads or writes graph files. If the parsed cache is already
-    /// warm, its exact snapshot is queued; otherwise `install_built` supplies it
-    /// when the ordinary background warm completes.
+    /// This never reads or writes graph files, and it queues nothing: the
+    /// graph's one index owner offers the projection its payload when the
+    /// first warm installs the parsed cache. So attach comes first, before
+    /// any parse, exactly as the app opens and refreshes a graph
+    /// (`attach_direct_files_services`, whose order src-tauri's graph tests
+    /// pin). A second producer of the full payload here, seeded from a cache
+    /// parsed before attach, served only fixtures in the other order and
+    /// raced the owner's own offer (GH #543, audit R8-14).
     pub fn attach_direct_projection(&self, path: PathBuf) -> io::Result<()> {
+        debug_assert!(
+            self.cache.read().unwrap().is_none(),
+            "attach the Direct projection before the first parse; nothing \
+             offers it a cache installed earlier (GH #543, R8-14)"
+        );
         let projection = Arc::new(crate::direct_projection::DirectProjection::start(path)?);
-        self.direct_projection.attach(projection, |projection| {
-            let cache = self.cache.read().unwrap();
-            if let Some(snapshot) = cache.as_ref().map(Arc::clone) {
-                let revisions = Arc::new(self.disk_revs.read().unwrap().clone());
-                projection.enqueue_full(
-                    self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
-                    snapshot,
-                    revisions,
-                    Arc::new(self.config().parse_config()),
-                    self.page_index_failures.read().unwrap().is_empty(),
-                    self.unread_sources(),
-                );
-            }
-        });
+        self.direct_projection.attach(projection);
         Ok(())
     }
 

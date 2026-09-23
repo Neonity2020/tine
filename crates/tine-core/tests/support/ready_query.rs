@@ -32,11 +32,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Attach this graph's disposable projection under `<root>/private/` and warm
 /// it. The database is graph-private state, exactly where the app puts it.
 pub fn attach_projection(graph: &Graph, root: &Path) {
-    // The parsed cache FIRST, then the projection. `warm_cache` prefers the
-    // projection when one is attached and then retains no parsed graph at all
-    // (R6), so attaching before the first warm would silently turn every
-    // fixture here into a warm-reopen session and change what it observes.
-    graph.warm_cache();
+    // Attach FIRST, then warm: the app's order (GH #543, R8-14). The warm
+    // offers the projection its payload; nothing else does.
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .expect("the disposable projection attaches");
@@ -49,7 +46,6 @@ pub fn attach_projection(graph: &Graph, root: &Path) {
 /// changes.
 pub fn attach_scratch_projection(graph: &Graph, tag: &str) {
     remove_scratch_projection(tag);
-    graph.warm_cache();
     graph
         .attach_direct_projection(scratch_projection_dir(tag).join("projection.sqlite"))
         .expect("the disposable projection attaches");

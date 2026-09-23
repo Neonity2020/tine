@@ -195,9 +195,11 @@ pub(super) struct PageBuildTestState {
     pub(super) derived_read_open_once: std::sync::Mutex<Option<PathBuf>>,
     pub(super) enumerations: std::sync::atomic::AtomicUsize,
     pub(super) parses: std::sync::atomic::AtomicUsize,
-    /// The part of `parses` made by an indexing build (see
-    /// `Graph::consumer_page_parses_test`).
-    pub(super) indexing_parses: std::sync::atomic::AtomicUsize,
+    /// The part of `parses` made outside an indexing build, counted on its
+    /// own: a difference of two counters read one after the other can come
+    /// out one short, or underflow, while the owner parses between the two
+    /// reads (GH #543, audit R9-07).
+    pub(super) consumer_parses: std::sync::atomic::AtomicUsize,
     /// Pages a warm repair parsed (one per changed page, never a graph pass).
     pub(super) repair_parses: std::sync::atomic::AtomicUsize,
     pub(super) installs: std::sync::atomic::AtomicUsize,

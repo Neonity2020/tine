@@ -293,10 +293,10 @@ struct PendingProjection {
     full: Option<PendingFull>,
     /// The last full snapshot accepted, by generation and identity. The same
     /// snapshot offered again at the same generation is the same work, and is
-    /// taken once: attach seeds the parsed cache, and the build that installed
-    /// that cache offers it too, so without this the second offer re-ran the
-    /// whole-graph validation and reopened a not-ready window in which every
-    /// query fell back to parsing (GH #543).
+    /// taken once: a repeated offer of the snapshot already accepted would
+    /// otherwise re-run the whole-graph validation and reopen a not-ready
+    /// window in which every query fell back to parsing (GH #543). Attach no
+    /// longer offers anything (R8-14); the index owner's warm is the producer.
     accepted_full: Option<(u64, std::sync::Weak<Vec<(PageEntry, Arc<Document>)>>)>,
     rebuild: bool,
     /// Set by `mark_stale`: the image may no longer describe the pages, so

@@ -958,10 +958,10 @@ fn print_asset_inlining_enforces_per_file_and_shared_export_budgets() {
 
 fn print_test_graph(dir: &Path) -> Graph {
     let graph = Graph::open(dir);
-    graph.warm_cache();
     graph
         .attach_direct_projection(dir.join("print-test.sqlite"))
         .unwrap();
+    graph.warm_cache();
     let started = std::time::Instant::now();
     while !graph.direct_projection_ready_test() {
         assert!(started.elapsed() < std::time::Duration::from_secs(30));
@@ -1748,9 +1748,8 @@ fn publish_tql_refuses_stale_main_until_normal_source_update() {
     .unwrap();
 
     let graph = Graph::open(&dir);
-    graph.warm_cache();
     let _projection = prepare_publication_graph(&graph);
-    // An external editor rewrites the source after the live cache was built.
+    // An external editor rewrites the source after the index was built.
     fs::write(
         dir.join("pages/Tasks.md"),
         "- TODO tql-current-token [[Alpha]]\n",

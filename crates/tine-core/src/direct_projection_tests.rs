@@ -1902,12 +1902,17 @@ fn direct_projection_matches_literal_search_and_virtual_reference_names() {
         )
         .unwrap();
     std::fs::write(root.join("pages/two.md"), "- unrelated content\n").unwrap();
+    // The parser's answer comes from its own graph with no projection;
+    // the graph under test attaches before any parse (GH #543, R8-14).
+    let parser_graph = Graph::open(&root);
+    parser_graph.warm_cache();
+    let oracle =
+        crate::query::search_cancellable(&parser_graph, "characteristically", 20, || false);
     let graph = Graph::open(&root);
-    graph.warm_cache();
-    let oracle = crate::query::search_cancellable(&graph, "characteristically", 20, || false);
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let selected = graph.search("characteristically", 20).unwrap();
@@ -2013,10 +2018,10 @@ fn referenced_names_are_read_once_per_cache_generation() {
     std::fs::create_dir_all(root.join("pages")).unwrap();
     std::fs::write(root.join("pages/one.md"), "- links to [[Inline Page]]\n").unwrap();
     let graph = Graph::open(&root);
-    graph.warm_cache();
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let keys = |graph: &Graph| {
@@ -2088,18 +2093,22 @@ fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
         .unwrap();
     std::fs::write(root.join("pages/unrelated.md"), "- unrelated\n").unwrap();
 
-    let graph = Graph::open(&root);
-    graph.warm_cache();
-    let parser_aliases = crate::query::page_aliases_with_owners(&graph);
-    let parser_backlinks = crate::query::backlinks(&graph, "target");
-    let parser_unlinked = crate::query::unlinked_refs(&graph, "target");
-    let parser_referrers = crate::query::block_referrers(&graph, target_id);
-    let parser_resolved = crate::query::resolve_block(&graph, target_id);
-    let parser_counts = graph.block_ref_counts().unwrap();
+    // The parser's answer comes from its own graph with no projection;
+    // the graph under test attaches before any parse (GH #543, R8-14).
+    let parser_graph = Graph::open(&root);
+    parser_graph.warm_cache();
+    let parser_aliases = crate::query::page_aliases_with_owners(&parser_graph);
+    let parser_backlinks = crate::query::backlinks(&parser_graph, "target");
+    let parser_unlinked = crate::query::unlinked_refs(&parser_graph, "target");
+    let parser_referrers = crate::query::block_referrers(&parser_graph, target_id);
+    let parser_resolved = crate::query::resolve_block(&parser_graph, target_id);
+    let parser_counts = parser_graph.block_ref_counts().unwrap();
 
+    let graph = Graph::open(&root);
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     assert_eq!(graph.page_aliases_with_owners(), parser_aliases);
@@ -2435,10 +2444,10 @@ fn interactive_plain_reference_recency_is_independent_per_title_and_alias() {
     std::fs::write(root.join("pages/source.md"), body).unwrap();
 
     let graph = Graph::open(&root);
-    graph.warm_cache();
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let candidates = graph
@@ -2492,10 +2501,10 @@ fn interactive_plain_reference_window_verifies_raw_page_preambles() {
     std::fs::write(root.join("pages/go.md"), "- owner\n").unwrap();
 
     let graph = Graph::open(&root);
-    graph.warm_cache();
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let groups = graph
@@ -2563,10 +2572,10 @@ fn interactive_plain_reference_window_counts_verified_page_and_block_owners_toge
     std::fs::write(root.join("pages/zz-block-target-source.md"), block_source).unwrap();
 
     let graph = Graph::open(&root);
-    graph.warm_cache();
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let candidates = graph
@@ -2640,10 +2649,10 @@ fn interactive_short_plain_reference_scan_bounds_exact_callback_work() {
     std::fs::write(root.join("pages/go.md"), "- owner\n").unwrap();
 
     let graph = Graph::open(&root);
-    graph.warm_cache();
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     reset_plain_reference_query_instrumentation();
@@ -2692,11 +2701,11 @@ fn interactive_indexed_plain_reference_keeps_exact_callback_work_bounded() {
     std::fs::write(root.join("pages/indexed target.md"), "- owner\n").unwrap();
 
     let graph = Graph::open(&root);
-    graph.warm_cache();
     let projection_path = root.join("private/projection.sqlite");
     graph
         .attach_direct_projection(projection_path.clone())
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
     let analyzer = rusqlite::Connection::open(&projection_path).expect("projection opens");
     analyzer
@@ -2753,10 +2762,10 @@ fn interactive_block_owner_does_not_admit_unwindowed_page_preamble() {
     std::fs::write(root.join("pages/target.md"), "- owner\n").unwrap();
 
     let graph = Graph::open(&root);
-    graph.warm_cache();
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let answer = graph
@@ -2792,10 +2801,10 @@ fn interactive_plain_reference_excludes_self_before_window_admission() {
     std::fs::write(root.join("pages/zzz-self.md"), own).unwrap();
 
     let graph = Graph::open(&root);
-    graph.warm_cache();
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let groups = graph
@@ -2845,14 +2854,18 @@ fn direct_projection_preserves_external_uuid_ambiguity_for_parser_resolution() {
     )
     .unwrap();
 
-    let graph = Graph::open(&root);
-    graph.warm_cache();
-    let parser_resolution = crate::query::resolve_block(&graph, target_id)
+    // The parser's answer comes from its own graph with no projection;
+    // the graph under test attaches before any parse (GH #543, R8-14).
+    let parser_graph = Graph::open(&root);
+    parser_graph.warm_cache();
+    let parser_resolution = crate::query::resolve_block(&parser_graph, target_id)
         .map(|group| signature(std::slice::from_ref(&group)));
     let projection_path = root.join("private/projection.sqlite");
+    let graph = Graph::open(&root);
     graph
         .attach_direct_projection(projection_path.clone())
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
 
     let database = PhysicalGraphProjectionDatabase::open_read_only(&projection_path).unwrap();
@@ -10144,21 +10157,22 @@ fn gh543_a_delete_during_the_warm_validation_parses_nothing() {
     assert_eq!(parses, 0, "the delete discarded the warm validation");
 }
 
-/// Attach seeds the projection with the installed parsed cache, and the build
-/// that installed it offers the same snapshot. The projection must take that
-/// snapshot once: a second acceptance re-validates the whole graph and drops
-/// readiness meanwhile, so queries fall back to parsing (GH #543 round 2).
+/// A full snapshot the projection already accepted, offered again at the same
+/// generation, must be taken once: a second acceptance re-validates the whole
+/// graph and drops readiness meanwhile, so queries fall back to parsing
+/// (GH #543 round 2). Attach used to be the second offerer; it offers nothing
+/// now (R8-14), and this pins the dedupe for any other repeat offer.
 #[test]
 fn the_same_full_snapshot_offered_twice_is_taken_once() {
     let _serial = serialize_projection_tests();
     let root = r6_graph("same-full-snapshot-once");
     let graph = Graph::open(&root);
-    graph.warm_cache();
-    let snapshot = graph.installed_page_snapshot_test().expect("warm cache");
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
+    graph.warm_cache();
     wait_ready(&graph);
+    let snapshot = graph.installed_page_snapshot_test().expect("warm cache");
     let projection = graph.direct_projection_test().unwrap();
     projection.reset_projection_health_checks_test();
 

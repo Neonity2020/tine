@@ -3750,7 +3750,6 @@ mod query_command_surface_tests {
     /// asking a question the projection cannot answer.
     fn ready_query_graph(dir: &std::path::Path) -> tine_core::model::Graph {
         let graph = tine_core::model::Graph::open(dir);
-        graph.warm_cache();
         graph
             .attach_direct_projection(dir.join("private/projection.sqlite"))
             .expect("the disposable projection attaches");

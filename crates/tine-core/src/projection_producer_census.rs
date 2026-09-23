@@ -2171,3 +2171,31 @@ fn watch_reach_has_one_producer() {
         "watch reach gained a decider; see this test's doc comment"
     );
 }
+
+/// A test counter is read with one load, never as arithmetic on two.
+///
+/// `consumer_page_parses_test` used to return `parses - indexing_parses`,
+/// two relaxed loads one after the other. The owner could parse between
+/// them, so the answer came out one short, and a seeded interleaving run
+/// underflowed on `consumer_page_parses_test() - before` about once in 300
+/// seeds (GH #543, audit R9-07). Count the part you want in its own counter
+/// instead; the exemplar is `PageBuildTestState::consumer_parses`
+/// (`crates/tine-core/src/model/page_cache_index.rs`).
+#[test]
+fn no_counter_is_read_as_arithmetic_on_two_loads() {
+    let pattern = Regex::new(r"\.load\([^)]*\)\s*[-+]\s*[\w.:()]*\.load\(").unwrap();
+    let offenders: Vec<String> = repository_rust_sources()
+        .iter()
+        .flat_map(|(path, source)| {
+            pattern
+                .find_iter(source)
+                .map(move |found| format!("{path}:{}", source[..found.start()].lines().count()))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "an atomic counter read as the sum or difference of two loads races its \
+         writer (GH #543, R9-07); keep the wanted part in its own counter like \
+         PageBuildTestState::consumer_parses: {offenders:?}"
+    );
+}

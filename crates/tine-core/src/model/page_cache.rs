@@ -1352,8 +1352,8 @@ impl Graph {
     fn count_page_parse_test(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.page_build_test.parses.fetch_add(1, Relaxed);
-        if INDEXING_BUILD_TEST.with(std::cell::Cell::get) {
-            self.page_build_test.indexing_parses.fetch_add(1, Relaxed);
+        if !INDEXING_BUILD_TEST.with(std::cell::Cell::get) {
+            self.page_build_test.consumer_parses.fetch_add(1, Relaxed);
         }
     }
 
@@ -1369,9 +1369,9 @@ impl Graph {
     /// rebuild is indexing, every other whole-graph parse is a consumer's.
     #[cfg(test)]
     pub(crate) fn consumer_page_parses_test(&self) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.page_build_test.parses.load(Relaxed)
-            - self.page_build_test.indexing_parses.load(Relaxed)
+        self.page_build_test
+            .consumer_parses
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]

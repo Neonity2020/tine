@@ -229,12 +229,12 @@ fn backlink_filter_context_indexes_visible_descendants_and_parser_owned_facets()
         .unwrap();
 
     let graph = Graph::open(&dir);
-    let runtime_id = graph.backlinks("Target")[0].blocks[0].id.clone();
     graph
         .attach_direct_projection(dir.join("private/projection.sqlite"))
         .unwrap();
     graph.warm_cache();
     wait_for_backlink_filter_projection(&graph);
+    let runtime_id = graph.backlinks("Target")[0].blocks[0].id.clone();
     let targets = [
         BacklinkFilterTarget {
             page: "Source".into(),
@@ -364,7 +364,11 @@ fn backlink_filter_context_scopes_alias_cycles_collisions_and_hydration() {
     }
 
     let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
     graph.warm_cache();
+    wait_for_backlink_filter_projection(&graph);
     let targets = graph.with_pages(|pages| {
         pages
             .iter()
@@ -376,10 +380,6 @@ fn backlink_filter_context_scopes_alias_cycles_collisions_and_hydration() {
             })
             .collect::<Vec<_>>()
     });
-    graph
-        .attach_direct_projection(dir.join("private/projection.sqlite"))
-        .unwrap();
-    wait_for_backlink_filter_projection(&graph);
     graph.reset_direct_projection_candidate_probe_test();
 
     let context = backlink_filter_context(&graph, "B", &targets, "exact needle").expect(
@@ -437,7 +437,11 @@ fn backlink_filter_context_hydrates_duplicate_physical_names_and_journal_spellin
     .unwrap();
 
     let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
     graph.warm_cache();
+    wait_for_backlink_filter_projection(&graph);
     let (duplicate_targets, journal_target) = graph.with_pages(|pages| {
         let duplicates = pages
             .iter()
@@ -464,10 +468,6 @@ fn backlink_filter_context_hydrates_duplicate_physical_names_and_journal_spellin
         2,
         "fixture needs duplicate physical names"
     );
-    graph
-        .attach_direct_projection(dir.join("private/projection.sqlite"))
-        .unwrap();
-    wait_for_backlink_filter_projection(&graph);
 
     graph.reset_direct_projection_candidate_probe_test();
     let duplicates =
@@ -568,7 +568,11 @@ fn backlink_filter_scoped_journal_names_match_effective_title_resolver() {
         .unwrap();
 
         let graph = Graph::open(&dir);
+        graph
+            .attach_direct_projection(dir.join("private/projection.sqlite"))
+            .unwrap();
         graph.warm_cache();
+        wait_for_backlink_filter_projection(&graph);
         assert_eq!(
             graph
                 .list_pages()
@@ -578,10 +582,6 @@ fn backlink_filter_scoped_journal_names_match_effective_title_resolver() {
             2,
             "fixture must expose duplicate effective journal names"
         );
-        graph
-            .attach_direct_projection(dir.join("private/projection.sqlite"))
-            .unwrap();
-        wait_for_backlink_filter_projection(&graph);
 
         let aliases = graph.page_aliases();
         for target in [format.title(day_20), format.title(day_21)] {
