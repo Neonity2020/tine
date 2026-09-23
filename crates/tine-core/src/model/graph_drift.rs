@@ -1,12 +1,15 @@
 //! What changed in the page set since a whole-graph pass read it.
 //!
 //! Two passes read every page once and must then account for whatever the
-//! app published while they read: the warm validation of a stored index and
-//! the cold parse. On a 10,000-page graph either read takes seconds, and a
-//! page opened, saved or deleted inside it is ordinary use. Discarding the
-//! pass for it sent the next reader into a second whole-graph parse (GH #543,
-//! audit R2-02 and R2-05). [`Graph::drift_since`] is the one account both
-//! passes use; a pass is abandoned only when a change has no name.
+//! app published while they read: the cold parse, which installs what it
+//! read, and the launch survey, which records the pages it could not read.
+//! (The survey's marks need no account: each is at most as new as what it
+//! observed, and a newer publication wins where they meet.) On a
+//! 10,000-page graph either read takes seconds, and a page opened, saved or
+//! deleted inside it is ordinary use. Discarding the pass for it sent the
+//! next reader into a second whole-graph parse (GH #543, audit R2-02 and
+//! R2-05). [`Graph::drift_since`] is the one account both passes use; a
+//! pass is abandoned only when a change has no name.
 
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -209,9 +212,9 @@ impl PassReadAt<'_> {
 ///
 /// The fields are private and [`GraphDrift::into_parts`] is the only way out:
 /// it hands every kind of change back positionally, so a consumer names each
-/// one. The warm validation used to read `removed` and `changed` by field and
-/// never saw `reread` when it was added, installing an index that dropped a
-/// newer watcher failure (GH #543, audit R4-01).
+/// one. A consumer that read `removed` and `changed` by field never saw
+/// `reread` when it was added, and installed an index that dropped a newer
+/// watcher failure (GH #543, audit R4-01).
 pub(super) struct GraphDrift {
     generation: u64,
     changed: HashSet<PathBuf>,

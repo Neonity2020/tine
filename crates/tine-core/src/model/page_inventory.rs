@@ -51,7 +51,7 @@ impl Graph {
                 Err(_) => return Ok(Vec::new()),
             },
         };
-        let failures = self.page_index_failures.read().unwrap().clone();
+        let failures = self.page_index_failures.read().unwrap().to_vec();
         let entries = if failures.is_empty() {
             base
         } else {
@@ -145,30 +145,22 @@ impl Graph {
     /// Capture a current list memo before a transaction that must discard the
     /// parsed cache. The transaction may update this in memory from bytes it
     /// already owns, avoiding a second whole-graph read/parse after commit.
-    pub(super) fn current_page_inventory_snapshot(&self) -> Option<(Vec<PageEntry>, Vec<String>)> {
+    pub(super) fn current_page_inventory_snapshot(&self) -> Option<Vec<PageEntry>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let entries = self
-            .page_list_cache
+        self.page_list_cache
             .read()
             .unwrap()
             .as_ref()
             .filter(|(memo_generation, _)| *memo_generation == generation)
-            .map(|(_, entries)| entries.clone())?;
-        let failures = self.page_index_failures.read().unwrap().clone();
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation)
-            .then_some((entries, failures))
+            .map(|(_, entries)| entries.clone())
     }
 
-    pub(super) fn publish_page_inventory_snapshot(
-        &self,
-        mut entries: Vec<PageEntry>,
-        mut failures: Vec<String>,
-    ) {
+    /// Publish the list memo a transaction updated. The failures it found
+    /// are already recorded ([`Graph::note_graph_text_state`]): the record
+    /// describes the disk and outlives the parsed cache.
+    pub(super) fn publish_page_inventory_snapshot(&self, mut entries: Vec<PageEntry>) {
         entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        failures.sort();
-        failures.dedup();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        *self.page_index_failures.write().unwrap() = failures;
         *self.page_list_cache.write().unwrap() = Some((generation, entries));
     }
 

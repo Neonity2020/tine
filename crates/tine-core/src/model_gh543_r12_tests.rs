@@ -200,7 +200,7 @@ fn a_move_while_a_validation_is_owed_is_not_lost() {
     pause.reached.wait();
     let at_walk = graph.cache_gen.load(std::sync::atomic::Ordering::Acquire);
     // The watcher meets p1 unreadable after the walk's drift check.
-    graph.record_watcher_identity_failure(&root.join("pages/p1.md"));
+    graph.record_watcher_identity_failure(&root.join("pages/p1.md"), false);
     assert_ne!(
         graph.cache_gen.load(std::sync::atomic::Ordering::Acquire),
         at_walk,

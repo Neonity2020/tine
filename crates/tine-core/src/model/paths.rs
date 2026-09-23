@@ -134,10 +134,11 @@ impl Graph {
         self.cache_gen.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Pages skipped by the latest whole-graph search-cache build because their
-    /// parse/projection panicked. Paths are graph-relative and safe to surface.
+    /// Graph text Tine cannot read or parse right now, and listing skips
+    /// (`path: why`), as last observed per path (`UnreadablePages`). Paths
+    /// are graph-relative and safe to surface.
     pub fn page_index_failures(&self) -> Vec<String> {
-        self.page_index_failures.read().unwrap().clone()
+        self.page_index_failures.read().unwrap().to_vec()
     }
 
     /// The page failures not yet announced, marking them announced. A failure

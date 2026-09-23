@@ -183,6 +183,15 @@ impl DirectProjection {
         self.shared.fresh_builds.load(Ordering::SeqCst)
     }
 
+    /// Fail the next fresh build just before it publishes, with `message`:
+    /// a deterministic lowering failure (audit R15-08).
+    #[cfg(test)]
+    pub(crate) fn fail_next_fresh_publication_test(&self, message: &str) {
+        let message = message.to_owned();
+        *self.shared.before_fresh_publication.lock().unwrap() =
+            Some(Box::new(move || Err(message)));
+    }
+
     /// Hold the next fresh build just before it publishes: the first barrier
     /// releases when it arrives, the second lets it go on.
     #[cfg(test)]

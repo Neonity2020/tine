@@ -962,11 +962,12 @@ impl Graph {
         }
     }
 
+    /// Through the readiness wait like every index read: asked at a
+    /// generation the index had not applied, it declined, and the caller
+    /// answered from a parsed cache that lacks an unreadable page's stored
+    /// references (audit R15-07).
     pub(super) fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self.direct_projection.get()?;
-        let names = projection.referenced_page_names(generation)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+        self.indexed_read(|projection, generation| projection.referenced_page_names(generation))
     }
 
     /// Load exactly the named pages from the parsed cache, in the order asked
@@ -1301,10 +1302,10 @@ impl Graph {
         &self,
         uuid: &str,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self.direct_projection.get()?;
-        let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
-        self.direct_projection_pages_for_paths(generation, paths)
+        self.indexed_read(|projection, generation| {
+            let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
+            self.direct_projection_pages_for_paths(generation, paths)
+        })
     }
 
     #[cfg(test)]

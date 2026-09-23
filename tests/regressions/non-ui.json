@@ -7524,6 +7524,117 @@
   "failBefore": "proven"
  },
  "notes": "GH #543, long interleaving run seed 3012 (1 in ~4,500 seed runs). A derived read declined in favour of an installed parsed cache; a rename discarded the cache before the reader read it, and the reader parsed the whole graph although the discard had queued its delta. Every index fallback now asks through Graph::indexed_or_fallback, which reads the named cache at once and sends a read whose cache vanished back to the index; a derived source guard pins every fallback to it. Fail-before tine-agents/evidence/gh550-batch/reconciler/cache-decline-discard-fail-before.log (3/3, 4 consumer parses)."
+},
+{
+ "id": "REG-UNREADABLE-RECORD-DISK-TRUTH-543",
+ "title": "A page Tine cannot read keeps refusing a new page of its name until the file is fixed, restored or deleted, and only then",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_survey_keeps_its_failures_across_a_mid_survey_edit",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_survey_keeps_its_failures_control",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_journal_migration_keeps_the_unreadable_owner_refusal",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_rename_keeps_the_unreadable_owner_refusal",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_rename_after_an_edit_keeps_the_unreadable_owner_refusal",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_control_no_rename_keeps_refusing",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_deleting_the_unreadable_page_clears_its_refusal_watcher_delete",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_deleting_the_unreadable_page_clears_its_refusal_sync_file",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_a_vanished_file_is_not_recorded_as_unreadable",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_a_listing_skip_does_not_refuse_every_creation",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_an_unreadable_date_titled_page_refuses_its_journal",
+   "crates/tine-core/src/model/unreadable_pages.rs::tests::retire_removes_a_file_and_its_listing_skip_but_not_its_directory",
+   "crates/tine-core/src/model/unreadable_pages.rs::tests::merge_keeps_the_newer_observation_per_path",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 15, R15-01..R15-06 and H1 (DIRECT-REF-CREATE-UNREADABLE-OWNER). page_index_failures was a copy of disk truth tied to the parsed-cache lifecycle: the survey dropped it when the generation moved, every cache discard (rename, merge, rescue, journal migration) cleared it, the watcher recorded vanished files, deletes never retired it, a FIFO listing skip refused every name, and a date title:: missed its journal. It is now one owned type (UnreadablePages) written only per path under the cache lock, merged by drift for the survey. The interleaving oracle asserts the record at settle both ways. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md (10 probes at c79a2546) and 9/60 long-run seeds with the record oracle. The rename probes passed at c79a2546 (a rename then restored the record from its memo, now removed) and stay as neighbors; the sync_file delete variant now follows the watcher's sync_deleted_file."
+},
+{
+ "id": "REG-INDEX-ANSWER-WAITED-GENERATION-543",
+ "title": "Page-name suggestions and block-reference candidates answer from the index like every other read, including names only an unreadable page references",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_cache_fallback_answers_like_the_index_for_an_unreadable_page",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::index_answers_are_asked_at_a_waited_generation"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 15, R15-07. direct_projection_referenced_page_names and _block_referrer_candidate_pages asked the index at a generation read straight from cache_gen, so mid-turn they declined and answered from a parsed cache lacking an unreadable page's retained rows. Both now go through indexed_read; a derived source guard pins every generation-keyed DirectProjection answer to a waited generation (necessity: reverting the names read fails it). Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md."
+},
+{
+ "id": "REG-FRESH-BUILD-CONTRADICTION-LATCH-543",
+ "title": "An index build that fails with contradictory rows twice gives up instead of rebuilding forever",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_a_deterministically_failing_fresh_build_is_not_repeated",
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_fresh_pass_over_a_cache_with_one_failure_does_not_reparse_the_graph"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 15, R15-08 (and R15-11's dead-branch residue). A fresh build that failed deterministically was rebuilt on backoff forever, bypassing the contradiction_rebuilt latch. A second ContradictoryRows from a fresh build now marks the worker failed and unavailable, so readers take their ordinary route. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md."
+},
+{
+ "id": "REG-RENAME-UNREADABLE-REFERRER-NAMED-543",
+ "title": "A rename blocked by a page Tine cannot read says which file blocked it",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r15_tests.rs::gh543_r15_a_rename_an_unreadable_page_fails_names_that_page"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 15, R15-09 (partial). The referrer scan's read error named no file; it now carries the file path. Skipping the unreadable referrer and reporting it, so the rename proceeds, needs a DTO field and a frontend notice and is carded separately. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md (probe audit543_r15_one_non_utf8_page_does_not_block_every_rename)."
 }
 ]
 }

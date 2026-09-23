@@ -153,8 +153,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   folder watcher no longer retries it forever while warning that it "will keep
   retrying". Tine now says once which file it could not read; only a new page
   whose name that file could hold (its file name, or a name written in it) is
-  refused, and the refusal names the file. Fixing or restoring the file clears
-  it (GH #543).
+  refused, and the refusal names the file. Fixing, restoring or deleting the
+  file clears it. Tine now keeps that record across a rename, a merge, a
+  journal file-name migration, and an edit made while it checks the graph at
+  launch; each of these could forget it, and creating a page of that name
+  then wrote a second file for it. A file that vanished is no longer reported
+  as unreadable, a special file in `pages/` (such as a named pipe) no longer
+  refuses every new page, a file whose `title::` is a date refuses that
+  journal, and page-name suggestions include names only that file
+  references. A rename that such a file blocks now names the file in its
+  error, and an index build that keeps failing the same way is not retried
+  forever (GH #543).
 - Deleting or renaming a page outside Tine (another editor, Syncthing, a
   file manager) no longer makes Tine rescan the whole graph folder. Only a
   removed folder that held pages still does (GH #543).

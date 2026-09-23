@@ -4,6 +4,10 @@
 
 use super::*;
 
+/// The listing skip for a FIFO, socket or device named like a page: never
+/// graph text, so it owns no page name (`failures_that_could_own`).
+pub(super) const NOT_A_REGULAR_FILE_SKIP: &str = ": graph text entry is not a regular file";
+
 impl Graph {
     pub(super) fn text_entries_with_limits_and_budget<'a>(
         &self,
@@ -354,9 +358,7 @@ impl Graph {
                     if graph_wide {
                         // A FIFO, socket or device is never graph text.
                         if is_page_file(&child_path) {
-                            skipped.push(format!(
-                                "{child_relative}: graph text entry is not a regular file"
-                            ));
+                            skipped.push(format!("{child_relative}{NOT_A_REGULAR_FILE_SKIP}"));
                         }
                         continue;
                     }

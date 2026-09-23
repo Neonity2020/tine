@@ -381,7 +381,10 @@ impl Graph {
         let stale = changed
             .into_iter()
             .chain(reread_since)
-            .chain(removed.into_iter().filter(|path| revs.contains_key(path)))
+            // A failed page that is gone leaves the failures as well.
+            .chain(removed.into_iter().filter(|path| {
+                revs.contains_key(path) || failures.iter().any(|f| self.root.join(f) == *path)
+            }))
             .collect::<std::collections::HashSet<_>>();
         if !stale.is_empty() {
             drop(guard);
@@ -415,7 +418,10 @@ impl Graph {
         *self.cache_index.write().unwrap() = Some(index);
         *self.disk_revs.write().unwrap() = revs.clone();
         *self.effective_identity_index.write().unwrap() = Some(effective_index);
-        *self.page_index_failures.write().unwrap() = failures;
+        self.page_index_failures
+            .write()
+            .unwrap()
+            .replace_after_full_read(failures);
         *self.page_list_cache.write().unwrap() = Some((expected_generation, page_list));
         #[cfg(test)]
         self.page_build_test
@@ -803,6 +809,9 @@ impl Graph {
             || self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
             |(generation, _, _)| *generation,
         );
+        // Noted before the survey reads: a change to a path after it is newer
+        // than what the survey found there (see `publish_page_index_failures`).
+        let structural = self.cache_structural_gen.begin_pass();
         let Some(stored) = projection.stored_revisions() else {
             return SurveyOutcome::Unavailable;
         };
@@ -977,10 +986,11 @@ impl Graph {
             }
             _ => absent,
         };
-        let generation = self.announce_survey_findings(&projection, generation, findings);
+        let announced = self.announce_survey_findings(&projection, generation, findings);
         // The failures first: a reader woken by readiness asks them which
         // identities are unknown (name-only creation refuses on any).
-        self.publish_page_index_failures(generation, failures);
+        self.publish_page_index_failures(generation, &structural, failures);
+        let generation = announced;
         projection.survey_validated(generation, Arc::clone(&parse_config));
         if !absent.is_empty() {
             if let Ok(gate) = self.lock_graph_text_identity_mutation() {
@@ -1065,11 +1075,44 @@ impl Graph {
         gone
     }
 
-    fn publish_page_index_failures(&self, generation: u64, mut failures: Vec<String>) {
-        failures.sort();
-        failures.dedup();
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
-            *self.page_index_failures.write().unwrap() = failures;
+    /// Merge the survey's failures into the record by path. A path something
+    /// changed after the survey read it (an edit, a watcher failure, a
+    /// delete) keeps what that newer writer recorded; every other path takes
+    /// the survey's observation. Publishing only at an unmoved generation
+    /// dropped the whole list on any edit during the survey, and the name an
+    /// unreadable page owned stopped being refused (audit R15-01).
+    fn publish_page_index_failures(
+        &self,
+        generation: u64,
+        structural: &graph_drift::PassWatermark,
+        failures: Vec<String>,
+    ) {
+        let cache = self.cache.write().unwrap();
+        let read_at = graph_drift::PassReadAt {
+            generation,
+            structural: structural.at(),
+            reread: &std::collections::HashMap::new(),
+        };
+        let drift = self.drift_since(&cache, &read_at, |_| None);
+        let mut record = self.page_index_failures.write().unwrap();
+        match drift.map(graph_drift::GraphDrift::into_parts) {
+            Some((_, paths)) => {
+                let newer = |failure: &str| {
+                    failure_sources(failure).any(|source| {
+                        let path = self.root.join(source);
+                        paths.changed.contains(&path)
+                            || paths.removed.contains(&path)
+                            || paths.reread.contains(&path)
+                    })
+                };
+                record.merge_pass(failures, newer);
+            }
+            // A change with no name: keep both, the conservative answer.
+            None => {
+                for failure in failures {
+                    record.record(failure);
+                }
+            }
         }
     }
 
@@ -1089,10 +1132,12 @@ impl Graph {
         if cancelled() {
             return false;
         }
-        if self.cache.read().unwrap().is_some()
-            && self.page_index_failures.read().unwrap().is_empty()
-        {
-            return true; // already built (e.g. by a query) — nothing to warm
+        // An installed cache is the parse this pass would do, failures and
+        // all: a Fresh pass never retries an unreadable page, which keeps its
+        // retained rows until the watcher or a save re-reads it (audit R15-11;
+        // `claim_page_build` answers `AlreadyAvailable` the same way).
+        if self.cache.read().unwrap().is_some() {
+            return true;
         }
         let permit = match self.admit_retained_graph_text_writer() {
             Ok(permit) => permit,
@@ -1325,8 +1370,6 @@ impl Graph {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// GH #543 test hook: pause the NEXT warm validation after it has
-    /// announced itself and before it reads page bytes.
     /// GH #543 test hook: pause the NEXT fast whole-graph parse after it has
     /// listed the pages and before it parses them.
     #[cfg(test)]
@@ -1336,6 +1379,8 @@ impl Graph {
         pause
     }
 
+    /// GH #543 test hook: pause the NEXT launch survey after it has
+    /// announced itself and before it reads page bytes.
     #[cfg(test)]
     pub(crate) fn pause_next_warm_validation_test(&self) -> Arc<PageBuildTestPause> {
         let pause = Arc::new(PageBuildTestPause::new());
@@ -1356,8 +1401,8 @@ impl Graph {
         pause
     }
 
-    /// GH #543 test hook: pause the NEXT warm validation after it has read
-    /// every page and before it checks whether the generation moved.
+    /// GH #543 test hook: pause the NEXT page publication right after it
+    /// releases the cache lock, with its new generation observable.
     #[cfg(test)]
     pub(crate) fn pause_next_page_publication_test(&self) -> Arc<PageBuildTestPause> {
         let pause = Arc::new(PageBuildTestPause::new());
@@ -1465,7 +1510,8 @@ impl Graph {
         // parsed cache. Reconciliation invalidates incompatible source revisions.
         let mut guard = self.cache.write().unwrap();
         *guard = None;
-        self.page_index_failures.write().unwrap().clear();
+        // `page_index_failures` stays: it describes the disk, not the cache,
+        // and the mutation that discards records what it changed there.
         *self.cache_index.write().unwrap() = None;
         *self.effective_identity_index.write().unwrap() = None;
         self.disk_revs.write().unwrap().clear(); // under the cache lock (cache → disk_revs)
@@ -1545,8 +1591,7 @@ impl Graph {
             ),
         );
         let mut resulting_failures = failures_guard.clone();
-        resulting_failures.retain(|failure| failure != &evict_entry.rel_path);
-        let failures_changed = resulting_failures != *failures_guard;
+        let failures_changed = resulting_failures.retire(&evict_entry.rel_path);
         let cache_built = guard.is_some();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
@@ -1620,13 +1665,13 @@ impl Graph {
             }
         } else if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() = Some(Arc::new(
-                build_effective_identity_index(newgen, pages, resulting_failures.clone()),
+                build_effective_identity_index(newgen, pages, resulting_failures.to_vec()),
             ));
         } else {
             self.advance_effective_identity_after_upsert(
                 newgen,
                 &evict_entry,
-                resulting_failures.clone(),
+                resulting_failures.to_vec(),
             );
         }
         let page_inventory_complete = resulting_failures.is_empty();
@@ -1891,6 +1936,13 @@ impl Graph {
         }
         *self.cache_index.write().unwrap() =
             guard.as_ref().map(|pages| build_page_cache_index(pages));
+        {
+            // A deleted page owns nothing (audit R15-03).
+            let mut failures = self.page_index_failures.write().unwrap();
+            for entry in &removed_entries {
+                failures.retire(&entry.rel_path);
+            }
+        }
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
@@ -1918,7 +1970,7 @@ impl Graph {
                 Some(Arc::new(build_effective_identity_index(
                     newgen,
                     pages,
-                    self.page_index_failures.read().unwrap().clone(),
+                    self.page_index_failures.read().unwrap().to_vec(),
                 )));
         } else {
             *self.effective_identity_index.write().unwrap() = None;
@@ -1953,6 +2005,12 @@ impl Graph {
         *self.derived_cache.write().unwrap() = None;
         let coming = self.index_delta_coming();
         let mut guard = self.cache.write().unwrap();
+        // A page that is gone owns nothing: its failure goes with it, or its
+        // name stays refused for the session (audit R15-03).
+        self.page_index_failures
+            .write()
+            .unwrap()
+            .retire(&entry.rel_path);
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
             if let Some(i) = self.cached_page_index_for_path(pages, &entry.path) {
@@ -1978,7 +2036,7 @@ impl Graph {
                 Some(Arc::new(build_effective_identity_index(
                     newgen,
                     pages,
-                    self.page_index_failures.read().unwrap().clone(),
+                    self.page_index_failures.read().unwrap().to_vec(),
                 )));
         } else {
             *self.effective_identity_index.write().unwrap() = None;

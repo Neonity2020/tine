@@ -247,8 +247,7 @@ struct PendingProjection {
     applied: HashMap<String, u64>,
     /// The survey validated the image under this configuration: the next turn
     /// reads the committed property registry from it. Queries capture from
-    /// that registry, so readiness waits for it; a turn used to do this for
-    /// the warm validation it ran.
+    /// that registry, so readiness waits for it.
     registry_owed: Option<Arc<ParseConfig>>,
     /// Every page the image holds is at least this new: the generation of the
     /// last fresh snapshot accepted.
@@ -383,8 +382,8 @@ struct ProjectionShared {
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
-    /// True while the worker is EXECUTING a turn that carries a build — a full
-    /// snapshot build or a warm validation. The
+    /// True while the worker is EXECUTING a turn that carries a build — a
+    /// fresh snapshot build. The
     /// queue empties the moment the worker takes that payload, so testing the
     /// queue alone reported `None` (idle) for the whole SQL transaction, and a
     /// surface that reruns on the completion edge announced a build finished
@@ -403,12 +402,12 @@ struct ProjectionShared {
     /// lease. None closes registration once worker teardown starts.
     worker_resources: Mutex<Option<Vec<Arc<dyn Send + Sync>>>>,
     /// R6: this session has validated the complete page inventory against
-    /// the projection at least once (a full snapshot, or a warm validation's
-    /// `Clean` or closing order turn). Until then a live delta keeps the file
+    /// the projection at least once (a fresh snapshot, or the launch
+    /// survey's `validated`). Until then a live delta keeps the file
     /// converging but must not publish readiness: rows of pages this session
     /// has never compared to disk could be stale from an earlier session.
     /// In-scope scenario: an external edit between two sessions, followed by
-    /// a save of some other page before the warm runs.
+    /// a save of some other page before the survey runs.
     validated: AtomicBool,
     #[cfg(test)]
     after_sql_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -2759,16 +2758,24 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 // batches committed, and the marks it returns below re-lower
                 // exactly those pages (audit R11-07). Asked before `pending`:
                 // the check reads the image.
-                let owes_new_image = match &error {
+                let failure = match &error {
                     ProjectionRefusal::Failed(message) => {
-                        fresh_build
-                            || owner::failure_owes_new_image(
-                                &shared,
-                                owner::IndexFailure::of_turn(message),
-                            )
+                        Some(owner::IndexFailure::of_turn(message))
                     }
-                    ProjectionRefusal::Stopped => false,
+                    ProjectionRefusal::Stopped => None,
                 };
+                let owes_new_image = failure.is_some_and(|failure| {
+                    fresh_build || owner::failure_owes_new_image(&shared, failure)
+                });
+                // A fresh build that violates a constraint lowered every page
+                // into an empty image: a Tine defect no rebuild fixes. It
+                // spends the one rebuild a contradiction owes, then the index
+                // stays down for the session and readers take their ordinary
+                // route, instead of relowering the graph on every backoff
+                // (audit R15-08).
+                let gives_up = fresh_build
+                    && failure == Some(owner::IndexFailure::ContradictoryRows)
+                    && shared.contradiction_rebuilt.swap(true, Ordering::AcqRel);
                 if matches!(error, ProjectionRefusal::Failed(_)) {
                     // Taken before `pending`: never hold both.
                     shared.committed_registry.lock().unwrap().take();
@@ -2795,9 +2802,19 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 if pending.registry_owed.is_none() && pending.full.is_none() {
                     pending.registry_owed = registry_owed;
                 }
+                if owes_new_image || gives_up {
+                    shared.worker_failed.store(true, Ordering::Release);
+                }
+                if gives_up {
+                    shared.worker_busy.store(false, Ordering::Release);
+                    shared.worker_available.store(false, Ordering::Release);
+                    drop(pending);
+                    shared.changed.notify_all();
+                    report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
+                    return;
+                }
                 if owes_new_image {
                     pending.rebuild = true;
-                    shared.worker_failed.store(true, Ordering::Release);
                 }
                 note_unsettled(&mut pending);
                 shared.worker_busy.store(false, Ordering::Release);

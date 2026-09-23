@@ -185,24 +185,35 @@ impl Graph {
             // with nothing queued to correct them. The next ordinary save of a
             // migrated page then published its NEW path beside the retired
             // one's surviving row, so one file answered twice.
+            let moved = moved
+                .into_iter()
+                .map(|(source, retired, target)| {
+                    let replacement = self
+                        .graph_text_read_to_string(&write, &target)
+                        .ok()
+                        .and_then(|content| {
+                            let provisional = self.graph_inventory_entry(&target).ok().flatten()?;
+                            parse_exact_page(self, &provisional, &content).ok()
+                        });
+                    // The old path owns nothing now, and the moved journal is
+                    // as readable as it was: recorded by path before the
+                    // discard moves the generation (audit R15-02).
+                    self.note_graph_text_state(&source, true);
+                    self.note_graph_text_state(&target, replacement.is_some());
+                    (source, retired, target, replacement)
+                })
+                .collect::<Vec<_>>();
             let coming = self.index_delta_coming();
             let touched = moved
                 .iter()
-                .flat_map(|(source, _, target)| [source.clone(), target.clone()])
+                .flat_map(|(source, _, target, _)| [source.clone(), target.clone()])
                 .collect();
             self.discard_parsed_cache(touched, graph_drift::IndexEffect::Sent(&coming));
             let mut page_set = Vec::new();
-            for (_, retired, target) in moved {
+            for (_, retired, _, replacement) in moved {
                 if let Some(entry) = retired {
                     page_set.push(crate::direct_projection::PageSetChange::Delete { entry });
                 }
-                let replacement = self
-                    .graph_text_read_to_string(&write, &target)
-                    .ok()
-                    .and_then(|content| {
-                        let provisional = self.graph_inventory_entry(&target).ok().flatten()?;
-                        parse_exact_page(self, &provisional, &content).ok()
-                    });
                 // Stale beats absent: without the replacement the retired rows
                 // are the only evidence this journal exists, so leave them and
                 // let a later warm reconcile (`rename_file_to_page` reasons the

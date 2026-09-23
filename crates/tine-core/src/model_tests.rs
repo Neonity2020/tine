@@ -1357,10 +1357,11 @@ fn search_cache_isolates_one_page_projection_panic() {
     );
     assert_eq!(g.page_index_failures(), vec![bad_path]);
 
-    // Invalidation clears the old diagnostic, and the paced warm-cache path
-    // applies the same page-sized isolation when it rebuilds.
+    // The record is what the disk holds, so discarding the parsed cache
+    // keeps it (audit R15-02), and the paced warm-cache path applies the
+    // same page-sized isolation when it rebuilds.
     g.invalidate_cache_test();
-    assert!(g.page_index_failures().is_empty());
+    assert_eq!(g.page_index_failures(), vec![bad.rel_path.clone()]);
     g.warm_cache();
     assert!(crate::query_plan::QueryPlan::friendly(needle, 0, 8)
         .execute_with_explain(&g, || false, false)
@@ -15629,3 +15630,6 @@ mod gh543_r13;
 
 #[path = "model_gh543_r14_tests.rs"]
 mod gh543_r14;
+
+#[path = "model_gh543_r15_tests.rs"]
+mod gh543_r15;

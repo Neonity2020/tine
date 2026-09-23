@@ -299,10 +299,15 @@ fn watcher_missing_and_changed_identity_record_failure_before_return() {
         });
         let result = graph.sync_file_checked(&path);
         if case == "missing" {
+            // A vanished file owns nothing: no record, no false notice, and
+            // its name is free once the watcher's delete lands (audit
+            // R15-04).
             assert!(result.unwrap().is_none());
-        } else {
-            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert!(graph.page_index_failures().is_empty());
+            let _ = fs::remove_dir_all(&dir);
+            continue;
         }
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert_eq!(graph.page_index_failures(), vec!["pages/Mutable.md"]);
         let failed = graph
             .effective_identity_index
@@ -350,8 +355,15 @@ fn cold_watcher_failures_publish_generation_bound_identity_evidence_until_repair
             assert!(graph.sync_file_checked(&path).unwrap().is_none());
         }
 
+        // A vanished file owns nothing, so it is not recorded as unreadable
+        // (audit R15-04); an invalid one is.
+        let recorded: Vec<&str> = if case == "missing" {
+            Vec::new()
+        } else {
+            vec!["pages/Cold Failure.md"]
+        };
         assert!(graph.cache.read().unwrap().is_none());
-        assert_eq!(graph.page_index_failures(), vec!["pages/Cold Failure.md"]);
+        assert_eq!(graph.page_index_failures(), recorded);
         let failed = graph
             .effective_identity_index
             .read()
@@ -360,8 +372,10 @@ fn cold_watcher_failures_publish_generation_bound_identity_evidence_until_repair
             .cloned()
             .expect("cold watcher failure must install effective evidence");
         assert_eq!(failed.generation(), graph.cache_generation());
-        assert_eq!(failed.failures, vec!["pages/Cold Failure.md"]);
-        assert!(failed.physical_paths.contains(&path));
+        assert_eq!(failed.failures, recorded);
+        if case != "missing" {
+            assert!(failed.physical_paths.contains(&path));
+        }
 
         // The unreadable file can own the title in its text; a vanished
         // file owns nothing. Neither owns an unrelated name.

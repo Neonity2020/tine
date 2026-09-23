@@ -168,11 +168,12 @@ pub(super) struct PageBuildTestState {
     /// Pause one fast whole-graph parse after it listed the pages and before
     /// it parses them, so a test can look at the progress bar mid-pass.
     pub(super) fast_parse_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
-    /// GH #543: pause one warm validation after it has announced itself and
+    /// GH #543: pause one launch survey after it has announced itself and
     /// before it reads page bytes, so a test can land a query in that window.
     pub(super) warm_validation_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
-    /// Pause one warm validation after it has read every page and before it
-    /// checks the generation, so a test can publish a page it already read.
+    /// Pause one launch survey after it has read what it will read and
+    /// before it records its findings, so a test can publish a page it
+    /// already read.
     pub(super) warm_read_done_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// Pause the next warm right before it offers its validation.
     pub(super) before_warm_enqueue: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,

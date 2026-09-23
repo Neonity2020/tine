@@ -60,7 +60,7 @@ impl Graph {
             match self.graph_text_read_optional_text_with_identity(&write, path) {
                 Ok(Some(snapshot)) => snapshot,
                 Ok(None) => {
-                    self.record_watcher_identity_failure(path);
+                    self.record_watcher_identity_failure(path, true);
                     return Ok(None);
                 }
                 Err(error) => return self.watcher_failure(path, error),
@@ -68,13 +68,13 @@ impl Graph {
         let current = match self.graph_text_read_optional_text_with_identity(&write, path) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
-                self.record_watcher_identity_failure(path);
+                self.record_watcher_identity_failure(path, true);
                 return Ok(None);
             }
             Err(error) => return self.watcher_failure(path, error),
         };
         if current.1 != identity || current.0 != content {
-            self.record_watcher_identity_failure(path);
+            self.record_watcher_identity_failure(path, false);
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "graph text watcher snapshot changed before reconciliation",
@@ -109,7 +109,7 @@ impl Graph {
     /// name-only creation for the session. Any other error may pass, and the
     /// watcher retries it.
     fn watcher_failure(&self, path: &Path, error: io::Error) -> io::Result<Option<PageEntry>> {
-        self.record_watcher_identity_failure(path);
+        self.record_watcher_identity_failure(path, false);
         if is_page_content_rejection(&error) {
             Ok(None)
         } else {

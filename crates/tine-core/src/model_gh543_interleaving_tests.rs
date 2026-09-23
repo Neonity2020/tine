@@ -324,6 +324,24 @@ fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<
             names(&oracle)
         ));
     }
+    // The record of unreadable pages is disk truth, and it is the only thing
+    // that refuses creating a name such a page may own. A page the harness
+    // made unreadable is in it once the graph settles, and a file that is
+    // gone is not (audit R15-01..R15-04, H1: nine of sixty long-run seeds
+    // lost a record before the record got one owner).
+    let failures = graph.page_index_failures();
+    for name in bad {
+        let rel = format!("pages/{name}.md");
+        if root.join(&rel).exists() && !failures.contains(&rel) {
+            findings.push(format!("unreadable {rel} is not recorded: {failures:?}"));
+        }
+    }
+    for failure in &failures {
+        if !crate::model::page_cache::failure_sources(failure).any(|path| root.join(path).exists())
+        {
+            findings.push(format!("recorded {failure} is gone: {failures:?}"));
+        }
+    }
 }
 
 /// What the watcher does with one drained batch: note the observation, take

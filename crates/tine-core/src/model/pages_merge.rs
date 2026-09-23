@@ -302,24 +302,24 @@ impl Graph {
         // Reopen only the committed destination, not the graph: this binds the
         // inventory entry to the exact bytes that now own the new name even if an
         // external editor changed the retained source inode during the move.
-        let updated_page_inventory =
-            page_inventory_snapshot.and_then(|(mut inventory, mut failures)| {
-                let content = self.graph_text_read_to_string(&write, &dst).ok()?;
+        let effective = self
+            .graph_text_read_to_string(&write, &dst)
+            .ok()
+            .and_then(|content| {
                 let provisional = self.graph_inventory_entry(&dst).ok().flatten()?;
-                let effective = parse_exact_page(self, &provisional, &content)
+                parse_exact_page(self, &provisional, &content)
                     .ok()
-                    .map(|(entry, _, _)| entry);
-                let src_rel = self.rel_path(&src);
-                let dst_rel = self.rel_path(&dst);
-                inventory.retain(|entry| entry.path != src);
-                failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
-                if let Some(entry) = effective {
-                    inventory.push(entry);
-                } else {
-                    failures.push(dst_rel);
-                }
-                Some((inventory, failures))
+                    .map(|(entry, _, _)| entry)
             });
+        // The old path owns nothing now, and the moved file is as readable as
+        // it was: recorded by path before the discard moves the generation.
+        self.note_graph_text_state(&src, true);
+        self.note_graph_text_state(&dst, effective.is_some());
+        let updated_page_inventory = page_inventory_snapshot.map(|mut inventory| {
+            inventory.retain(|entry| entry.path != src);
+            inventory.extend(effective);
+            inventory
+        });
         // The parsed snapshot is invalidated because this rescue changes the
         // physical kind/path. Preserve the separately updated list memo when its
         // pre-transaction generation was current.
@@ -329,8 +329,8 @@ impl Graph {
             vec![src.clone(), dst.clone()],
             graph_drift::IndexEffect::Sent(&coming),
         );
-        if let Some((inventory, failures)) = updated_page_inventory {
-            self.publish_page_inventory_snapshot(inventory, failures);
+        if let Some(inventory) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory);
         }
         // GH #543: the rescue moved a page's file and told the index only that
         // something had changed. Nothing was queued, so search went on offering

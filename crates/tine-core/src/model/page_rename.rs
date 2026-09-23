@@ -290,12 +290,19 @@ impl Graph {
         let mut edits_charge =
             RetainedHeapCharge::new(Some(&content_budget), "graph rename edit vector")?;
         for entry in entries.iter() {
-            let content = self.graph_text_read_to_string_with_budget(
-                &write,
-                &entry.path,
-                &mut content_budget,
-                "graph rename baseline bytes",
-            )?;
+            // A file the rename cannot read fails it, naming that file: an
+            // error that named none left the user no way to find it (audit
+            // R15-09).
+            let content = self
+                .graph_text_read_to_string_with_budget(
+                    &write,
+                    &entry.path,
+                    &mut content_budget,
+                    "graph rename baseline bytes",
+                )
+                .map_err(|error| {
+                    io::Error::new(error.kind(), format!("{}: {error}", entry.rel_path))
+                })?;
             let is_org = Format::from_path(&entry.path) == Format::Org;
             // One inline-ref pass + one `tags::` pass per file (each computes code
             // ranges once), regardless of how many descendants are being renamed.
@@ -635,30 +642,38 @@ impl Graph {
         // the parsed cache: unchanged entries preserve their exact physical and
         // effective identity, while only the edited subset is reparsed. A cold or
         // already-stale memo remains cold and retains the ordinary disk rebuild.
-        let updated_page_inventory =
-            page_inventory_snapshot.map(|(mut inventory, mut failures)| {
-                for edit in &edits {
-                    inventory.retain(|entry| entry.path != edit.src);
-                    let src_rel = self.rel_path(&edit.src);
-                    let dst_rel = self.rel_path(&edit.dst);
-                    failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
-                    let parsed = self
-                        .graph_inventory_entry(&edit.dst)
-                        .ok()
-                        .flatten()
-                        .and_then(|entry| {
-                            parse_exact_page(self, &entry, &edit.new_content)
-                                .ok()
-                                .map(|(effective, _, _)| effective)
-                        });
-                    if let Some(entry) = parsed {
-                        inventory.push(entry);
-                    } else {
-                        failures.push(dst_rel);
-                    }
+        let outcomes = edits
+            .iter()
+            .map(|edit| {
+                self.graph_inventory_entry(&edit.dst)
+                    .ok()
+                    .flatten()
+                    .and_then(|entry| {
+                        parse_exact_page(self, &entry, &edit.new_content)
+                            .ok()
+                            .map(|(effective, _, _)| effective)
+                    })
+            })
+            .collect::<Vec<_>>();
+        // What the rename wrote is what the disk holds now: a moved page's
+        // old path owns nothing, and a replacement that does not parse is
+        // unreadable. Recorded by path, before the discard moves the
+        // generation; the discard no longer clears the record (audit R15-02).
+        for (edit, parsed) in edits.iter().zip(&outcomes) {
+            if edit.dst != edit.src {
+                self.note_graph_text_state(&edit.src, true);
+            }
+            self.note_graph_text_state(&edit.dst, parsed.is_some());
+        }
+        let updated_page_inventory = page_inventory_snapshot.map(|mut inventory| {
+            for (edit, parsed) in edits.iter().zip(outcomes) {
+                inventory.retain(|entry| entry.path != edit.src);
+                if let Some(entry) = parsed {
+                    inventory.push(entry);
                 }
-                (inventory, failures)
-            });
+            }
+            inventory
+        });
         let coming = self.index_delta_coming();
         self.discard_parsed_cache(
             edits
@@ -667,8 +682,8 @@ impl Graph {
                 .collect(),
             graph_drift::IndexEffect::Sent(&coming),
         );
-        if let Some((inventory, failures)) = updated_page_inventory {
-            self.publish_page_inventory_snapshot(inventory, failures);
+        if let Some(inventory) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory);
         }
         // GH #543: a rename is a PRODUCER, exactly as a delete is.
         // Discarding the parsed cache only moves the generation, and an

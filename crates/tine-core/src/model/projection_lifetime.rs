@@ -236,12 +236,14 @@ impl Graph {
     fn unread_sources(&self) -> Vec<String> {
         let failures = self.page_index_failures.read().unwrap();
         if failures
+            .as_slice()
             .iter()
             .any(|failure| failure.starts_with(super::page_cache::GRAPH_TEXT_SCOPE_FAILURE))
         {
             return vec![String::new()];
         }
         failures
+            .as_slice()
             .iter()
             .filter_map(|failure| {
                 super::page_cache::failure_sources(failure)
@@ -328,12 +330,12 @@ impl Graph {
 
     /// Readiness for a whole-graph derived read (page list, aliases, property
     /// owners, block-ref counts). Beyond the short delta wait, a read that
-    /// finds a warm validation or queued edits in flight and no parsed cache
-    /// keeps waiting for them: its only alternative is parsing every page, and on a
-    /// warm reopen that parse queued a full snapshot which outranked the warm
-    /// and doubled the time to a working search (GH #543). The warm finishes
-    /// no later than such a parse would; if it gives up, the read falls back
-    /// as before. With a parsed cache present the fallback is cheap, so no
+    /// finds the launch survey, a fresh build or queued edits in flight and
+    /// no complete parsed cache keeps waiting for them: its only alternative
+    /// is parsing every page, and on a warm reopen that parse queued a full
+    /// snapshot which outranked the survey and doubled the time to a working
+    /// search (GH #543). The survey finishes no later than such a parse
+    /// would; if it gives up, the read falls back as before. With a parsed cache present the fallback is cheap, so no
     /// extra wait (this also keeps the warm thread from waiting on itself).
     /// Returns the generation the projection is ready at, which is newer than
     /// `generation` when a page was published during the wait.
@@ -396,7 +398,14 @@ impl Graph {
                     _ => false,
                 }
             };
-            let cached = self.cache.read().unwrap().is_some();
+            // The cache answers as the index would only when it holds every
+            // page: for a page Tine cannot read, the index keeps its stored
+            // rows and the cache has none, so an answer flipped with
+            // readiness (audit R15-07). Then the read waits for the index.
+            let cached = {
+                let cache = self.cache.read().unwrap();
+                cache.is_some() && self.page_index_failures.read().unwrap().is_empty()
+            };
             if !coming || cached {
                 if projection.ready_at(generation) {
                     return Some(generation);

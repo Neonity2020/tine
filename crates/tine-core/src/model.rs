@@ -88,6 +88,7 @@ pub use crate::filesystem_durability::{
 };
 use projection_fs::*;
 mod trash;
+mod unreadable_pages;
 pub(crate) use crate::query::graph::PageFallback;
 use asset_files::*;
 use asset_refs::*;
@@ -349,10 +350,11 @@ pub struct Graph {
     /// One source-inventory repair at a time. Joiners return to readiness
     /// admission without retaining a snapshot or waiting under a graph lock.
     projection_recovery: std::sync::Mutex<()>,
-    /// Graph-relative paths of pages skipped by the latest whole-graph cache
-    /// build because their parse/projection panicked. Kept retrievable so an
-    /// lsdoc ownership gap can never degrade search completeness invisibly.
-    page_index_failures: RwLock<Vec<String>>,
+    /// Graph text Tine could not read or parse, as the disk holds it now:
+    /// it outlives the parsed cache, and changes only by path
+    /// (`model/unreadable_pages.rs`). Kept retrievable so an lsdoc ownership
+    /// gap can never degrade search completeness invisibly.
+    page_index_failures: RwLock<unreadable_pages::UnreadablePages>,
     /// The `page_index_failures` already announced to the user, so each
     /// unreadable page is announced once per breakage.
     announced_page_failures: std::sync::Mutex<Vec<String>>,
@@ -373,11 +375,11 @@ pub struct Graph {
     cache_gen: std::sync::atomic::AtomicU64,
     /// Moved, under the cache write lock and before `cache_gen`, by every
     /// generation move that is not a one-page upsert: a removal or a whole
-    /// cache invalidation. A warm validation that sees `cache_gen` move while
-    /// this stays put knows each move published one page and its session
-    /// revision, so it can check those pages against what it read instead of
-    /// rereading the whole graph (GH #543). Each move names what it removed;
-    /// see `graph_drift`.
+    /// cache invalidation. A whole-graph pass that sees `cache_gen` move
+    /// while this stays put knows each move published one page and its
+    /// session revision, so it can check those pages against what it read
+    /// instead of rereading the whole graph (GH #543). Each move names what
+    /// it removed; see `graph_drift`.
     cache_structural_gen: graph_drift::StructuralGeneration,
     /// Pages counted by the running whole-graph check or read, for the
     /// indexing progress bar only (GH #543).

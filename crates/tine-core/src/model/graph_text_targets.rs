@@ -541,7 +541,7 @@ impl Graph {
     /// travel with it, as with the parsed evidence.
     fn indexed_creation_evidence(&self) -> Option<DirectCreationEvidence> {
         let (generation, entries) = self.direct_projection_page_inventory()?;
-        let failures = self.page_index_failures.read().unwrap().clone();
+        let failures = self.page_index_failures.read().unwrap().to_vec();
         let mut owners = std::collections::HashMap::with_capacity(entries.len());
         let mut physical_paths = std::collections::HashSet::with_capacity(entries.len());
         for entry in entries {
@@ -658,9 +658,29 @@ impl Graph {
         name: &str,
     ) -> Vec<String> {
         let key = crate::refs::page_key(name);
+        // A journal's name is its date, written in any format the journal
+        // format accepts: `title:: 2026-09-23` owns "Sep 23rd, 2026", which
+        // no substring of the bytes shows (audit R15-06).
+        let date = self
+            .journal_format
+            .parse(name)
+            .map(|date| date.ordinal_key());
+        let names_date = |text: &str| {
+            date.is_some_and(|date| {
+                self.journal_format
+                    .parse(text.trim())
+                    .map(|d| d.ordinal_key())
+                    == Some(date)
+            })
+        };
         failures
             .iter()
             .filter(|failure| {
+                // A FIFO, socket or device is never graph text, so it is no
+                // page and owns no name (audit R15-05).
+                if failure.ends_with(super::graph_text_inventory::NOT_A_REGULAR_FILE_SKIP) {
+                    return false;
+                }
                 let path = self.root.join(failure.as_str());
                 let Some(entry) = self
                     .entry_for_path(&path)
@@ -668,7 +688,7 @@ impl Graph {
                 else {
                     return true;
                 };
-                if crate::refs::page_key(&entry.name) == key {
+                if crate::refs::page_key(&entry.name) == key || names_date(&entry.name) {
                     return true;
                 }
                 // Bytes, not text: a title written as UTF-8 survives a lossy
@@ -676,7 +696,12 @@ impl Graph {
                 match self.graph_text_read_optional(permit, &path) {
                     Ok(None) => false,
                     Ok(Some(bytes)) => {
-                        crate::refs::page_key(&String::from_utf8_lossy(&bytes)).contains(&key)
+                        let text = String::from_utf8_lossy(&bytes);
+                        crate::refs::page_key(&text).contains(&key)
+                            || (date.is_some()
+                                && text.lines().any(|line| {
+                                    title_value(line).is_some_and(|value| names_date(value))
+                                }))
                     }
                     Err(_) => true,
                 }
@@ -715,16 +740,19 @@ impl Graph {
         *guard = Some(Arc::new(next));
     }
 
-    pub(super) fn record_watcher_identity_failure(&self, path: &Path) {
+    /// The watcher could not reconcile `path`: its state changed without a
+    /// publication. A file that is gone (`gone`) owns nothing and leaves the
+    /// record; recording it as unreadable announced a page that never
+    /// existed and refused its name (audit R15-04).
+    pub(super) fn record_watcher_identity_failure(&self, path: &Path, gone: bool) {
         let failure = self.rel_path(path);
         let projection = self.direct_projection.get();
         let cache = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         let mut failures = failures_guard.clone();
-        if !failures.iter().any(|candidate| candidate == &failure) {
-            failures.push(failure);
-            failures.sort();
-            failures.dedup();
+        failures.retire(&failure);
+        if !gone {
+            failures.record(failure);
         }
         let generation = self.move_cache_generation(
             &cache,
@@ -737,7 +765,7 @@ impl Graph {
             Some(pages) => Some(Arc::new(build_effective_identity_index(
                 generation,
                 pages,
-                failures.clone(),
+                failures.to_vec(),
             ))),
             None => {
                 let retained = self.effective_identity_index.read().unwrap().clone();
@@ -746,14 +774,14 @@ impl Graph {
                         generation: std::sync::atomic::AtomicU64::new(generation),
                         owners: std::collections::HashMap::new(),
                         physical_paths: std::iter::once(path.to_path_buf()).collect(),
-                        failures: failures.clone(),
+                        failures: failures.to_vec(),
                     },
                     |current| {
                         let mut next = (*current).clone();
                         next.generation
                             .store(generation, std::sync::atomic::Ordering::Release);
                         next.physical_paths.insert(path.to_path_buf());
-                        next.failures = failures.clone();
+                        next.failures = failures.to_vec();
                         next
                     },
                 )))
@@ -772,14 +800,10 @@ impl Graph {
         let projection = self.direct_projection.get();
         let cache = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
-        if !failures_guard
-            .iter()
-            .any(|failure| failure == &entry.rel_path)
-        {
+        let mut failures = failures_guard.clone();
+        if !failures.retire(&entry.rel_path) {
             return;
         }
-        let mut failures = failures_guard.clone();
-        failures.retain(|failure| failure != &entry.rel_path);
         let generation = self.move_cache_generation(
             &cache,
             Some(graph_drift::StructuralChange::Reread(vec![entry
@@ -791,7 +815,7 @@ impl Graph {
             Some(pages) => Arc::new(build_effective_identity_index(
                 generation,
                 pages,
-                failures.clone(),
+                failures.to_vec(),
             )),
             None => {
                 let retained = self.effective_identity_index.read().unwrap().clone();
@@ -816,7 +840,7 @@ impl Graph {
                     .entry(page_cache_key(entry.kind, &entry.name))
                     .or_default()
                     .push(entry.clone());
-                next.failures = failures.clone();
+                next.failures = failures.to_vec();
                 Arc::new(next)
             }
         };
@@ -1143,5 +1167,16 @@ fn portable_listing_batch_get(
         let listing = std::rc::Rc::new(PortableListing::read(directory)?);
         listings.insert(relative.to_owned(), listing.clone());
         Ok(Some(listing))
+    })
+}
+
+/// The value of a `title::` property or an Org `#+title:` line, if `line`
+/// is one.
+fn title_value(line: &str) -> Option<&str> {
+    let line = line.trim_start().trim_start_matches(['-', '*', ' ', '\t']);
+    ["title::", "#+title:"].iter().find_map(|prefix| {
+        line.get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .map(|_| &line[prefix.len()..])
     })
 }

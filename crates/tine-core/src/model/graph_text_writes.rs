@@ -21,15 +21,14 @@ impl Graph {
             };
             self.recent_writes.lock().unwrap().remove(path);
             match self.graph_text_read_optional_text(permit, path) {
-                Ok(Some(content)) => {
-                    if let Ok((entry, document, revision)) =
-                        parse_exact_page(self, &entry, &content)
-                    {
-                        self.cache_upsert(entry, document, revision);
-                    }
-                }
+                Ok(Some(content)) => match parse_exact_page(self, &entry, &content) {
+                    Ok((entry, document, revision)) => self.cache_upsert(entry, document, revision),
+                    // Unreadable now: recorded, or the name it may own stops
+                    // being refused (audit R15-02).
+                    Err(_) => self.record_watcher_identity_failure(path, false),
+                },
                 Ok(None) => self.cache_remove_path(&entry),
-                Err(_) => {}
+                Err(_) => self.record_watcher_identity_failure(path, false),
             }
         }
     }
