@@ -35,6 +35,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   right-sidebar pins are checked in one request instead of one per pin, and
   the indexing progress bar keeps watching after its status reads fail
   instead of stopping for the rest of the session (GH #543).
+- An index found holding inconsistent entries while many pages were being
+  updated at once, or holding one entry it cannot read, is now rebuilt instead
+  of being worked around by reading every page, and an edit that lands while
+  the index is being re-checked no longer leaves page lists reading every
+  page. A newly opened graph is scanned once instead of twice by the file
+  watcher, and a query block that is removed, or whose graph is switched, stops
+  retrying while the index is busy (GH #543).
 - After switching graphs, the previous graph's conflict banners and favourites
   order no longer show on the new graph while it loads (GH #543).
 - Changing `:hidden` (or another setting that reopens the graph) in

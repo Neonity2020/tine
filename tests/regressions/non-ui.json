@@ -7038,6 +7038,134 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 11, R11-12. Ten failed polls ended the follower, and nothing restarted it while the binding stood, so a later index pass showed no progress for the session; the bar's singleton also kept a reference to the ended follower. The follower now slows to the watch cadence and ends only with its binding, and the bar forgets a follower that ended. The old test 'gives up when every poll fails' pinned the removed behaviour and was rewritten to the new contract. Evidence gh550-batch/indexing-audit-r11/necessity-R11-09-12.txt."
+},
+{
+ "id": "REG-CONTRADICTION-DURING-BULK-UPDATE-REBUILT-543",
+ "title": "An index found inconsistent while a long update turn or a fresh build's finish runs is rebuilt exactly once",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r12_tests.rs::a_contradiction_during_a_bulk_update_turn_is_rebuilt",
+   "crates/tine-core/src/model_gh543_r12_tests.rs::a_contradiction_during_a_small_update_turn_is_rebuilt",
+   "crates/tine-core/src/model_gh543_r12_tests.rs::a_rebuild_asked_for_while_a_fresh_build_finishes_is_that_build",
+   "crates/tine-core/src/model_gh543_r12_tests.rs::index_progress_is_presentation_only"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 12, R12-01. The decider asked 'is a fresh build replacing the image?' through the presentation progress counter, which also counts any lowering over one batch and stops before a fresh build's finish: a contradiction met during a bulk update spent its once-per-projection rebuild on nothing (queries failed for the session), and a rebuild asked for during the finish queued a second whole-graph build. The answer is now the worker-owned fresh_build_running flag, set when a turn decides a fresh build and cleared when its outcome is recorded; the guard keeps the counter presentation-only. Evidence gh550-batch/indexing-audit-r12/necessity-r12-core.txt."
+},
+{
+ "id": "REG-MOVE-WHILE-VALIDATION-OWED-KEPT-543",
+ "title": "A page change while an index re-check is owed is not lost, so listing pages afterwards reads no page",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r12_tests.rs::a_move_while_a_validation_is_owed_is_not_lost"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 12, R12-02. advance_generation returned early while a validation was owed, dropping the move; readiness never reached the moved generation and list_pages parsed the graph. The move is always recorded; readiness still waits for the validation. Evidence gh550-batch/indexing-audit-r12/necessity-r12-core.txt."
+},
+{
+ "id": "REG-CORRUPT-DERIVED-ROW-REBUILDS-INDEX-543",
+ "title": "An index row a read cannot decode asks for a new index image instead of parsing the graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r12_tests.rs::a_corrupt_derived_row_asks_for_a_new_image",
+   "crates/tine-core/src/model_gh543_r12_tests.rs::index_readers_report_damage"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 12, R12-05. Index readers turned SQL/decode errors into None with .ok(), so detected damage never reached failure_owes_new_image and every session parsed the graph instead. Readers now call .reported(self), which maps the error to an IndexFailure and asks the one decider; indexed_read waits for the owed image. Guard: no raw .ok() on an index answer. Evidence gh550-batch/indexing-audit-r12/necessity-r12-core.txt."
+},
+{
+ "id": "REG-WATCHER-REPLACED-GRAPH-ONE-REBIND-543",
+ "title": "The file watcher takes a replaced graph on in one place, and scans a newly watched graph once",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/watcher/tests.rs::the_watcher_rebaselines_a_replaced_graph",
+   "src-tauri/src/watcher/tests.rs::a_replaced_graph_is_taken_on_in_one_place",
+   "src-tauri/src/watcher/tests.rs::an_unwatched_root_is_polled_and_diffed_when_watched"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 12, R12-03 and R12-07. The R11-05 rebaseline guard sliced the wrong arm and could not fail; the two same-root arms reset different fields. Both now call WatchedGraph::rebind (a full reset through WatchedGraph::new, keeping only a drained frontier the new graph owns), pinned behaviourally. A first cycle no longer re-walks a polled or newly watched root it just walked for its baseline. Mutation checks: gh550-batch/indexing-audit-r12/necessity-r12-tauri.txt."
+},
+{
+ "id": "REG-QUERY-PARSE-RETRY-ENDS-WITH-BLOCK-AND-GRAPH-543",
+ "title": "A query block's wait for the index ends when the block is removed or the graph is switched",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/queryParseRetryOwner.test.tsx::stops polling query_parse once the block is gone",
+   "src/queryParseRetryOwner.test.tsx::stops polling query_parse once the graph is rebound",
+   "src/queryReadinessOwners.guard.test.ts::names a disposal in every caller's gate"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 12, R12-06. The query_parse readiness retry was gated only on its own request, which never changes after unmount, so a removed block polled for as long as the index stayed not ready, and into the next graph. runQueryWhenCurrent now owns the binding half for every caller; each caller's gate names its disposal (owner table). Evidence gh550-batch/indexing-audit-r12/necessity-r12-frontend.txt."
 }
 ]
 }
