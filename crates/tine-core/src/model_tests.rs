@@ -9091,14 +9091,13 @@ fn indexed_exhaustive_fallback_is_not_eligible_for_interactive_memo() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// An attached graph's unlinked references are the Interactive window both
-/// before its index is ready and after, at one source generation.
+/// An attached graph's unlinked references before its index is ready are the
+/// exhaustive parser answer (window + 25), and that answer is not reused as
+/// the Interactive window once the index is ready, at one source generation.
 ///
-/// This test used to parse the graph before attaching, get the exhaustive
-/// parser answer (window + 25), and check that answer was not reused once
-/// the projection became ready. The app always attaches before its first
-/// parse, and attaching after one is now a debug assertion (GH #543,
-/// R8-14), so that exhaustive pre-attach answer no longer exists.
+/// With no index owner nothing offers the index a snapshot until the warm:
+/// the parse a read does installs a cache and offers nothing (GH #543,
+/// audit R10-03), so the read before `warm_cache` is the parser fallback.
 #[test]
 fn unlinked_refs_are_window_bounded_before_and_after_readiness() {
     let dir = scratch("bounded-unlinked-memo-readiness");
@@ -9121,7 +9120,7 @@ fn unlinked_refs_are_window_bounded_before_and_after_readiness() {
     let fallback = g
         .unlinked_refs_bounded_indexed("Target", limits.0, limits.1)
         .expect("a projection not yet ready keeps the established parser fallback");
-    assert_eq!(fallback.total, window);
+    assert_eq!(fallback.total, match_count);
     let fallback_membership = fallback
         .groups
         .iter()
@@ -9148,7 +9147,7 @@ fn unlinked_refs_are_window_bounded_before_and_after_readiness() {
         .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(indexed_membership.len(), window);
-    assert_eq!(fallback_membership.len(), window);
+    assert_eq!(fallback_membership.len(), match_count);
 
     let _ = fs::remove_dir_all(&dir);
 }

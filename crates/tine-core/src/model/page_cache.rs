@@ -382,7 +382,6 @@ impl Graph {
                 stale,
             ));
         }
-        let source_complete = failures.is_empty();
         let effective_index = Arc::new(build_effective_identity_index(
             expected_generation,
             &pages,
@@ -403,18 +402,10 @@ impl Graph {
             .installs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
-        // Refused during a warm, nothing is owed: this cache carries no page
-        // change the index lacks (every change moved the generation the
-        // install was checked against), and the warm delivers its own
-        // inventory or offers this cache when it finishes.
-        let _ = self.direct_projection_enqueue_full(
-            expected_generation,
-            pages,
-            Arc::new(revs),
-            false,
-            source_complete,
-            projection_lifetime::FullOffer::Consumer,
-        );
+        // A consumer's install offers the index nothing: every page change
+        // reached it as an update, and whole-index work is the owner's to
+        // start (GH #543, audit R10-03). The owner offers this cache when its
+        // pass needs one.
         Ok(PageCacheInstallOutcome::Installed)
     }
 

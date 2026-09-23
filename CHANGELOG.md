@@ -95,6 +95,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - A query with a very long `(or …)` or `(and …)` list (about a thousand terms)
   now answers. It used to fail, and each failure rebuilt the whole search
   index again, over and over while the query was on screen (GH #543).
+- Opening a graph after its pages or settings changed while Tine was closed
+  takes the cheaper of two routes every time: a few changed pages are
+  updated in place, and a settings change that affects every page builds the
+  search index fresh instead of rewriting it page by page (GH #543).
+- A feature that reads the whole graph, such as the unused-assets list, no
+  longer starts a second search-index build while the index is still being
+  prepared (GH #543).
+- The indexing bar now shows while search waits for the index to be repaired,
+  instead of disappearing while searches keep saying the index is not ready
+  (GH #543).
 
 - While Tine finished indexing a graph, a failed index update could leave it
   waiting for itself, so page lists and searches never loaded until a restart

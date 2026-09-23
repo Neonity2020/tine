@@ -69,9 +69,7 @@ impl Graph {
     /// (audit R5-03), so the running pass is consulted before readiness.
     /// Presentation only.
     pub fn indexing_progress(&self) -> Option<crate::indexing_progress::IndexingProgress> {
-        use crate::direct_projection::ProjectionProgress;
         use crate::indexing_progress::{IndexingPhase, IndexingProgress};
-        use crate::query::QueryReadinessReason as Reason;
         let projection = self.direct_projection.get();
         let Some(projection) = projection else {
             return self.indexing_progress.snapshot();
@@ -92,12 +90,19 @@ impl Graph {
         if projection.backing_off() {
             return None;
         }
-        match projection.progress_at(generation) {
-            ProjectionProgress::Working(Reason::Recovering | Reason::Indexing) => {
-                Some(IndexingProgress::unmeasured(IndexingPhase::Indexing))
-            }
-            _ => None,
-        }
+        // The index's one decider says whether graph-sized work is owed; the
+        // bar asks it, as the readers that wait do. A full snapshot applied
+        // as a repair is `InHand` with no build progress and no pass
+        // running, and an earlier rule of the bar's own hid it while readers
+        // waited for it (GH #543, audit R10-04). Page updates are not
+        // graph-sized and never show the bar.
+        use crate::direct_projection::IndexNeed;
+        let (need, _) = projection.index_need_now();
+        matches!(
+            need,
+            IndexNeed::SettingUp | IndexNeed::InHand | IndexNeed::Fresh | IndexNeed::Validate
+        )
+        .then(|| IndexingProgress::unmeasured(IndexingPhase::Indexing))
     }
 
     /// Test barrier for ordinary producer progression. Production queries read
@@ -194,12 +199,12 @@ impl Graph {
     /// the rebuild latched with nothing to ride in on and every later capture
     /// refused for the lifetime of the graph.
     ///
-    /// `offer` says who is offering. While index work is coming only its
-    /// owner may: a page consumer that built the cache inside the warm (an
-    /// asset listing, a whole-graph read) used to offer a full snapshot that
-    /// superseded the warm's cheap validation with a complete rebuild
-    /// (GH #543, audit R4-04). The owner offers what was installed when it
-    /// finishes ([`Graph::offer_installed_cache`]).
+    /// Only the index owner offers ([`Graph::offer_installed_cache`]). A page
+    /// consumer that installs the parsed cache offers nothing: its offer was
+    /// a second producer of whole-index work, which superseded the warm's
+    /// cheap validation (audit R4-04) and, refused only while work was
+    /// coming, started a whole build inside the owner's backoff (GH #543,
+    /// audit R10-03).
     ///
     /// The outcome says whether the snapshot was refused. A caller whose
     /// snapshot also carried a page change owes that page's update another
@@ -212,17 +217,10 @@ impl Graph {
         revisions: Arc<std::collections::HashMap<PathBuf, String>>,
         force: bool,
         source_complete: bool,
-        offer: FullOffer,
     ) -> FullOfferOutcome {
         let Some(projection) = self.direct_projection.get() else {
             return FullOfferOutcome::NoIndex;
         };
-        if offer == FullOffer::Consumer && projection.coming() {
-            crate::direct_projection::projection_diag(|| {
-                format!("full not offered at generation={generation}: a warm owns readiness")
-            });
-            return FullOfferOutcome::RefusedDuringWarm;
-        }
         // R6: a snapshot of exactly what the ready index holds would only
         // open a NotReady window while it re-validates. Readiness alone is
         // not that: the parsed cache and the index can disagree at one
@@ -297,15 +295,7 @@ impl Graph {
         let Some((generation, pages, revisions, source_complete)) = captured else {
             return FullOfferOutcome::NoIndex;
         };
-        // The warm owner is never refused for being a consumer.
-        self.direct_projection_enqueue_full(
-            generation,
-            pages,
-            revisions,
-            false,
-            source_complete,
-            FullOffer::WarmOwner,
-        )
+        self.direct_projection_enqueue_full(generation, pages, revisions, false, source_complete)
     }
 
     /// The ONE way a mutation that changes the page SET tells the index what it
@@ -615,18 +605,6 @@ pub(super) enum FullOfferOutcome {
     Queued,
     /// The index holds exactly this snapshot at this generation.
     AlreadyCurrent,
-    /// A page consumer offered while index work is coming.
-    RefusedDuringWarm,
     /// The snapshot is older than the queue.
     Outdated,
-}
-
-/// Who offers the index a full snapshot; see
-/// [`Graph::direct_projection_enqueue_full`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum FullOffer {
-    /// A page consumer that installed the parsed cache on its own account.
-    Consumer,
-    /// The warm that owns readiness, or a repair that runs with no warm.
-    WarmOwner,
 }

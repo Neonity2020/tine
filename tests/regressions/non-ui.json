@@ -6512,6 +6512,81 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 10, R10-01. The SQL compiler joined n-ary AND/OR flat, which SQLite nests one level per operand; a 985-term (or ...) (7 KB, inside the input caps) failed with 'Expression tree is too large'. The dispatcher treated every failed read as a damaged image and rebuilt the whole index, the rebuild succeeded (resetting the owner's backoff), and the query block retried NotReady forever: back-to-back whole-index rebuilds while the block was on screen. Fix: join_balanced keeps boolean depth at log2(n); a failed read requests a rebuild only when a schema check plus quick_check (once per ready generation) finds the image damaged, and otherwise answers Unavailable(ReadFailed). Fail-before: both model tests fail with either half reverted (evidence gh550-batch/indexing-audit-r10/necessity-R10-01.txt)."
+},
+{
+ "id": "REG-A-CLOSED-GRAPH-CHANGE-TAKES-THE-CHEAPER-ROUTE-543",
+ "title": "A graph changed while Tine was closed is repaired when few pages differ and built fresh when most do, on every path",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r10_tests.rs::gh543_a_config_changed_while_closed_is_built_fresh_on_every_path",
+   "crates/tine-core/src/model_gh543_r10_tests.rs::gh543_a_few_pages_changed_while_closed_are_repaired_on_every_path",
+   "crates/tine-core/src/model_gh543_r10_tests.rs::the_repair_share_bound_has_one_reader"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-02. The warm validation applied a share bound (above a quarter of the pages differ -> fresh build) but the worker's full-snapshot repair path did not, so a parse configuration changed while Tine was closed was rewritten page by page in place whenever the snapshot arrived by the full path. Fix: one rule, repair::repair_is_proportionate, read by both repair paths (guard pins one reader). Fail-before: evidence gh550-batch/indexing-audit-r10/necessity-R10-02.txt."
+},
+{
+ "id": "REG-A-CONSUMER-PARSE-STARTS-NO-INDEX-BUILD-543",
+ "title": "A whole-graph read that parses the graph offers the index nothing; only the index owner starts whole-index work",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r10_tests.rs::gh543_a_consumer_parse_starts_no_index_build_during_the_backoff",
+   "crates/tine-core/src/model_gh543_r10_tests.rs::only_the_index_owner_offers_a_full_snapshot"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-03. A consumer's parsed-cache install (orphan assets, a read racing the warm) offered the index a full snapshot, refused only while work was coming, so during the owner's backoff it started a whole build. Shape: the consumer offer and its FullOffer enum are removed; the owner's pass offers the installed cache. Guard: exactly two production calls of direct_projection_enqueue_full. Fail-before: auditor probe audit543_r10_consumer_full_offer_bypasses_the_backoff (evidence gh550-batch/indexing-audit-r10/verify-by-manager-rust.log). Also closes a latent hole found by the full suite: a stale image no longer dedupes a re-offered identical snapshot."
+},
+{
+ "id": "REG-THE-INDEXING-BAR-SHOWS-WHILE-READERS-WAIT-543",
+ "title": "The indexing bar shows whenever readers are waiting for index work, including a full repair",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r10_tests.rs::gh543_the_bar_shows_while_readers_wait_for_a_full_repair"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 10, R10-04. indexing_progress decided from its own progress match, which hid the bar during a full-repair turn while readers got NotReady. It now asks the index decider (index_need) the same question readers' waits ask. Fail-before: auditor probe audit543_r10_bar_is_hidden_while_a_full_repair_runs (evidence gh550-batch/indexing-audit-r10/verify-by-manager-rust.log)."
 }
 ]
 }

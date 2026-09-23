@@ -10090,14 +10090,16 @@ fn gh543_progress_answers_while_a_joined_build_runs() {
             release.wait();
         }
     }));
-    // An explicit whole-graph consumer (e.g. orphan-asset listing) captures
-    // the shared snapshot before the delayed launch warm reaches it.
+    // An explicit whole-graph consumer (e.g. orphan-asset listing) installs
+    // the shared snapshot before the delayed launch warm reaches it. It offers
+    // the index nothing (audit R10-03): the warm offers that cache, and the
+    // build it starts is the one paused here.
     let _ = graph.orphan_assets();
-    reached.wait();
     let warm = {
         let graph = Arc::clone(&graph);
         std::thread::spawn(move || graph.warm_cache())
     };
+    reached.wait();
     // Let the warm reach its readiness wait on the paused build.
     std::thread::sleep(Duration::from_millis(300));
     let (tx, rx) = mpsc::channel();

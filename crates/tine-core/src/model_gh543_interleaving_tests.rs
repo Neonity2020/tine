@@ -1402,6 +1402,9 @@ fn gh543_a_stale_image_is_not_made_ready_by_a_page_update() {
 /// offered to an index that called itself current, and the owner looped on
 /// a need that never cleared -- with the rebuild the failed read asked for
 /// never happening.
+///
+/// The read fails on a damaged image: only that owes a rebuild. A read
+/// refused on an intact image owes none (audit R10-01).
 #[test]
 fn gh543_a_validation_that_needs_a_fresh_build_is_not_ready() {
     const PAGES: usize = 12;
@@ -1419,6 +1422,10 @@ fn gh543_a_validation_that_needs_a_fresh_build_is_not_ready() {
     let pause = graph.pause_next_warm_before_enqueue_test();
     graph.direct_projection_mark_stale_test();
     pause.reached.wait();
+    graph
+        .direct_projection_test()
+        .unwrap()
+        .inject_image_damage_test();
     graph.direct_projection_recover_after_failed_read_test();
     pause.release.wait();
     assert!(owner.wait_ready(Duration::from_secs(10)));

@@ -95,13 +95,24 @@ pub(super) fn validate_warm(
     // repair, as it does through a clean validation and a full snapshot
     // (`apply_full_repair`): asking for a full parse instead gains
     // nothing, because that parse cannot read the page either.
-    if changed * WARM_REPAIR_MAX_SHARE_DIVISOR > walk {
+    if !repair_is_proportionate(changed, walk) {
         return Ok(WarmOutcome::FreshBuildRequired);
     }
     Ok(WarmOutcome::Changed {
         replacements: source_delta.replacements,
         deletions: source_delta.deletions,
     })
+}
+
+/// Whether an image that differs from its source by `changed` of `total`
+/// pages is repaired in place rather than built fresh. It is the one rule
+/// for both repair paths, the warm validation and a full snapshot: the full
+/// path once had no bound, so a parse configuration changed while Tine was
+/// closed re-lowered every page in one worker turn that nothing could stop
+/// and no progress bar showed (GH #543, audit R10-02). A fresh build of
+/// that many pages is no dearer, stops between batches, and reports progress.
+pub(super) fn repair_is_proportionate(changed: usize, total: usize) -> bool {
+    changed * REPAIR_MAX_SHARE_DIVISOR <= total
 }
 
 /// Bring the image to a full snapshot by lowering only the pages `delta`

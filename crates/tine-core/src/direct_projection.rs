@@ -54,6 +54,23 @@ static PHYSICAL_PAGE_LOWERINGS: Mutex<(Option<PathBuf>, u64)> = Mutex::new((None
 #[cfg(test)]
 static BEFORE_APPLY_PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
+/// Count page lowerings under `root` from now on (model-level tests).
+#[cfg(test)]
+pub(crate) fn count_page_lowerings_test(root: &Path) {
+    *PHYSICAL_PAGE_LOWERINGS.lock().unwrap() = (Some(root.to_path_buf()), 0);
+}
+
+#[cfg(test)]
+pub(crate) fn page_lowerings_test() -> u64 {
+    PHYSICAL_PAGE_LOWERINGS.lock().unwrap().1
+}
+
+/// Run `hook` on the worker once, just before its next turn applies.
+#[cfg(test)]
+pub(crate) fn before_next_apply_test(hook: Box<dyn FnOnce() + Send>) {
+    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(hook);
+}
+
 #[cfg(test)]
 fn run_before_apply_deltas_hook() {
     let hook = BEFORE_APPLY_PENDING.lock().unwrap().take();
@@ -228,10 +245,11 @@ pub(crate) struct WarmRepair {
     pub(crate) deletions: Vec<String>,
 }
 
-/// Above this share of the walk, a stale image is rebuilt from a complete
+/// Above this share of the pages, a stale image is rebuilt from a complete
 /// parsed snapshot instead: it parses the same pages and writes a fresh file
-/// rather than rewriting most of the old one in place.
-const WARM_REPAIR_MAX_SHARE_DIVISOR: usize = 4;
+/// rather than rewriting most of the old one in place. Read only by
+/// `repair::repair_is_proportionate`, the one rule for both repair paths.
+const REPAIR_MAX_SHARE_DIVISOR: usize = 4;
 
 /// What the worker's warm-validation turn decided (R6), read by the warm
 /// thread through `wait_warm_outcome`.
@@ -1315,8 +1333,11 @@ impl DirectProjection {
                             .upgrade()
                             .is_some_and(|snapshot| Arc::ptr_eq(&snapshot, &pages))
                 });
+        // A stale image owes a re-derivation of its page set, and this
+        // snapshot is one: taking it again is the repair, not a repeat.
         if already_accepted
             && !pending.rebuild
+            && !pending.stale
             && generation == pending.latest_generation
             && !self.shared.worker_failed.load(Ordering::Acquire)
         {
@@ -2591,6 +2612,14 @@ impl DirectProjection {
             .store(true, Ordering::Release);
     }
 
+    /// The next failed read finds the stored image damaged.
+    #[cfg(test)]
+    pub(crate) fn inject_image_damage_test(&self) {
+        self.shared
+            .inject_image_damage
+            .store(true, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_next_statement_failure(&self) {
         self.shared
@@ -3034,9 +3063,19 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let full_repair = full.as_ref().and_then(|full| {
             let repairable = existing_image_healthy
                 && (!full.source_complete || !rebuild && !requires_full_rebuild && !config_changed);
-            repairable
+            let delta = repairable
                 .then(|| full_repair_delta(writer_slot.as_ref().expect("healthy writer"), full))
-                .and_then(Result::ok)
+                .and_then(Result::ok)?;
+            // The warm validation's bound (R10-02). The stored revisions carry
+            // the parse configuration's digest, so a configuration changed
+            // while Tine was closed differs on every page and is built fresh
+            // here, though `config_changed` only sees this session's changes.
+            // An incomplete snapshot is repaired whatever its share: a fresh
+            // build would erase the pages it could not read.
+            let changed = delta.replacements.len() + delta.deletions.len();
+            (!full.source_complete
+                || repair_is_proportionate(changed, full.pages.len() + full.retained.len()))
+            .then_some(delta)
         });
         let fresh_build = had_full && full_repair.is_none();
         let registry_reset = fresh_build
@@ -3877,7 +3916,9 @@ mod repair;
 mod warm_queue;
 pub(crate) use lowering::*;
 use page_order::{adopt_queue_order, reconcile_page_order, settle_unseeded_deltas};
-use repair::{apply_full_repair, apply_warm_repair, full_repair_delta, validate_warm};
+use repair::{
+    apply_full_repair, apply_warm_repair, full_repair_delta, repair_is_proportionate, validate_warm,
+};
 pub(crate) use warm_queue::WarmRefusal;
 #[cfg(test)]
 #[path = "direct_projection_tests.rs"]

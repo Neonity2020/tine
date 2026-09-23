@@ -196,3 +196,250 @@ fn gh543_a_read_refused_on_an_intact_image_does_not_rebuild_it() {
     assert_eq!(answer.map(|answer| answer.groups.len()).ok(), Some(12));
     r10_finish(root, graph, owner);
 }
+
+/// Build and release a stored index for `root`, as a previous session would.
+fn r10_prebuild(root: &Path, database: &Path) {
+    let graph = Graph::open(root);
+    graph
+        .attach_direct_projection(database.to_path_buf())
+        .unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(10))
+        .unwrap();
+    crate::direct_projection::release_projection(&graph);
+}
+
+/// Hold the worker's next turn just before it applies: `.0` is reached,
+/// `.1` releases it.
+fn r10_hold_next_turn() -> Arc<(std::sync::Barrier, std::sync::Barrier)> {
+    let pair = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    let held = Arc::clone(&pair);
+    crate::direct_projection::before_next_apply_test(Box::new(move || {
+        held.0.wait();
+        held.1.wait();
+    }));
+    pair
+}
+
+/// R10-02: a parse configuration changed while Tine was closed differs on
+/// every page, so it is built fresh whichever way the full snapshot reaches
+/// the worker: after a clean launch walk (the control), or after a walk an
+/// unnamed change abandoned. The second once took the full snapshot as a
+/// repair and re-lowered every page in one turn nothing could stop.
+#[test]
+fn gh543_a_config_changed_while_closed_is_built_fresh_on_every_path() {
+    let run = |abandon: bool| -> u64 {
+        let root = r10_scratch(if abandon {
+            "cfg-abandon"
+        } else {
+            "cfg-control"
+        });
+        r10_pages(&root, 12);
+        let database = root.join("private/projection.sqlite");
+        r10_prebuild(&root, &database);
+        fs::create_dir_all(root.join("logseq")).unwrap();
+        fs::write(
+            root.join("logseq/config.edn"),
+            "{:property/separated-by-commas #{:foo}}\n",
+        )
+        .unwrap();
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database).unwrap();
+        let pause = graph.pause_next_warm_after_read_test();
+        let owner = R10Owner::start(&graph);
+        pause.reached.wait();
+        if abandon {
+            graph.drift_generation_test();
+        }
+        pause.release.wait();
+        assert!(owner.wait_settled(Duration::from_secs(10)));
+        assert!(owner.wait_ready(Duration::from_secs(10)));
+        r10_settle(&graph);
+        let fresh = graph.direct_projection_test().unwrap().fresh_builds_test();
+        r10_finish(root, graph, owner);
+        fresh
+    };
+    assert_eq!(
+        run(false),
+        1,
+        "control: a clean walk sends the change to a fresh build"
+    );
+    assert_eq!(
+        run(true),
+        1,
+        "an abandoned walk repaired every page in one turn"
+    );
+}
+
+/// R10-02's class: one repair-or-rebuild rule for both repair paths. A few
+/// pages edited while closed are still repaired in place after an abandoned
+/// walk (R9-01), lowering only those pages.
+#[test]
+fn gh543_a_few_pages_changed_while_closed_are_repaired_on_every_path() {
+    let root = r10_scratch("few-changed-abandon");
+    r10_pages(&root, 12);
+    let database = root.join("private/projection.sqlite");
+    r10_prebuild(&root, &database);
+    fs::write(root.join("pages/p5.md"), "- edited while closed [[p6]]\n").unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    crate::direct_projection::count_page_lowerings_test(&root);
+    let pause = graph.pause_next_warm_after_read_test();
+    let owner = R10Owner::start(&graph);
+    pause.reached.wait();
+    graph.drift_generation_test();
+    pause.release.wait();
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    r10_settle(&graph);
+    assert_eq!(
+        graph.direct_projection_test().unwrap().fresh_builds_test(),
+        0
+    );
+    assert_eq!(crate::direct_projection::page_lowerings_test(), 1);
+    r10_finish(root, graph, owner);
+}
+
+/// R10-02's shape: the share bound is read in one place.
+#[test]
+fn the_repair_share_bound_has_one_reader() {
+    let sources = [
+        include_str!("direct_projection.rs"),
+        include_str!("direct_projection/repair.rs"),
+    ];
+    let uses = sources
+        .iter()
+        .map(|source| source.matches("REPAIR_MAX_SHARE_DIVISOR").count())
+        .sum::<usize>();
+    assert_eq!(
+        uses, 2,
+        "REPAIR_MAX_SHARE_DIVISOR is declared once and read once, by \
+         repair::repair_is_proportionate: the warm and full repair paths must \
+         not decide 'repair or rebuild' differently (GH #543, audit R10-02)"
+    );
+}
+
+/// R10-04: the bar shows while readers wait for a full snapshot applied as a
+/// repair (a turn with no build progress and no owner pass running).
+#[test]
+fn gh543_the_bar_shows_while_readers_wait_for_a_full_repair() {
+    let root = r10_scratch("bar-full-repair");
+    r10_pages(&root, 12);
+    let database = root.join("private/projection.sqlite");
+    r10_prebuild(&root, &database);
+    fs::write(root.join("pages/p5.md"), "- edited while closed [[p6]]\n").unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let owner = R10Owner::start(&graph);
+    pause.reached.wait();
+    // An unnamed change abandons the launch walk: the owner escalates to a
+    // fresh pass, whose complete snapshot the worker applies as a repair.
+    graph.drift_generation_test();
+    let hold = r10_hold_next_turn();
+    pause.release.wait();
+    hold.0.wait();
+    let projection = graph.direct_projection_test().unwrap();
+    let progress = graph.indexing_progress();
+    let waiting = projection.coming() && !graph.direct_projection_ready_test();
+    hold.1.wait();
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    assert!(
+        graph.indexing_progress().is_none(),
+        "the bar outlived the work"
+    );
+    r10_finish(root, graph, owner);
+    assert!(waiting, "precondition: readers wait for this turn");
+    assert!(
+        progress.is_some(),
+        "the bar claimed idle while readers waited"
+    );
+}
+
+/// R10-03: while the owner backs off after failed turns, a page consumer's
+/// whole-graph parse starts no index build; only the owner offers a full
+/// snapshot.
+#[test]
+fn gh543_a_consumer_parse_starts_no_index_build_during_the_backoff() {
+    let (root, graph, owner) = r10_ready_graph("consumer-backoff");
+    let projection = graph.direct_projection_test().unwrap();
+    // Every worker turn fails until the owner is backing off.
+    let injecting = Arc::new(AtomicBool::new(true));
+    let injector = {
+        let (projection, injecting) = (Arc::clone(&projection), Arc::clone(&injecting));
+        std::thread::spawn(move || {
+            while injecting.load(Ordering::Acquire) {
+                projection.inject_next_turn_failure_test();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    fs::write(root.join("pages/p1.md"), "- edit that fails to index\n").unwrap();
+    let _ = graph.sync_file_checked(&root.join("pages/p1.md"));
+    let started = Instant::now();
+    while !projection.backing_off() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    injecting.store(false, Ordering::Release);
+    injector.join().unwrap();
+    assert!(
+        projection.backing_off(),
+        "precondition: the owner is backing off"
+    );
+    let before = projection.fresh_builds_test();
+    // A rename drops the parsed cache; the next display read parses the
+    // whole graph and installs it.
+    graph.rename_page("p3", "p3x").unwrap();
+    graph.with_pages(|_| ());
+    assert!(projection.wait_drained_test() || projection.backing_off());
+    assert_eq!(
+        projection.fresh_builds_test(),
+        before,
+        "a consumer's parse started a whole index build inside the backoff"
+    );
+    r10_finish(root, graph, owner);
+}
+
+/// Every non-test `.rs` file under `crates/tine-core/src`, with its text.
+fn r10_production_sources() -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !path.to_string_lossy().ends_with("_tests.rs")
+                && !path.to_string_lossy().ends_with("tests.rs")
+            {
+                out.push((path.clone(), fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    out
+}
+
+/// R10-03's shape: the owner's `offer_installed_cache` is the one caller
+/// that offers the index a full snapshot.
+#[test]
+fn only_the_index_owner_offers_a_full_snapshot() {
+    let sites: Vec<_> = r10_production_sources()
+        .iter()
+        .flat_map(|(file, source)| {
+            source
+                .match_indices("direct_projection_enqueue_full(")
+                .map(move |(at, _)| format!("{}:{}", file.display(), source[..at].lines().count()))
+        })
+        .collect();
+    assert_eq!(
+        sites.len(),
+        2,
+        "direct_projection_enqueue_full is declared once and called once, by \
+         Graph::offer_installed_cache (the index owner, model/projection_lifetime.rs): \
+         a consumer that offers a full snapshot is a second producer of \
+         whole-index work (GH #543, I-12, audit R10-03): {sites:?}"
+    );
+}
