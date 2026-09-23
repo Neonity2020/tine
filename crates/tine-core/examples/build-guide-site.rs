@@ -27,9 +27,18 @@ use tine_core::publish::publish_graph_app;
 use tine_core::Graph;
 
 const GUIDE_JOURNALS: [(&str, &str); 3] = [
-    ("2026_09_21.md", include_str!("guide-journals/2026_09_21.md")),
-    ("2026_09_22.md", include_str!("guide-journals/2026_09_22.md")),
-    ("2026_09_23.md", include_str!("guide-journals/2026_09_23.md")),
+    (
+        "2026_09_21.md",
+        include_str!("guide-journals/2026_09_21.md"),
+    ),
+    (
+        "2026_09_22.md",
+        include_str!("guide-journals/2026_09_22.md"),
+    ),
+    (
+        "2026_09_23.md",
+        include_str!("guide-journals/2026_09_23.md"),
+    ),
 ];
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
