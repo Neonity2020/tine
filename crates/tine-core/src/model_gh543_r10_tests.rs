@@ -304,13 +304,9 @@ fn gh543_a_few_pages_changed_while_closed_are_repaired_on_every_path() {
 /// R10-02's shape: the share bound is read in one place.
 #[test]
 fn the_repair_share_bound_has_one_reader() {
-    let sources = [
-        include_str!("direct_projection.rs"),
-        include_str!("direct_projection/repair.rs"),
-    ];
-    let uses = sources
+    let uses = crate::projection_producer_census::production_rust()
         .iter()
-        .map(|source| source.matches("REPAIR_MAX_SHARE_DIVISOR").count())
+        .map(|file| file.code.matches("REPAIR_MAX_SHARE_DIVISOR").count())
         .sum::<usize>();
     assert_eq!(
         uses, 2,
@@ -402,36 +398,18 @@ fn gh543_a_consumer_parse_starts_no_index_build_during_the_backoff() {
     r10_finish(root, graph, owner);
 }
 
-/// Every non-test `.rs` file under `crates/tine-core/src`, with its text.
-fn r10_production_sources() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && !path.to_string_lossy().ends_with("_tests.rs")
-                && !path.to_string_lossy().ends_with("tests.rs")
-            {
-                out.push((path.clone(), fs::read_to_string(&path).unwrap()));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
-    out
-}
-
 /// R10-03's shape: the owner's `offer_installed_cache` is the one caller
 /// that offers the index a full snapshot.
 #[test]
 fn only_the_index_owner_offers_a_full_snapshot() {
-    let sites: Vec<_> = r10_production_sources()
+    let sites: Vec<_> = crate::projection_producer_census::production_rust()
         .iter()
-        .flat_map(|(file, source)| {
-            source
+        .flat_map(|file| {
+            file.code
                 .match_indices("direct_projection_enqueue_full(")
-                .map(move |(at, _)| format!("{}:{}", file.display(), source[..at].lines().count()))
+                .map(move |(at, _)| {
+                    format!("{}:{}", file.relative, file.code[..at].lines().count())
+                })
         })
         .collect();
     assert_eq!(
