@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { classifyNativeCallError, OperationCancelledError, QueryNotReadyError, QueryUnavailableError } from "./backend";
-import { runQueryWhenCurrent, runQueryWhenReady } from "./queryReadiness";
+import { manualLifetime, runQueryWhenCurrent, runQueryWhenReady } from "./queryReadiness";
+import { bumpGraphBinding } from "./persistence";
+import { setGraphMeta, setGraphTransitioning } from "./ui";
 import { resetSharedQueryResultsForTests, sharedQueryResult } from "./queryResultCache";
 
 afterEach(() => { vi.useRealTimers(); resetSharedQueryResultsForTests(); });
@@ -63,9 +65,10 @@ describe("owned query readiness", () => {
       const pending: unknown[] = [];
       let finish!: () => void;
       const run = runQueryWhenCurrent(
+        manualLifetime().lifetime,
         () => new Promise<string>((resolve, reject) => { finish = () => settle(resolve, reject); }),
         () => current,
-        (error) => pending.push(error),
+        (error: unknown) => pending.push(error),
       );
       current = false;
       finish();
@@ -75,9 +78,9 @@ describe("owned query readiness", () => {
   });
 
   it("returns a current eager attempt's answer and rethrows its real failure", async () => {
-    await expect(runQueryWhenCurrent(async () => "answer", () => true)).resolves.toBe("answer");
+    await expect(runQueryWhenCurrent(manualLifetime().lifetime, async () => "answer", () => true)).resolves.toBe("answer");
     const failure = new Error("real failure");
-    await expect(runQueryWhenCurrent(async () => { throw failure; }, () => true)).rejects.toBe(failure);
+    await expect(runQueryWhenCurrent(manualLifetime().lifetime, async () => { throw failure; }, () => true)).rejects.toBe(failure);
   });
 
   it("backs off pending attempts and returns the actual answer", async () => {
@@ -174,4 +177,69 @@ describe("owned query readiness", () => {
     expect(a.onPending).not.toHaveBeenCalled();
     expect(b.onPending).toHaveBeenLastCalledWith(null);
   });
+
+  // GH #543, audits R12-06 and R13-01: whose is the retry? It ends with its
+  // component and with its graph, and survives a reopen of the same graph.
+  describe("the owner of a readiness retry", () => {
+    const notReady = () => Promise.reject(new QueryNotReadyError("indexing"));
+    afterEach(() => { vi.useRealTimers(); setGraphMeta(null); setGraphTransitioning(false); });
+
+    it("stops retrying once its lifetime ends", async () => {
+      vi.useFakeTimers();
+      const { lifetime, end } = manualLifetime();
+      const load = vi.fn(notReady);
+      const run = runQueryWhenCurrent(lifetime, load);
+      const settled = expect(run).rejects.toBeInstanceOf(OperationCancelledError);
+      await vi.advanceTimersByTimeAsync(300);
+      end();
+      const atEnd = load.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      await settled;
+      expect(load.mock.calls.length - atEnd).toBe(0);
+    });
+
+    it("ends when the app switches to another graph", async () => {
+      vi.useFakeTimers();
+      setGraphMeta({ root: "/first" } as never);
+      const load = vi.fn(notReady);
+      const run = runQueryWhenCurrent(manualLifetime().lifetime, load);
+      const settled = expect(run).rejects.toBeInstanceOf(OperationCancelledError);
+      await vi.advanceTimersByTimeAsync(300);
+      setGraphMeta({ root: "/second" } as never);
+      bumpGraphBinding();
+      const atSwitch = load.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      await settled;
+      expect(load.mock.calls.length - atSwitch, "the retry read the next graph").toBe(0);
+    });
+
+    it("reads the reopened graph when the same graph is reopened", async () => {
+      vi.useFakeTimers();
+      setGraphMeta({ root: "/first" } as never);
+      let ready = false;
+      const run = runQueryWhenCurrent(manualLifetime().lifetime, () => (ready ? Promise.resolve("answer") : notReady()));
+      await vi.advanceTimersByTimeAsync(300);
+      // A config.edn reopen: the binding moves, the root does not.
+      bumpGraphBinding();
+      ready = true;
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(run).resolves.toBe("answer");
+    });
+
+    it("takes no answer while a graph is being opened", async () => {
+      vi.useFakeTimers();
+      setGraphMeta({ root: "/first" } as never);
+      setGraphTransitioning(true);
+      const load = vi.fn(() => Promise.resolve("maybe the next graph's answer"));
+      const run = runQueryWhenCurrent(manualLifetime().lifetime, load);
+      let settled = false;
+      void run.then(() => { settled = true; }, () => { settled = true; });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(settled).toBe(false);
+      setGraphTransitioning(false);
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(run).resolves.toBe("maybe the next graph's answer");
+    });
+  });
 });
+

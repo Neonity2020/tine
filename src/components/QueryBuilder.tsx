@@ -41,7 +41,7 @@ import {
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { createReadyQueryResource } from "../createReadyQueryResource";
 import { readLatestOr } from "../resourceRead";
-import { runQueryWhenCurrent } from "../queryReadiness";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import { graphBinding } from "../persistence";
 import { QueryDisplay } from "./QueryDisplay";
 import type { QueryDisplayControl } from "../editor/queryViewProperties";
@@ -216,6 +216,7 @@ function QueryTextPane(props: {
    *  settled` — newer than the last response we ACCEPTED — which lets revision 1
    *  land while revision 2 is still in flight. */
   const accepts = (mine: number) => !disposed && mine === revision();
+  const lifetime = componentLifetime();
 
   // The session's own text is PRINTED BY RUST. The pane never renders a query it
   // spelled itself — that was the twin this packet removed. The printer's answer
@@ -275,6 +276,7 @@ function QueryTextPane(props: {
       // cancellation identity, so the shared readiness owner reuses it rather
       // than the pane inventing a second policy.
       parsed = await runQueryWhenCurrent(
+        lifetime,
         () => backend().parseQuery(source, props.dialect),
         () => accepts(mine),
       );
@@ -736,6 +738,7 @@ export function QueryBuilder(props: {
   // I-20: anchor previews obey the same current-revision rule as text parses.
   // Selecting the original anchor or closing the sheet cancels pending work.
   let anchorRevision = 0;
+  const anchorLifetime = componentLifetime();
   const invalidateAnchorPreview = () => {
     anchorRevision += 1;
     setAnchorPrompt(null);
@@ -861,6 +864,7 @@ export function QueryBuilder(props: {
     try {
       const text = await backend().printQuery(next, current.view, "tql");
       parsed = await runQueryWhenCurrent(
+        anchorLifetime,
         () => backend().parseQuery(text, "tql"),
         () => mine === anchorRevision,
       );

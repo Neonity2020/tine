@@ -76,7 +76,7 @@ import type { PageKind, QueryPublicationRequest, RefGroup } from "../types";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { graphBinding } from "../persistence";
 import { createReadyQueryResource } from "../createReadyQueryResource";
-import { runQueryWhenCurrent } from "../queryReadiness";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
@@ -336,18 +336,16 @@ export function QueryMacro(props: {
   // A removed block's parse is nobody's: its request never changes, so
   // without this the retry polled `query_parse` for as long as the index
   // stayed not ready (GH #543, audit R12-06).
-  let disposed = false;
-  onCleanup(() => {
-    disposed = true;
-  });
+  const lifetime = componentLifetime();
   const [parsedSnapshot] = createResource(parseRequest, async (request) => {
     setParsePending(null);
     return {
       request,
       reading: await runQueryWhenCurrent(
+        lifetime,
         () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
-        () => !disposed && parseRequest() === request,
-        (error) => { if (!disposed && parseRequest() === request) setParsePending(error); },
+        () => parseRequest() === request,
+        (error) => { if (!lifetime.ended() && parseRequest() === request) setParsePending(error); },
       ),
     };
   });
@@ -615,8 +613,9 @@ export function QueryMacro(props: {
       // directives that a reprint would otherwise discard.
       try {
         const fresh = await runQueryWhenCurrent(
+          lifetime,
           () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
-          () => !disposed && graphEpoch() === epochAtStart && doc.byId[props.blockId!]?.raw === rawAtStart,
+          () => graphEpoch() === epochAtStart && doc.byId[props.blockId!]?.raw === rawAtStart,
         );
         const rebased = { ...fresh.view };
         for (const key of ["view", "sort", "group_by", "columns", "aggregates", "sample"] as const) {

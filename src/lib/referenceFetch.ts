@@ -1,6 +1,5 @@
-import { onCleanup } from "solid-js";
 import { OperationCancelledError, type QueryNotReadyError } from "../backend";
-import { runQueryWhenCurrent } from "../queryReadiness";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import { classifyReferenceLoadError, type ReferenceLoadError } from "./referenceLoadError";
 import { graphEpoch } from "../ui";
 import { graphBinding } from "../persistence";
@@ -57,15 +56,12 @@ export function createReferenceFetcher(options: {
   /** Non-null while the read is waiting for the index rather than failing. */
   setIndexPending: (error: QueryNotReadyError | null) => void;
 }): <T>(read: ReferenceRead, load: () => Promise<T[]>) => Promise<T[]> {
-  let disposed = false;
-  onCleanup(() => {
-    disposed = true;
-  });
+  const lifetime = componentLifetime();
   return async <T>(read: ReferenceRead, load: () => Promise<T[]>): Promise<T[]> => {
-    const current = () => !disposed && sameReferenceRead(options.currentRead(), read);
+    const current = () => !lifetime.ended() && sameReferenceRead(options.currentRead(), read);
     options.setLoadError(null);
     try {
-      return await runQueryWhenCurrent(load, current, options.setIndexPending);
+      return await runQueryWhenCurrent(lifetime, load, current, options.setIndexPending);
     } catch (error) {
       // A superseded read is not a failure the user should see; the resource
       // for the new page is already running, and the panel's error state is

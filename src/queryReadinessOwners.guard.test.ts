@@ -1,24 +1,13 @@
-// GH #543, audit R12-06: "whose is a readiness retry?" `runQueryWhenCurrent`
-// owns the graph half (the binding the read started on). Each caller's gate
-// owns the other half: it must end when its owner is disposed. Exemplar:
-// `createReferenceFetcher` in src/lib/referenceFetch.ts.
+// GH #543, audits R12-06 and R13-08: "whose is a readiness retry?" A retry
+// ends with its component because `runQueryWhenCurrent` requires a
+// `Lifetime`, and the only lifetime a component can make ends in its
+// `onCleanup` (`componentLifetime`). The behaviour is pinned by
+// src/queryParseRetryOwner.test.tsx and QueryExportDialog.test.tsx; this guard
+// keeps the type from being bypassed. Exemplar: `QueryMacro` in
+// src/components/Macro.tsx.
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-
-/** Per file: how many calls, and the disposal each call's gate reads (any
- *  of them; each one is set or bumped by that component's onCleanup). */
-const OWNERS: Record<string, { calls: number; disposal: string[] }> = {
-  "components/Macro.tsx": { calls: 2, disposal: ["!disposed"] },
-  // `current` reads the fetcher's own `disposed`.
-  "lib/referenceFetch.ts": { calls: 1, disposal: ["current"] },
-  "components/QueryExportDialog.tsx": { calls: 2, disposal: ["!disposed"] },
-  // `accepts` reads `disposed`; `anchorRevision` is bumped on cleanup.
-  "components/QueryBuilder.tsx": { calls: 2, disposal: ["accepts(", "anchorRevision"] },
-  // Bumped on cleanup.
-  "components/LinkedReferences.tsx": { calls: 1, disposal: ["nativeRequestVersion"] },
-  "components/Settings.tsx": { calls: 1, disposal: ["!publishDisposed"] },
-};
 
 function sources(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -29,54 +18,32 @@ function sources(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** The argument list of each `runQueryWhenCurrent(` call. */
-function calls(text: string): string[] {
-  const found: string[] = [];
-  let at = text.indexOf("runQueryWhenCurrent(");
-  while (at >= 0) {
-    let depth = 0;
-    let end = at + "runQueryWhenCurrent".length;
-    for (; end < text.length; end++) {
-      if (text[end] === "(") depth++;
-      else if (text[end] === ")" && --depth === 0) break;
-    }
-    found.push(text.slice(at, end + 1));
-    at = text.indexOf("runQueryWhenCurrent(", end);
-  }
-  return found;
-}
+describe("readiness retries end with their owner (GH #543, R12-06/R13-08)", () => {
+  const root = join(__dirname);
+  const production = sources(root).map((path) => ({
+    relative: path.slice(root.length + 1),
+    text: readFileSync(path, "utf8"),
+  }));
 
-describe("readiness retries end with their owner (GH #543, R12-06)", () => {
-  it("names a disposal in every caller's gate", () => {
-    const root = join(__dirname);
-    const seen: Record<string, number> = {};
-    const missing: string[] = [];
-    for (const path of sources(root)) {
-      const relative = path.slice(root.length + 1);
-      if (relative === "queryReadiness.ts") continue;
-      const found = calls(readFileSync(path, "utf8"));
-      if (found.length === 0) continue;
-      seen[relative] = found.length;
-      const owner = OWNERS[relative];
-      for (const call of found) {
-        if (!owner || !owner.disposal.some((token) => call.includes(token))) missing.push(`${relative}: ${call.slice(0, 120)}`);
-      }
-    }
+  it("makes a Lifetime only in queryReadiness.ts", () => {
+    const forged = production
+      .filter(({ relative, text }) => relative !== "queryReadiness.ts" && /as\s+Lifetime\b/.test(text))
+      .map(({ relative }) => relative);
     expect(
-      seen,
-      "a new runQueryWhenCurrent caller: add it to OWNERS with the disposal its gate reads",
-    ).toEqual(Object.fromEntries(Object.entries(OWNERS).map(([file, { calls }]) => [file, calls])));
-    expect(
-      missing,
-      "a readiness retry whose gate never ends when its owner is disposed polls for as long " +
-        "as the index is not ready; read a disposal flag set in onCleanup (exemplar: " +
-        "createReferenceFetcher)",
+      forged,
+      "a Lifetime cast outside queryReadiness.ts can never end: call componentLifetime() in the " +
+        "component's setup (exemplar: QueryMacro in src/components/Macro.tsx)",
     ).toEqual([]);
   });
 
-  it("keeps the binding half in the shared helper", () => {
-    const helper = readFileSync(join(__dirname, "queryReadiness.ts"), "utf8");
-    const body = helper.slice(helper.indexOf("export function runQueryWhenCurrent"));
-    expect(body).toMatch(/const binding = graphBinding\(\);\s*const isCurrent = \(\) => graphBinding\(\) === binding && callerIsCurrent\(\);/);
+  it("gives every component retry a lifetime that ends with the component", () => {
+    const manual = production
+      .filter(({ relative, text }) => relative !== "queryReadiness.ts" && text.includes("manualLifetime("))
+      .map(({ relative }) => relative);
+    expect(
+      manual,
+      "manualLifetime() is for owners that are not components and must call its end(); a " +
+        "component uses componentLifetime(), which ends in onCleanup (exemplar: QueryMacro)",
+    ).toEqual([]);
   });
 });

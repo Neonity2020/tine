@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
-import { closeSettings, openSettings } from "../ui";
+import { closeSettings, graphMeta, openSettings, setGraphMeta } from "../ui";
 import { backend, QueryNotReadyError } from "../backend";
 
 // "Export graph to HTML" publishes the public-page capability: only pages
@@ -88,6 +88,8 @@ describe("Settings → Graph → Export graph to HTML while indexing (GH #543)",
 describe("Settings → Graph → Export graph to HTML across a graph switch (GH #543)", () => {
   it("does not export the graph opened while it waited", async () => {
     const { bumpGraphBinding } = await import("../persistence");
+    const before = graphMeta();
+    setGraphMeta({ ...(before ?? {}), root: "/mock/graph" } as never);
     let ready = false;
     const publish = vi.spyOn(backend(), "publishHtml").mockImplementation(async () => {
       if (!ready) throw new QueryNotReadyError("indexing");
@@ -104,13 +106,47 @@ describe("Settings → Graph → Export graph to HTML across a graph switch (GH 
         .click();
       await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index"));
       const attempts = publish.mock.calls.length;
-      bumpGraphBinding(); // another graph is opened in this window
+      // Another graph is opened in this window.
+      setGraphMeta({ ...(before ?? {}), root: "/mock/other-graph" } as never);
+      bumpGraphBinding();
       ready = true;
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       expect(publish.mock.calls.length, "a retry exported the newly opened graph").toBe(attempts);
       expect(root.textContent).not.toContain("Exported 5 pages");
+      expect(root.textContent, "the export still says it waits").not.toContain("Waiting for the index");
     } finally {
       dispose();
+      setGraphMeta(before);
+    }
+  }, 10_000);
+
+  // GH #543, audit R13-01: a reopen of the SAME graph (a config.edn change)
+  // is not a switch; the export waits on and exports it.
+  it("exports the same graph after it is reopened while it waited", async () => {
+    const { bumpGraphBinding } = await import("../persistence");
+    const before = graphMeta();
+    setGraphMeta({ ...(before ?? {}), root: "/mock/graph" } as never);
+    let ready = false;
+    vi.spyOn(backend(), "publishHtml").mockImplementation(async () => {
+      if (!ready) throw new QueryNotReadyError("indexing");
+      return ["/mock/graph/publish", 5];
+    });
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <Settings />, root);
+    try {
+      openSettings("graph");
+      await tick();
+      [...root.querySelectorAll("button")]
+        .find((candidate) => candidate.textContent?.includes("Export graph to HTML"))!
+        .click();
+      await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index"));
+      bumpGraphBinding(); // the backend reopened this graph
+      ready = true;
+      await vi.waitFor(() => expect(root.textContent).toContain("Exported 5 pages"), { timeout: 3_000 });
+    } finally {
+      dispose();
+      setGraphMeta(before);
     }
   }, 10_000);
 });

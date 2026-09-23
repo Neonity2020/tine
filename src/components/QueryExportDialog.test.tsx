@@ -13,6 +13,8 @@ import {
   toasts,
 } from "../ui";
 import { clearTransientLayersForTest } from "../transientLayers";
+import { notifyGraphRebound } from "../modeHooks";
+import "../persistence"; // a rebound moves the graph binding
 import type { QueryPublicationPlan, QueryPublicationRequest } from "../types";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -213,6 +215,42 @@ describe("QueryExportDialog while the index is being built", () => {
       expect(publish.mock.calls.length).toBeGreaterThan(1);
     } finally {
       dispose();
+    }
+  }, 10_000);
+});
+
+// GH #543, audits R12-06 and R13-01: the plan's readiness wait ends with the
+// dialog, and survives a reopen of the same graph (a config.edn change).
+describe("QueryExportDialog's readiness wait", () => {
+  it("stops asking for a plan once the dialog is gone", async () => {
+    const planCall = vi.spyOn(backend(), "publishQueryPlan").mockRejectedValue(new QueryNotReadyError("indexing"));
+    const { root, dispose } = mount();
+    openQueryExport(request);
+    await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index to be ready"));
+    dispose();
+    closeQueryExport();
+    const atClose = planCall.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    expect(planCall.mock.calls.length - atClose, "a closed dialog keeps asking for a plan").toBe(0);
+    root.remove();
+  }, 10_000);
+
+  it("shows the plan after the same graph is reopened while it waits", async () => {
+    let ready = false;
+    vi.spyOn(backend(), "publishQueryPlan").mockImplementation(async () => {
+      if (!ready) throw new QueryNotReadyError("indexing");
+      return plan();
+    });
+    const { root, dispose } = mount();
+    try {
+      openQueryExport(request);
+      await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index to be ready"));
+      notifyGraphRebound();
+      ready = true;
+      await vi.waitFor(() => expect(root.textContent).toContain("Tasks"), { timeout: 3_000 });
+    } finally {
+      dispose();
+      closeQueryExport();
     }
   }, 10_000);
 });

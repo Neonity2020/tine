@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createResource, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { backend, OperationCancelledError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
-import { runQueryWhenCurrent } from "../queryReadiness";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import { queryExportRequest, closeQueryExport, openSettings, pushToast } from "../ui";
 import { registerTransientLayer } from "../transientLayers";
 import type { QueryPublicationPlan, QueryPublicationRequest } from "../types";
@@ -55,18 +55,16 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
   // not-ready. It waits and plans again once the index is ready, rather than
   // showing the wait as a refusal nothing retries (GH #543, audit R6-05).
   const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
-  let disposed = false;
-  onCleanup(() => {
-    disposed = true;
-  });
+  const lifetime = componentLifetime();
   const [planResource] = createResource(
     () => plannedName(),
     async (forName): Promise<QueryPublicationPlan | { refused: string }> => {
       if (!forName.trim()) return { refused: "Give the export a name." };
       try {
         return await runQueryWhenCurrent(
+          lifetime,
           () => backend().publishQueryPlan({ ...props.request, name: forName, folder: null }),
-          () => !disposed && plannedName() === forName,
+          () => plannedName() === forName,
           setIndexPending,
         );
       } catch (e) {
@@ -130,8 +128,9 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
         replace: p.exists && destination() === "replace",
       };
       const outcome = await runQueryWhenCurrent(
+        lifetime,
         () => backend().publishQuery(request, p.fingerprint),
-        () => !disposed,
+        () => true,
         setIndexPending,
       );
       closeQueryExport();

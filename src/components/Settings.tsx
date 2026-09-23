@@ -132,8 +132,7 @@ import {
   OperationCancelledError,
   type BackupInfo,
 } from "../backend";
-import { runQueryWhenCurrent } from "../queryReadiness";
-import { graphBinding } from "../persistence";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import type { AssetInfo, TrashStats, JournalFile, PageEntry } from "../types";
 import { ConflictFileRow } from "./JournalConflictFileRow";
 import { formatJournal } from "../journal";
@@ -318,22 +317,20 @@ export function Settings(): JSX.Element {
     });
   };
   const [publishMsg, setPublishMsg] = createSignal("");
-  let publishDisposed = false;
-  onCleanup(() => {
-    publishDisposed = true;
-  });
+  const publishLifetime = componentLifetime();
   const doPublish = async () => {
     setPublishMsg("Exporting…");
     // The export belongs to the graph it was started on: each retry asks the
     // backend for the CURRENT graph, so a switch while waiting used to export
-    // the other graph (GH #543, audit R8-10).
-    const binding = graphBinding();
+    // the other graph (GH #543, audit R8-10). `runQueryWhenCurrent` ends the
+    // wait on a switch; a reopen of the same graph keeps it (audit R13-01).
     try {
       // Publication reads its queries from the index; while the index is
       // being built it waits for it rather than failing (GH #543, audit R6-05).
       const [dir, n] = await runQueryWhenCurrent(
+        publishLifetime,
         () => backend().publishHtml(),
-        () => !publishDisposed && graphBinding() === binding,
+        () => true,
         (pending) => setPublishMsg(pending ? "Waiting for the index to be ready…" : "Exporting…"),
       );
       // A zero is a successful export of nothing, which reads as a broken
@@ -344,7 +341,12 @@ export function Settings(): JSX.Element {
           : `Exported ${n} pages to ${dir}`,
       );
     } catch (e) {
-      if (e instanceof OperationCancelledError) return;
+      if (e instanceof OperationCancelledError) {
+        // The graph was switched away: nothing was exported, and the
+        // "Waiting…" line must not stay.
+        if (!publishLifetime.ended()) setPublishMsg("");
+        return;
+      }
       setPublishMsg(`Failed: ${String(e)}`);
     }
   };

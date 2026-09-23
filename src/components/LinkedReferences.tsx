@@ -23,7 +23,7 @@ import { mergeReferenceGroups } from "../lib/referenceGroups";
 import { ReferenceExportChooser } from "./ReferenceExportChooser";
 import { createLongPress } from "../render/longPress";
 import { readOr } from "../resourceRead";
-import { runQueryWhenCurrent } from "../queryReadiness";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import { backlinkFilterFacets } from "../lib/backlinkFilterFacets";
 
 // One identity fold for chips, filters, and group merging (DUP-2/DUP-8): the
@@ -188,6 +188,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   const [nativeContextLoading, setNativeContextLoading] = createSignal(false);
   const [nativeContextError, setNativeContextError] = createSignal<unknown>();
   let nativeRequestVersion = 0;
+  const lifetime = componentLifetime();
   createEffect(() => {
     const request = nativeContextRequest();
     const version = ++nativeRequestVersion;
@@ -198,6 +199,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     }
     setNativeContextLoading(true);
     void runQueryWhenCurrent(
+      lifetime,
       () => backend().getBacklinkFilterContext(
         request.name,
         request.inventory.targets,
