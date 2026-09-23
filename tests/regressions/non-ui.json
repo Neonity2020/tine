@@ -6162,6 +6162,42 @@
   "failBefore": "proven"
  },
  "notes": "Round-7 indexing audit R7-01. delete_page_expected passes cache_remove the inventory's answer, but cache_remove guessed from the page-list memo and, finding nothing with a cold cache, marked the index stale: the owner walked every page (and during the launch check abandoned and repeated its walk). cache_remove now takes the inventory's answer as authoritative; a page with no file moves the generation with IndexEffect::Unchanged. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r7/necessity-fail-before.log."
+},
+{
+ "id": "REG-A-CLOSED-WINDOW-RELEASES-ITS-INDEX-WRITER-543",
+ "title": "Closing a window releases its graph's index writer, so reopening the graph indexes at once",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src-tauri/src/state.rs::a_window_close_detaches_its_graphs_index_writer", "src-tauri/src/state.rs::graphs_are_retired_only_where_they_are_replaced"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Round-7 indexing audit R7-05. GraphRegistry::remove retired the slot without detaching its projection, unlike bind for a different root; a reopen waited in LeaseWait until every clone of the old Graph dropped. Both now go through one retire_slot, which the retirement census pins. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r7/necessity-close-detach.log."
+},
+{
+ "id": "REG-A-PUBLISHED-GRAPH-ALWAYS-GETS-ITS-INDEX-OWNER-543",
+ "title": "A graph that has been opened always starts its index owner, even if saving the recent-graphs list fails",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src-tauri/src/graph.rs::every_direct_files_graph_is_attached_through_one_function"],
+  "scenario": null,
+  "failBefore": "structural"
+ },
+ "notes": "Round-7 indexing audit R7-03 (reasoned, not reproduced: needs a failing settings write). publish_prepared_direct_files returned remember_graph's error after the slot was published, dropping the warm ticket: no owner, no launch completion, and the open reported as failed. The owner now starts right after publication and remembering is non-fatal (a fixed diag line). The source-order guard fails if anything fallible sits between publication and warm_cache_async."
 }
 ]
 }

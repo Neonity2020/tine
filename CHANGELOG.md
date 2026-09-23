@@ -70,6 +70,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Closing a window and opening its graph again could leave search and queries
+  without an index until Tine finished releasing the old window. The closed
+  window's graph now lets go of its index at once, as switching graphs
+  already did (GH #543).
+
+- If Tine could not update its list of recent graphs while opening a graph
+  (for example on a full disk), the open was reported as failed although the
+  graph was open, and its search index was never built for the session. The
+  graph now opens and indexes normally; only the recent-graphs entry is
+  skipped (GH #543).
+
 - Tine could keep one CPU core busy for as long as a graph stayed open after
   its search index needed re-checking while another window was indexing, or
   after a query found the index damaged; the damaged index also kept

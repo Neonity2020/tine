@@ -223,23 +223,7 @@ impl GraphRegistry {
             // preserves the frontend binding lease. Let its already-running
             // warm/backup finish; a real graph switch revokes the old source.
             if old.binding_generation != slot.binding_generation || old.root_key != slot.root_key {
-                old.background_cancelled
-                    .store(true, std::sync::atomic::Ordering::Release);
-                old.graph().retire();
-                // Stop the displaced index writer now, not when the last
-                // reference to its graph drops: it holds the database's lease,
-                // which a switch back needs (GH #543). Off this thread, which
-                // holds the registry lock.
-                let displaced = old.graph();
-                std::thread::spawn(move || {
-                    if !displaced.detach_direct_projection(Duration::from_secs(15)) {
-                        crate::debug::diag(
-                            "Direct Files projection worker of a displaced graph did not stop \
-                             within 15 s"
-                                .to_string(),
-                        );
-                    }
-                });
+                retire_slot(&old);
             }
             self.by_root.remove(&old.root_key);
         }
@@ -274,13 +258,32 @@ impl GraphRegistry {
 
     pub(crate) fn remove(&mut self, window: &str) -> Option<Arc<GraphSlot>> {
         let slot = self.by_window.remove(window)?;
-        slot.background_cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
-        slot.graph().retire();
-        // This revokes Tauri background work and display reads.
+        retire_slot(&slot);
         self.by_root.remove(&slot.root_key);
         Some(slot)
     }
+}
+
+/// Retire a slot a window has left -- a graph switch or a window close: its
+/// background work and display reads are revoked, and its index writer is
+/// stopped now, not when the last reference to its graph drops. The writer
+/// holds the database's lease, which reopening the graph needs; a close that
+/// skipped this left a reopen waiting for the lease until every clone of the
+/// old graph was gone (GH #543, audit R7-05). The detach runs off the calling
+/// thread, which holds the registry lock.
+fn retire_slot(slot: &Arc<GraphSlot>) {
+    slot.background_cancelled
+        .store(true, std::sync::atomic::Ordering::Release);
+    slot.graph().retire();
+    let displaced = slot.graph();
+    std::thread::spawn(move || {
+        if !displaced.detach_direct_projection(Duration::from_secs(15)) {
+            crate::debug::diag(
+                "Direct Files projection worker of a retired graph did not stop within 15 s"
+                    .to_string(),
+            );
+        }
+    });
 }
 
 #[derive(Default)]
@@ -951,10 +954,11 @@ mod tests {
         sites.sort();
         assert_eq!(
             sites,
-            ["bind", "commit", "remove"],
-            "Graph::retire is called outside the three places a graph is replaced. \
-             A retired graph never answers a display read again, so retire only \
-             after every fallible step; see PreparedRefresh::commit (I-13)."
+            ["commit", "retire_slot"],
+            "Graph::retire is called outside the two places a graph is replaced: \
+             retire_slot (a window switching graphs or closing) and a refresh's \
+             commit. A retired graph never answers a display read again, so retire \
+             only after every fallible step; see PreparedRefresh::commit (I-13)."
         );
     }
 
@@ -1294,6 +1298,37 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The window-close sibling of the switch above (audit R7-05): a closed
+    /// window's graph lets go of its index writer too, so reopening the graph
+    /// does not wait for the lease until every clone of it is dropped.
+    #[test]
+    fn a_window_close_detaches_its_graphs_index_writer() {
+        let base = std::env::temp_dir().join(format!("tine-close-detach-{}", uuid::Uuid::new_v4()));
+        let slot = graph(&base.join("a"));
+        slot.graph()
+            .attach_direct_projection(base.join("index/projection.sqlite"))
+            .unwrap();
+        let mut registry = GraphRegistry::default();
+        registry.bind("main".into(), Arc::clone(&slot)).unwrap();
+        // A capture binding or an in-flight command still holds the slot.
+        let removed = registry.remove("main").unwrap();
+        let (wake, _woken) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        while slot
+            .graph()
+            .observe_direct_projection_commits(wake.clone())
+            .is_some()
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the closed window's graph kept its index writer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(removed);
         let _ = std::fs::remove_dir_all(base);
     }
 

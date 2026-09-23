@@ -622,10 +622,22 @@ pub(crate) fn publish_prepared_direct_files(
         root_key,
     } = prepared;
     let (slot, warm) = publish_direct_files_slot(state, window_label, graph, root_key)?;
+    let binding_generation = slot.binding_generation;
+    let application_page_admission = slot.application_page_admission();
+    // The graph is published: its index owner starts now, before anything
+    // that can fail. An error returned after publication dropped the warm
+    // ticket, leaving an open graph whose index nobody owned and whose
+    // whole-graph views waited for a completion that never came (GH #543,
+    // audit R7-03).
+    warm_cache_async(app.clone(), window_label.to_string(), slot.clone(), warm)?;
     // Opening no longer mutates the tree, so the launch snapshot is never on a
     // rename's critical path: it stays the ordinary background backup.
-    backup_async(app.clone(), window_label.to_string(), slot.clone())?;
-    remember_graph(app, &meta.root)?;
+    backup_async(app.clone(), window_label.to_string(), slot)?;
+    // The recent-graphs list is bookkeeping; a settings write that fails
+    // (a full disk) does not un-open the graph.
+    if remember_graph(app, &meta.root).is_err() {
+        crate::debug::diag("remembering the opened graph in settings failed".to_string());
+    }
     if let Some(window) = app.get_webview_window(window_label) {
         let name = Path::new(&meta.root)
             .file_name()
@@ -633,9 +645,6 @@ pub(crate) fn publish_prepared_direct_files(
             .unwrap_or("Graph");
         let _ = window.set_title(&format!("Tine — {name}"));
     }
-    let binding_generation = slot.binding_generation;
-    let application_page_admission = slot.application_page_admission();
-    warm_cache_async(app.clone(), window_label.to_string(), slot, warm)?;
     Ok(DirectFilesOpen {
         meta,
         binding_generation,
@@ -1482,6 +1491,23 @@ mod tests {
             retire < detach && detach < attach && attach < slot,
             "refresh commit retires the old graph, stops its projection worker, \
              attaches, then builds the slot"
+        );
+        // The open path starts the owner of a published graph before
+        // anything that can fail: an error in between dropped the warm ticket
+        // and left the graph's index unowned (GH #543, audit R7-03).
+        let open = &graph[graph
+            .find("pub(crate) fn publish_prepared_direct_files(")
+            .expect("open publication")..];
+        let open = &open[..open.find("\n}\n").expect("open publication ends")];
+        let published = open
+            .find("publish_direct_files_slot(")
+            .expect("open publishes");
+        let warmed = open.find("warm_cache_async(").expect("open warms");
+        let between = &open[published..warmed];
+        assert!(
+            published < warmed && between.matches('?').count() == 1,
+            "nothing fallible sits between publishing the graph and starting its \
+             index owner: {between}"
         );
         let refresh_entry = &state[state
             .find("pub(crate) fn refresh_graph_for_label")
