@@ -423,12 +423,19 @@ async function runBackend(mode) {
     if (MISSING_TARGET) {
       // Use the reported conflict entry, which pins the physical path. A plain
       // page link may legitimately open a prospective page by name instead.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        await browser.$(".conflict-queue-badge").click();
-        await browser.waitUntil(async () => (await browser.$$(".page-conflict")).length > 0,
-          { timeout: 15_000, timeoutMsg: "conflict entry did not open its review" });
-        if ((await browser.$$(".recovery-draft")).length) break;
-      }
+      // The badge opens the Conflicts overview (GH #536); its row for this page
+      // opens the review. The row list re-renders from the live queue, so find
+      // and activate the row in one round trip rather than holding a handle.
+      await browser.$(".conflict-queue-badge").click();
+      await browser.waitUntil(async () => {
+        if ((await browser.$$(".page-conflict")).length > 0) return true;
+        await browser.execute((name) => {
+          const row = [...document.querySelectorAll(".conflict-overview-open")]
+            .find((button) => button.textContent?.trim() === name);
+          row?.click();
+        }, cases[0].name);
+        return false;
+      }, { timeout: 15_000, interval: 500, timeoutMsg: "conflict entry did not open its review" });
       await browser.$(".recovery-draft").waitForExist({ timeout: 15_000 });
       const preview = await browser.$(".recovery-draft pre").getText();
       if (!preview.includes(cases[0].local)) throw new Error("missing-target view lost retained writing");
