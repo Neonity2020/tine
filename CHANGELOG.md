@@ -16,7 +16,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   unchanged pages. A page Tine cannot parse no longer keeps the index from
   becoming ready; a journal migrated or a page rescued while a check runs, or a
   page saved during that check, is no longer dropped from search; and an index
-  holding contradictory rows is rebuilt once instead of retrying forever. Query
+  holding contradictory rows is rebuilt once instead of retrying forever. A
+  page created at launch beside a page Tine cannot parse is refused without
+  reading the whole graph first. Query
   results now list pages in file-path order, so a page created this session
   takes its place instead of appearing last (GH #543).
 - A query block, the query export dialog, or a publish waiting for the index

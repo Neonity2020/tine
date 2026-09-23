@@ -614,13 +614,20 @@ impl Graph {
             },
             DirectCreationEvidence::Cold => match self.indexed_creation_evidence() {
                 Some(evidence) => evidence,
-                None => {
-                    let outcome = self.repair_page_cache_once(permit);
-                    if !outcome.installed() {
-                        return Err(outcome.creation_error());
+                // Asking the index waited for the launch survey, which may
+                // have published a parse failure since: that is
+                // failure-bearing evidence, refused above, and parsing the
+                // whole graph would not settle it (GH #543).
+                None => match self.direct_creation_evidence()? {
+                    DirectCreationEvidence::Cold => {
+                        let outcome = self.repair_page_cache_once(permit);
+                        if !outcome.installed() {
+                            return Err(outcome.creation_error());
+                        }
+                        self.direct_creation_evidence()?
                     }
-                    self.direct_creation_evidence()?
-                }
+                    warm => warm,
+                },
             },
         };
         let DirectCreationEvidence::Warm {

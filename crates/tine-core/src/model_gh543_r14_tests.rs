@@ -242,3 +242,63 @@ fn gh543_r14_a_page_saved_during_a_validation_walk_stays_indexed() {
         "a page saved during a validation walk was deleted from the index"
     );
 }
+
+/// The survey that finds a page it cannot parse publishes that failure
+/// before readiness. A page creation waiting for the launch survey asks,
+/// once woken, which identities are unknown: it read no failure, and either
+/// trusted the stored identity of a page whose content it never parsed, or
+/// found the failure a moment later and parsed the whole graph only to
+/// refuse. Name-only creation refuses on an unknown identity, without the
+/// parse.
+#[test]
+fn gh543_a_creation_waiting_for_the_survey_refuses_without_parsing() {
+    let root = r10_scratch("r14-create-during-survey");
+    r10_pages(&root, 12);
+    let database = root.join("private/projection.sqlite");
+    r10_prebuild(&root, &database);
+    fs::write(
+        root.join("pages/p3.md"),
+        format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n"),
+    )
+    .unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let survey = graph.pause_next_warm_after_read_test();
+    let owner = R10Owner::start(&graph);
+    survey.reached.wait();
+    let asked = graph.pause_next_derived_read_test();
+    let parses = graph.consumer_page_parses_test();
+    let creator = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || {
+            graph
+                .save_page(
+                    &markdown_page_dto("fresh", "fresh", "- fresh page\n").unwrap(),
+                    None,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    };
+    asked.reached.wait();
+    asked.release.wait();
+    // Let the creation reach its wait for the survey.
+    std::thread::sleep(Duration::from_millis(100));
+    survey.release.wait();
+    let created = creator.join().unwrap();
+    assert!(owner.wait_ready(Duration::from_secs(20)));
+    let parsed = graph.consumer_page_parses_test() - parses;
+    let state = graph.direct_projection_test().unwrap().debug_state_test();
+    r10_finish(root, graph, owner);
+    assert!(
+        created
+            .as_ref()
+            .is_err_and(|error| error.contains("unreadable or unparseable")
+                || error.contains("failure-bearing")),
+        "a creation beside an unparseable page was not refused: {created:?} {state}"
+    );
+    assert_eq!(
+        parsed, 0,
+        "the creation parsed the graph to refuse: {created:?} {state}"
+    );
+}

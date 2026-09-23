@@ -959,8 +959,10 @@ impl Graph {
             }
             _ => absent,
         };
-        projection.survey_validated(generation, Arc::clone(&parse_config));
+        // The failures first: a reader woken by readiness asks them which
+        // identities are unknown (name-only creation refuses on any).
         self.publish_page_index_failures(generation, failures);
+        projection.survey_validated(generation, Arc::clone(&parse_config));
         if !absent.is_empty() {
             if let Ok(gate) = self.lock_graph_text_identity_mutation() {
                 self.confirm_absences(&projection, &permit, absent, &parse_config, gate);

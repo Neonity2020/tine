@@ -2,13 +2,17 @@
 //!
 //! Each seed drives a small graph through a random sequence of saves,
 //! creations, deletes, renames, merges, external edits (reported and
-//! missed), watcher rescans and restarts, while the launch warm runs on its
-//! own thread and a reader keeps asking indexed questions. After the
-//! sequence settles, four user outcomes must hold:
+//! missed), watcher rescans, pages whose parse panics and their repair,
+//! journal file-name migrations, rescues of a file into a page, mid-session
+//! surveys, `config.edn` changes, and restarts both orderly and abrupt, while
+//! the index owner runs on its own thread and a reader keeps asking indexed
+//! questions. After the sequence settles, four user outcomes must hold:
 //!
-//! 1. every wait returned (no reader call, warm or close outlived its bound);
+//! 1. every wait returned (no reader call, owner or close outlived its bound);
 //! 2. readiness is published at the graph's current generation;
-//! 3. the index answers what a fresh parse of the disk answers;
+//! 3. the index answers what a fresh parse of the disk answers, for every
+//!    page that can be parsed (a page whose parse panics keeps whatever rows
+//!    the index held for it, by design);
 //! 4. no consumer ran a whole-graph parse while the projection was alive.
 //!
 //! Stage 0 of the one-indexing-owner design
@@ -181,6 +185,15 @@ impl Session {
         ok
     }
 
+    /// Quit without waiting for the owner to settle: stop the reader, then
+    /// close with whatever pass is in flight.
+    fn close_abruptly(mut self, findings: &mut Vec<String>) {
+        self.stop.store(true, Ordering::Relaxed);
+        join_within("reader", self.reader.take(), findings);
+        findings.extend(self.read_errors.lock().unwrap().drain(..));
+        self.close(findings);
+    }
+
     fn close(mut self, findings: &mut Vec<String>) {
         self.owner_stop.store(true, Ordering::Release);
         join_within("owner", self.owner.take(), findings);
@@ -240,7 +253,15 @@ fn check_session_work(
     }
 }
 
-fn check_settled(root: &Path, graph: &Graph, findings: &mut Vec<String>) {
+/// `config.edn` variants that each change the parse config's digest.
+const CONFIGS: &[&str] = &[
+    "{}",
+    "{:property/separated-by-commas #{:status}}",
+    "{:ignored-page-references-keywords #{:status}}",
+    "{:block-hidden-properties #{:status}}",
+];
+
+fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<String>) {
     let started = Instant::now();
     while !graph.direct_projection_ready_test() {
         if started.elapsed() > SETTLE_BOUND {
@@ -264,6 +285,7 @@ fn check_settled(root: &Path, graph: &Graph, findings: &mut Vec<String>) {
                 let answer = |groups: &[crate::model::RefGroup]| {
                     let mut raws = groups
                         .iter()
+                        .filter(|group| !bad.contains(&group.page.to_lowercase()))
                         .flat_map(|group| {
                             group
                                 .blocks
@@ -290,6 +312,7 @@ fn check_settled(root: &Path, graph: &Graph, findings: &mut Vec<String>) {
             .list_pages()
             .into_iter()
             .map(|entry| entry.name.to_lowercase())
+            .filter(|name| !bad.contains(name))
             .collect::<Vec<_>>();
         names.sort();
         names
@@ -342,6 +365,10 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
         fs::write(page_path(&root, &name), text).unwrap();
     }
     let mut next_name = names.len();
+    // Pages whose parse panics: out of `names` until repaired.
+    let mut bad = Vec::<String>::new();
+    // The next journal day to write under a legacy file name.
+    let mut journal_day = 4u64;
     let mut findings = Vec::new();
     // Every session reopens a stored image, so any whole-graph parse the
     // sequence sees is a consumer's, not the first open's fresh build.
@@ -389,7 +416,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
         }
         let pick =
             |rng: &mut Rng, names: &[String]| names[rng.below(names.len() as u64) as usize].clone();
-        let op = rng.below(100);
+        let op = rng.below(120);
         if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
             eprintln!("seed {seed} step {step}: op {op} names {names:?}");
         }
@@ -503,20 +530,92 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
                 acting_parses += graph.consumer_page_parses_test() - before;
                 read
             }
-            // Restart: quiesce, release the lease, reopen on the same database.
-            93..=99 => {
+            // Restart: quiesce, release the lease, reopen on the same
+            // database. 114..=116 first change `config.edn`, which takes
+            // effect at the reopen; 117..=119 quit without quiescing.
+            93..=99 | 114..=119 => {
+                if (114..=116).contains(&op) {
+                    let config = CONFIGS[rng.below(CONFIGS.len() as u64) as usize];
+                    fs::create_dir_all(root.join("logseq")).unwrap();
+                    fs::write(root.join("logseq/config.edn"), config).unwrap();
+                }
                 check_session_work(&graph, acting_parses, session_steps, &mut findings);
                 acting_parses = 0;
                 session_steps = 0;
                 drop(graph);
-                if !session.quiesce(&mut findings) {
-                    break;
+                if op >= 117 {
+                    session.close_abruptly(&mut findings);
+                } else {
+                    if !session.quiesce(&mut findings) {
+                        break;
+                    }
+                    session.close(&mut findings);
                 }
-                session.close(&mut findings);
                 // A missed change is still missed after a restart; the
                 // launch check is what must find it.
                 missed.clear();
                 session = Session::open(&root, &database);
+                Ok(())
+            }
+            // A page's parse starts panicking: an external edit, reported
+            // or missed. It leaves `names` until it is repaired.
+            100..=103 if names.len() > 1 => {
+                let name = pick(&mut rng, &names);
+                let path = page_path(&root, &name);
+                fs::write(&path, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
+                names.retain(|existing| existing != &name);
+                bad.push(name);
+                if rng.below(2) == 0 {
+                    missed.push(path);
+                    Ok(())
+                } else {
+                    watcher_reconcile(&graph, false, vec![path])
+                }
+            }
+            // The panicking page is repaired by an external edit.
+            104..=105 if !bad.is_empty() => {
+                let name = bad.remove(rng.below(bad.len() as u64) as usize);
+                let path = page_path(&root, &name);
+                fs::write(&path, page_text(&mut rng, &names)).unwrap();
+                names.push(name);
+                watcher_reconcile(&graph, false, vec![path])
+            }
+            // A journal written under a legacy file name, reported or not,
+            // then the journal file-name migration.
+            106..=108 if journal_day <= 20 => {
+                let path = root.join(format!("journals/Jun {journal_day}th, 2026.md"));
+                journal_day += 1;
+                fs::write(&path, page_text(&mut rng, &names)).unwrap();
+                let reported = if rng.below(2) == 0 {
+                    watcher_reconcile(&graph, false, vec![path])
+                } else {
+                    Ok(())
+                };
+                reported.and_then(|()| {
+                    graph
+                        .migrate_journal_filenames_checked()
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+            }
+            // Rescue: turn a file into a page under a new name.
+            109..=110 if !names.is_empty() => {
+                let old = pick(&mut rng, &names);
+                let new = format!("p{next_name}");
+                next_name += 1;
+                let rescued = graph
+                    .rename_file_to_page(&format!("pages/{old}.md"), &new)
+                    .map_err(|e| e.to_string());
+                if rescued.is_ok() {
+                    names.retain(|existing| existing != &old);
+                    names.push(new);
+                }
+                rescued
+            }
+            // The index owes a survey mid-session, as after a failed turn on
+            // an intact image.
+            111..=113 => {
+                graph.direct_projection_owe_validation_test();
                 Ok(())
             }
             _ => Ok(()),
@@ -539,7 +638,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
         let _ = watcher_reconcile(&graph, true, missed.drain(..).collect());
     }
     if session.quiesce(&mut findings) {
-        check_settled(&root, &graph, &mut findings);
+        check_settled(&root, &graph, &bad, &mut findings);
         check_session_work(&graph, acting_parses, session_steps, &mut findings);
         drop(graph);
         session.close(&mut findings);
@@ -579,15 +678,19 @@ fn gh543_seeded_interleavings_converge() {
 }
 
 /// The long local run: `TINE_INTERLEAVING_SEEDS=500 cargo test -p tine-core
-/// gh543_long_interleaving_run -- --ignored`.
+/// gh543_long_interleaving_run -- --ignored`; `TINE_INTERLEAVING_FIRST`
+/// moves the first seed (default 1000).
 #[test]
 #[ignore = "long local run"]
 fn gh543_long_interleaving_run() {
-    let count = std::env::var("TINE_INTERLEAVING_SEEDS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(200u64);
-    run_seeds(1_000..1_000 + count, 60);
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let first = env("TINE_INTERLEAVING_FIRST", 1_000);
+    run_seeds(first..first + env("TINE_INTERLEAVING_SEEDS", 200), 60);
 }
 
 fn save_existing(graph: &Graph, name: &str, text: &str) {
@@ -653,7 +756,7 @@ fn gh543_a_page_created_after_reopening_a_graph_with_a_deleted_page_is_indexed()
         projection.debug_state_test()
     );
     let mut findings = Vec::new();
-    check_settled(&root, &graph, &mut findings);
+    check_settled(&root, &graph, &[], &mut findings);
     assert!(findings.is_empty(), "{findings:#?}");
     assert_eq!(
         graph.consumer_page_parses_test(),

@@ -7398,6 +7398,31 @@
   "failBefore": "proven"
  },
  "notes": "GH #543, found while building the reconciler. An update turn whose writes violated a UNIQUE/NOT NULL/CHECK constraint was classified as a transient failure, so the owner backed off forever and the index never became ready; quick_check does not see such rows. IndexFailure::of_turn classifies a constraint violation as ContradictoryRows, which spends the once-per-projection token and rebuilds. Fail-before tine-agents/evidence/gh550-batch/reconciler/constraint-turn-fail-before.log."
+},
+{
+ "id": "REG-CREATION-DURING-SURVEY-NO-PARSE-543",
+ "title": "Creating a page at launch beside an unparseable page is refused without parsing the whole graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_a_creation_waiting_for_the_survey_refuses_without_parsing",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543, found by the extended interleaving harness (seed 4, panicking-page op). The launch survey published readiness before its parse failures, so a creation waiting for it read no failure, then found it and parsed the whole graph only to refuse. Failures are now published before readiness, and a creation whose index answer was withheld by a failure re-checks the evidence and refuses without the parse. Fail-before tine-agents/evidence/gh550-batch/reconciler/creation-during-survey-fail-before.log (3/3)."
 }
 ]
 }
