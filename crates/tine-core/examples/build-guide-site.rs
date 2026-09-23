@@ -12,6 +12,8 @@
 //! Guide self-contained under one directory, the emitted HTML is rewritten to
 //! `assets/<file>` and the graph's `assets/` is copied in alongside the pages.
 //!
+//! Three sample journal days (`guide-journals/`) are added for this site only.
+//!
 //! Usage: cargo run -q -p tine-core --example build-guide-site -- website/guide dist
 //! (Re-run after changing the demo templates in src/templates/.)
 
@@ -23,6 +25,12 @@ use tine_core::onboarding::create_demo_graph;
 use tine_core::publish::app_export::PublishedAppBundle;
 use tine_core::publish::publish_graph_app;
 use tine_core::Graph;
+
+const GUIDE_JOURNALS: [(&str, &str); 3] = [
+    ("2026_09_21.md", include_str!("guide-journals/2026_09_21.md")),
+    ("2026_09_22.md", include_str!("guide-journals/2026_09_22.md")),
+    ("2026_09_23.md", include_str!("guide-journals/2026_09_23.md")),
+];
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
@@ -86,6 +94,11 @@ fn main() {
     fs::create_dir_all(&tmp).expect("create temp graph dir");
 
     create_demo_graph(&tmp).expect("scaffold demo graph");
+    // A few sample days so the Guide's Journals view is not empty. They live
+    // only in this public site, never in a user's demo graph or Guide copy.
+    for (name, text) in GUIDE_JOURNALS {
+        fs::write(tmp.join("journals").join(name), text).expect("write sample journal");
+    }
 
     let mut graph = Graph::open(&tmp);
     graph.config_mut().all_pages_public = true;

@@ -243,11 +243,9 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   `page-property`, `priority`, `page`, `namespace`, `page-tags`, `scheduled`,
   `deadline`, `journal`, page-refs, boolean `or/and/not`, `:today`/`:current-page`-style
   inputs) map onto the same engine; any unsupported part is **flagged** in the result
-  rather than silently dropped or wrongly answered. The "⚙ advanced" switch is
-  **two-way**: an advanced block shows a **← Simple** control that returns to the
-  visual builder — restoring the exact pre-conversion query within a session, or
-  reverse-parsing recognized raw Datalog otherwise (and disabling itself, with a
-  tooltip, when the query has no visual representation).
+  rather than silently dropped or wrongly answered. An advanced query stays
+  advanced and is edited as text; there is no conversion to or from the visual
+  builder (the old "⚙ advanced" / "← Simple" switch was removed in 0.6.983).
 
 ## Sheets (2-D grids)
 
@@ -405,8 +403,9 @@ within a column; merged cells are still v2+.
   entire layout (all panes tint to show the scope) — so "split only the left
   half" and "split the whole screen" are both two keystrokes away, in either
   direction.
-- **Open to the side:** `Ctrl+click` a page link, tag, or block reference to open
-  it in another pane, creating a right split when needed. In the `Ctrl+K` switcher,
+- **Open to the side:** `Alt+click` a page link, tag, or block reference to open
+  it in another pane, creating a right split when needed (`Ctrl+click` or middle-click opens a background tab
+  instead). In the `Ctrl+K` switcher,
   `Alt+Enter` opens the highlighted page/create/block result in the other pane.
 - **Tab drag:** drag a tab within a strip to reorder it, onto another pane's strip
   to move it at that position, onto a pane body to append and activate it there,
@@ -660,9 +659,9 @@ within a column; merged cells are still v2+.
   close control, press Escape, or press Android Back to dismiss them safely. At
   640 px and wider—including tablets—they remain persistent desktop-style panes,
   can be open together, and retain their resize controls.
-- **Distribution** — sideloaded, release-signed APK attached to each GitHub
-  release (built and signed in CI). Play Store / F-Droid are planned; iOS is
-  being scoped.
+- **Distribution** — on [F-Droid](https://f-droid.org/packages/page.tine.app/), plus a release-signed APK attached to
+  each GitHub release (built and signed in CI). iOS is a public
+  [TestFlight](https://testflight.apple.com/join/rpGGpTVW) beta.
 
 ## Customization & output
 
