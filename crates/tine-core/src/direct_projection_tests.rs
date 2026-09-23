@@ -233,10 +233,9 @@ fn every_fixture_drives_projection_recovery_through_the_retrying_helper() {
             if !line.contains(CALL) {
                 continue;
             }
-            // Production calls it on `self` exactly once per query and
-            // turns a repair that did not take into an error the next
-            // query retries; that is the contract, not a defect.
-            if line.contains("self.direct_projection_recover_after_failed_read()") {
+            // The single-attempt entry point for interleaving fixtures, which
+            // race that one attempt deliberately (its doc says so).
+            if current == "direct_projection_recover_after_failed_read_test" {
                 continue;
             }
             if current == HELPER {
@@ -5669,6 +5668,7 @@ fn empty_projection_shared() -> ProjectionShared {
         reader: Mutex::new(None),
         image_verified_intact_at: Mutex::new(None),
         contradiction_rebuilt: AtomicBool::new(false),
+        fresh_build_running: AtomicBool::new(false),
         query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
         session_pages: Mutex::new(Arc::new(HashSet::new())),
         committed_registry: Arc::new(Mutex::new(None)),
@@ -5679,7 +5679,7 @@ fn empty_projection_shared() -> ProjectionShared {
         worker_resources: Mutex::new(Some(Vec::new())),
         validated: AtomicBool::new(false),
         after_sql_commit: Mutex::new(None),
-        after_fresh_build_batch: Mutex::new(None),
+        after_lowering_batch: Mutex::new(None),
         before_fresh_publication: Mutex::new(None),
         fresh_builds: AtomicU64::new(0),
         after_fresh_publication: Mutex::new(None),
@@ -7645,7 +7645,7 @@ fn gh543_a_read_failing_during_a_fresh_build_does_not_queue_another() {
     // The first failure repairs: a reset and a fresh build, held mid-build.
     let reached = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
-    *projection.shared.after_fresh_build_batch.lock().unwrap() = Some(Box::new({
+    *projection.shared.after_lowering_batch.lock().unwrap() = Some(Box::new({
         let reached = Arc::clone(&reached);
         let release = Arc::clone(&release);
         move || {
@@ -7709,7 +7709,7 @@ fn cancellation_between_fresh_build_batches_discards_the_partial_stage() {
     let projection = graph.direct_projection_test().unwrap();
     let reached = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
-    *projection.shared.after_fresh_build_batch.lock().unwrap() = Some(Box::new({
+    *projection.shared.after_lowering_batch.lock().unwrap() = Some(Box::new({
         let reached = Arc::clone(&reached);
         let release = Arc::clone(&release);
         move || {
@@ -7767,7 +7767,7 @@ fn edit_delete_and_rename_during_staged_build_reconcile_after_publication() {
     let projection = graph.direct_projection_test().unwrap();
     let reached = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
-    *projection.shared.after_fresh_build_batch.lock().unwrap() = Some(Box::new({
+    *projection.shared.after_lowering_batch.lock().unwrap() = Some(Box::new({
         let reached = Arc::clone(&reached);
         let release = Arc::clone(&release);
         move || {
@@ -9744,7 +9744,7 @@ fn gh543_indexing_progress_counts_each_whole_graph_pass() {
     let projection = graph.direct_projection_test().unwrap();
     let reached = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
-    *projection.shared.after_fresh_build_batch.lock().unwrap() = Some(Box::new({
+    *projection.shared.after_lowering_batch.lock().unwrap() = Some(Box::new({
         let reached = Arc::clone(&reached);
         let release = Arc::clone(&release);
         move || {
@@ -10073,7 +10073,7 @@ fn gh543_progress_answers_while_a_joined_build_runs() {
     let projection = graph.direct_projection_test().unwrap();
     let reached = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
-    *projection.shared.after_fresh_build_batch.lock().unwrap() = Some(Box::new({
+    *projection.shared.after_lowering_batch.lock().unwrap() = Some(Box::new({
         let reached = Arc::clone(&reached);
         let release = Arc::clone(&release);
         move || {

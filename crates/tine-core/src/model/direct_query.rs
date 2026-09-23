@@ -1331,8 +1331,9 @@ impl Graph {
         self.direct_projection.get()
     }
 
-    /// R3: the production rebuild path a failed read takes — request the
-    /// rebuild, then enqueue the warm parser snapshot it needs.
+    /// ONE recovery attempt, for an interleaving fixture that races that
+    /// single attempt against other work and asserts what it did. A fixture
+    /// that only needs recovery to converge uses `recover_until_ready`.
     #[cfg(test)]
     pub(crate) fn direct_projection_recover_after_failed_read_test(&self) {
         self.direct_projection_recover_after_failed_read();

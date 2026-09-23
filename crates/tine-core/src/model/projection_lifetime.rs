@@ -94,8 +94,8 @@ impl Graph {
         // bar asks it, as the readers that wait do. A full snapshot applied
         // as a repair is `InHand` with no build progress and no pass
         // running, and an earlier rule of the bar's own hid it while readers
-        // waited for it (GH #543, audit R10-04). Page updates are not
-        // graph-sized and never show the bar.
+        // waited for it (GH #543, audit R10-04). An update turn shows the
+        // bar only through the lowering loop's count, past one batch.
         use crate::direct_projection::IndexNeed;
         let (need, _) = projection.index_need_now();
         matches!(

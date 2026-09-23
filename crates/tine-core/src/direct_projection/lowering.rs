@@ -132,7 +132,7 @@ pub(super) fn lower_in_batches(
         .map_err(LoweringError::Failed)?;
         #[cfg(test)]
         {
-            let hook = shared.after_fresh_build_batch.lock().unwrap().take();
+            let hook = shared.after_lowering_batch.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
             }

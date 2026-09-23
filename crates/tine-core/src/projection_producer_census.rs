@@ -1597,9 +1597,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // in-place repair writes each batch through `lower_in_batches`, so
     // repair.rs gains one `apply_with_source_revisions_and_aliases` call (an
     // existing write kind). No new write kind, schema or dependency pin.
+    // 2026-09-23: GH #543 (audit R12-05) index readers report damage to the
+    // one decider: `direct_projection_owner.rs` matches
+    // `MaterializationError::Corrupt` to classify a read error, and an
+    // undecodable derived row is reported as `Corrupt` in
+    // `derived_reads.rs`. Error types only; no write, schema or pin change.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "0d21701efc751d62963525e25423e25e979241467fa619cbefdbbc9e77918e3c",
+        "cf52a68d80d6358b5c219fd8e4a69b2b268b89e194d4d9d2bc1392b24047bdc3",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

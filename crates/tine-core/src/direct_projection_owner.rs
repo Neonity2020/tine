@@ -76,6 +76,68 @@ impl IndexFailure {
     }
 }
 
+impl IndexFailure {
+    /// The failure an index read that returned `error` met, by the rule
+    /// query dispatch uses: a corrupt row is a contradiction, anything else a
+    /// statement the image refused.
+    pub(crate) fn of_materialization(error: &tine_storage::sqlite::MaterializationError) -> Self {
+        match error {
+            tine_storage::sqlite::MaterializationError::Corrupt(_) => Self::ContradictoryRows,
+            _ => Self::StatementRefused,
+        }
+    }
+}
+
+/// K1's front door for the index's own readers (GH #543, audit R12-05): a
+/// read that fails reports what it met to the one decider, which asks for a
+/// new image when one is owed, and answers `None`. `.ok()` on a reader's SQL
+/// result swallowed detected damage, so the image was never replaced and each
+/// session parsed the graph instead. Guard: `index_readers_report_damage`.
+pub(super) trait ReportDamage<T> {
+    fn reported(self, projection: &DirectProjection) -> Option<T>;
+}
+
+/// An index reader's error, as the failure it met (`None`: not a failure,
+/// e.g. a cancelled job).
+pub(super) trait ReadError {
+    fn failure(&self) -> Option<IndexFailure>;
+}
+
+impl ReadError for tine_storage::sqlite::MaterializationError {
+    fn failure(&self) -> Option<IndexFailure> {
+        Some(IndexFailure::of_materialization(self))
+    }
+}
+
+impl ReadError for crate::query::results::ResultReadError {
+    fn failure(&self) -> Option<IndexFailure> {
+        use crate::query::results::ResultReadError;
+        match self {
+            ResultReadError::Cancelled => None,
+            ResultReadError::Corrupt(_) => Some(IndexFailure::ContradictoryRows),
+            ResultReadError::Sql(error) => error.failure(),
+            ResultReadError::StatisticsResourceLimit => Some(IndexFailure::StatementRefused),
+        }
+    }
+}
+
+impl<T, E: ReadError> ReportDamage<T> for Result<T, E> {
+    fn reported(self, projection: &DirectProjection) -> Option<T> {
+        match self {
+            Ok(value) => Some(value),
+            Err(error) => {
+                if error
+                    .failure()
+                    .is_some_and(|failure| failure_owes_new_image(&projection.shared, failure))
+                {
+                    projection.request_rebuild();
+                }
+                None
+            }
+        }
+    }
+}
+
 /// The one answer to "does this failure owe the index a new image?" (GH #543,
 /// class K1). Only damage does; every other failure is answered in place.
 ///
@@ -131,7 +193,9 @@ pub(super) fn image_is_current(shared: &ProjectionShared, pending: &PendingProje
 }
 
 /// Whether a fresh build already owns this image's replacement: one is
-/// running, or a rebuild is queued with the payload that carries it. A
+/// running (`fresh_build_running`, the worker's own answer, never the
+/// progress counter: audit R12-01), or a rebuild is queued with the payload
+/// that carries it. A
 /// read that failed on the current image owes nothing more then -- the
 /// build replaces that image whole -- and a second request would queue a
 /// second complete build behind it (GH #543, indexing audit IT-10).
@@ -139,7 +203,8 @@ pub(super) fn fresh_build_owns_image(
     shared: &ProjectionShared,
     pending: &PendingProjection,
 ) -> bool {
-    shared.build_progress.snapshot().is_some() || (pending.rebuild && pending.full.is_some())
+    shared.fresh_build_running.load(Ordering::Acquire)
+        || (pending.rebuild && pending.full.is_some())
 }
 
 /// Whether the owner is waiting out a backoff after passes or turns that did

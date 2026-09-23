@@ -4,8 +4,11 @@
 //! Opening a large graph runs up to three whole-graph passes in the
 //! background: checking the stored search index against every page, reading
 //! every page when that index is missing or stale, and building a fresh index.
-//! Each pass counts the pages it has finished here. The counters are
-//! presentation only: nothing reads them to decide what to do.
+//! Each pass counts the pages it has finished here, and so does any other
+//! lowering longer than one batch. The counters are presentation only:
+//! nothing reads them to decide what to do (guard
+//! `index_progress_is_presentation_only`; the decision that once did is
+//! GH #543, audit R12-01).
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 

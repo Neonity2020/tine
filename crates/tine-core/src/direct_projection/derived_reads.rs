@@ -21,8 +21,10 @@ pub(crate) struct DerivedPage {
     pub(crate) session_ids: Option<(String, Vec<(String, usize)>)>,
 }
 
+/// A row whose shape the schema forbids contradicts the image, as query
+/// dispatch reads it (audit R12-05).
 fn invalid() -> tine_storage::sqlite::MaterializationError {
-    tine_storage::sqlite::MaterializationError::InvalidQuery("invalid derived row".into())
+    tine_storage::sqlite::MaterializationError::Corrupt("invalid derived row".into())
 }
 fn text(
     row: &[PhysicalQueryValue],
@@ -66,14 +68,15 @@ impl DirectProjection {
             all_session: false,
         };
         let mut snapshot =
-            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(())).ok()?;
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
         let mut seeds = std::collections::BTreeSet::new();
         let mut read_seeds = |sql: &str, params: &[PhysicalQueryValue]| {
             crate::query::projection_sql::visit(&mut snapshot, sql, params, |row| {
                 seeds.insert(integer(row, 0)?);
                 Ok(std::ops::ControlFlow::Continue(()))
             })
-            .ok()
+            .reported(self)
         };
         match selection {
             DerivedSelection::Resolve(ids) | DerivedSelection::Preview(ids) => {
@@ -117,7 +120,7 @@ impl DirectProjection {
                         Ok(std::ops::ControlFlow::Continue(()))
                     },
                 )
-                .ok()?;
+                .reported(self)?;
             }
         }
         let mut pages: Vec<DerivedPage> = Vec::new();
@@ -172,7 +175,7 @@ impl DirectProjection {
                 ));
                 Ok(std::ops::ControlFlow::Continue(()))
             })
-            .ok()?;
+            .reported(self)?;
         }
         // Deterministic physical path/preorder wins for duplicate claimants.
         rows.sort_by(|a, b| {
@@ -204,7 +207,7 @@ impl DirectProjection {
                 );
             },
         )
-        .ok()?;
+        .reported(self)?;
         for row in rows.iter().rev() {
             let mut block = blocks.remove(&row.block_id)?;
             block.children.reverse();
@@ -232,7 +235,7 @@ impl DirectProjection {
                         let (id, _) = resolve_identity(&identity, integer(row, 4)?, &page.path, &text(row, 2)?, &text(row, 1)?, integer(row, 3)? as usize).map_err(|_| invalid())?;
                         preorder.push((id, integer(row, 5)? as usize));
                         Ok(std::ops::ControlFlow::Continue(()))
-                    }).ok()?;
+                    }).reported(self)?;
                 page.session_ids = revision.map(|revision| (revision, preorder));
             }
         }
@@ -325,7 +328,8 @@ impl DirectProjection {
     ) -> Option<Vec<(String, String)>> {
         let _reader = self.shared_reader_at(generation)?;
         let mut snapshot =
-            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(())).ok()?;
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
         let mut rows = Vec::new();
         for key in keys {
             crate::query::projection_sql::visit(&mut snapshot,
@@ -333,7 +337,7 @@ impl DirectProjection {
                 &[PhysicalQueryValue::Text(key.clone())], |row| {
                     rows.push((text(row, 0)?, text(row, 1)?));
                     Ok(std::ops::ControlFlow::Continue(()))
-                }).ok()?;
+                }).reported(self)?;
         }
         self.ready_at(generation).then_some(rows)
     }
@@ -341,7 +345,8 @@ impl DirectProjection {
     pub(crate) fn journal_content_names(&self, generation: u64) -> Option<Vec<String>> {
         let _reader = self.shared_reader_at(generation)?;
         let mut snapshot =
-            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(())).ok()?;
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
         let mut content_pages = std::collections::BTreeMap::new();
         crate::query::projection_sql::visit(&mut snapshot,
             "SELECT p.path, n.raw, bt.content FROM pages p JOIN names n ON n.name_id = p.name_id JOIN blocks b ON b.page_id = p.page_id JOIN block_text bt ON bt.block_id = b.block_id WHERE p.text_kind = 1 ORDER BY p.path, b.preorder", &[], |row| {
@@ -350,7 +355,7 @@ impl DirectProjection {
                     content_pages.insert(path, text(row, 1)?);
                 }
                 Ok(std::ops::ControlFlow::Continue(()))
-            }).ok()?;
+            }).reported(self)?;
         self.ready_at(generation)
             .then(|| content_pages.into_values().collect())
     }

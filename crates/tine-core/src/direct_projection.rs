@@ -28,6 +28,7 @@ use uuid::Uuid;
 mod lease;
 #[path = "direct_projection_owner.rs"]
 mod owner;
+use owner::ReportDamage;
 use owner::{backing_off, image_is_current, index_need, note_unsettled};
 pub(crate) use owner::{IndexFailure, IndexNeed, IndexOwnerRegistration, OwnerStep};
 
@@ -314,9 +315,9 @@ struct PendingProjection {
     /// longer offers anything (R8-14); the index owner's warm is the producer.
     accepted_full: Option<(u64, std::sync::Weak<Vec<(PageEntry, Arc<Document>)>>)>,
     rebuild: bool,
-    /// A validation is owed: a worker turn failed on an intact image and
-    /// rolled back, so the pages it carried are not in the image (K1, audit
-    /// R11-07). `advance_generation` must not carry readiness past it.
+    /// A validation is owed: a worker turn failed on an intact image. It
+    /// commits batch by batch, so the image may hold some of the pages it
+    /// carried and not the rest (K1, audit R11-07). `advance_generation` must not carry readiness past it.
     /// Cleared when a full snapshot or warm validation, which re-derive the
     /// page set, is accepted.
     revalidate: bool,
@@ -645,6 +646,12 @@ struct ProjectionShared {
     /// Rows contradicting each other have already cost this projection one
     /// fresh build; see [`owner::failure_owes_new_image`].
     contradiction_rebuilt: AtomicBool,
+    /// Worker-owned: the running turn builds a fresh image, from the moment
+    /// it decides to until its outcome is recorded. The one answer to "does a
+    /// fresh build own the image's replacement?"; the progress counter also
+    /// counts update and repair turns, and stops before the build publishes
+    /// (GH #543, audit R12-01).
+    fresh_build_running: AtomicBool,
     /// R3: the ONE admission/cancellation owner for database-owned query jobs
     /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
     /// drains every job before it replaces or resets the file, and `Drop`
@@ -695,7 +702,8 @@ struct ProjectionShared {
     #[cfg(test)]
     after_sql_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
-    after_fresh_build_batch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Fires after the next batch of any lowering loop, not only a fresh build's.
+    after_lowering_batch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_fresh_publication: Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
     /// From-scratch builds this index has started.
@@ -1189,6 +1197,7 @@ impl DirectProjection {
             reader: Mutex::new(None),
             image_verified_intact_at: Mutex::new(None),
             contradiction_rebuilt: AtomicBool::new(false),
+            fresh_build_running: AtomicBool::new(false),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
             committed_registry: Arc::new(Mutex::new(None)),
@@ -1201,7 +1210,7 @@ impl DirectProjection {
             #[cfg(test)]
             after_sql_commit: Mutex::new(None),
             #[cfg(test)]
-            after_fresh_build_batch: Mutex::new(None),
+            after_lowering_batch: Mutex::new(None),
             #[cfg(test)]
             before_fresh_publication: Mutex::new(None),
             #[cfg(test)]
@@ -1440,7 +1449,7 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
+        .reported(self)?;
         self.ready_at(cache_generation).then_some(rows)
     }
 
@@ -1579,12 +1588,12 @@ impl DirectProjection {
     /// work queued publishes readiness at the latest generation when the work
     /// drains. Without this the index stayed not-ready with nothing coming,
     /// and every indexed read fell back to parsing the graph (GH #543, audit
-    /// R4-03).
+    /// R4-03). The move is recorded even while a validation is owed: a walk
+    /// taken before it is refused as outranked only if it is, and readiness
+    /// is not published over the owed validation (`image_is_current`)
+    /// (GH #543, audit R12-02).
     pub(crate) fn advance_generation(&self, generation: u64) {
         let mut pending = self.shared.pending.lock().unwrap();
-        if pending.revalidate {
-            return;
-        }
         pending.latest_generation = pending.latest_generation.max(generation);
         if !self.shared.worker_busy.load(Ordering::Acquire)
             && self.shared.ready.load(Ordering::Acquire)
@@ -1706,7 +1715,7 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
+        .reported(self)?;
         if !self.ready_at(cache_generation) {
             return None;
         }
@@ -1788,7 +1797,7 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
+        .reported(self)?;
 
         let mut rows: Vec<OwnerRow> = Vec::new();
         drain_after(
@@ -1833,7 +1842,7 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
+        .reported(self)?;
 
         // The generation must still hold AFTER both scans, or the two halves
         // could straddle a rebuild — the same re-check `property_facets` makes.
@@ -2041,7 +2050,7 @@ impl DirectProjection {
             },
             |_, _| None,
         )
-        .ok()?;
+        .reported(self)?;
         if !self.ready_at(cache_generation) {
             return None;
         }
@@ -2061,7 +2070,8 @@ impl DirectProjection {
         let _reader = self.shared_reader_at(cache_generation)?;
         let mut aliases = Vec::new();
         let mut snapshot =
-            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(())).ok()?;
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
         crate::query::projection_sql::visit(
             &mut snapshot,
             "SELECT alias.raw, owner.raw, p.path \
@@ -2091,7 +2101,7 @@ impl DirectProjection {
                 Ok(std::ops::ControlFlow::Continue(()))
             },
         )
-        .ok()?;
+        .reported(self)?;
         self.ready_at(cache_generation).then_some(aliases)
     }
 
@@ -2128,7 +2138,7 @@ impl DirectProjection {
             },
             |_, _| None,
         )
-        .ok()?;
+        .reported(self)?;
         self.ready_at(cache_generation).then_some(names)
     }
 
@@ -2176,7 +2186,10 @@ impl DirectProjection {
         // spelling could otherwise union candidates from opposite sides of an
         // edit even though each individual query was coherent.
         let mut plain_snapshot = if kind == ReferenceKind::Plain {
-            Some(PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(())).ok()?)
+            Some(
+                PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                    .reported(self)?,
+            )
         } else {
             None
         };
@@ -2213,7 +2226,7 @@ impl DirectProjection {
                         },
                         |_, _| None,
                     )
-                    .ok()?;
+                    .reported(self)?;
                 }
                 ReferenceKind::Plain => {
                     let folded = crate::search_query::canonical_fold(name);
@@ -2270,7 +2283,7 @@ impl DirectProjection {
                                     };
                                     Ok(matched.then(Vec::new))
                                 })
-                                .ok()?;
+                                .reported(self)?;
                             params.push(PhysicalQueryValue::Integer(
                                 i64::try_from(window).unwrap_or(i64::MAX),
                             ));
@@ -2403,7 +2416,7 @@ impl DirectProjection {
                         }
                         Ok(std::ops::ControlFlow::Continue(()))
                     })
-                    .ok()?;
+                    .reported(self)?;
                 }
             }
         }
@@ -2425,17 +2438,17 @@ impl DirectProjection {
         let parsed_uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
         let reader = self.shared_reader_at(cache_generation)?;
         let read = reader.as_ref()?.read();
-        let block = match read.block(uuid).ok()? {
+        let block = match read.block(uuid).reported(self)? {
             Some(block) => crate::query::logseq_uuid_owner([block], false),
             None => crate::query::logseq_uuid_owner(
-                read.blocks_by_logseq_uuid(parsed_uuid, 2).ok()?,
+                read.blocks_by_logseq_uuid(parsed_uuid, 2).reported(self)?,
                 false,
             ),
         };
         let page = match block {
             Some(block) => read
                 .page_with_header_validation(&block.page_path, |_, _| Ok(()))
-                .ok()?
+                .reported(self)?
                 .map(|page| page.name),
             None => None,
         };
@@ -2463,7 +2476,7 @@ impl DirectProjection {
             },
             |_, _| None,
         )
-        .ok()?;
+        .reported(self)?;
         self.ready_at(cache_generation).then_some(counts)
     }
 
@@ -2485,7 +2498,7 @@ impl DirectProjection {
             },
             |_, _| None,
         )
-        .ok()?;
+        .reported(self)?;
         self.ready_at(cache_generation).then_some(paths)
     }
 
@@ -2953,6 +2966,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 .then_some(delta)
         });
         let fresh_build = had_full && full_repair.is_none();
+        shared
+            .fresh_build_running
+            .store(fresh_build, Ordering::Release);
         let registry_reset = fresh_build
             || had_warm
             || full_repair
@@ -3190,7 +3206,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 shared.ready.store(false, Ordering::Release);
                 // K1: a failed turn owes a new image only when it was building
                 // one or the image is damaged. On an intact image the turn
-                // rolled back; a validation re-derives what it carried, where
+                // left at most some of its batches committed; a validation
+                // re-derives what it carried, where
                 // a fresh build re-lowered every page for a disk blip (audit
                 // R11-07). Asked before `pending`: the check reads the image.
                 let owes_new_image = matches!(error, ProjectionRefusal::Failed(_))
@@ -3204,6 +3221,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 }
                 let mut pending = shared.pending.lock().unwrap();
                 pending.building = false;
+                shared.fresh_build_running.store(false, Ordering::Release);
                 match error {
                     // Nothing was written and nothing is broken: the
                     // committed image and its registry stand, readiness is
@@ -3263,6 +3281,12 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             )
         });
         let mut pending = shared.pending.lock().unwrap();
+        if fresh_build {
+            // A rebuild asked for while this build ran was asked of the image
+            // it has just replaced (audit R12-01; IT-10's second build).
+            pending.rebuild = false;
+        }
+        shared.fresh_build_running.store(false, Ordering::Release);
         if had_full {
             pending.requires_full_rebuild = false;
         } else if had_warm {
@@ -3779,8 +3803,8 @@ pub(crate) fn release_projection<G: crate::query::graph::QueryGraph>(graph: &G) 
 /// Retry projection recovery until it converges.
 ///
 /// `direct_projection_recover_after_failed_read` is ONE attempt and is allowed
-/// to accomplish nothing -- `model.rs` says so itself where it turns "the
-/// repair did not take" into `Unavailable(ReadFailed)`. If the turn carrying a
+/// to accomplish nothing: a read whose repair did not take answers
+/// `Unavailable` and the next read asks again. If the turn carrying a
 /// rebuild's payload fails, the payload is gone and the attempt achieved
 /// nothing, so the projection stays failed until something enqueues work again.
 ///

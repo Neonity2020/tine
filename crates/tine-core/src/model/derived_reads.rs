@@ -130,6 +130,11 @@ impl Graph {
                     self.load_page(&entry).expect("test page opens");
                 }
             }
+            // A read that met damage has asked the one decider for a new
+            // image; wait for it rather than parse the graph (audit R12-05).
+            if answer.is_none() && projection.coming() {
+                continue;
+            }
             if self.cache_generation() == generation {
                 return answer;
             }

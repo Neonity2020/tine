@@ -15914,3 +15914,6 @@ mod gh543_r10;
 
 #[path = "model_gh543_r11_tests.rs"]
 mod gh543_r11;
+
+#[path = "model_gh543_r12_tests.rs"]
+mod gh543_r12;

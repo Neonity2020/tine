@@ -158,7 +158,7 @@ impl DirectProjection {
     /// Run `hook` on the worker once, after the next lowering batch it writes.
     #[cfg(test)]
     pub(crate) fn after_next_lowering_batch_test(&self, hook: Box<dyn FnOnce() + Send>) {
-        *self.shared.after_fresh_build_batch.lock().unwrap() = Some(hook);
+        *self.shared.after_lowering_batch.lock().unwrap() = Some(hook);
     }
 
     /// From-scratch builds this index has started.
