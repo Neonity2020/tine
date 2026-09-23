@@ -61,7 +61,7 @@ pub(super) fn stored_unread_pages(
     let mut pages = Vec::new();
     crate::query::projection_sql::visit(
         &mut snapshot,
-        "SELECT p.path, n.raw, p.text_kind, t.preamble, s.revision FROM pages p JOIN names n ON n.name_id = p.name_id JOIN direct_source_revisions s ON s.path = p.path LEFT JOIN page_text t ON t.page_id = p.page_id ORDER BY p.path",
+        "SELECT p.path, n.raw, p.text_kind, t.preamble, s.revision, p.journal_day FROM pages p JOIN names n ON n.name_id = p.name_id JOIN direct_source_revisions s ON s.path = p.path LEFT JOIN page_text t ON t.page_id = p.page_id ORDER BY p.path",
         &[],
         |row| {
             let path = text(row, 0)?;
@@ -70,14 +70,21 @@ pub(super) fn stored_unread_pages(
                     Some(PhysicalQueryValue::Null) => None,
                     _ => Some(text(row, 3)?),
                 };
-                pages.push((path, text(row, 1)?, integer(row, 2)?, preamble, text(row, 4)?));
+                pages.push((
+                    path,
+                    text(row, 1)?,
+                    integer(row, 2)?,
+                    preamble,
+                    text(row, 4)?,
+                    integer(row, 5)?,
+                ));
             }
             Ok(std::ops::ControlFlow::Continue(()))
         },
     )
     .map_err(|error| error.to_string())?;
     let mut carried = Vec::with_capacity(pages.len());
-    for (rel_path, name, kind, pre_block, revision) in pages {
+    for (rel_path, name, kind, pre_block, revision, journal_day) in pages {
         let kind = kind
             .and_then(page_kind_from_sql)
             .ok_or_else(|| format!("carried page {rel_path} has no known text kind"))?;
@@ -132,7 +139,10 @@ pub(super) fn stored_unread_pages(
             entry: PageEntry {
                 name,
                 kind,
-                date_key: None,
+                // A carried page keeps the day its row holds: the day is the
+                // page's own `date_key`, which the stem alone cannot recover
+                // for a `title::`-named journal (GH #543, audit R13-06).
+                date_key: journal_day,
                 path: PathBuf::from(&rel_path),
                 rel_path,
             },

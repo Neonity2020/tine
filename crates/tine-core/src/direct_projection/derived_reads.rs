@@ -16,7 +16,12 @@ pub(crate) enum DerivedSelection<'a> {
 pub(crate) struct DerivedPage {
     pub(crate) name: String,
     pub(crate) path: String,
-    pub(crate) kind: i64,
+    pub(crate) kind: PageKind,
+    /// The stored `pages.journal_day`, which is the parse's `date_key` by
+    /// construction. A journal's day is read from its row, never parsed back
+    /// from its name: a title format without a year cannot parse the name it
+    /// wrote (GH #543, audit R13-06).
+    pub(crate) journal_day: Option<i64>,
     pub(crate) document: Document,
     pub(crate) session_ids: Option<(String, Vec<(String, usize)>)>,
 }
@@ -25,6 +30,27 @@ pub(crate) struct DerivedPage {
 /// dispatch reads it (audit R12-05).
 fn invalid() -> tine_storage::sqlite::MaterializationError {
     tine_storage::sqlite::MaterializationError::Corrupt("invalid derived row".into())
+}
+
+/// A stored `text_kind`, decoded where it is read so an unknown value is
+/// reported as damage (audit R13-05). Decoding it later, in the model, turned
+/// it into `None` that no one reported, and the read parsed the graph.
+pub(crate) fn page_kind(kind: i64) -> Result<PageKind, tine_storage::sqlite::MaterializationError> {
+    super::page_kind_from_sql(kind).ok_or_else(|| {
+        tine_storage::sqlite::MaterializationError::Corrupt(format!(
+            "unknown Direct Files text kind {kind}"
+        ))
+    })
+}
+
+fn optional_integer(
+    row: &[PhysicalQueryValue],
+    at: usize,
+) -> Result<Option<i64>, tine_storage::sqlite::MaterializationError> {
+    match row.get(at) {
+        Some(PhysicalQueryValue::Null) => Ok(None),
+        _ => integer(row, at).map(Some),
+    }
 }
 fn text(
     row: &[PhysicalQueryValue],
@@ -131,7 +157,7 @@ impl DirectProjection {
                 .iter()
                 .map(|id| PhysicalQueryValue::Integer(*id))
                 .collect::<Vec<_>>();
-            let sql = format!("SELECT b.block_id, b.page_id, b.parent_block_id, b.result_id, b.estimated_bytes, b.tag_count, b.property_count, b.order_key, p.path, n.raw, p.text_kind FROM blocks b JOIN pages p ON p.page_id = b.page_id JOIN names n ON n.name_id = p.name_id WHERE b.block_id IN ({}) ORDER BY p.path, b.preorder", vec!["?"; chunk.len()].join(", "));
+            let sql = format!("SELECT b.block_id, b.page_id, b.parent_block_id, b.result_id, b.estimated_bytes, b.tag_count, b.property_count, b.order_key, p.path, n.raw, p.text_kind, p.journal_day FROM blocks b JOIN pages p ON p.page_id = b.page_id JOIN names n ON n.name_id = p.name_id WHERE b.block_id IN ({}) ORDER BY p.path, b.preorder", vec!["?"; chunk.len()].join(", "));
             crate::query::projection_sql::visit(&mut snapshot, &sql, &params, |row| {
                 let path = text(row, 8)?;
                 let page = *page_indices.entry(path.clone()).or_insert_with(|| {
@@ -139,14 +165,16 @@ impl DirectProjection {
                     pages.push(DerivedPage {
                         name: String::new(),
                         path: path.clone(),
-                        kind: 0,
+                        kind: PageKind::Page,
+                        journal_day: None,
                         document: Document::default(),
                         session_ids: None,
                     });
                     index
                 });
                 pages[page].name = text(row, 9)?;
-                pages[page].kind = integer(row, 10)?;
+                pages[page].kind = page_kind(integer(row, 10)?)?;
+                pages[page].journal_day = optional_integer(row, 11)?;
                 let page_id = integer(row, 1)?;
                 let (result_id, estimate) = resolve_identity(
                     &identity,
@@ -342,21 +370,43 @@ impl DirectProjection {
         self.ready_at(generation).then_some(rows)
     }
 
-    pub(crate) fn journal_content_names(&self, generation: u64) -> Option<Vec<String>> {
+    /// The days of the journals that have content, from their stored
+    /// `journal_day` (see [`DerivedPage::journal_day`]).
+    pub(crate) fn journal_content_days(&self, generation: u64) -> Option<Vec<i64>> {
         let _reader = self.shared_reader_at(generation)?;
         let mut snapshot =
             PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
                 .reported(self)?;
         let mut content_pages = std::collections::BTreeMap::new();
         crate::query::projection_sql::visit(&mut snapshot,
-            "SELECT p.path, n.raw, bt.content FROM pages p JOIN names n ON n.name_id = p.name_id JOIN blocks b ON b.page_id = p.page_id JOIN block_text bt ON bt.block_id = b.block_id WHERE p.text_kind = 1 ORDER BY p.path, b.preorder", &[], |row| {
+            "SELECT p.path, p.journal_day, bt.content FROM pages p JOIN blocks b ON b.page_id = p.page_id JOIN block_text bt ON bt.block_id = b.block_id WHERE p.text_kind = 1 ORDER BY p.path, b.preorder", &[], |row| {
                 let path = text(row, 0)?;
                 if !content_pages.contains_key(&path) && crate::vocab::block_raw_has_content(&text(row, 2)?) {
-                    content_pages.insert(path, text(row, 1)?);
+                    content_pages.insert(path, optional_integer(row, 1)?);
                 }
                 Ok(std::ops::ControlFlow::Continue(()))
             }).reported(self)?;
         self.ready_at(generation)
-            .then(|| content_pages.into_values().collect())
+            .then(|| content_pages.into_values().flatten().collect())
+    }
+
+    /// Every journal's stored day by path (see [`DerivedPage::journal_day`]).
+    pub(crate) fn journal_days(&self, generation: u64) -> Option<HashMap<String, i64>> {
+        let _reader = self.shared_reader_at(generation)?;
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
+        let mut days = HashMap::new();
+        crate::query::projection_sql::visit(
+            &mut snapshot,
+            "SELECT path, journal_day FROM pages WHERE text_kind = 1 AND journal_day IS NOT NULL",
+            &[],
+            |row| {
+                days.insert(text(row, 0)?, integer(row, 1)?);
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )
+        .reported(self)?;
+        self.ready_at(generation).then_some(days)
     }
 }

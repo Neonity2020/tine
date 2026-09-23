@@ -812,7 +812,9 @@ impl Graph {
         }
         let generation = self.move_cache_generation(
             &cache,
-            Some(graph_drift::StructuralChange::Reread(path.to_path_buf())),
+            Some(graph_drift::StructuralChange::Reread(vec![
+                path.to_path_buf()
+            ])),
             graph_drift::IndexEffect::Unchanged(projection.as_ref()),
         );
         let next = match cache.as_ref() {
@@ -864,7 +866,9 @@ impl Graph {
         failures.retain(|failure| failure != &entry.rel_path);
         let generation = self.move_cache_generation(
             &cache,
-            Some(graph_drift::StructuralChange::Reread(entry.path.clone())),
+            Some(graph_drift::StructuralChange::Reread(vec![entry
+                .path
+                .clone()])),
             graph_drift::IndexEffect::Unchanged(projection.as_ref()),
         );
         let next = match cache.as_ref() {

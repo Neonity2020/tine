@@ -94,6 +94,20 @@ impl Graph {
     }
 
     #[cfg(test)]
+    pub(crate) fn leave_indexed_reads_unanswered_test(&self, unanswered: bool) {
+        self.page_build_test
+            .unanswered_indexed_reads
+            .store(unanswered, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexed_read_attempts_test(&self) -> usize {
+        self.page_build_test
+            .indexed_read_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_page_during_next_derived_read_test(&self, path: Option<PathBuf>) {
         *self.page_build_test.derived_read_open_once.lock().unwrap() = path;
     }
@@ -118,6 +132,19 @@ impl Graph {
             let (projection, generation) = self.derived_reader()?;
             let answer = read(&projection, generation);
             #[cfg(test)]
+            let answer = {
+                use std::sync::atomic::Ordering;
+                self.page_build_test
+                    .indexed_read_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                answer.filter(|_| {
+                    !self
+                        .page_build_test
+                        .unanswered_indexed_reads
+                        .load(Ordering::Acquire)
+                })
+            };
+            #[cfg(test)]
             {
                 let path = self
                     .page_build_test
@@ -131,8 +158,10 @@ impl Graph {
                 }
             }
             // A read that met damage has asked the one decider for a new
-            // image; wait for it rather than parse the graph (audit R12-05).
+            // image; wait for it rather than parse the graph (audit R12-05),
+            // and sleep while it comes rather than spin (audit R13-07).
             if answer.is_none() && projection.coming() {
+                projection.wait_while_coming(std::time::Duration::from_millis(50));
                 continue;
             }
             if self.cache_generation() == generation {
@@ -173,26 +202,20 @@ impl Graph {
                             .or_insert(ids);
                     }
                 }
-                let kind = crate::direct_projection::page_kind_from_sql(row.kind)?;
-                let date_key = (kind == PageKind::Journal)
-                    .then(|| {
-                        self.journal_format
-                            .parse(&row.name)
-                            .map(|date| date.ordinal_key())
-                    })
-                    .flatten();
-                Some((
+                (
                     PageEntry {
                         name: row.name,
-                        kind,
-                        date_key,
+                        kind: row.kind,
+                        date_key: (row.kind == PageKind::Journal)
+                            .then_some(row.journal_day)
+                            .flatten(),
                         path: self.root.join(&row.path),
                         rel_path: row.path,
                     },
                     Arc::new(row.document),
-                ))
+                )
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         if let DerivedSelection::Resolve(ids) | DerivedSelection::Preview(ids) = *selection {
             let mut available = HashSet::new();
             for (_, doc) in &pages {
@@ -300,17 +323,6 @@ impl Graph {
     }
 
     pub(super) fn indexed_journal_content_days(&self) -> Option<Vec<i64>> {
-        self.indexed_read(|projection, generation| {
-            let names = projection.journal_content_names(generation)?;
-            let days = names
-                .iter()
-                .filter_map(|name| {
-                    self.journal_format
-                        .parse(name)
-                        .map(|date| date.ordinal_key())
-                })
-                .collect();
-            Some(days)
-        })
+        self.indexed_read(|projection, generation| projection.journal_content_days(generation))
     }
 }

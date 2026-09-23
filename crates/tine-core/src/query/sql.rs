@@ -2248,9 +2248,8 @@ impl Compiler<'_> {
         }
     }
 
-    /// `page.day` reads `pages.journal_day`, the ONE journal-day answer
-    /// (`JournalDays::day`) that also fills `PageEntry::date_key`, which is what
-    /// the walk compares.
+    /// `page.day` reads `pages.journal_day`, which lowering stores from
+    /// `PageEntry::date_key`, the day the walk compares.
     fn page_day(&mut self, op: CmpOp, value: &Value, p: &str) -> String {
         let column = format!("{p}.journal_day");
         if op == CmpOp::IsSet {

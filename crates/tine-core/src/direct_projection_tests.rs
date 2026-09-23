@@ -3344,7 +3344,7 @@ fn extractor_version_participates_in_disposable_source_revision() {
         .collect::<String>();
     assert_eq!(
         projected,
-        format!("direct-facts-v2:{hex}:sha256:unchanged-source")
+        format!("direct-facts-v3:{hex}:sha256:unchanged-source")
     );
     assert_ne!(projected, source);
 }

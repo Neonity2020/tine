@@ -329,7 +329,6 @@ pub(super) fn physical_page(
             })
             .collect();
     }
-    let journal_days = crate::query::derived::JournalDays::new(parse_config);
     let page_property_atoms = crate::query::derived::property_atom_rows(
         &properties
             .iter()
@@ -345,7 +344,9 @@ pub(super) fn physical_page(
             name_key: crate::refs::page_key(&entry.name),
             path: entry.rel_path.clone(),
             text_kind: page_kind_to_sql(entry.kind),
-            journal_day: journal_days.day(&entry.rel_path, entry.kind == PageKind::Journal),
+            // The page's own day: `PageEntry::date_key`, which a `title::` can
+            // set where the file stem names no date (GH #543, audit R13-06).
+            journal_day: entry.date_key.filter(|_| entry.kind == PageKind::Journal),
             preamble: document.pre_block.clone(),
             search_tokens: crate::search_query::canonical_fold(&visible_search_text),
             properties,

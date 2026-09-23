@@ -10,6 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- A query block, the query export dialog, or a publish waiting for the index
+  no longer stays stuck on "Updating…" when `config.edn` changes and the graph
+  reopens; an asset changed at that moment is no longer missed. A journal
+  named by a date `title::` under a journal title format without a year now
+  lists as a journal with its calendar day and date-query day, instead of
+  making the page list read every page each session. At launch, a brief index
+  error, migrating journal file names, or turning a file into a page no longer
+  makes Tine read the whole graph; an index entry with an unreadable page type
+  is rebuilt; and a lookup waiting for the index no longer keeps a CPU core
+  busy (GH #543).
 - Changing a setting while one page file cannot be read (a sync conflict, a
   locked file, a disk error) now re-indexes in about a fifth of the time,
   shows progress, and stops promptly when Tine closes; the unreadable page

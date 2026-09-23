@@ -17,6 +17,13 @@ impl Graph {
         self.page_listing(true)
     }
 
+    /// Forget the memoized page list, as a reopen that never parsed has none:
+    /// the next listing asks the index (statement census).
+    #[cfg(test)]
+    pub(crate) fn forget_page_list_test(&self) {
+        *self.page_list_cache.write().unwrap() = None;
+    }
+
     fn page_listing(&self, exact: bool) -> io::Result<Vec<PageEntry>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         if let Some((g, entries)) = self.page_list_cache.read().unwrap().as_ref() {

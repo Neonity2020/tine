@@ -3291,7 +3291,7 @@ fn is_recency_field(field: &str) -> bool {
 /// holds a page's journal ordinal and its absolute path — R3's database result
 /// read, which never sees a `PageEntry` — asks the SAME producer rather than
 /// spelling the axis a second time (I-12, D-14). `pages.journal_day` is
-/// `PageEntry::date_key` by construction (`derived::JournalDays::day`).
+/// `PageEntry::date_key` by construction (`lowering::physical_page` stores it).
 pub(crate) fn page_recency_secs_for(date_key: Option<i64>, absolute: &std::path::Path) -> i64 {
     if let Some(dk) = date_key {
         return JournalDate::from_ordinal(dk).to_days() * 86_400;

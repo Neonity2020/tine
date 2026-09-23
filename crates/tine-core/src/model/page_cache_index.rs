@@ -193,6 +193,11 @@ pub(super) struct PageBuildTestState {
     /// GH #543: open this unchanged page once inside an index-backed derived
     /// read, after its SQL answer and before its generation check.
     pub(super) derived_read_open_once: std::sync::Mutex<Option<PathBuf>>,
+    /// Index-backed derived reads answer `None` while this is set, as one
+    /// that met damage does.
+    pub(super) unanswered_indexed_reads: std::sync::atomic::AtomicBool,
+    /// Attempts `indexed_read` made.
+    pub(super) indexed_read_attempts: std::sync::atomic::AtomicUsize,
     pub(super) enumerations: std::sync::atomic::AtomicUsize,
     pub(super) parses: std::sync::atomic::AtomicUsize,
     /// The part of `parses` made outside an indexing build, counted on its

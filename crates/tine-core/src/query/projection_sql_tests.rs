@@ -77,6 +77,10 @@ fn exercise_every_surface(graph: &Graph) {
     graph.block_referrers_bounded("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", 10, 10000);
     graph.templates();
     graph.journal_content_days();
+    // The page list of a graph that never parsed: the index inventory, with
+    // each journal's day from its row.
+    graph.forget_page_list_test();
+    assert!(!graph.list_pages().is_empty());
     // Friendly search: names (default), content and both; block hits with
     // ancestors (breadcrumbs) and the trigram-driven candidate path.
     graph

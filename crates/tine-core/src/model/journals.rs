@@ -138,7 +138,7 @@ impl Graph {
         // thread, so the per-move acquisitions underneath still work.
         let _identity = self.lock_graph_text_identity_mutation()?;
         let write = self.admit_graph_text_writer()?;
-        let mut moved: Vec<(Option<PageEntry>, PathBuf)> = Vec::new();
+        let mut moved: Vec<(PathBuf, Option<PageEntry>, PathBuf)> = Vec::new();
         // GH #543 (seventh audit A7-N3): the enumeration and the moves are
         // fallible, and every one of their error exits used to `?` straight
         // past the publication below — leaving files this function had ALREADY
@@ -169,7 +169,7 @@ impl Graph {
                         || (self.graph_text_exists(&write, &target).unwrap_or(false)
                             && !self.graph_text_exists(&write, &p).unwrap_or(true));
                     if landed {
-                        moved.push((retired, target));
+                        moved.push((p.clone(), retired, target));
                     }
                     attempt?;
                 }
@@ -185,9 +185,13 @@ impl Graph {
             // migrated page then published its NEW path beside the retired
             // one's surviving row, so one file answered twice.
             let coming = self.index_delta_coming();
-            self.discard_parsed_cache(graph_drift::IndexEffect::Sent(&coming));
+            let touched = moved
+                .iter()
+                .flat_map(|(source, _, target)| [source.clone(), target.clone()])
+                .collect();
+            self.discard_parsed_cache(touched, graph_drift::IndexEffect::Sent(&coming));
             let mut page_set = Vec::new();
-            for (retired, target) in moved {
+            for (_, retired, target) in moved {
                 if let Some(entry) = retired {
                     page_set.push(crate::direct_projection::PageSetChange::Delete { entry });
                 }

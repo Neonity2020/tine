@@ -528,8 +528,8 @@ impl Graph {
     /// One owner iteration inline, for callers that run no owner loop (the
     /// CLI, headless runs, tests, and a failed query's repair with no owner):
     /// the pass the owner loop would run for `need`, then -- with no loop to
-    /// come back -- a fresh build when that pass settled nothing. Whether the
-    /// need is settled; `None` when `cancelled`.
+    /// come back -- one more pass for whatever the decider asks next. Whether
+    /// the need is settled; `None` when `cancelled`.
     pub(super) fn inline_index_pass(
         &self,
         projection: &crate::direct_projection::DirectProjection,
@@ -540,11 +540,15 @@ impl Graph {
         if !matches!(need, IndexNeed::Validate | IndexNeed::Fresh) {
             return Some(true);
         }
-        let mut escalate = false;
-        if self.index_pass(projection, need, &mut escalate, cancelled)? {
+        if self.index_pass(projection, need, cancelled)? {
             return Some(true);
         }
-        self.index_pass(projection, IndexNeed::Fresh, &mut escalate, cancelled)
+        match projection.index_need_now().0 {
+            next @ (IndexNeed::Validate | IndexNeed::Fresh) => {
+                self.index_pass(projection, next, cancelled)
+            }
+            _ => Some(true),
+        }
     }
 
     /// Test pause point: the owner (or an inline warm) is about to report
@@ -611,9 +615,6 @@ impl Graph {
             return;
         };
         let mut settle_owed = true;
-        // A validation that settled nothing on an image never validated this
-        // session is not walked again: the next pass builds.
-        let mut escalate = false;
         loop {
             match projection.wait_owner_step(settle_owed, &cancelled) {
                 OwnerStep::Cancelled => return,
@@ -648,9 +649,7 @@ impl Graph {
                     if backing_off || !matches!(need, IndexNeed::Validate | IndexNeed::Fresh) {
                         continue;
                     }
-                    let Some(settled) =
-                        self.index_pass(&projection, need, &mut escalate, &cancelled)
-                    else {
+                    let Some(settled) = self.index_pass(&projection, need, &cancelled) else {
                         return;
                     };
                     if cancelled() {
@@ -667,10 +666,16 @@ impl Graph {
     /// One whole-graph index pass for `need`, the only one there is: the
     /// owner loop runs it, and so does a repair when no owner is registered
     /// (the CLI, headless runs, tests). `Validate` walks the graph against
-    /// the stored revisions; `Fresh` -- or `escalate`, set when a validation
-    /// of an image never validated this session settled nothing -- builds and
-    /// offers the parsed snapshot. Whether the pass settled the need; `None`
-    /// when `cancelled`.
+    /// the stored revisions; `Fresh` builds and offers the parsed snapshot.
+    /// Whether the pass settled the need; `None` when `cancelled`.
+    ///
+    /// Which pass comes next is the decider's alone (`index_need`). The owner
+    /// used to keep a flag of its own that turned a validation which settled
+    /// nothing into a fresh build; it overrode K1, so a failed turn on an
+    /// intact image, which owes a validation, parsed the whole graph (GH
+    /// #543, audit R13-03). A validation that finds the image needs
+    /// replacing says so through the worker (`FreshBuildRequired`), and the
+    /// decider answers `Fresh`.
     ///
     /// A pass settles its need only if the need has moved on when it ends --
     /// handed to the worker (`InHand`) or met. A pass that reports success
@@ -681,26 +686,21 @@ impl Graph {
         &self,
         projection: &crate::direct_projection::DirectProjection,
         need: crate::direct_projection::IndexNeed,
-        escalate: &mut bool,
         cancelled: &impl Fn() -> bool,
     ) -> Option<bool> {
         #[cfg(test)]
         self.page_build_test
             .owner_passes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let reported =
-            if need == crate::direct_projection::IndexNeed::Fresh || std::mem::take(escalate) {
-                self.fresh_index_pass(cancelled)
-            } else {
-                match self.warm_projection_cancellable(cancelled) {
-                    WarmProjectionOutcome::Owned => true,
-                    WarmProjectionOutcome::Cancelled => return None,
-                    WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => {
-                        *escalate = !projection.validated();
-                        false
-                    }
-                }
-            };
+        let reported = if need == crate::direct_projection::IndexNeed::Fresh {
+            self.fresh_index_pass(cancelled)
+        } else {
+            match self.warm_projection_cancellable(cancelled) {
+                WarmProjectionOutcome::Owned => true,
+                WarmProjectionOutcome::Cancelled => return None,
+                WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => false,
+            }
+        };
         Some(reported && projection.index_need_now().0 != need)
     }
 
@@ -1311,7 +1311,10 @@ impl Graph {
         if let Some(projection) = self.direct_projection.get() {
             projection.owe_validation_test();
         }
-        self.discard_parsed_cache(graph_drift::IndexEffect::Unchanged(None));
+        self.discard_parsed_cache_as(
+            graph_drift::StructuralChange::Unnamed,
+            graph_drift::IndexEffect::Unchanged(None),
+        );
     }
 
     #[cfg(test)]
@@ -1498,8 +1501,24 @@ impl Graph {
     }
 
     /// Drop the parsed cache and every map derived from it after a mutation
-    /// that moved or retired pages; `effect` says how the index hears of it.
-    pub(super) fn discard_parsed_cache(&self, effect: graph_drift::IndexEffect<'_>) {
+    /// that moved, created, rewrote or retired the pages at `touched`;
+    /// `effect` says how the index hears of it. A whole-graph pass in flight
+    /// reads those paths again and keeps its work: the change has names.
+    /// Recording it unnamed threw the launch walk away and parsed the whole
+    /// graph after a journal migration (GH #543, audit R13-04).
+    pub(super) fn discard_parsed_cache(
+        &self,
+        touched: Vec<PathBuf>,
+        effect: graph_drift::IndexEffect<'_>,
+    ) {
+        self.discard_parsed_cache_as(graph_drift::StructuralChange::Reread(touched), effect);
+    }
+
+    fn discard_parsed_cache_as(
+        &self,
+        change: graph_drift::StructuralChange,
+        effect: graph_drift::IndexEffect<'_>,
+    ) {
         // Compatible IDs are owned by session_page_ids, independently of the
         // parsed cache. Reconciliation invalidates incompatible source revisions.
         let mut guard = self.cache.write().unwrap();
@@ -1512,7 +1531,7 @@ impl Graph {
                                                  // a reader that loads the new gen then reads the cache sees None (and
                                                  // rebuilds from disk) rather than the stale pre-invalidation content — same
                                                  // gen-after-content ordering as cache_upsert.
-        self.move_cache_generation(&guard, Some(graph_drift::StructuralChange::Unnamed), effect);
+        self.move_cache_generation(&guard, Some(change), effect);
         drop(guard);
         #[cfg(test)]
         {

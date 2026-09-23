@@ -615,7 +615,13 @@ impl Graph {
                 }
             }
             let coming = self.index_delta_coming();
-            self.discard_parsed_cache(graph_drift::IndexEffect::Sent(&coming));
+            self.discard_parsed_cache(
+                edits
+                    .iter()
+                    .flat_map(|edit| [edit.src.clone(), edit.dst.clone()])
+                    .collect(),
+                graph_drift::IndexEffect::Sent(&coming),
+            );
             self.reconcile_failed_graph_text_paths(
                 &write,
                 edits
@@ -654,7 +660,13 @@ impl Graph {
                 (inventory, failures)
             });
         let coming = self.index_delta_coming();
-        self.discard_parsed_cache(graph_drift::IndexEffect::Sent(&coming));
+        self.discard_parsed_cache(
+            edits
+                .iter()
+                .flat_map(|edit| [edit.src.clone(), edit.dst.clone()])
+                .collect(),
+            graph_drift::IndexEffect::Sent(&coming),
+        );
         if let Some((inventory, failures)) = updated_page_inventory {
             self.publish_page_inventory_snapshot(inventory, failures);
         }

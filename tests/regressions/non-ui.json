@@ -7159,13 +7159,144 @@
  "coverage": {
   "tests": [
    "src/queryParseRetryOwner.test.tsx::stops polling query_parse once the block is gone",
-   "src/queryParseRetryOwner.test.tsx::stops polling query_parse once the graph is rebound",
-   "src/queryReadinessOwners.guard.test.ts::names a disposal in every caller's gate"
+   "src/queryParseRetryOwner.test.tsx::stops polling query_parse once the app switches to another graph",
+   "src/queryReadinessOwners.guard.test.ts::gives every component retry a lifetime that ends with the component"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 12, R12-06. The query_parse readiness retry was gated only on its own request, which never changes after unmount, so a removed block polled for as long as the index stayed not ready, and into the next graph. runQueryWhenCurrent now owns the binding half for every caller; each caller's gate names its disposal (owner table). Evidence gh550-batch/indexing-audit-r12/necessity-r12-frontend.txt."
+},
+{
+ "id": "REG-QUERY-WAIT-SURVIVES-SAME-GRAPH-REOPEN-543",
+ "title": "A query block, export dialog or publish waiting for the index answers after the same graph reopens",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/queryReadiness.test.ts::reads the reopened graph when the same graph is reopened",
+   "src/queryReadiness.test.ts::ends when the app switches to another graph",
+   "src/queryParseRetryOwner.test.tsx::reads its query once the same graph is reopened",
+   "src/components/QueryExportDialog.test.tsx::shows the plan after the same graph is reopened while it waits",
+   "src/components/Settings.publishZero.test.tsx::exports the same graph after it is reopened while it waited",
+   "src/queryReadinessOwners.guard.test.ts::gives every component retry a lifetime that ends with the component"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 13, R13-01 (regression from 39bf74dc) and R13-08 (the r12 owners guard did not fail when its fix was removed). A config.edn reopen bumped the graph binding, which cancelled a readiness retry on the same graph, and nothing asked again. The retry's graph identity is now the captured root; its end is a Lifetime made only by componentLifetime (ends in onCleanup) or manualLifetime. Evidence gh550-batch/indexing-audit-r13/RECEIPT-indexing-audit-r13.md; fix d5d3c894."
+},
+{
+ "id": "REG-WATCHER-SAME-ROOT-REBIND-KEEPS-ASSET-CHANGE-543",
+ "title": "An asset change queued as the same graph reopens is still delivered",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/watcher/tests.rs::a_replaced_graph_keeps_a_queued_asset_change",
+   "src-tauri/src/watcher/tests.rs::a_moved_asset_folder_is_watched_afresh"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 13, R13-02 (regression from 254690f2). A same-root rebind replaced the watched graph and its asset state together, dropping an asset change queued for that cycle. WatchedGraph::take_on is the one hand-over: asset state is kept when the asset root is unchanged. Evidence gh550-batch/indexing-audit-r13/RECEIPT-indexing-audit-r13.md; fix 1d9b1661."
+},
+{
+ "id": "REG-LAUNCH-WALK-SURVIVES-NAMED-CHANGES-543",
+ "title": "A launch check is not thrown away, and the graph not parsed, by a failed turn, a journal migration or a file rescue",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r13_tests.rs::a_failed_launch_validation_turn_on_an_intact_image_is_validated_again",
+   "crates/tine-core/src/model_gh543_r13_tests.rs::a_change_during_the_launch_walk_keeps_the_walk",
+   "crates/tine-core/src/model_gh543_r13_tests.rs::only_tests_record_an_unnamed_change"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 13, R13-03 and R13-04. The owner's private escalate flag turned a failed validation turn on an intact image into a whole-graph parse (K1 now decides alone); migration and rescue recorded an unnamed structural change though they knew their paths, so a walk in flight was discarded. discard_parsed_cache now takes the touched paths (StructuralChange::Reread); Unnamed is test-only. Necessity gh550-batch/indexing-audit-r13/necessity-r13-core.txt."
+},
+{
+ "id": "REG-INDEX-READS-DECODED-ROWS-543",
+ "title": "A damaged page kind is rebuilt, and a title::-dated journal keeps its day, from the index",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r13_tests.rs::a_corrupt_kind_in_a_derived_page_asks_for_a_new_image",
+   "crates/tine-core/src/model_gh543_r13_tests.rs::a_journal_titled_by_a_year_less_format_is_listed_from_the_index",
+   "crates/tine-core/src/model_gh543_r13_tests.rs::the_model_reads_decoded_index_rows",
+   "crates/tine-core/src/direct_projection_tests.rs::extractor_version_participates_in_disposable_source_revision"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 13, R13-05 and R13-06. The model decoded stored kinds itself and dropped damage as None; the index derived a journal's day from the file stem, which disagreed with the page's own date_key for a title::-named journal and failed the inventory under a year-less title format. Kinds are decoded once (derived_reads::page_kind, reported Corrupt); pages.journal_day is PageEntry::date_key (lowering, carried pages keep their row's day); facts version 3 relowers old images. Necessity gh550-batch/indexing-audit-r13/necessity-r13-core.txt."
+},
+{
+ "id": "REG-WAITING-INDEX-READ-SLEEPS-543",
+ "title": "A lookup waiting for announced index work sleeps instead of spinning a core",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r13_tests.rs::a_read_waiting_for_announced_work_sleeps"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 13, R13-07. indexed_read looped on coming() while the readiness wait returned at once, spinning a core; it now waits on the projection's change condvar (wait_while_coming, 50 ms bound). Necessity gh550-batch/indexing-audit-r13/necessity-r13-core.txt."
 }
 ]
 }

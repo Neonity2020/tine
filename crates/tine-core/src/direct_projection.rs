@@ -46,7 +46,9 @@ type SharedCommittedRegistry = Arc<Mutex<Option<CommittedRegistryOwner>>>;
 // Bump it whenever unchanged source bytes must be lowered into new/different
 // physical facts. The source-revision delta then rebuilds each page once even
 // when tine-storage's disposable SQLite schema itself remains compatible.
-const DIRECT_PROJECTION_FACTS_VERSION: u32 = 2;
+// v3: `pages.journal_day` is the page's own `date_key`, so a journal named by
+// `title::` has its day (GH #543, audit R13-06).
+const DIRECT_PROJECTION_FACTS_VERSION: u32 = 3;
 const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(test)]
 // Test receipts count only their own graph, including its worker threads.
@@ -1412,13 +1414,13 @@ impl DirectProjection {
         true
     }
 
-    /// R6: the projected page inventory as `(name, path, text_kind)` rows,
+    /// R6: the projected page inventory as `(name, path, kind)` rows,
     /// read through `drain_after` from the ready projection. `list_pages`
     /// rebuilds `PageEntry`s from it instead of parsing every file.
     pub(crate) fn page_inventory(
         &self,
         cache_generation: u64,
-    ) -> Option<Vec<(String, String, i64)>> {
+    ) -> Option<Vec<(String, String, PageKind)>> {
         let reader = self.shared_reader_at(cache_generation)?;
         let read = reader.as_ref()?.read();
         let mut rows = Vec::new();
@@ -1428,17 +1430,12 @@ impl DirectProjection {
                     cursor.as_ref().map(|(_, path)| path.as_str()),
                     cursor.as_ref().map(|(id, _)| *id),
                     batch,
-                    |_, kind| match kind {
-                        0 | 1 => Ok(()),
-                        _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
-                            format!("unknown Direct Files text kind {kind}"),
-                        )),
-                    },
+                    |_, kind| derived_reads::page_kind(kind).map(|_| ()),
                 )
             },
             |row| (row.cursor, row.path.clone()),
             |row| {
-                rows.push((row.name, row.path, row.text_kind));
+                rows.push((row.name, row.path, derived_reads::page_kind(row.text_kind)?));
                 Ok(())
             },
             |error, batch| {
@@ -1767,12 +1764,7 @@ impl DirectProjection {
                     cursor.as_ref().map(|(_, path)| path.as_str()),
                     cursor.as_ref().map(|(id, _)| *id),
                     batch,
-                    |_, kind| match kind {
-                        0 | 1 => Ok(()),
-                        _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
-                            format!("unknown Direct Files text kind {kind}"),
-                        )),
-                    },
+                    |_, kind| derived_reads::page_kind(kind).map(|_| ()),
                 )
             },
             |row| (row.cursor, row.path.clone()),

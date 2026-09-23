@@ -16,11 +16,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) enum StructuralChange {
     /// These page files left the page set.
     Removed(Vec<PathBuf>),
-    /// This page file's state changed without a publication, such as becoming
-    /// unreadable: a pass that read it reads it again.
-    Reread(PathBuf),
-    /// The page set changed in a way no path list describes: a broad
-    /// invalidation, or a delete whose file could not be named.
+    /// These page files' state changed without a publication, such as
+    /// becoming unreadable, or being moved, created or rewritten by a
+    /// journal migration, rename or rescue: a pass that read them reads them
+    /// again, and one that is gone leaves the pass.
+    Reread(Vec<PathBuf>),
+    /// The page set changed in a way no path list describes. Only tests make
+    /// one: every change the app makes knows its paths, and an unnamed one
+    /// throws away a whole-graph pass in flight (GH #543, audits R11-08,
+    /// R13-04).
+    #[cfg(test)]
     Unnamed,
 }
 
@@ -143,9 +148,12 @@ impl StructuralGeneration {
                     log.paths.insert(path, (at, PathEvent::Removed));
                 }
             }
-            StructuralChange::Reread(path) => {
-                log.paths.insert(path, (at, PathEvent::Reread));
+            StructuralChange::Reread(paths) => {
+                for path in paths {
+                    log.paths.insert(path, (at, PathEvent::Reread));
+                }
             }
+            #[cfg(test)]
             StructuralChange::Unnamed => log.unnamed_at = at,
         }
         if log.paths.len() >= log.prune_at {

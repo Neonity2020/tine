@@ -1602,9 +1602,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `MaterializationError::Corrupt` to classify a read error, and an
     // undecodable derived row is reported as `Corrupt` in
     // `derived_reads.rs`. Error types only; no write, schema or pin change.
+    // 2026-09-23: GH #543 (audits R13-05, R13-06) a stored page kind is decoded
+    // once, by `derived_reads::page_kind`, so `direct_projection.rs` loses its
+    // two `Corrupt` constructions, and a journal's day is read from its row:
+    // `derived_reads.rs` gains one read-only `open_direct` (`journal_days`)
+    // and one `Integer` decode. Reads and error types only; no write, schema
+    // or pin change.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "cf52a68d80d6358b5c219fd8e4a69b2b268b89e194d4d9d2bc1392b24047bdc3",
+        "56b88b8c39a67df9a5e2679627ec4dfb309c0023c4e9a7222c0f87bc6a262a3b",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

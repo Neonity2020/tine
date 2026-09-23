@@ -447,8 +447,11 @@ impl Graph {
 
     /// R6: the page inventory from the ready projection, rebuilt into the
     /// walk's `PageEntry` shape. `pages.name` is the effective (title::-aware)
-    /// name because the producer lowers the effective entry; kind comes from
-    /// the row and a journal's sort key from its name.
+    /// name because the producer lowers the effective entry; kind and a
+    /// journal's day come from the row. Parsing the day back from the name
+    /// failed the whole inventory for a date `title::` under a title format
+    /// without a year, and every page list parsed the graph (GH #543, audit
+    /// R13-06).
     pub(super) fn direct_projection_page_inventory(&self) -> Option<(u64, Vec<PageEntry>)> {
         self.indexed_read(|projection, generation| {
             self.direct_projection_page_inventory_at(projection, generation)
@@ -461,11 +464,11 @@ impl Graph {
         generation: u64,
     ) -> Option<(u64, Vec<PageEntry>)> {
         let rows = projection.page_inventory(generation)?;
+        let days = projection.journal_days(generation)?;
         let mut entries = Vec::with_capacity(rows.len());
         for (name, rel_path, kind) in rows {
-            let kind = crate::direct_projection::page_kind_from_sql(kind)?;
             let date_key = match kind {
-                PageKind::Journal => Some(self.journal_format.parse(&name)?.ordinal_key()),
+                PageKind::Journal => days.get(&rel_path).copied(),
                 PageKind::Page => None,
             };
             entries.push(PageEntry {

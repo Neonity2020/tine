@@ -293,6 +293,20 @@ impl DirectProjection {
         index_work_coming(&self.shared, &self.shared.pending.lock().unwrap())
     }
 
+    /// Wait, at most `limit`, for the index's state to change while work is
+    /// coming. A reader whose answer waits on that work sleeps here instead
+    /// of asking again at once: the readiness wait returns at once while the
+    /// image is ready, so a read that looped on `coming()` alone spun a core
+    /// for as long as an update was announced (GH #543, audit R13-07). Every
+    /// input of `coming()` notifies `changed`; `limit` bounds a wakeup lost
+    /// to an announcement dropped between the check and the wait.
+    pub(crate) fn wait_while_coming(&self, limit: std::time::Duration) {
+        let pending = self.shared.pending.lock().unwrap();
+        if index_work_coming(&self.shared, &pending) {
+            drop(self.shared.changed.wait_timeout(pending, limit).unwrap());
+        }
+    }
+
     /// The owner loop's wait: returns when there is a pass to run and no
     /// backoff holds it, when the launch completion is due (`settle_owed` and
     /// nothing coming), when the worker is gone, or when `cancelled`. Every
