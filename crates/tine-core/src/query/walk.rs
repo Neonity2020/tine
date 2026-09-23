@@ -182,7 +182,18 @@ pub(crate) struct GraphQueryPages<'a>(pub(crate) &'a Graph);
 impl QueryPageSource for GraphQueryPages<'_> {
     fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>) {
         self.0.with_pages(|pages| {
-            for (entry, doc) in pages {
+            // The index orders pages by relative path in byte order, so this
+            // enumerates them the same way (reconciler design §6). The launch
+            // inventory already is; pages created this session are appended,
+            // and only then does an enumeration sort.
+            let by_path = |(left, _): &&(PageEntry, _), (right, _): &&(PageEntry, _)| {
+                left.rel_path.as_bytes().cmp(right.rel_path.as_bytes())
+            };
+            let mut ordered = pages.iter().collect::<Vec<_>>();
+            if !ordered.is_sorted_by(|left, right| by_path(left, right).is_le()) {
+                ordered.sort_by(by_path);
+            }
+            for (entry, doc) in ordered {
                 let recency = || page_recency_secs(entry);
                 let flow = visit(QueryPageView {
                     path: &entry.rel_path,

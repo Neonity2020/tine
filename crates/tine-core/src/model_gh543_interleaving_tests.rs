@@ -702,8 +702,14 @@ fn gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm() {
     let projection = graph.direct_projection_test().unwrap();
     projection.inject_next_turn_failure_test();
     save_existing(&graph, "p0", "- TODO edited\n");
+    // The failed turn's marks are retried at once, so the drain ends green;
+    // the injection being taken is what proves the turn failed.
     assert!(
-        !projection.wait_drained_test(),
+        projection.wait_drained_test(),
+        "the retried turn failed too"
+    );
+    assert!(
+        !projection.turn_failure_injection_pending_test(),
         "the injected turn failure did not happen"
     );
     pause.release.wait();
@@ -822,6 +828,23 @@ fn gh543_an_unreadable_page_does_not_keep_the_index_down() {
     );
     assert_eq!(hits("wombat"), 0, "the changed page kept its old rows");
     assert_eq!(hits("ibis"), 1);
+    // A page ordered after the unreadable one takes an ordinary update: it
+    // once claimed a page position the unreadable page's rows still held,
+    // and that failure rebuilt the index.
+    let failures = crate::direct_projection::reported_projection_failures_test();
+    fs::write(page_path(&root, "p2"), "- edited heron\n").unwrap();
+    graph.sync_file_checked(&page_path(&root, "p2")).unwrap();
+    graph
+        .wait_for_direct_projection_for_test(Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(
+        crate::direct_projection::reported_projection_failures_test(),
+        failures,
+        "the update after the unreadable page failed: {}",
+        projection.debug_state_test()
+    );
+    assert_eq!(hits("heron"), 1, "the later page's edit is not indexed");
+    assert_eq!(hits("marmot"), 1, "the unreadable page lost its rows");
     crate::direct_projection::release_projection(&graph);
     let _ = fs::remove_dir_all(root);
 }

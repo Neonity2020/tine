@@ -31,39 +31,44 @@ impl DirectProjection {
     pub(crate) fn debug_state_test(&self) -> String {
         let pending = self.shared.pending.lock().unwrap();
         format!(
-            "ready={} validated={} ready_generation={} latest_generation={} full={} deltas={} warm={} warm_outcome={:?} rebuild={} stop={} page_order={} worker_available={} worker_failed={} worker_busy={} need={:?} revalidate={} turn_failed={} requires_full_rebuild={}",
+            "ready={} validated={} ready_generation={} latest_generation={} floor={} full={} marks={} in_flight={} applied={} rebuild={} building={} stop={} worker_available={} worker_failed={} worker_busy={} need={:?} backing_off={} turn_failed={}",
             self.shared.ready.load(Ordering::Acquire),
             self.shared.validated.load(Ordering::Acquire),
             self.shared.ready_generation.load(Ordering::Acquire),
             pending.latest_generation,
+            pending.floor,
             pending.full.is_some(),
-            pending.deltas.len(),
-            pending.warm.is_some(),
-            pending.warm_outcome.as_ref().map(|(_, outcome)| match outcome {
-                WarmOutcome::Clean => "Clean".to_owned(),
-                WarmOutcome::FreshBuildRequired => "FreshBuildRequired".to_owned(),
-                WarmOutcome::Changed {
-                    replacements,
-                    deletions,
-                } => format!(
-                    "Changed(replacements={}, deletions={})",
-                    replacements.len(),
-                    deletions.len()
-                ),
-                WarmOutcome::Superseded => "Superseded".to_owned(),
-                WarmOutcome::Failed => "Failed".to_owned(),
-            }),
+            pending.marks.len(),
+            pending.in_flight.len(),
+            pending.applied.len(),
             pending.rebuild,
+            pending.building,
             pending.stop,
-            pending.page_order.len(),
             self.shared.worker_available.load(Ordering::Acquire),
             self.shared.worker_failed.load(Ordering::Acquire),
             self.shared.worker_busy.load(Ordering::Acquire),
             index_need(&self.shared, &pending),
-            pending.revalidate,
+            backing_off(&pending),
             self.shared.last_turn_failed.load(Ordering::Acquire),
-            pending.requires_full_rebuild,
         )
+    }
+
+    /// Owe the image a survey again, as if many files had changed behind the
+    /// graph with no event naming them. Nothing in the app does this: every
+    /// change reaches the graph by path (audit R11-08).
+    #[cfg(test)]
+    /// The image is validated but not ready: what a queued mark leaves.
+    pub(crate) fn unready_test(&self) {
+        let _pending = self.shared.pending.lock().unwrap();
+        self.shared.ready.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn owe_validation_test(&self) {
+        let _pending = self.shared.pending.lock().unwrap();
+        self.shared.validated.store(false, Ordering::Release);
+        self.shared.ready.store(false, Ordering::Release);
+        drop(_pending);
+        self.shared.changed.notify_all();
     }
 
     #[cfg(test)]
@@ -85,6 +90,11 @@ impl DirectProjection {
         self.shared
             .inject_turn_failure
             .store(true, Ordering::Release);
+    }
+
+    /// Whether an injected turn failure is still waiting for a turn.
+    pub(crate) fn turn_failure_injection_pending_test(&self) -> bool {
+        self.shared.inject_turn_failure.load(Ordering::Acquire)
     }
 
     /// Refuse the next statement on an intact image, as SQLite refuses a
@@ -159,6 +169,12 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn after_next_lowering_batch_test(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.shared.after_lowering_batch.lock().unwrap() = Some(hook);
+    }
+
+    /// Whether the worker's current turn is a fresh build.
+    #[cfg(test)]
+    pub(crate) fn fresh_build_running_test(&self) -> bool {
+        self.shared.fresh_build_running.load(Ordering::Acquire)
     }
 
     /// From-scratch builds this index has started.

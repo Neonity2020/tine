@@ -163,13 +163,16 @@ candidates are never lost.
 **Query metadata stays on its physical owner (schema 30).** `blocks` stores
 public result identity, tree preorder, construction estimate and tag/property
 counts without duplicating raw payload. `pages` stores the corresponding page
-estimate, property count and Direct session position. A posting's `own` bit
+estimate and property count. A posting's `own` bit
 answers a block-own-reference probe without a second relation. These are
 rebuildable facts in the page transaction with explicit FK-off cleanup.
-Direct full reconciliation reuses projected facts for unchanged source revisions
-and reconciles only `pages.position`. Identical order performs no order
-writes. Live page deltas capture retained/append/remove positions before queue
-coalescing. The shared runtime-ID helper reproduces fresh-session IDs from page
+**Page order is a function of the page, not of history** (GH #543): every
+Direct read orders pages by graph-relative `path`, byte order
+(`COLLATE BINARY`), and the parse path enumerates pages in the same order, so a
+page created this session takes its path's place, not the end. A fresh build
+still stores `pages.position` in that order because storage's schema requires
+it; page deltas pass none, nothing reads it, and tine-core tracks no positions.
+The shared runtime-ID helper reproduces fresh-session IDs from page
 path and structural order; live identity mappings and metadata-backed result
 consumption are subsequent packets. Removing global parsing from warm startup
 and result consumption remains separate from cold reconstruction: a cold,
@@ -190,13 +193,12 @@ Projection-only filtering does not load these payload tables.
 fails.** One ready query's public result is constructed from ONE owned read
 snapshot, in two stages. The DESCRIPTOR read wraps the compiler's selected-id
 relation and adds only ordering and result metadata — the selected `blocks`
-row, the page's display fields, `blocks.order_key`, and `pages.position`
+row, the page's display fields, `blocks.order_key`, and `pages.path`
 — with no raw text, tag or property payload; every join in it is
-LEFT, so a missing `blocks` or `pages` row, a Direct
-result page with no `pages.position`, a selected block whose `blocks.page_id`
+LEFT, so a missing `blocks` or `pages` row, a selected block whose `blocks.page_id`
 does not match its result page, or a `pages.text_kind` outside the two
 written values FAILS the read rather than dropping a selected descriptor. Cross-
-page order is `pages.position`, then `blocks.preorder`
+page order is `pages.path` (byte order), then `blocks.preorder`
 within a page. The PAYLOAD read then runs for ADMITTED ids only, in batches of
 128 bound ids and exactly three statements per batch — block/text/task/planning
 facets, then `tags` by owner and ordinal, then `properties` by owner and ordinal
@@ -269,38 +271,39 @@ none of them) answers with the structural runtime id the shared helper
 reproduces from page path and structural order, which is the id a fresh parse
 assigns it.
 
-**Warm validation from bytes, never from a parsed graph.** Opening a Direct
-Files graph validates the projection against the walk inventory and each
-page's exact content revision computed from file bytes, parsing nothing. An
-unchanged graph is READY with no parsed cache and nothing retained. When the
-walk read every page and at most a quarter of them changed, were added or
-were deleted since the image was written, the warm is **repaired page by
-page** (GH #543): exactly those pages are parsed, the worker applies them and
-the deletions in one transaction that also reconciles `pages.position` to the
-walk order, and then validates again; readiness is published only after that
-check is clean, never from a partial image. At most two repairs are attempted
-per warm. A larger change, an incomplete walk (a page it could not read), a
-missing, damaged or config-mismatched projection is rebuilt from one captured
-parsed snapshot in an unpublished same-directory stage, in bounded batches.
-In-scope scenario: Syncthing or another device delivering a few pages between
-two sessions.
-Live saves and deletions enqueue their delta whether or not a parsed cache
-exists, but readiness is published only after this session has validated the
-complete inventory once (a full snapshot or a clean warm) — a delta alone
-never publishes an inventory this process has not compared to disk.
-`pages.position` is reconciled from the captured order or the delta's retained,
-appended or removed position. In-scope scenario: an external edit between two
-sessions, followed by a save of a different page before the warm completes.
-Until this session's order is seeded from an inventory, a delta carries no
-position (GH #550): a page the image already holds at the same source revision
-is dropped, a changed one is applied in place and keeps its stored position,
-and a page the image does not hold waits for the warm (which repairs or
-rebuilds it) instead of being given a guessed position. A warm that names
-pages to repair returns the queue to this unseeded state until its repair
-lands, because the walk's order already includes pages the image does not
-hold, and an update for exactly the bytes a repair wrote is not lowered again. Launch reads such as the Journals feed publish
-exactly these deltas; counting their positions from 0 collided with the stored
-ones and rebuilt the whole projection on every launch.
+**Reconciliation from bytes, never from a parsed graph** (GH #543). The index
+keeps one invariant: for every page it holds the newest change this session
+made or observed. Each change is a *mark* carrying the generation of the edit
+that made it; a mark older than what the image already holds for that page, or
+than a mark already queued for it, is dropped. Every producer — saves,
+deletions, renames, merges, journal migration, the watcher, page opens —
+records a mark at its generation, and a page open whose bytes the index
+already holds records none. Opening a Direct Files graph runs one *survey*: it
+reads each listed file's exact content revision from bytes and compares it with
+the revision the image stores, parsing nothing for an unchanged page. An
+unchanged graph is READY with no parsed cache and nothing retained. When at most
+a quarter of the pages changed, appeared or disappeared, exactly the changed
+pages are parsed and recorded as marks at the survey's generation, and the
+worker lowers them like any edit. A stored page no longer listed is deleted only
+after a read under the graph-text identity gate finds it gone, so a save that
+retires and republishes a file is never taken for a deletion; a file that
+exists but cannot be read keeps its rows. A larger change, or a missing,
+damaged or config-mismatched image, is rebuilt from one captured parsed
+snapshot in an unpublished same-directory stage, in bounded batches; a full
+snapshot is accepted only while a fresh image is owed, and the pages it could
+not read keep the rows the replaced image had for them. In-scope scenarios:
+Syncthing or another device delivering pages between two sessions; an external
+editor saving during launch.
+Live saves and deletions record their mark whether or not a parsed cache
+exists, but readiness is published only after this session has compared the
+complete inventory with the image once (a survey or a fresh build) — a delta
+alone never publishes an inventory this process has not compared to disk. A
+worker turn that fails on an intact image returns its marks to the queue, which
+re-lowers exactly the pages it may have half-written; a turn whose writes
+violate a constraint met rows that contradict each other, which `quick_check`
+does not see, and rebuilds the image once per projection. In-scope scenario: an
+external edit between two sessions, followed by a save of a different page
+before the survey completes.
 
 **One parse config, or a re-lowering.** Six graph-config facts decide those
 derived rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,
@@ -407,10 +410,10 @@ One-page cache upserts and deletes still enqueue coalesced WAL transactions.
 The editor, watcher, and save paths never wait for SQL. Ordinary pending deltas
 may serve the older complete committed image; readiness at the exact current
 graph generation waits for reconciliation. Replacement construction admits no
-partial staged image. A clean same-config full capture reuses the healthy image
-without draining pinned readers, including when `with_pages` installs a parsed
-cache after a SQL-only warm reopen. A whole-graph derived read (page inventory, aliases,
-icons, journal days, block-ref counts) with no parsed cache waits while a warm,
+partial staged image. A parsed cache that `with_pages` installs after a
+SQL-only reopen is not offered to the index: a full capture is taken only when
+a fresh image is owed. A whole-graph derived read (page inventory, aliases,
+icons, journal days, block-ref counts) with no parsed cache waits while a survey,
 a turn in progress, or an edit queued on a validated image is coming, and
 parses the graph only when none is. Once the app replaces a graph (a switch or
 a refresh) it retires it, only after every step that can fail, so a failed
@@ -611,11 +614,11 @@ the anonymized corpus, with controls recorded in `RECEIPT-db1.md` (under 1% for 
 `(page_id, name, text_kind, journal_day, path)`. A row that does not have its
 required shape is a failed read, never an empty answer. The lowered selection
 statement itself has no ordering metadata. Its descriptor wrapper does: Direct
-block answers carry `pages.position` and
+block answers carry `pages.path` and
 `blocks.preorder` and end with `ORDER BY` on those columns; the
-page wrapper carries the same page position. Missing Direct order metadata
-fails the read, because silently moving a page would change which rows survive
-a bounded budget.
+page wrapper orders by the same page path. Missing Direct order metadata
+fails the read (a result with no page row), because silently moving a page would
+change which rows survive a bounded budget.
 
 Page results carry physical graph-relative `path`, name, kind, optional journal
 day and authored ordered properties. Their shared descriptor wrapper applies

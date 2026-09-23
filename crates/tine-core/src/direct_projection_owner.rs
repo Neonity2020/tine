@@ -17,15 +17,14 @@ pub(crate) enum IndexNeed {
     /// their ordinary route. A retired predecessor in this process that is
     /// letting go reads as `SettingUp` (see `direct_projection_lease`).
     LeaseWait,
-    /// A full snapshot or a warm validation is queued or being applied.
+    /// A fresh snapshot is queued or being built.
     InHand,
     /// Only a complete parsed snapshot can make the index ready: there is no
     /// usable image, or a read found the image damaged. Walking the graph to
     /// validate the image first would only be read again.
     Fresh,
-    /// The image may be good but has not been checked against the pages this
-    /// session, or an unnamed deletion may have left it describing pages
-    /// that are gone.
+    /// The image may be good but has not been surveyed against the pages
+    /// this session.
     Validate,
     /// Nothing whole-graph is owed: page updates keep the image current.
     Nothing,
@@ -44,11 +43,11 @@ pub(super) fn index_need(shared: &ProjectionShared, pending: &PendingProjection)
         IndexNeed::LeaseWait
     } else if !pending.set_up {
         IndexNeed::SettingUp
-    } else if pending.full.is_some() || pending.warm.is_some() || pending.building {
+    } else if pending.full.is_some() || pending.building {
         IndexNeed::InHand
-    } else if pending.requires_full_rebuild || pending.rebuild {
+    } else if pending.rebuild {
         IndexNeed::Fresh
-    } else if !shared.validated.load(Ordering::Acquire) || pending.revalidate {
+    } else if !shared.validated.load(Ordering::Acquire) {
         IndexNeed::Validate
     } else {
         IndexNeed::Nothing
@@ -67,6 +66,22 @@ pub(crate) enum IndexFailure {
 }
 
 impl IndexFailure {
+    /// The failure a worker turn that failed with `message` met. A constraint
+    /// the turn's writes violated is rows contradicting what lowering writes
+    /// -- orphans only a Tine defect leaves, which `quick_check` passes -- so
+    /// it is `ContradictoryRows`; as `TurnFailed` it re-failed every retry and
+    /// the index never recovered. tine-storage carries SQLite's error as text
+    /// (`MaterializationError::Sqlite`), so this reads SQLite's constraint
+    /// message; `a_constraint_violation_reads_as_contradictory_rows` pins it
+    /// against rusqlite's real output.
+    pub(crate) fn of_turn(message: &str) -> Self {
+        if message.contains(" constraint failed") {
+            Self::ContradictoryRows
+        } else {
+            Self::TurnFailed
+        }
+    }
+
     /// The failure a read that answered `reason` met.
     pub(crate) fn of_read(reason: crate::query::QueryUnavailableReason) -> Self {
         match reason {
@@ -148,13 +163,16 @@ impl<T, E: ReadError> ReportDamage<T> for Result<T, E> {
 ///   (audit R10-01). The check (schema plus `quick_check`) runs once per
 ///   ready generation.
 /// - `ContradictoryRows`: the reader's own evidence of damage `quick_check`
-///   cannot see -- rows only a Tine defect writes, such as a page with no
-///   position. Ignoring it left task and reference queries failing for the
+///   cannot see -- rows only a Tine defect writes, such as a block whose
+///   page row is missing. Ignoring it left task and reference queries failing for the
 ///   rest of the session (audit R11-06). Once per projection: a contradiction
 ///   on the rebuilt image is a lowering defect no rebuild fixes.
+///   A turn whose writes violate a constraint met the same evidence
+///   ([`IndexFailure::of_turn`]).
 /// - `TurnFailed`: only when the image is damaged, checked afresh (the failed
-///   turn may be what damaged it). An intact image owes a validation instead,
-///   which the worker records (audit R11-07).
+///   turn may be what damaged it). On an intact image the turn's marks go
+///   back to the queue and re-lower exactly the pages it may have half
+///   written (audit R11-07).
 pub(super) fn failure_owes_new_image(shared: &ProjectionShared, failure: IndexFailure) -> bool {
     #[cfg(test)]
     if shared.inject_image_damage.swap(false, Ordering::AcqRel) {
@@ -182,8 +200,7 @@ fn image_is_intact(shared: &ProjectionShared, memoized: bool) -> bool {
 
 /// Whether the stored image answers for `pending.latest_generation`: nothing
 /// whole-graph is owed and no page update is queued. The one test readiness
-/// is published under -- by the worker at the end of a turn and by
-/// `advance_generation` -- so readiness is never claimed over an image the
+/// is published under (`publish_if_current`), so readiness is never claimed over an image the
 /// decider still owes a pass. A turn that ignored a stale mark or a latched
 /// fresh build published readiness beside a `Validate`/`Fresh` need; the
 /// owner's pass then found the image "ready", did nothing, and ran again at
@@ -252,8 +269,11 @@ pub(super) fn index_work_coming(shared: &ProjectionShared, pending: &PendingProj
         IndexNeed::Terminal | IndexNeed::LeaseWait => false,
         IndexNeed::SettingUp | IndexNeed::InHand => true,
         IndexNeed::Validate | IndexNeed::Fresh if !backing_off(pending) => true,
+        // Marks a failed turn returned wait out the backoff, and so do
+        // readers not: nothing takes them before it ends.
         _ => {
-            pending.has_work()
+            pending.worker_can_take()
+                || !pending.in_flight.is_empty()
                 || shared.deltas_coming.load(Ordering::Acquire) > 0
                 || shared.worker_busy.load(Ordering::Acquire)
         }

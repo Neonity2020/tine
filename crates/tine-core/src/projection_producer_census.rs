@@ -1608,9 +1608,17 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `derived_reads.rs` gains one read-only `open_direct` (`journal_days`)
     // and one `Integer` decode. Reads and error types only; no write, schema
     // or pin change.
+    // 2026-09-23: GH #543 index reconciler (design note
+    // 2026-09-23-index-reconciler-design.md) deletes warm_queue.rs,
+    // page_order.rs and repair.rs: every `source_delta` read, the page-order
+    // apply (`apply_with_source_revisions_aliases_and_page_order`) and the
+    // sent-source `ContentDigest` / `PhysicalGraphProjectionSourceDelta`
+    // names go. The survey reads stored revisions through one more read-only
+    // `open_direct`. Removals and reads only; no new write kind, schema or
+    // dependency pin.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "56b88b8c39a67df9a5e2679627ec4dfb309c0023c4e9a7222c0f87bc6a262a3b",
+        "f547233646248bcf36332d45ee4981f0abe6ffa673b9abcb743153ceceb63ead",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -2110,8 +2118,8 @@ fn comments_that_cite_a_test_name_a_test_that_exists() {
 /// "Does Tine already hold these bytes of this page" has one answer:
 /// `Graph::page_revision_current` asks every store (parsed cache, served
 /// session record, index) through one rule, and the index's part is
-/// `DirectProjection::holds_source_revision`, which reads what this session
-/// SENT before the stored image. Each extra producer so far trusted one store
+/// `DirectProjection::holds_source_revision`, which answers from the page's
+/// queued mark before the stored image. Each extra producer so far trusted one store
 /// for another and lost an edit or republished unchanged bytes (GH #543,
 /// audits R8-02, R9-02, R9-03). `image_holds_source_revision` is the narrower
 /// question "do the stored rows carry these exact bytes", which only a
@@ -2141,7 +2149,6 @@ fn page_currency_has_one_producer() {
     assert_eq!(
         sites,
         [
-            "crates/tine-core/src/direct_projection/derived_reads.rs image_holds_source_revision 1",
             "crates/tine-core/src/model/graph_drift.rs holds_source_revision 1",
             "crates/tine-core/src/model/graph_drift.rs image_holds_source_revision 1",
             "crates/tine-core/src/model/graph_drift.rs index_has_revision 1",

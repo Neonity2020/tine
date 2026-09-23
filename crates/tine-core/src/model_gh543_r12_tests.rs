@@ -25,8 +25,10 @@ fn r12_ready_graph(tag: &str, pages: usize) -> (PathBuf, Arc<Graph>, R10Owner) {
     (root, graph, owner)
 }
 
-/// Make every page row contradict the schema's invariants without breaking
-/// the schema itself: reads find contradictory rows, quick_check passes.
+/// Make pages p50..p59 contradict the schema's invariants without breaking
+/// the schema itself: each of their blocks' page row is gone (its id moved),
+/// so reads find contradictory rows while quick_check passes. The update
+/// turns below touch only p0..p41, which lower cleanly beside the damage.
 fn contradict(root: &Path) {
     let connection = rusqlite::Connection::open(root.join("private/projection.sqlite")).unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
@@ -35,7 +37,10 @@ fn contradict(root: &Path) {
         .unwrap();
     assert!(
         connection
-            .execute("UPDATE pages SET position = NULL", [])
+            .execute(
+                "UPDATE pages SET page_id = page_id + 1000000 WHERE path GLOB '*p5[0-9].md'",
+                [],
+            )
             .unwrap()
             > 0
     );
@@ -331,5 +336,47 @@ fn index_readers_report_damage() {
         "an index reader discards its SQL error with `.ok()`; use `.reported(self)` \
          so detected damage reaches failure_owes_new_image (GH #543, audit R12-05; \
          exemplar: DirectProjection::page_inventory): {offenders:?}"
+    );
+}
+
+/// Reconciler round (GH #543): an update turn whose writes collide with
+/// contradictory rows (here: orphaned blocks of every page, their page rows
+/// moved) failed a constraint. It was taken as an ordinary failed turn on an
+/// intact image, so its marks went back and failed again at every retry: the
+/// index never recovered and every reader parsed the graph. The violation is
+/// the contradiction's evidence and rebuilds the index once.
+#[test]
+fn an_update_turn_that_meets_contradictory_rows_rebuilds_the_index_once() {
+    let (root, graph, owner) = r12_ready_graph("r12-turn-contradiction", 12);
+    let projection = graph.direct_projection_test().unwrap();
+    let connection = rusqlite::Connection::open(root.join("private/projection.sqlite")).unwrap();
+    connection.busy_timeout(Duration::from_secs(5)).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    connection
+        .execute("UPDATE pages SET page_id = page_id + 1000000", [])
+        .unwrap();
+    drop(connection);
+    let before = projection.fresh_builds_test();
+    fs::write(root.join("pages/p0.md"), "- TODO edited [[p1]]\n").unwrap();
+    graph.sync_file_checked(&root.join("pages/p0.md")).unwrap();
+    let started = Instant::now();
+    while !(projection.fresh_builds_test() > before && graph.direct_projection_ready_test())
+        && started.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let state = projection.debug_state_test();
+    let rebuilt = projection.fresh_builds_test() - before;
+    let answer = graph
+        .run_query_bounded("(task TODO)", 20_000, 32 << 20)
+        .map(|answer| answer.groups.len());
+    r10_finish(root, graph, owner);
+    assert_eq!(rebuilt, 1, "the index was not rebuilt once: {state}");
+    assert_eq!(
+        answer.ok(),
+        Some(12),
+        "the rebuilt index answers every page"
     );
 }

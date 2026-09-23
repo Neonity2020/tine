@@ -5239,7 +5239,7 @@
  "coverage": {
   "tests": [
    "crates/tine-core/src/direct_projection_tests.rs::gh543_a_page_opened_during_the_warm_read_keeps_the_warm",
-   "crates/tine-core/src/direct_projection_tests.rs::a_page_the_walk_could_not_read_keeps_its_place_for_later_updates"
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_an_unreadable_page_does_not_keep_the_index_down"
   ],
   "scenario": null,
   "failBefore": "proven"
@@ -7297,6 +7297,107 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 13, R13-07. indexed_read looped on coming() while the readiness wait returned at once, spinning a core; it now waits on the projection's change condvar (wait_while_coming, 50 ms bound). Necessity gh550-batch/indexing-audit-r13/necessity-r13-core.txt."
+},
+{
+ "id": "REG-INDEX-RECONCILER-PANICKING-PAGE-543",
+ "title": "A page whose parse panics no longer keeps the index from ever becoming ready at launch",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_r14_panicking_page_changed_between_sessions_becomes_ready",
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_r14_panicking_page_from_an_earlier_session_becomes_ready"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 14, R14-01 (regression from r13 5a7e66b7). The launch walk could not settle a panicking page and nothing decided a rebuild, so the owner re-walked forever. Fixed by replacing the walk/repair protocol with a reconciler (per-page generation marks, one survey from bytes): the survey records the parse failure and the page keeps its rows. Fail-before tine-agents/evidence/gh550-batch/reconciler/r14-fail-before.log."
+},
+{
+ "id": "REG-INDEX-RECONCILER-MIDSESSION-PATHS-543",
+ "title": "A migrated journal or a rescued page stays in the index when a check runs mid-session",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_r14_mid_session_walk_keeps_a_migrated_journal",
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_r14_mid_session_walk_keeps_a_rescued_page",
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_r14_control_reread_without_a_walk"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 14, R14-02 (regression from r13). A mid-session walk kept only pages from its own listing, so a path named by a re-read was deleted from a ready index. The reconciler records every named path as a mark at its generation; the survey never overrides a newer mark. Fail-before tine-agents/evidence/gh550-batch/reconciler/r14-fail-before.log."
+},
+{
+ "id": "REG-INDEX-RECONCILER-SAVE-DURING-CHECK-543",
+ "title": "An editor save during an index check no longer removes the saved page from the index",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_r14_a_page_saved_during_a_validation_walk_stays_indexed",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 14, R14-03 (interleaving harness seed 1085). A save briefly leaves no file at the page's name; the walk read that as a deletion and its carried repair was applied after the save's own update. Marks older than what the image holds for a page are dropped, and a stored page is deleted only after a read under the graph-text identity gate finds it gone. Fail-before tine-agents/evidence/gh550-batch/reconciler/r14-fail-before.log."
+},
+{
+ "id": "REG-INDEX-CONSTRAINT-TURN-REBUILDS-543",
+ "title": "An index write that meets contradictory rows rebuilds the index once instead of retrying forever",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r12_tests.rs::an_update_turn_that_meets_contradictory_rows_rebuilds_the_index_once",
+   "crates/tine-core/src/direct_projection_tests.rs::a_constraint_violation_reads_as_contradictory_rows"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543, found while building the reconciler. An update turn whose writes violated a UNIQUE/NOT NULL/CHECK constraint was classified as a transient failure, so the owner backed off forever and the index never became ready; quick_check does not see such rows. IndexFailure::of_turn classifies a constraint violation as ContradictoryRows, which spends the once-per-projection token and rebuilds. Fail-before tine-agents/evidence/gh550-batch/reconciler/constraint-turn-fail-before.log."
 }
 ]
 }

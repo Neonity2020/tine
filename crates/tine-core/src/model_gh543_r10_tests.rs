@@ -316,27 +316,34 @@ fn the_repair_share_bound_has_one_reader() {
     );
 }
 
-/// R10-04: the bar shows while readers wait for a full snapshot applied as a
-/// repair (a turn with no build progress and no owner pass running).
+/// R10-04: the bar shows while readers wait for graph-sized work. The audit's
+/// shape was a full snapshot applied as a repair (a turn with no build
+/// progress and no owner pass running); the reconciler takes a full snapshot
+/// only as a fresh build, so this holds the fresh build the launch survey
+/// owes when most pages changed while Tine was closed.
 #[test]
 fn gh543_the_bar_shows_while_readers_wait_for_a_full_repair() {
     let root = r10_scratch("bar-full-repair");
     r10_pages(&root, 12);
     let database = root.join("private/projection.sqlite");
     r10_prebuild(&root, &database);
-    fs::write(root.join("pages/p5.md"), "- edited while closed [[p6]]\n").unwrap();
+    for index in 0..12 {
+        fs::write(
+            root.join("pages").join(format!("p{index}.md")),
+            format!("- edited while closed {index}\n"),
+        )
+        .unwrap();
+    }
     let graph = Arc::new(Graph::open(&root));
     graph.attach_direct_projection(database).unwrap();
-    let pause = graph.pause_next_warm_after_read_test();
-    let owner = R10Owner::start(&graph);
-    pause.reached.wait();
-    // An unnamed change abandons the launch walk: the owner escalates to a
-    // fresh pass, whose complete snapshot the worker applies as a repair.
-    graph.drift_generation_test();
     let hold = r10_hold_next_turn();
-    pause.release.wait();
+    let owner = R10Owner::start(&graph);
     hold.0.wait();
     let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        projection.fresh_build_running_test(),
+        "precondition: the held turn is the fresh build"
+    );
     let progress = graph.indexing_progress();
     let waiting = projection.coming() && !graph.direct_projection_ready_test();
     hold.1.wait();

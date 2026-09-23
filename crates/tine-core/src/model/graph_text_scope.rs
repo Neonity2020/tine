@@ -75,6 +75,15 @@ impl Graph {
             .lock_identity_mutation())
     }
 
+    pub(super) fn try_lock_graph_text_identity_mutation(
+        &self,
+    ) -> Option<GraphTextIdentityMutationGuard<'_>> {
+        self.graph_text_write_binding()
+            .ok()?
+            .gate
+            .try_lock_identity_mutation()
+    }
+
     pub(super) fn graph_text_permit_root<'a>(
         &self,
         permit: &'a GraphTextWritePermit,

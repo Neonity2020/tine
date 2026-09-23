@@ -255,11 +255,15 @@ fn gh543_a_failed_turn_on_an_intact_image_is_validated_not_rebuilt() {
     fs::write(root.join("pages/p1.md"), "- edited k1turn [[p2]]\n").unwrap();
     let _ = graph.sync_file_checked(&root.join("pages/p1.md"));
     let started = std::time::Instant::now();
-    while !projection.last_turn_failed_test() && started.elapsed() < Duration::from_secs(10) {
+    // The failed turn's marks are retried at once, so `last_turn_failed`
+    // may already be cleared; the injection being taken is the proof.
+    while projection.turn_failure_injection_pending_test()
+        && started.elapsed() < Duration::from_secs(10)
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
-        projection.last_turn_failed_test(),
+        !projection.turn_failure_injection_pending_test(),
         "precondition: the injected turn failure happened"
     );
     assert!(owner.wait_ready(Duration::from_secs(20)));
@@ -276,8 +280,9 @@ fn gh543_a_failed_turn_on_an_intact_image_is_validated_not_rebuilt() {
     r10_finish(root, graph, owner);
 }
 
-/// R11-06 (class K1): rows that contradict each other -- here a page with no
-/// position, damage only a Tine defect writes and `quick_check` cannot see --
+/// R11-06 (class K1): rows that contradict each other -- here blocks whose
+/// page row is gone, damage only a Tine defect writes and `quick_check`
+/// cannot see (foreign keys are not part of it) --
 /// make a read answer `InvalidSnapshot`. That answer is the reader's own
 /// evidence of damage and owes a new image; ignoring it in favour of the
 /// structural check left task and reference queries failing for the rest of
@@ -297,7 +302,7 @@ fn gh543_contradictory_rows_rebuild_the_index_once() {
             .unwrap();
         assert!(
             connection
-                .execute("UPDATE pages SET position = NULL", [])
+                .execute("UPDATE pages SET page_id = page_id + 1000000", [])
                 .unwrap()
                 > 0
         );
@@ -336,7 +341,7 @@ fn gh543_contradictory_rows_rebuild_the_index_once() {
             .pragma_update(None, "foreign_keys", false)
             .unwrap();
         connection
-            .execute("UPDATE pages SET position = NULL", [])
+            .execute("UPDATE pages SET page_id = page_id + 1000000", [])
             .unwrap();
     }
     for _ in 0..3 {
@@ -410,15 +415,16 @@ fn a_failure_owes_a_new_image_by_one_decider() {
         "a second place marks the worker failed (K1, I-24)"
     );
     assert!(
-        worker.contains("owner::failure_owes_new_image(&shared, owner::IndexFailure::TurnFailed)")
+        worker.contains("owner::IndexFailure::of_turn(message)")
+            && worker.contains("owner::failure_owes_new_image(")
             && worker.contains("if owes_new_image {"),
         "a failed turn must ask the K1 decider before it latches a fresh build"
     );
     assert_eq!(
-        worker.matches("revalidate = true").count(),
-        1,
-        "the index owes a validation for a second production reason; name its \
-         scenario or route it through the failed-turn arm (R11-08)"
+        worker.matches("validated.store(false").count(),
+        0,
+        "the index owes a validation again after it has one; a failed turn \
+         returns its marks instead (R11-08, reconciler design §5)"
     );
     assert!(
         repair

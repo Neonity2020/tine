@@ -44,7 +44,7 @@ const BACKLINK_FILTER_JOURNAL_SQL: &str = "SELECT page_name.raw
 FROM names AS page_name
 JOIN pages AS page INDEXED BY pages_name_idx ON page.name_id = page_name.name_id
 WHERE page_name.key = ?1 AND page.text_kind = 1
-ORDER BY page.position
+ORDER BY page.path
 LIMIT 1";
 
 const BACKLINK_FILTER_SOURCE_BATCH: usize = 256;

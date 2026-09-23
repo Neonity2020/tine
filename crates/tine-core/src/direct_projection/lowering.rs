@@ -6,9 +6,7 @@ use super::*;
 
 /// Queued page updates as the loop's input: the pages to lower and the
 /// pages to delete.
-pub(super) fn delta_inputs(
-    deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> (Vec<LoweringInput>, Vec<String>) {
+pub(super) fn delta_inputs(deltas: BTreeMap<String, Mark>) -> (Vec<LoweringInput>, Vec<String>) {
     let mut pages = Vec::new();
     let mut deletions = Vec::new();
     for (_, (_, delta)) in deltas {
@@ -18,13 +16,11 @@ pub(super) fn delta_inputs(
                 document,
                 revision,
                 parse_config,
-                page_position,
             } => pages.push(LoweringInput {
                 revision: projection_source_revision(&revision, parse_config.digest()),
                 entry,
                 document,
                 parse_config,
-                position: page_position,
             }),
             PageDelta::Delete { entry } => deletions.push(entry.rel_path),
         }
@@ -39,9 +35,6 @@ pub(super) struct LoweringInput {
     pub(super) document: Arc<Document>,
     pub(super) revision: String,
     pub(super) parse_config: Arc<ParseConfig>,
-    /// The page's place in the order, or `None` to leave it to the order
-    /// turn (a stored page keeps its own).
-    pub(super) position: Option<u64>,
 }
 
 /// Why a batched lowering ended early.
@@ -103,10 +96,9 @@ pub(super) fn lower_in_batches(
         let mut aliases = Vec::new();
         let mut revisions = Vec::with_capacity(chunk.len());
         for page in chunk {
-            let (mut physical, mut postings, mut page_aliases) =
+            let (physical, mut postings, mut page_aliases) =
                 physical_page(&page.entry, &page.document, &page.parse_config)
                     .map_err(LoweringError::Failed)?;
-            physical.position = page.position;
             revisions.push(PhysicalGraphProjectionSourceRevision {
                 path: page.entry.rel_path.clone(),
                 revision: page.revision.clone(),

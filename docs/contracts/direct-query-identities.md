@@ -15,8 +15,8 @@ compatible identities. An incompatible source revision or parse configuration
 cannot reuse its old map. A new Graph starts with no session mappings and derives structural runtime IDs; it can reuse an unchanged projection without rebuilding the database.
 
 Snapshot jobs capture the projection's set of pages carrying current-session
-IDs. Pages lowered from the session's captured Documents are Live; rows reused
-by a clean warm reopen are Structural. This provenance controls whether result
+IDs. Pages lowered from the session's captured Documents are Live; rows an unchanged
+reopen's survey kept are Structural. This provenance controls whether result
 construction uses stored IDs or deterministic structural IDs. Authority
 serialization is unchanged.
 

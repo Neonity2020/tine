@@ -149,7 +149,6 @@ pub(super) fn stored_unread_pages(
             document: Arc::new(Document { pre_block, roots }),
             revision,
             parse_config: Arc::clone(parse_config),
-            position: None,
         });
     }
     Ok(carried)

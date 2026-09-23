@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- The search index now keeps every page current by one rule: each change
+  carries the moment it was made, and an older change never overwrites a
+  newer one. At launch Tine compares each file with the index without parsing
+  unchanged pages. A page Tine cannot parse no longer keeps the index from
+  becoming ready; a journal migrated or a page rescued while a check runs, or a
+  page saved during that check, is no longer dropped from search; and an index
+  holding contradictory rows is rebuilt once instead of retrying forever. Query
+  results now list pages in file-path order, so a page created this session
+  takes its place instead of appearing last (GH #543).
 - A query block, the query export dialog, or a publish waiting for the index
   no longer stays stuck on "Updating…" when `config.edn` changes and the graph
   reopens; an asset changed at that moment is no longer missed. A journal

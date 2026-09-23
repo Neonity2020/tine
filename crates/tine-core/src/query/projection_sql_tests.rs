@@ -321,6 +321,14 @@ fn every_projection_statement_shape_is_blessed() {
         &std::sync::Arc::new(crate::config::ParseConfig::default()),
     )
     .expect("the census image's pages are carried");
+    // The reconciler's launch survey compares the image's stored revisions
+    // with the graph; the watcher asks whether the image holds pages under a
+    // directory (GH #543).
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(projection
+        .stored_revisions()
+        .is_some_and(|stored| !stored.is_empty()));
+    assert_eq!(projection.holds_pages_under("pages/"), Some(true));
 
     let recorded: BTreeSet<String> = census::recorded().into_keys().collect();
     let assert_shape = |label: &str, required: &[&str], forbidden: &[&str]| {
@@ -332,6 +340,16 @@ fn every_projection_statement_shape_is_blessed() {
             "statement census did not execute {label}"
         );
     };
+    assert_shape(
+        "survey stored revisions SQL",
+        &["SELECT path, revision FROM direct_source_revisions"],
+        &["WHERE"],
+    );
+    assert_shape(
+        "image pages under a directory SQL",
+        &["SELECT path FROM pages WHERE path >= ?"],
+        &[],
+    );
     let indexed_unlinked = [
         "SELECT path, result_id, entity_id, entity_type",
         "FROM (SELECT rowid FROM search_fts WHERE search_fts MATCH ? ORDER BY rowid DESC) c",

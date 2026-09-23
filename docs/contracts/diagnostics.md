@@ -46,7 +46,7 @@ graph object, split it:
 exemplar — the fixed failure family always-on, the raw error behind the flag.
 
 The projection's lifecycle channel, `direct_projection.rs::projection_diag`, is
-a class (a) core line of this kind: it records when a warm validation announces
+a class (a) core line of this kind: it records when the reopen survey announces
 itself, how long its inventory read took, how many pages it queued, each worker
 turn's duration and applied rows, how far a partial build has streamed, and the
 generation at which readiness is published (GH #543). Its payload is written at

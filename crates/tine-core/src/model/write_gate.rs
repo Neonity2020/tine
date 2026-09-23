@@ -72,6 +72,21 @@ impl GraphTextWriteGate {
         GraphTextIdentityMutationGuard { gate: self }
     }
 
+    /// The gate, when no other thread holds it; `None` instead of waiting.
+    pub(super) fn try_lock_identity_mutation(&self) -> Option<GraphTextIdentityMutationGuard<'_>> {
+        let caller = std::thread::current().id();
+        let mut state = self.identity_mutation.lock().unwrap();
+        if state.owner.as_ref().is_some_and(|owner| owner != &caller) {
+            return None;
+        }
+        state.owner = Some(caller);
+        state.depth = state
+            .depth
+            .checked_add(1)
+            .expect("graph-text identity mutation depth exhausted");
+        Some(GraphTextIdentityMutationGuard { gate: self })
+    }
+
     pub(super) fn identity_mutation_epoch(&self) -> u64 {
         self.identity_mutation.lock().unwrap().epoch
     }

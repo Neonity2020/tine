@@ -535,7 +535,7 @@ mod page_column {
     pub(super) const TEXT_KIND: usize = 2;
     pub(super) const JOURNAL_DAY: usize = 3;
     pub(super) const PATH: usize = 4;
-    pub(super) const POSITION: usize = 5;
+    pub(super) const STORED_PAGE: usize = 5;
     pub(super) const ESTIMATED_BYTES: usize = 6;
     pub(super) const PROPERTY_COUNT: usize = 7;
     pub(super) const MATCHED_TOTAL: usize = 8;
@@ -562,10 +562,10 @@ fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, S
     };
     let journal_day = opt_integer(row, column::JOURNAL_DAY, "pages.journal_day")?;
     let path = text(row, column::PATH, "pages.path")?;
-    let position = opt_integer(row, column::POSITION, "pages.position")?;
-    // Direct Files' page order IS this column (see `decode_descriptor`).
-    if position.is_none() {
-        return Err("pages.position is absent for a matched page".to_string());
+    // The order is the stored page's path (see `decode_descriptor`); a
+    // matched page with no stored row would sort to one end of the answer.
+    if opt_integer(row, column::STORED_PAGE, "pages.page_id")?.is_none() {
+        return Err("the page row is absent for a matched page".to_string());
     }
     Ok(PageResultDescriptor {
         page_id,
@@ -862,7 +862,7 @@ mod descriptor_column {
     pub(super) const TAG_COUNT: usize = 10;
     pub(super) const PROPERTY_COUNT: usize = 11;
     pub(super) const ORDER_KEY: usize = 12;
-    pub(super) const POSITION: usize = 13;
+    pub(super) const STORED_PAGE: usize = 13;
     pub(super) const COLUMNS: usize = 14;
 }
 
@@ -1053,12 +1053,11 @@ fn decode_descriptor(
     let tag_count = count(row, column::TAG_COUNT, "blocks.tag_count")?;
     let property_count = count(row, column::PROPERTY_COUNT, "blocks.property_count")?;
     let order_key = text(row, column::ORDER_KEY, "blocks.order_key")?;
-    let position = opt_integer(row, column::POSITION, "pages.position")?;
-    // Direct Files' cross-page order IS this column; a NULL would silently
-    // sort a page to one end of the answer, which changes which rows survive a
-    // truncated budget.
-    if position.is_none() {
-        return Err("pages.position is absent for a result page".to_string());
+    // Direct Files' cross-page order is the stored page's path; a missing
+    // page row would silently sort a page to one end of the answer, which
+    // changes which rows survive a truncated budget.
+    if opt_integer(row, column::STORED_PAGE, "pages.page_id")?.is_none() {
+        return Err("the page row is absent for a result page".to_string());
     }
     let (result_id, estimated_bytes) = resolve_identity(
         inputs.identity,

@@ -456,8 +456,8 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
     let (row, select, from) = match query.anchor {
         // §5.3's block row is `(block_id, page_id, path)` and nothing else.
         // `block_id` is the answer, `page_id` is the page's routing identity,
-        // and `path` is the order key the descriptor read (`query/results.rs`) joins
-        // stored page position on. Page name and text kind were
+        // and `path` is the order key the descriptor read (`query/results.rs`)
+        // orders pages by. Page name and text kind were
         // decoration: no consumer of these rows ever decoded either, and the
         // descriptor read takes both from the page row of the ANSWER only.
         Anchor::Block => (
@@ -548,7 +548,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         (Row::Page(_), _) => (select, from),
     };
     // The selection relation answers membership only. Descriptor/page wrappers
-    // apply page order using persisted page positions and preorder. Keeping presentation order out of this relation also
+    // apply page order by page path and preorder. Keeping presentation order out of this relation also
     // leaves the predicate's index choices independent of a pages.path sort.
     let mut sql = match &cte {
         Some(cte) => format!("{cte} {select} {from} WHERE {where_}"),
@@ -604,14 +604,15 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
 /// this campaign exists to prevent (I-12, D-14).
 ///
 /// **Every join is LEFT on purpose (D-3).** A missing `blocks` or `pages` row,
-/// a required page position, or
+/// a page row, or
 /// a `text_kind` outside [`crate::direct_projection::page_kind_from_sql`] must
 /// FAIL the read. An inner join would answer the same question with fewer rows,
 /// which is the one thing a damaged disposable cache may never do.
 ///
-/// **Ordering** is the order the walk CHARGES its budget in:
-/// `pages.position` (the projection's copy of the inventory order
-/// `GraphQueryPages::for_each_page` enumerates). Within a page it is always `blocks.preorder`.
+/// **Ordering** is the order the walk CHARGES its budget in: the page's
+/// relative path in byte order, the order `GraphQueryPages::for_each_page`
+/// enumerates (a function of the page, never of history: GH #543, reconciler
+/// design §6). Within a page it is always `blocks.preorder`.
 ///
 /// `Anchor::Page` statements have no block descriptor and are rejected here:
 /// their rows are consumed exactly as they are today.
@@ -640,7 +641,7 @@ pub(crate) fn descriptor_view_statement(
         "" => "WITH".to_string(),
         ctes => format!("{ctes},"),
     };
-    let base = "p.position";
+    let base = "p.path COLLATE BINARY";
     let mut params = statement.params.clone();
     let mut ranks = statement.ranks.clone();
     let mut terms = Vec::new();
@@ -687,8 +688,8 @@ pub(crate) fn descriptor_view_statement(
     terms.push(format!("{base} ASC"));
     terms.push("b.preorder ASC".into());
     let page_cte = match recency_expression {
-        Some(expression) => format!(", qe_order_pages AS MATERIALIZED (SELECT p.page_id, n.raw AS name, p.text_kind, p.journal_day, p.path, p.position, {expression} AS qe_recency FROM pages p JOIN names n ON n.name_id = p.name_id WHERE p.page_id IN (SELECT page_id FROM r))"),
-        None => ", qe_order_pages AS MATERIALIZED (SELECT p.page_id, n.raw AS name, p.text_kind, p.journal_day, p.path, p.position FROM pages p JOIN names n ON n.name_id = p.name_id WHERE p.page_id IN (SELECT page_id FROM r))".to_owned(),
+        Some(expression) => format!(", qe_order_pages AS MATERIALIZED (SELECT p.page_id, n.raw AS name, p.text_kind, p.journal_day, p.path, {expression} AS qe_recency FROM pages p JOIN names n ON n.name_id = p.name_id WHERE p.page_id IN (SELECT page_id FROM r))"),
+        None => ", qe_order_pages AS MATERIALIZED (SELECT p.page_id, n.raw AS name, p.text_kind, p.journal_day, p.path FROM pages p JOIN names n ON n.name_id = p.name_id WHERE p.page_id IN (SELECT page_id FROM r))".to_owned(),
     };
     Ok(RankedPageStatement {
         query: SqlQuery {
@@ -696,7 +697,7 @@ pub(crate) fn descriptor_view_statement(
                 "{with} r(block_id, page_id) AS ({body}){page_cte} \
              SELECT r.block_id, r.page_id, p.name, p.text_kind, p.journal_day, p.path, \
              b.page_id, b.preorder, b.result_id, b.estimated_bytes, b.tag_count, \
-             b.property_count, b.order_key, p.position{extra} \
+             b.property_count, b.order_key, p.page_id{extra} \
              FROM r \
              LEFT JOIN blocks b ON b.block_id = r.block_id \
              LEFT JOIN qe_order_pages p ON p.page_id = r.page_id \
@@ -971,9 +972,9 @@ fn statistics_columns(
 /// carries. Sort programs and property keys are bound values. A block-anchored
 /// statement is rejected because its rows belong to the block descriptor read.
 ///
-/// **The join is LEFT on purpose (D-3).** The page order IS
-/// `pages.position`; a missing value must FAIL the read rather than
-/// sort a page silently to one end of a truncated answer.
+/// **The join is LEFT on purpose (D-3).** The page order is the stored
+/// page's path; a missing page row must FAIL the read rather than sort a
+/// page silently to one end of a truncated answer.
 pub(crate) struct RankedPageStatement {
     pub(crate) query: SqlQuery,
     pub(crate) ranks: QueryRankPrograms,
@@ -997,7 +998,7 @@ pub(crate) fn page_statement(
         "" => "WITH".to_string(),
         ctes => format!("{ctes},"),
     };
-    let base = "stored.position";
+    let base = "stored.path COLLATE BINARY";
     let mut params = statement.params.clone();
     let mut ranks = statement.ranks.clone();
     let mut lowercase = None;
@@ -1055,7 +1056,7 @@ pub(crate) fn page_statement(
         query: SqlQuery {
             sql: format!(
                 "{with} r(page_id, name, text_kind, journal_day, path) AS ({body}) \
-                 SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, stored.position, \
+                 SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, stored.page_id, \
                         stored.estimated_bytes, stored.property_count, COUNT(*) OVER (){statistics} \
                  FROM r \
                  LEFT JOIN pages stored ON stored.page_id = r.page_id \

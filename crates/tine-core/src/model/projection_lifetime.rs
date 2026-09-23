@@ -193,49 +193,23 @@ impl Graph {
         Some(self.rel_path(&winner))
     }
 
-    /// `force` skips the readiness shortcut below. A repair that has latched
-    /// `pending.rebuild` MUST force: the worker consumes that flag only
-    /// together with a full or warm payload, so a skipped snapshot would leave
-    /// the rebuild latched with nothing to ride in on and every later capture
-    /// refused for the lifetime of the graph.
+    /// Queue a parsed snapshot for a fresh build. Only the index owner
+    /// offers, and only when the decider owes a fresh image
+    /// ([`Graph::offer_installed_cache`]); a page consumer that installs the
+    /// parsed cache offers nothing (GH #543, audits R4-04, R10-03).
     ///
-    /// Only the index owner offers ([`Graph::offer_installed_cache`]). A page
-    /// consumer that installs the parsed cache offers nothing: its offer was
-    /// a second producer of whole-index work, which superseded the warm's
-    /// cheap validation (audit R4-04) and, refused only while work was
-    /// coming, started a whole build inside the owner's backoff (GH #543,
-    /// audit R10-03).
-    ///
-    /// The outcome says whether the snapshot was refused. A caller whose
-    /// snapshot also carried a page change owes that page's update another
-    /// way when it was: a refused recovery snapshot used to drop the
-    /// recovered page from the index for the session (audit R5-01).
+    /// The outcome says whether the snapshot was refused as older than the
+    /// queue.
     pub(super) fn direct_projection_enqueue_full(
         &self,
         generation: u64,
         pages: Arc<Vec<(PageEntry, Arc<Document>)>>,
         revisions: Arc<std::collections::HashMap<PathBuf, String>>,
-        force: bool,
         source_complete: bool,
     ) -> FullOfferOutcome {
         let Some(projection) = self.direct_projection.get() else {
             return FullOfferOutcome::NoIndex;
         };
-        // R6: a snapshot of exactly what the ready index holds would only
-        // open a NotReady window while it re-validates. Readiness alone is
-        // not that: the parsed cache and the index can disagree at one
-        // generation, and a snapshot refused on readiness left the pages it
-        // carried out of the index (GH #543, audits R8-02, R9-14).
-        if !force
-            && projection.holds_exactly(
-                generation,
-                &pages,
-                &revisions,
-                &self.config().parse_config().digest(),
-            )
-        {
-            return FullOfferOutcome::AlreadyCurrent;
-        }
         let retained = if source_complete {
             Vec::new()
         } else {
@@ -269,16 +243,17 @@ impl Graph {
         }
         failures
             .iter()
-            .filter(|rel_path| std::fs::symlink_metadata(self.root.join(rel_path)).is_ok())
-            .cloned()
+            .filter_map(|failure| {
+                super::page_cache::failure_sources(failure)
+                    .find(|source| std::fs::symlink_metadata(self.root.join(source)).is_ok())
+            })
+            .map(str::to_owned)
             .collect()
     }
 
-    /// Offer the installed parsed cache to the index as the warm's payload,
-    /// once the warm that owns readiness has a cache: its own build, a build
-    /// it joined, or one a consumer installed while it ran and could not
-    /// offer. The index takes an identical snapshot at one generation once
-    /// and skips one it is already ready at.
+    /// Offer the installed parsed cache to the index for a fresh build: the
+    /// owner's `Fresh` pass, and the parsed-cache warm of a graph whose index
+    /// is gone.
     pub(super) fn offer_installed_cache(&self) -> FullOfferOutcome {
         let captured = {
             let cache = self.cache.read().unwrap();
@@ -294,7 +269,7 @@ impl Graph {
         let Some((generation, pages, revisions, source_complete)) = captured else {
             return FullOfferOutcome::NoIndex;
         };
-        self.direct_projection_enqueue_full(generation, pages, revisions, false, source_complete)
+        self.direct_projection_enqueue_full(generation, pages, revisions, source_complete)
     }
 
     /// The ONE way a mutation that changes the page SET tells the index what it
@@ -605,8 +580,6 @@ pub(super) enum FullOfferOutcome {
     NoIndex,
     /// The index takes it.
     Queued,
-    /// The index holds exactly this snapshot at this generation.
-    AlreadyCurrent,
     /// The snapshot is older than the queue.
     Outdated,
 }

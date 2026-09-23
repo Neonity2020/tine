@@ -7,17 +7,37 @@ use super::*;
 /// not be listed: nothing under it was read.
 pub(super) const GRAPH_TEXT_SCOPE_FAILURE: &str = "graph-text-scope: ";
 
-/// What `warm_projection_cancellable` achieved.
+/// The graph-relative paths a page-index failure may name: a failure is a
+/// bare path (a read or parse failure) or `path: error` (a listing skip),
+/// and a path may itself contain `": "`, so every candidate is offered.
+/// The one reader of failure text (GH #543): the fresh build's carried
+/// sources and the survey's absences both ask it.
+pub(super) fn failure_sources(failure: &str) -> impl Iterator<Item = &str> {
+    failure
+        .match_indices(": ")
+        .map(move |(at, _)| &failure[..at])
+        .chain(std::iter::once(failure))
+}
+
+/// Whether `failure` names `rel_path` or a directory above it, so the page
+/// could not be read rather than being gone.
+pub(super) fn failure_covers(failure: &str, rel_path: &str) -> bool {
+    failure.starts_with(GRAPH_TEXT_SCOPE_FAILURE)
+        || failure_sources(failure).any(|source| {
+            source == rel_path
+                || (rel_path.starts_with(source)
+                    && rel_path.as_bytes().get(source.len()) == Some(&b'/'))
+        })
+}
+
+/// What the launch survey achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WarmProjectionOutcome {
-    /// The projection (or a parsed snapshot already queued to it) owns
-    /// readiness at the generation the warm observed.
+pub(super) enum SurveyOutcome {
+    /// The survey's marks, or the fresh build it found owed, are queued.
     Owned,
-    /// Validation settled nothing: the image needs a fresh build, a mutation
-    /// raced the warm, or updates kept outranking it. The caller builds.
-    Retry,
-    /// No projection can own readiness: none attached, the graph text scope
-    /// unreadable, the writer lease held elsewhere, or the worker failed.
+    /// No projection can take them: none attached, the graph text scope or
+    /// the stored image unreadable, the writer lease held elsewhere, or the
+    /// worker gone.
     Unavailable,
     Cancelled,
 }
@@ -537,18 +557,18 @@ impl Graph {
         cancelled: &impl Fn() -> bool,
     ) -> Option<bool> {
         use crate::direct_projection::IndexNeed;
-        if !matches!(need, IndexNeed::Validate | IndexNeed::Fresh) {
-            return Some(true);
-        }
-        if self.index_pass(projection, need, cancelled)? {
-            return Some(true);
-        }
-        match projection.index_need_now().0 {
-            next @ (IndexNeed::Validate | IndexNeed::Fresh) => {
-                self.index_pass(projection, next, cancelled)
+        // Two passes: a survey that finds too much stale owes a fresh build
+        // next, and an unsettled pass gets one retry.
+        let mut need = need;
+        let mut settled = true;
+        for _ in 0..2 {
+            if !matches!(need, IndexNeed::Validate | IndexNeed::Fresh) {
+                return Some(true);
             }
-            _ => Some(true),
+            settled = self.index_pass(projection, need, cancelled)?;
+            need = projection.index_need_now().0;
         }
+        Some(settled)
     }
 
     /// Test pause point: the owner (or an inline warm) is about to report
@@ -665,23 +685,19 @@ impl Graph {
 
     /// One whole-graph index pass for `need`, the only one there is: the
     /// owner loop runs it, and so does a repair when no owner is registered
-    /// (the CLI, headless runs, tests). `Validate` walks the graph against
-    /// the stored revisions; `Fresh` builds and offers the parsed snapshot.
-    /// Whether the pass settled the need; `None` when `cancelled`.
+    /// (the CLI, headless runs, tests). `Validate` surveys the graph against
+    /// the stored revisions and queues its differences as marks; `Fresh`
+    /// builds and offers the parsed snapshot. Whether the pass settled the
+    /// need; `None` when `cancelled`.
     ///
-    /// Which pass comes next is the decider's alone (`index_need`). The owner
-    /// used to keep a flag of its own that turned a validation which settled
-    /// nothing into a fresh build; it overrode K1, so a failed turn on an
-    /// intact image, which owes a validation, parsed the whole graph (GH
-    /// #543, audit R13-03). A validation that finds the image needs
-    /// replacing says so through the worker (`FreshBuildRequired`), and the
-    /// decider answers `Fresh`.
+    /// Which pass comes next is the decider's alone (`index_need`): a survey
+    /// that finds too much of the image stale owes a fresh build, and the
+    /// decider answers `Fresh` (GH #543, audit R13-03).
     ///
-    /// A pass settles its need only if the need has moved on when it ends --
-    /// handed to the worker (`InHand`) or met. A pass that reports success
-    /// while the same need stands did nothing, and counting it settled let
-    /// the owner run it again at once, without the backoff, for as long as
-    /// the graph stayed open (GH #543, audit R7-02).
+    /// A pass settles its need only if the need has moved on when it ends. A
+    /// pass that reports success while the same need stands did nothing, and
+    /// counting it settled let the owner run it again at once, without the
+    /// backoff, for as long as the graph stayed open (GH #543, audit R7-02).
     pub(super) fn index_pass(
         &self,
         projection: &crate::direct_projection::DirectProjection,
@@ -695,10 +711,10 @@ impl Graph {
         let reported = if need == crate::direct_projection::IndexNeed::Fresh {
             self.fresh_index_pass(cancelled)
         } else {
-            match self.warm_projection_cancellable(cancelled) {
-                WarmProjectionOutcome::Owned => true,
-                WarmProjectionOutcome::Cancelled => return None,
-                WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => false,
+            match self.survey_projection_cancellable(cancelled) {
+                SurveyOutcome::Owned => true,
+                SurveyOutcome::Cancelled => return None,
+                SurveyOutcome::Unavailable => false,
             }
         };
         Some(reported && projection.index_need_now().0 != need)
@@ -710,85 +726,47 @@ impl Graph {
         if !self.build_page_cache_cancellable(cancelled) {
             return false;
         }
-        matches!(
-            self.offer_installed_cache(),
-            projection_lifetime::FullOfferOutcome::Queued
-                | projection_lifetime::FullOfferOutcome::AlreadyCurrent
-        )
+        self.offer_installed_cache() == projection_lifetime::FullOfferOutcome::Queued
     }
 
-    /// R6 warm validation: publish Direct Files projection readiness from the
-    /// walk inventory and each page's exact content revision, parsing nothing
-    /// unless the worker names replacements.
+    /// The launch survey (GH #543, the reconciler; design §4): compare the
+    /// stored image with the graph and turn every difference into a mark.
     ///
-    /// `Owned` means the projection (or a full snapshot already queued to it)
-    /// owns readiness at the generation this warm observed. `Retry` means the
-    /// validation settled nothing -- the image needs a fresh build, a mutation
-    /// raced it, or updates kept outranking it -- and the caller still owes
-    /// readiness: the owner builds the parsed snapshot, which the
-    /// worker publishes. Dropping the outcome is how an obligation ends up
-    /// with no producer (GH #543). `Unavailable` means no projection can own
-    /// readiness at all: none attached, the graph text scope unreadable, the
-    /// lease held by another instance, or the worker gone. `Cancelled` is the
-    /// binding being revoked under us.
-    pub(super) fn warm_projection_cancellable(
+    /// It loads `cache_gen` BEFORE it reads anything, so every mark it
+    /// records is at most as new as its observation: a save or a watcher
+    /// update that races it is newer and wins wherever the two meet. It never
+    /// waits for a verdict, retries, or carries anything to a later pass.
+    /// Its outputs are marks, a fresh build owed, and `validated`.
+    ///
+    /// A page that cannot be read or parsed keeps its stored rows and is
+    /// recorded as a failure, the answer the fresh build gives. A stored page
+    /// the survey did not find is deleted only after `validated`, under the
+    /// graph-text identity gate, once a re-check confirms it is gone: no Tine
+    /// save sits between retiring and publishing a file then (audit R14-03),
+    /// and a rename holding the gate while it waits for readiness finds
+    /// readiness already owed only to marks.
+    pub(super) fn survey_projection_cancellable(
         &self,
         cancelled: &impl Fn() -> bool,
-    ) -> WarmProjectionOutcome {
-        use WarmProjectionOutcome as Outcome;
+    ) -> SurveyOutcome {
         if cancelled() {
-            return Outcome::Cancelled;
+            return SurveyOutcome::Cancelled;
         }
         let Some(projection) = self.direct_projection.get() else {
-            // No projection to own readiness; a parsed cache is all there is.
-            return if self.cache.read().unwrap().is_some() {
-                Outcome::Owned
-            } else {
-                Outcome::Unavailable
-            };
+            return SurveyOutcome::Unavailable;
         };
-        if self.cache.read().unwrap().is_some() {
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            // A complete cache installation queues its exact snapshot. A
-            // partial cache does not own a stale rebuild: retry the inventory
-            // so an unreadable page can recover without replacing the older
-            // complete SQL image with an omission.
-            if projection.ready_at(generation) {
-                return Outcome::Owned;
-            }
-            if self.page_index_failures.read().unwrap().is_empty() {
-                // A consumer may have installed it inside an earlier warm and
-                // been refused the offer; this warm owns it now.
-                return match self.offer_installed_cache() {
-                    super::projection_lifetime::FullOfferOutcome::Queued
-                    | super::projection_lifetime::FullOfferOutcome::AlreadyCurrent => {
-                        Outcome::Owned
-                    }
-                    _ => Outcome::Retry,
-                };
-            }
-        }
-        // Walk the graph only to validate an image that may be good. With no
-        // usable image the walk's reads are thrown away and the build reads
-        // every page again (GH #543, R6-04).
         match projection.wait_index_need(cancelled) {
-            crate::direct_projection::IndexNeed::Fresh => return Outcome::Retry,
             crate::direct_projection::IndexNeed::Terminal
-            | crate::direct_projection::IndexNeed::LeaseWait => return Outcome::Unavailable,
-            crate::direct_projection::IndexNeed::SettingUp => return Outcome::Cancelled,
+            | crate::direct_projection::IndexNeed::LeaseWait => return SurveyOutcome::Unavailable,
+            crate::direct_projection::IndexNeed::SettingUp => return SurveyOutcome::Cancelled,
             _ => {}
         }
-        // A query landing inside the inventory read below (seconds on a
-        // 10k-page graph, tens on Windows) sees Indexing through the owner's
-        // registration, not an idle projection it should repair (GH #543).
-        let warm_started = std::time::Instant::now();
-        crate::direct_projection::projection_diag(|| {
-            "warm announced; reading inventory".to_owned()
-        });
+        let started = std::time::Instant::now();
+        crate::direct_projection::projection_diag(|| "survey announced".to_owned());
         #[cfg(test)]
         {
             // Bind first: an `if let` scrutinee would hold the guard across
-            // the pause and block the very second warm the test provokes.
+            // the pause and block the very second pass the test provokes.
             let pause = self
                 .page_build_test
                 .warm_validation_pause
@@ -801,64 +779,166 @@ impl Graph {
             }
         }
         let Ok(permit) = self.admit_retained_graph_text_writer() else {
-            return Outcome::Unavailable;
+            return SurveyOutcome::Unavailable;
         };
-        let pass = self.cache_structural_gen.begin_pass();
-        let structural = pass.at();
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
-            return Outcome::Unavailable;
+        let parse_config = Arc::new(self.config().parse_config());
+        let digest = parse_config.digest();
+        // A complete installed parsed cache is the graph as of its generation:
+        // it answers without reading a file. Taken under the cache lock, so
+        // its generation, pages and revisions are one observation.
+        let installed = {
+            let cache = self.cache.read().unwrap();
+            cache
+                .as_ref()
+                .filter(|_| self.page_index_failures.read().unwrap().is_empty())
+                .map(|pages| {
+                    (
+                        self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                        Arc::clone(pages),
+                        self.disk_revs.read().unwrap().clone(),
+                    )
+                })
         };
-        #[cfg(test)]
-        self.vanish_after_listing_test();
-        let mut walk_order = entries
-            .iter()
-            .map(|entry| entry.rel_path.clone())
-            .collect::<Vec<_>>();
-        let mut sources = Vec::with_capacity(entries.len());
-        let mut retained = Vec::new();
-        let mut failures = skipped;
-        let mut text_bytes = 0u64;
-        let progress = self.indexing_progress.begin(
-            crate::indexing_progress::IndexingPhase::Checking,
-            entries.len(),
+        let generation = installed.as_ref().map_or_else(
+            || self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+            |(generation, _, _)| *generation,
         );
-        for (i, entry) in entries.into_iter().enumerate() {
+        let Some(stored) = projection.stored_revisions() else {
+            return SurveyOutcome::Unavailable;
+        };
+        let differs = |rel_path: &str, revision: &str| {
+            stored.get(rel_path).map(String::as_str)
+                != Some(
+                    crate::direct_projection::projection_source_revision(revision, digest.clone())
+                        .as_str(),
+                )
+        };
+        let mut changes = Vec::new();
+        // Changed files are parsed only once the change is known to be small
+        // enough to repair: a survey that owes a fresh build parses nothing.
+        let mut to_parse = Vec::new();
+        let mut found = std::collections::HashSet::new();
+        let mut failures = Vec::new();
+        // The check stays reported until the survey has decided.
+        let mut _checking = None;
+        if let Some((_, pages, revisions)) = installed {
+            for (entry, document) in pages.iter() {
+                found.insert(entry.rel_path.clone());
+                let Some(revision) = revisions.get(&entry.path) else {
+                    continue;
+                };
+                if differs(&entry.rel_path, revision) {
+                    changes.push(crate::direct_projection::PageSetChange::Replace {
+                        entry: entry.clone(),
+                        document: Arc::clone(document),
+                        revision: revision.clone(),
+                    });
+                }
+            }
+        } else {
+            let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
+                return SurveyOutcome::Unavailable;
+            };
+            #[cfg(test)]
+            self.vanish_after_listing_test();
+            failures = skipped;
+            let bound = entries.len().max(stored.len());
+            let progress = self.indexing_progress.begin(
+                crate::indexing_progress::IndexingPhase::Checking,
+                entries.len(),
+            );
+            for (i, entry) in entries.into_iter().enumerate() {
+                if cancelled() {
+                    return SurveyOutcome::Cancelled;
+                }
+                progress.advance(1);
+                match self.graph_text_read_optional_text_with_identity(&permit, &entry.path) {
+                    Ok(Some((content, _))) => {
+                        found.insert(entry.rel_path.clone());
+                        if !differs(&entry.rel_path, &content_rev(&content)) {
+                            continue;
+                        }
+                        to_parse.push((entry, content));
+                        if !crate::direct_projection::repair_is_proportionate(to_parse.len(), bound)
+                        {
+                            #[cfg(test)]
+                            self.pause_warm_read_done_test();
+                            projection.survey_owes_fresh_build();
+                            return SurveyOutcome::Owned;
+                        }
+                    }
+                    // Gone since the listing: the absence check below decides.
+                    Ok(None) => {}
+                    // The file exists and could not be read: its rows stay.
+                    Err(_) => {
+                        found.insert(entry.rel_path.clone());
+                        failures.push(entry.rel_path);
+                    }
+                }
+                if i % 24 == 23 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            _checking = Some(progress);
+        }
+        #[cfg(test)]
+        self.pause_warm_read_done_test();
+        // A stored page the listing or a read failed on is unreadable, not
+        // gone: it keeps its rows and does not count toward the repair bound.
+        let absent = stored
+            .keys()
+            .filter(|rel_path| !found.contains(*rel_path))
+            .filter(|rel_path| {
+                !failures
+                    .iter()
+                    .any(|failure| failure_covers(failure, rel_path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let total = found.len().max(stored.len());
+        crate::direct_projection::projection_diag(|| {
+            format!(
+                "survey read in {}ms at generation={generation}: changed={} absent={} failures={} total={total}",
+                started.elapsed().as_millis(),
+                changes.len() + to_parse.len(),
+                absent.len(),
+                failures.len(),
+            )
+        });
+        if !crate::direct_projection::repair_is_proportionate(
+            changes.len() + to_parse.len() + absent.len(),
+            total,
+        ) {
+            projection.survey_owes_fresh_build();
+            return SurveyOutcome::Owned;
+        }
+        for (entry, content) in to_parse {
             if cancelled() {
-                return Outcome::Cancelled;
+                return SurveyOutcome::Cancelled;
             }
-            progress.advance(1);
-            match self.graph_text_read_optional_text_with_identity(&permit, &entry.path) {
-                Ok(Some((content, _))) => {
-                    let revision = content_rev(&content);
-                    text_bytes += content.len() as u64;
-                    sources.push((entry, revision));
+            #[cfg(test)]
+            self.page_build_test
+                .repair_parses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let rel_path = entry.rel_path.clone();
+            match isolate_page_parse(entry, &self.journal_format, |entry| {
+                Some(self.parse_session_page_content(entry, &content))
+            }) {
+                Ok(Some((entry, document, revision))) => {
+                    changes.push(crate::direct_projection::PageSetChange::Replace {
+                        entry,
+                        document: Arc::new(document),
+                        revision,
+                    });
                 }
-                // The file is genuinely gone: omitting it from `sources` is
-                // how the walk says "delete its rows". A gone page is not an
-                // unreadable one; naming it a failure left the inventory
-                // looking incomplete, and page creation then refused or parsed
-                // the whole graph (GH #543).
-                Ok(None) => walk_order.retain(|rel_path| rel_path != &entry.rel_path),
-                // The file EXISTS and could not be read. Omitting it would
-                // delete a live page's rows over a transient disk error or a
-                // Windows sharing violation (GH #543), so name it retained:
-                // validation keeps its rows and its old stored revision, and
-                // the next warm re-reads it.
-                Err(_) => {
-                    retained.push(entry.clone());
-                    failures.push(entry.rel_path);
-                }
-            }
-            if i % 24 == 23 {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                _ => failures.push(rel_path),
             }
         }
         #[cfg(test)]
         {
             let pause = self
                 .page_build_test
-                .warm_read_done_pause
+                .before_warm_enqueue
                 .lock()
                 .unwrap()
                 .take();
@@ -867,286 +947,62 @@ impl Graph {
                 pause.release.wait();
             }
         }
-        let read_at = generation;
-        let abandoned = || {
-            crate::direct_projection::projection_diag(|| {
-                format!(
-                    "warm abandoned on drift after {}ms",
-                    warm_started.elapsed().as_millis()
-                )
-            });
-            Outcome::Retry
+        projection.record_survey_marks(generation, changes, Arc::clone(&parse_config));
+        // Absences are confirmed before readiness when no writer holds the
+        // gate, so a page deleted while closed is gone once the index is
+        // ready. A writer holding it may be waiting for readiness itself, so
+        // then they are confirmed after it (design §4.6).
+        let absent = match self.try_lock_graph_text_identity_mutation() {
+            Some(gate) if !absent.is_empty() => {
+                self.confirm_absences(&projection, &permit, absent, &parse_config, gate);
+                Vec::new()
+            }
+            _ => absent,
         };
-        crate::direct_projection::projection_diag(|| {
-            format!(
-                "warm inventory read in {}ms pages={} retained={} failures={} text_mib={:.1}",
-                warm_started.elapsed().as_millis(),
-                sources.len(),
-                retained.len(),
-                failures.len(),
-                text_bytes as f64 / (1024.0 * 1024.0),
-            )
-        });
-        let parse_config = Arc::new(self.config().parse_config());
-        // A stale image is repaired page by page at most this many times
-        // before the complete rebuild takes over: each repair re-validates,
-        // and a graph still changing underneath it gets the rebuild.
-        let mut repairs_left = 2usize;
-        let mut repair = None;
-        // A page update queued between the drift check and the offer outranks
-        // the offer's generation. The inventory is still good, so the warm
-        // accounts for the update and offers again, at most this many times
-        // before the graph is parsed (audit R5-02): each retry costs one drift
-        // check, and a graph still changing that fast gets the full parse.
-        let mut outranked_left = 8usize;
-        // When the warm read a page again after the walk; see `PassReadAt`.
-        let mut reread_at = std::collections::HashMap::new();
-        loop {
-            // A page removed since the read leaves the walk (its queued
-            // deletion follows), and every page published since the read at
-            // other bytes is left as the image holds it, its queued update
-            // applied after validation (audit IT-03, R2-05).
-            let drift = {
-                let read = sources
-                    .iter()
-                    .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
-                    .collect::<std::collections::HashMap<_, _>>();
-                let cache = self.cache.read().unwrap();
-                let read_at = graph_drift::PassReadAt {
-                    generation: read_at,
-                    structural,
-                    reread: &reread_at,
-                };
-                self.drift_since(&cache, &read_at, |path| read.get(path).copied())
-            };
-            let Some(drift) = drift else {
-                return abandoned();
-            };
-            let (
-                generation,
-                graph_drift::DriftPaths {
-                    changed: published,
-                    removed,
-                    reread,
-                },
-            ) = drift.into_parts();
-            if !removed.is_empty() {
-                let removed_rel = sources
-                    .iter()
-                    .map(|(entry, _)| entry)
-                    .chain(&retained)
-                    .filter(|entry| removed.contains(&entry.path))
-                    .map(|entry| entry.rel_path.clone())
-                    .collect::<std::collections::HashSet<_>>();
-                sources.retain(|(entry, _)| !removed.contains(&entry.path));
-                retained.retain(|entry| !removed.contains(&entry.path));
-                walk_order.retain(|rel_path| !removed_rel.contains(rel_path));
-            }
-            // A page whose state changed after the walk read it without a
-            // publication -- typically one the watcher found unreadable -- is
-            // read again now, so the failures this warm publishes are no older
-            // than the watcher's (audit R4-01). Only these pages are read.
-            for path in reread {
-                reread_at.insert(path.clone(), self.cache_structural_gen.load());
-                let rel_path = self.rel_path(&path);
-                failures.retain(|failure| failure != &rel_path);
-                let listed = sources.iter().position(|(entry, _)| entry.path == path);
-                let kept = retained.iter().position(|entry| entry.path == path);
-                match self.graph_text_read_optional_text_with_identity(&permit, &path) {
-                    Ok(Some((content, _))) => {
-                        let revision = content_rev(&content);
-                        if let Some(i) = listed {
-                            sources[i].1 = revision;
-                        } else if let Some(i) = kept {
-                            let entry = retained.remove(i);
-                            sources.push((entry, revision));
-                        }
-                    }
-                    Ok(None) => {
-                        if let Some(i) = listed {
-                            sources.remove(i);
-                        }
-                        if let Some(i) = kept {
-                            retained.remove(i);
-                        }
-                        walk_order.retain(|candidate| candidate != &rel_path);
-                    }
-                    Err(_) => {
-                        if let Some(i) = listed {
-                            let (entry, _) = sources.remove(i);
-                            retained.push(entry);
-                        }
-                        failures.push(rel_path);
-                    }
-                }
-            }
-            // Validation leaves these pages as the image holds them, and the
-            // updates they published replace them after it (audit IT-03).
-            let mut published_pages = Vec::with_capacity(published.len());
-            for path in &published {
-                let rel_path = match sources.iter().find(|(entry, _)| &entry.path == path) {
-                    Some((entry, _)) => entry.rel_path.clone(),
-                    // A page created after the read: the walk never listed it.
-                    None => match self.entry_for_path(path) {
-                        Some(entry) => entry.rel_path,
-                        None => return abandoned(),
-                    },
-                };
-                published_pages.push(rel_path);
-            }
-            if generation != read_at {
-                // Each of those publications queued an update; the queue takes
-                // the warm beside them and applies them after validating it.
-                crate::direct_projection::projection_diag(|| {
-                    format!(
-                        "warm kept across generations {read_at}..{generation}; \
-                         {} page(s) published since the read follow as updates",
-                        published.len()
-                    )
-                });
-            }
-            #[cfg(test)]
-            {
-                let pause = self
-                    .page_build_test
-                    .before_warm_enqueue
-                    .lock()
-                    .unwrap()
-                    .take();
-                if let Some(pause) = pause {
-                    pause.reached.wait();
-                    pause.release.wait();
-                }
-            }
-            let attempt = projection.enqueue_warm_with_repair(
-                generation,
-                sources.clone(),
-                retained.clone(),
-                published_pages,
-                walk_order.clone(),
-                &mut repair,
-                Arc::clone(&parse_config),
-                text_bytes,
-            );
-            let attempt = match attempt {
-                Ok(attempt) => attempt,
-                Err(crate::direct_projection::WarmRefusal::Outranked) if outranked_left > 0 => {
-                    outranked_left -= 1;
-                    if cancelled() {
-                        return Outcome::Cancelled;
-                    }
-                    continue;
-                }
-                // Another producer owns readiness, or updates kept outranking.
-                Err(
-                    crate::direct_projection::WarmRefusal::Superseded
-                    | crate::direct_projection::WarmRefusal::Outranked,
-                ) => return Outcome::Retry,
-                Err(crate::direct_projection::WarmRefusal::Unavailable) => {
-                    return Outcome::Unavailable;
-                }
-            };
-            let outcome_started = std::time::Instant::now();
-            // Waiting on THIS attempt's verdict: a warm admitted after this
-            // one owns the queue, and its verdict is not ours to take (GH #543).
-            let outcome = projection.wait_warm_outcome(attempt);
-            crate::direct_projection::projection_diag(|| {
-                format!(
-                    "warm validation returned {} after {}ms",
-                    match &outcome {
-                        crate::direct_projection::WarmOutcome::Clean => "clean".to_owned(),
-                        crate::direct_projection::WarmOutcome::Superseded =>
-                            "superseded".to_owned(),
-                        crate::direct_projection::WarmOutcome::Failed => "failed".to_owned(),
-                        crate::direct_projection::WarmOutcome::FreshBuildRequired =>
-                            "fresh-build-required".to_owned(),
-                        crate::direct_projection::WarmOutcome::Changed {
-                            replacements,
-                            deletions,
-                        } => format!(
-                            "changed replacements={} deletions={}",
-                            replacements.len(),
-                            deletions.len()
-                        ),
-                    },
-                    outcome_started.elapsed().as_millis()
-                )
-            });
-            match outcome {
-                crate::direct_projection::WarmOutcome::Clean => {
-                    self.publish_page_index_failures(generation, failures);
-                    return Outcome::Owned;
-                }
-                crate::direct_projection::WarmOutcome::Superseded => {
-                    // A captured parsed snapshot already owns readiness.
-                    return Outcome::Owned;
-                }
-                crate::direct_projection::WarmOutcome::Failed => return Outcome::Unavailable,
-                crate::direct_projection::WarmOutcome::FreshBuildRequired => {
-                    return Outcome::Retry;
-                }
-                crate::direct_projection::WarmOutcome::Changed {
-                    replacements,
-                    deletions,
-                } => {
-                    if repairs_left == 0 {
-                        return Outcome::Retry;
-                    }
-                    repairs_left -= 1;
-                    if cancelled() {
-                        return Outcome::Cancelled;
-                    }
-                    let Some(parsed) = self.parse_warm_repair(&permit, &mut sources, &replacements)
-                    else {
-                        return Outcome::Retry;
-                    };
-                    repair = Some(crate::direct_projection::WarmRepair {
-                        replacements: parsed,
-                        deletions,
-                    });
-                }
+        projection.survey_validated(generation, Arc::clone(&parse_config));
+        self.publish_page_index_failures(generation, failures);
+        if !absent.is_empty() {
+            if let Ok(gate) = self.lock_graph_text_identity_mutation() {
+                self.confirm_absences(&projection, &permit, absent, &parse_config, gate);
             }
         }
+        SurveyOutcome::Owned
     }
 
-    /// Parse exactly the pages a warm validation named `Changed`, updating
-    /// their revisions in `sources` to the bytes parsed. `None` when one of
-    /// them cannot be read or parsed: the complete rebuild then owns it.
-    fn parse_warm_repair(
+    /// Delete the rows of stored pages the survey did not find, each only
+    /// once a re-check under the graph-text identity gate finds it gone. The
+    /// generation is loaded before the re-check, so a page re-created after
+    /// it is a newer mark than the deletion (design §4.6).
+    fn confirm_absences(
         &self,
+        projection: &crate::direct_projection::DirectProjection,
         permit: &GraphTextWritePermit,
-        sources: &mut [(PageEntry, String)],
-        replacements: &[String],
-    ) -> Option<Vec<(PageEntry, Arc<Document>, String)>> {
-        let index = sources
-            .iter()
-            .enumerate()
-            .map(|(i, (entry, _))| (entry.rel_path.clone(), i))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut parsed = Vec::with_capacity(replacements.len());
-        for rel_path in replacements {
-            let i = *index.get(rel_path)?;
-            let entry = sources[i].0.clone();
-            let Ok(Some((content, _))) =
-                self.graph_text_read_optional_text_with_identity(permit, &entry.path)
-            else {
-                return None;
-            };
-            #[cfg(test)]
-            self.page_build_test
-                .repair_parses
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let Ok(Some((effective, document, revision))) =
-                isolate_page_parse(entry, &self.journal_format, |entry| {
-                    Some(self.parse_session_page_content(entry, &content))
+        absent: Vec<String>,
+        parse_config: &Arc<crate::config::ParseConfig>,
+        _gate: GraphTextIdentityMutationGuard<'_>,
+    ) {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let deletions = absent
+            .into_iter()
+            .filter_map(|rel_path| {
+                let path = self.root.join(&rel_path);
+                // Gone means the read finds no file. A file or directory that
+                // cannot be read keeps its rows.
+                if !matches!(self.graph_text_read_optional_text(permit, &path), Ok(None)) {
+                    return None;
+                }
+                Some(crate::direct_projection::PageSetChange::Delete {
+                    entry: self.entry_for_path(&path).unwrap_or(PageEntry {
+                        name: rel_path.clone(),
+                        kind: PageKind::Page,
+                        date_key: None,
+                        path,
+                        rel_path,
+                    }),
                 })
-            else {
-                return None;
-            };
-            sources[i].1 = revision.clone();
-            parsed.push((effective, Arc::new(document), revision));
-        }
-        Some(parsed)
+            })
+            .collect::<Vec<_>>();
+        projection.record_survey_marks(generation, deletions, Arc::clone(parse_config));
     }
 
     fn publish_page_index_failures(&self, generation: u64, mut failures: Vec<String>) {
@@ -1380,17 +1236,18 @@ impl Graph {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Move the cache generation as a save would, without a save: a warm
-    /// validation that observes it abandons, exactly as on a racing edit.
-    /// There is no page to check the move against, so it counts as structural.
+    /// Move the cache generation mid-survey, as a racing change the index
+    /// does not describe would. There is no page to check the move against,
+    /// so it counts as structural; the index is told the new generation, as
+    /// every production mover tells it (a mark or `advance_generation`).
     #[cfg(test)]
     pub(crate) fn drift_generation_test(&self) {
-        let coming = self.index_delta_coming();
+        let projection = self.direct_projection.get();
         let cache = self.cache.write().unwrap();
         self.move_cache_generation(
             &cache,
             Some(graph_drift::StructuralChange::Unnamed),
-            graph_drift::IndexEffect::Sent(&coming),
+            graph_drift::IndexEffect::Unchanged(projection.as_ref()),
         );
     }
 
@@ -1446,6 +1303,22 @@ impl Graph {
         let pause = Arc::new(PageBuildTestPause::new());
         *self.page_build_test.upsert_published_pause.lock().unwrap() = Some(Arc::clone(&pause));
         pause
+    }
+
+    /// The survey has read what it will read: after the last file, or at
+    /// the early exit that owes a fresh build.
+    #[cfg(test)]
+    fn pause_warm_read_done_test(&self) {
+        let pause = self
+            .page_build_test
+            .warm_read_done_pause
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.wait();
+            pause.release.wait();
+        }
     }
 
     #[cfg(test)]

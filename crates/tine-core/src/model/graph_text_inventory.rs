@@ -493,7 +493,7 @@ impl Graph {
     /// Construct a list entry only after assigning the exact path's canonical
     /// longest-root owner. This is also the only ownership rule used by cache
     /// paths through `entry_for_path`.
-    fn graph_text_inventory_entry(&self, path: &Path) -> io::Result<Option<PageEntry>> {
+    pub(super) fn graph_text_inventory_entry(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         if !is_page_file(path) {
             return Ok(None);
         }

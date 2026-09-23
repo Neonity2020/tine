@@ -576,7 +576,7 @@ fn the_database_result_equals_the_walk_over_a_real_corpus() {
 // ===== ordering =====
 
 /// Direct Files' cross-page base order IS the order the walk enumerates pages
-/// in. The projection materializes it in `pages.position`; if the two ever
+/// in: both order by the page's relative path, byte order. If the two ever
 /// drifted, a truncated budget would keep different rows on the two paths.
 fn page_order_differences(corpus: &Corpus) -> Vec<String> {
     let mut walk_order: Vec<String> = Vec::new();
@@ -588,7 +588,7 @@ fn page_order_differences(corpus: &Corpus) -> Vec<String> {
     let rows = snapshot
         .run_projection_query(
             "SELECT n.raw FROM pages p JOIN names n ON n.name_id = p.name_id \
-             ORDER BY p.position",
+             ORDER BY p.path COLLATE BINARY",
             &[],
         )
         .expect("the page order is readable through the snapshot");
@@ -626,7 +626,27 @@ fn the_stored_page_order_is_the_walks_page_order() {
     let differences = page_order_differences(&corpus);
     assert!(
         differences.is_empty(),
-        "pages.position is not the walk's enumeration order:\n{}",
+        "the index's page order is not the walk's enumeration order:\n{}",
+        differences.join("\n")
+    );
+    // A page created this session takes its path's place on both sides, not
+    // the end: the order is a function of the page, not of history.
+    use std::time::{Duration, Instant};
+    let created = corpus.root.join("pages/0 created in session.md");
+    std::fs::write(&created, "- created in session\n").unwrap();
+    corpus.graph.sync_file_checked(&created).unwrap();
+    let started = Instant::now();
+    while !corpus.graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the index did not take the created page"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let differences = page_order_differences(&corpus);
+    assert!(
+        differences.is_empty(),
+        "a page created this session broke the shared page order:\n{}",
         differences.join("\n")
     );
 }
@@ -647,7 +667,7 @@ fn the_stored_page_order_is_the_walks_page_order_over_a_real_corpus() {
     );
     assert!(
         differences.is_empty(),
-        "pages.position is not the walk's enumeration order on a real graph:\n{}",
+        "the index's page order is not the walk's enumeration order on a real graph:\n{}",
         differences.join("\n")
     );
 }
@@ -1969,11 +1989,8 @@ fn inconsistent_page_result_metadata_fails_instead_of_shrinking_the_answer() {
     write_page_result_corpus(&root, 3);
     let corpus = Corpus::open(root, true);
     let page = "pages/Page000.md";
+    // `pages.position` is not read: pages order by path (GH #543 reconciler).
     let damages = [
-        (
-            "missing-order",
-            "UPDATE pages SET position = NULL WHERE path = ?1",
-        ),
         (
             "count",
             "UPDATE pages SET property_count = property_count + 1 WHERE path = ?1",
@@ -2014,7 +2031,7 @@ fn every_missing_required_row_fails_the_read_rather_than_shortening_it() {
 
     // The shape is the fast corpus's TAGGED root block, so one query reaches a
     // block that has compact owner metadata, a `block_text` row, a `tags`
-    // row and a page with a stored position.
+    // row and a page row.
     let source = "#inline-tag";
     let dialect = QueryDialect::Og;
     let healthy = read_answer(
@@ -2046,16 +2063,12 @@ fn every_missing_required_row_fails_the_read_rather_than_shortening_it() {
         "the damaged block must carry a tag"
     );
 
-    let damages: [(&str, &str); 3] = [
+    // `pages.position` is not read: pages order by path (GH #543 reconciler).
+    let damages: [(&str, &str); 2] = [
         ("text", "DELETE FROM block_text WHERE block_id = ?1"),
         (
             "tag",
             "DELETE FROM tags WHERE owner_type = 1 AND owner_id = ?1 AND ordinal = 0",
-        ),
-        (
-            "order",
-            "UPDATE pages SET position = NULL WHERE page_id = \
-             (SELECT page_id FROM blocks WHERE block_id = ?1)",
         ),
     ];
     for (tag, damage) in damages {

@@ -270,51 +270,114 @@ impl DirectProjection {
         self.ready_at(generation).then_some(pages)
     }
 
-    /// Whether the index holds, or has been sent, content `revision` of the
-    /// page at graph-relative `rel` under the parse configuration
-    /// `digest`: what this session sent answers first, then the stored image
-    /// when it is ready at `generation`. This is the one answer to "does the
-    /// index have these bytes"; see [`SentSources`].
+    /// Whether the index holds, or is being given, content `revision` of the
+    /// page at graph-relative `rel` under the parse configuration `digest`.
+    /// The one answer to "does the index have these bytes" (design §7): the
+    /// page's queued or in-flight mark if it has one, else the stored image's
+    /// row. While a fresh build is queued or running, the snapshot it builds
+    /// from answers; a fresh image owed without one answers no: the row read
+    /// would be the image's that is going away. Before the worker has set up the
+    /// image is read as it is: if the worker then finds it damaged, the fresh
+    /// build it owes takes every page from a complete snapshot.
     pub(crate) fn holds_source_revision(
         &self,
-        generation: u64,
+        _generation: u64,
         rel: &str,
         revision: &str,
         digest: &tine_storage::ContentDigest,
     ) -> bool {
-        let sent = self
-            .shared
-            .pending
-            .lock()
-            .unwrap()
-            .sent_carries(rel, revision, digest);
-        sent.unwrap_or_else(|| {
-            self.image_holds_source_revision(
-                generation,
-                rel,
-                &projection_source_revision(revision, digest.clone()),
-            )
-        })
+        {
+            let pending = self.shared.pending.lock().unwrap();
+            if let Some(delta) = pending.queued(rel) {
+                return delta.carries(revision, digest);
+            }
+            if pending.full.is_some() || pending.building {
+                return pending
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|(revisions, config)| {
+                        config == digest && revisions.get(rel).is_some_and(|held| held == revision)
+                    });
+            }
+            if pending.rebuild {
+                return false;
+            }
+        }
+        self.stored_revision_is(rel, &projection_source_revision(revision, digest.clone()))
     }
 
-    /// Whether the index, ready at `generation`, already holds exactly this
-    /// snapshot: every page at its revision under `digest`, and no other.
-    /// Readiness alone does not say so; the parsed cache and the index can
-    /// disagree at one generation (GH #543, audits R8-02, R9-14).
-    pub(crate) fn holds_exactly(
+    /// Whether the stored image's row for `rel` is at exactly `revision`.
+    fn stored_revision_is(&self, rel: &str, revision: &str) -> bool {
+        let Some(mut snapshot) =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)
+        else {
+            return false;
+        };
+        let mut held = false;
+        let read = crate::query::projection_sql::visit(
+            &mut snapshot,
+            "SELECT revision FROM direct_source_revisions WHERE path = ?",
+            &[PhysicalQueryValue::Text(rel.to_owned())],
+            |row| {
+                held = matches!(row, [PhysicalQueryValue::Text(stored)] if stored == revision);
+                Ok(std::ops::ControlFlow::Break(()))
+            },
+        );
+        read.reported(self).is_some() && held
+    }
+
+    /// Every page the stored image holds, with its stored
+    /// [`projection_source_revision`], for the launch survey. `None` when the
+    /// image cannot be read; the survey then owes a fresh build.
+    pub(crate) fn stored_revisions(&self) -> Option<HashMap<String, String>> {
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
+        let mut stored = HashMap::new();
+        crate::query::projection_sql::visit(
+            &mut snapshot,
+            "SELECT path, revision FROM direct_source_revisions",
+            &[],
+            |row| {
+                stored.insert(text(row, 0)?, text(row, 1)?);
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )
+        .reported(self)?;
+        Some(stored)
+    }
+
+    /// Whether the stored image holds a page whose graph-relative path
+    /// starts with `prefix`, other than those in `deleted`; `None` when it cannot
+    /// be read.
+    pub(crate) fn image_paths_under(
         &self,
-        generation: u64,
-        pages: &[(PageEntry, Arc<Document>)],
-        revisions: &std::collections::HashMap<std::path::PathBuf, String>,
-        digest: &tine_storage::ContentDigest,
-    ) -> bool {
-        self.ready_at(generation)
-            && self
-                .shared
-                .pending
-                .lock()
-                .unwrap()
-                .sent_is(pages, revisions, digest)
+        prefix: &str,
+        deleted: &HashSet<String>,
+    ) -> Option<bool> {
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
+        let mut held = false;
+        crate::query::projection_sql::visit(
+            &mut snapshot,
+            "SELECT path FROM pages WHERE path >= ? ORDER BY path",
+            &[PhysicalQueryValue::Text(prefix.to_owned())],
+            |row| {
+                let page = text(row, 0)?;
+                if !page.starts_with(prefix) {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                if deleted.contains(&page) {
+                    return Ok(std::ops::ControlFlow::Continue(()));
+                }
+                held = true;
+                Ok(std::ops::ControlFlow::Break(()))
+            },
+        )
+        .reported(self)?;
+        Some(held)
     }
 
     /// Whether the stored image, ready at `generation`, holds the page at
@@ -331,22 +394,7 @@ impl DirectProjection {
         let Some(_reader) = self.shared_reader_at(generation) else {
             return false;
         };
-        let Ok(mut snapshot) =
-            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
-        else {
-            return false;
-        };
-        let mut held = false;
-        let read = crate::query::projection_sql::visit(
-            &mut snapshot,
-            "SELECT revision FROM direct_source_revisions WHERE path = ?",
-            &[PhysicalQueryValue::Text(rel.to_owned())],
-            |row| {
-                held = matches!(row, [PhysicalQueryValue::Text(stored)] if stored == revision);
-                Ok(std::ops::ControlFlow::Break(()))
-            },
-        );
-        read.is_ok() && held && self.ready_at(generation)
+        self.stored_revision_is(rel, revision) && self.ready_at(generation)
     }
 
     pub(crate) fn page_icon_rows(
