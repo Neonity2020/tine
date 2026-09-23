@@ -141,7 +141,8 @@ fn issue137_current_contract_snapshot_uses_real_parser_and_engine() {
         cold_unlinked_json,
         serde_json::to_string(graph.unlinked_refs("Target").as_ref()).unwrap()
     );
-    graph.invalidate_cache();
+    // A cold graph over the same files.
+    let graph = fixture.graph();
     assert_eq!(
         membership_signature(cold_linked.as_ref()),
         membership_signature(graph.backlinks("Target").as_ref())
@@ -183,7 +184,8 @@ fn issue232_cache_rebuild_preserves_block_identity() {
         first,
         serde_json::to_string(graph.backlinks("Target").as_ref()).unwrap()
     );
-    graph.invalidate_cache();
+    // A cold graph over the same files.
+    let graph = fixture.graph();
     assert_eq!(
         first,
         serde_json::to_string(graph.backlinks("Target").as_ref()).unwrap()
@@ -276,7 +278,8 @@ fn issue232_merge_output_matches_destination_reload_identity() {
         .collect::<Vec<_>>();
     assert_eq!(merged_ids.len(), 3);
 
-    graph.invalidate_cache();
+    // A cold graph over the same files.
+    let graph = fixture.graph();
     let reloaded_ids = graph
         .load_page(&destination)
         .unwrap()

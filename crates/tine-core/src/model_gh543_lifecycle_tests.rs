@@ -249,7 +249,7 @@ fn gh543_a_turn_failure_while_the_owner_settles_does_not_hang_it() {
     let base = page.rev.clone();
     graph.save_page(&page, base.as_deref()).unwrap();
     let started = Instant::now();
-    while !index_state(&graph).contains("worker_failed=true")
+    while !index_state(&graph).contains("turn_failed=true")
         && started.elapsed() < Duration::from_secs(5)
     {
         std::thread::sleep(Duration::from_millis(5));
@@ -334,7 +334,7 @@ fn gh543_a_reused_snapshot_on_a_reopened_image_takes_the_queue_order() {
     crate::direct_projection::release_projection(&graph);
     let _ = fs::remove_dir_all(&root);
     assert!(
-        !state.contains("worker_failed=true"),
+        !state.contains("turn_failed=true"),
         "a page created after a reused full snapshot on a reopened image failed the index turn"
     );
 }

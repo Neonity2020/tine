@@ -1,7 +1,9 @@
 //! GH #543, indexing audit round 11: each finding's class, pinned. The
 //! fixtures follow the auditor's probes (evidence `indexing-audit-r11`).
 
-use super::gh543_r10::{r10_finish, r10_pages, r10_prebuild, r10_scratch, r10_settle, R10Owner};
+use super::gh543_r10::{
+    r10_finish, r10_pages, r10_prebuild, r10_ready_graph, r10_scratch, r10_settle, R10Owner,
+};
 use super::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -236,4 +238,212 @@ fn gh543_a_carried_page_lowers_as_its_file_parses() {
     assert_eq!(compared, files.len(), "every fixture page is compared");
     assert_eq!(carried.len(), files.len());
     fs::remove_dir_all(root).unwrap();
+}
+
+/// R11-07 (class K1, "when does a failure owe the index a new image?"): one
+/// worker turn failing -- a transient disk error, a busy database -- on an
+/// intact image rolled back and damaged nothing. It owes a validation, which
+/// re-lowers the page the failed turn carried, and not a whole fresh build:
+/// on 10k pages that was ~17 s of re-indexing with search withdrawn, for a
+/// blip.
+#[test]
+fn gh543_a_failed_turn_on_an_intact_image_is_validated_not_rebuilt() {
+    let (root, graph, owner) = r10_ready_graph("k1-turn");
+    let projection = graph.direct_projection_test().unwrap();
+    let before = projection.fresh_builds_test();
+    projection.inject_next_turn_failure_test();
+    fs::write(root.join("pages/p1.md"), "- edited k1turn [[p2]]\n").unwrap();
+    let _ = graph.sync_file_checked(&root.join("pages/p1.md"));
+    let started = std::time::Instant::now();
+    while !projection.last_turn_failed_test() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        projection.last_turn_failed_test(),
+        "precondition: the injected turn failure happened"
+    );
+    assert!(owner.wait_ready(Duration::from_secs(20)));
+    r10_settle(&graph);
+    assert!(
+        !graph.search("k1turn", 50).unwrap().is_empty(),
+        "the validation did not re-derive the page the failed turn carried"
+    );
+    assert_eq!(
+        projection.fresh_builds_test(),
+        before,
+        "one failed turn on an intact image rebuilt the whole index"
+    );
+    r10_finish(root, graph, owner);
+}
+
+/// R11-06 (class K1): rows that contradict each other -- here a page with no
+/// position, damage only a Tine defect writes and `quick_check` cannot see --
+/// make a read answer `InvalidSnapshot`. That answer is the reader's own
+/// evidence of damage and owes a new image; ignoring it in favour of the
+/// structural check left task and reference queries failing for the rest of
+/// the session. One rebuild per session: a contradiction on a freshly built
+/// image is a lowering defect no rebuild can fix, and rebuilding for it would
+/// loop.
+#[test]
+fn gh543_contradictory_rows_rebuild_the_index_once() {
+    let (root, graph, owner) = r10_ready_graph("k1-contradiction");
+    let projection = graph.direct_projection_test().unwrap();
+    {
+        let connection =
+            rusqlite::Connection::open(root.join("private/projection.sqlite")).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        assert!(
+            connection
+                .execute("UPDATE pages SET position = NULL", [])
+                .unwrap()
+                > 0
+        );
+    }
+    let before = projection.fresh_builds_test();
+    let first = graph.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+    // `InvalidSnapshot` before the fix; the read now also asks for the
+    // rebuild and answers that it is recovering.
+    assert!(
+        first.is_err(),
+        "precondition: the damage is visible to the read: {first:?}"
+    );
+    let started = std::time::Instant::now();
+    let answer = loop {
+        let answer = graph.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        if answer.is_ok() || started.elapsed() > Duration::from_secs(20) {
+            break answer;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        answer.map(|answer| answer.groups.len()).ok(),
+        Some(12),
+        "the contradictory image was never replaced"
+    );
+    assert_eq!(projection.fresh_builds_test(), before + 1);
+
+    // The same contradiction again, now on the rebuilt image: no second
+    // rebuild.
+    r10_settle(&graph);
+    {
+        let connection =
+            rusqlite::Connection::open(root.join("private/projection.sqlite")).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        connection
+            .execute("UPDATE pages SET position = NULL", [])
+            .unwrap();
+    }
+    for _ in 0..3 {
+        let _ = graph.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = projection.wait_drained_test();
+    assert_eq!(
+        projection.fresh_builds_test(),
+        before + 1,
+        "a contradiction on a freshly built image rebuilt it again"
+    );
+    r10_finish(root, graph, owner);
+}
+
+/// K1 and R11-08, pinned in the source: whether a failure owes the index a new
+/// image has one answer, `failure_owes_new_image`, which both the worker and a
+/// failed read's repair ask; and the index owes a validation for one
+/// production reason, a turn that failed on an intact image. A second
+/// producer of "rebuild after a failure" is how a failed turn came to rebuild
+/// unconditionally beside the decider the reads used (audit R11-07); a
+/// "stale" producer only fixtures reached kept a public entry point and a
+/// false doc for months (R11-08). Exemplar: `direct_projection_owner.rs`.
+#[test]
+fn a_failure_owes_a_new_image_by_one_decider() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let read = |file: &str| fs::read_to_string(src.join(file)).unwrap();
+    let production = |text: &str| -> String {
+        // Drop `#[cfg(test)]` items: they set state fixtures need.
+        let mut kept = String::new();
+        let mut skip_depth: Option<i32> = None;
+        let mut pending_cfg_test = false;
+        let mut depth = 0i32;
+        for line in text.lines() {
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            if skip_depth.is_none() && line.trim() == "#[cfg(test)]" {
+                pending_cfg_test = true;
+                continue;
+            }
+            if pending_cfg_test && skip_depth.is_none() {
+                pending_cfg_test = false;
+                if opens > closes {
+                    skip_depth = Some(depth);
+                }
+                depth += opens - closes;
+                continue;
+            }
+            depth += opens - closes;
+            if let Some(at) = skip_depth {
+                if depth <= at {
+                    skip_depth = None;
+                }
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+        kept
+    };
+    let worker = production(&read("direct_projection.rs"));
+    let repair = production(&read("model/direct_query.rs"));
+    let owner = read("direct_projection_owner.rs");
+    assert!(
+        owner.contains("pub(super) fn failure_owes_new_image("),
+        "the K1 decider moved; update this guard"
+    );
+    assert_eq!(
+        worker.matches("worker_failed.store(true").count(),
+        1,
+        "a second place marks the worker failed (K1, I-24)"
+    );
+    assert!(
+        worker.contains("owner::failure_owes_new_image(&shared, owner::IndexFailure::TurnFailed)")
+            && worker.contains("if owes_new_image {"),
+        "a failed turn must ask the K1 decider before it latches a fresh build"
+    );
+    assert_eq!(
+        worker.matches("revalidate = true").count(),
+        1,
+        "the index owes a validation for a second production reason; name its \
+         scenario or route it through the failed-turn arm (R11-08)"
+    );
+    assert!(
+        repair
+            .contains("failure.is_some_and(|failure| projection.failure_owes_new_image(failure))"),
+        "a failed read's repair must ask the K1 decider"
+    );
+    for (file, text) in [
+        ("direct_projection.rs", &worker),
+        ("model/direct_query.rs", &repair),
+    ] {
+        for gone in [
+            "failed_read_found_damage",
+            "fn mark_stale",
+            "projection.worker_failed() ||",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "{file}: `{gone}` came back (K1/R11-08)"
+            );
+        }
+    }
+    let page_cache = production(&read("model/page_cache.rs"));
+    assert!(
+        !page_cache.contains("fn invalidate_cache"),
+        "a production whole-graph invalidation came back; every change reaches \
+         the graph by path (R11-08)"
+    );
 }

@@ -6913,6 +6913,54 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 11, R11-05 (R10-13 residual). The same-root watcher entry kept the old graph's stamp baseline across a reopen, so the carried full diff reported every file a restore rewrote (200/200 for byte-identical copies) into the new graph via sync_file_checked, overlapping the new graph's own owner pass. Fix: when the slot hands the watcher a different Graph for the root, the watcher takes that graph's baseline. Evidence gh550-batch/indexing-audit-r11/necessity-R11-04-05.txt."
+},
+{
+ "id": "REG-A-FAILED-INDEX-TURN-IS-VALIDATED-NOT-REBUILT-543",
+ "title": "One failed index write on an intact index re-checks the index instead of rebuilding it whole",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r11_tests.rs::gh543_a_failed_turn_on_an_intact_image_is_validated_not_rebuilt"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-07 (class K1). A worker turn that failed (a disk error, a busy database) latched a whole fresh build unconditionally: ~17 s of re-indexing on 10k pages with search withdrawn, for a transient blip. The turn rolled back; on an intact image a validation re-derives what it carried. Only a turn that was building a new image, or one on a damaged image, owes a new one. Evidence gh550-batch/indexing-audit-r11/necessity-R11-06-07.txt."
+},
+{
+ "id": "REG-CONTRADICTORY-INDEX-ROWS-ARE-REBUILT-ONCE-543",
+ "title": "An index whose rows contradict each other is rebuilt, so task and reference queries recover in the same session",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r11_tests.rs::gh543_contradictory_rows_rebuild_the_index_once"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-06 (class K1). A read that found contradictory rows answered InvalidSnapshot, but the repair asked only schema + quick_check, which cannot see logical damage, so queries failed for the rest of the session. The reader's own evidence now owes one rebuild per projection; a contradiction on the rebuilt image is a lowering defect and is not rebuilt again. Reachable only through a Tine defect writing such rows (precedent: the stage-0 seed-6 pages.position bug). Evidence gh550-batch/indexing-audit-r11/necessity-R11-06-07.txt."
 }
 ]
 }

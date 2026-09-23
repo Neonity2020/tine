@@ -126,7 +126,7 @@ impl DirectProjection {
             parse_config,
         });
         pending.latest_generation = generation;
-        pending.stale = false;
+        pending.revalidate = false;
         self.shared.changed.notify_all();
         projection_diag(|| {
             format!(

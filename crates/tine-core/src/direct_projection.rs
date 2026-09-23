@@ -29,7 +29,7 @@ mod lease;
 #[path = "direct_projection_owner.rs"]
 mod owner;
 use owner::{backing_off, image_is_current, index_need, note_unsettled};
-pub(crate) use owner::{IndexNeed, IndexOwnerRegistration, OwnerStep};
+pub(crate) use owner::{IndexFailure, IndexNeed, IndexOwnerRegistration, OwnerStep};
 
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
 type PageRevisions = Arc<HashMap<PathBuf, String>>;
@@ -314,11 +314,12 @@ struct PendingProjection {
     /// longer offers anything (R8-14); the index owner's warm is the producer.
     accepted_full: Option<(u64, std::sync::Weak<Vec<(PageEntry, Arc<Document>)>>)>,
     rebuild: bool,
-    /// Set by `mark_stale`: the image may no longer describe the pages, so
-    /// `advance_generation` must not carry readiness past it. Cleared when a
-    /// full snapshot or warm validation, which re-derive the page set, is
-    /// accepted.
-    stale: bool,
+    /// A validation is owed: a worker turn failed on an intact image and
+    /// rolled back, so the pages it carried are not in the image (K1, audit
+    /// R11-07). `advance_generation` must not carry readiness past it.
+    /// Cleared when a full snapshot or warm validation, which re-derive the
+    /// page set, is accepted.
+    revalidate: bool,
     deltas: BTreeMap<String, (u64, PageDelta)>,
     latest_generation: u64,
     stop: bool,
@@ -641,6 +642,9 @@ struct ProjectionShared {
     /// image intact, so a statement SQLite refuses is checked once, not on
     /// every retry (audit R10-01).
     image_verified_intact_at: Mutex<Option<u64>>,
+    /// Rows contradicting each other have already cost this projection one
+    /// fresh build; see [`owner::failure_owes_new_image`].
+    contradiction_rebuilt: AtomicBool,
     /// R3: the ONE admission/cancellation owner for database-owned query jobs
     /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
     /// drains every job before it replaces or resets the file, and `Drop`
@@ -754,6 +758,10 @@ struct ProjectionShared {
     /// Fail the worker's next turn, as a disk error or a SQLite fault would.
     #[cfg(test)]
     inject_turn_failure: AtomicBool,
+    /// The worker's last turn failed. A failure on an intact image leaves
+    /// nothing else behind to observe it by.
+    #[cfg(test)]
+    last_turn_failed: AtomicBool,
     /// The worker found the writer lease held at least once.
     #[cfg(test)]
     pub(super) lease_contended: AtomicBool,
@@ -1180,6 +1188,7 @@ impl DirectProjection {
             commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
             image_verified_intact_at: Mutex::new(None),
+            contradiction_rebuilt: AtomicBool::new(false),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
             committed_registry: Arc::new(Mutex::new(None)),
@@ -1229,6 +1238,8 @@ impl DirectProjection {
             #[cfg(test)]
             inject_turn_failure: AtomicBool::new(false),
             #[cfg(test)]
+            last_turn_failed: AtomicBool::new(false),
+            #[cfg(test)]
             lease_contended: AtomicBool::new(false),
             #[cfg(test)]
             fallback_reads: AtomicU64::new(0),
@@ -1258,9 +1269,11 @@ impl DirectProjection {
         DeltaComing(Arc::clone(&self.shared))
     }
 
-    /// True while the last worker turn failed. The flag clears on the next
-    /// successful turn, so it names a projection that owes a reset — not one
-    /// that has merely never started.
+    /// True while a failed turn owes a new image (K1: it was building one, or
+    /// the image is damaged). A turn that failed on an intact image owes a
+    /// validation instead and leaves this clear. The flag clears on the next
+    /// successful turn or accepted full snapshot.
+    #[cfg(test)]
     pub(crate) fn worker_failed(&self) -> bool {
         self.shared.worker_failed.load(Ordering::Acquire)
     }
@@ -1338,11 +1351,12 @@ impl DirectProjection {
                             .upgrade()
                             .is_some_and(|snapshot| Arc::ptr_eq(&snapshot, &pages))
                 });
-        // A stale image owes a re-derivation of its page set, and this
-        // snapshot is one: taking it again is the repair, not a repeat.
+        // An image owing a validation owes a re-derivation of its page set,
+        // and this snapshot is one: taking it again is the repair, not a
+        // repeat.
         if already_accepted
             && !pending.rebuild
-            && !pending.stale
+            && !pending.revalidate
             && generation == pending.latest_generation
             && !self.shared.worker_failed.load(Ordering::Acquire)
         {
@@ -1377,7 +1391,7 @@ impl DirectProjection {
         });
         pending.deltas.clear();
         pending.latest_generation = generation;
-        pending.stale = false;
+        pending.revalidate = false;
 
         // A complete parsed snapshot owns readiness from here. A validation
         // still in flight is superseded and its waiter is released.
@@ -1568,7 +1582,7 @@ impl DirectProjection {
     /// R4-03).
     pub(crate) fn advance_generation(&self, generation: u64) {
         let mut pending = self.shared.pending.lock().unwrap();
-        if pending.stale {
+        if pending.revalidate {
             return;
         }
         pending.latest_generation = pending.latest_generation.max(generation);
@@ -1601,12 +1615,17 @@ impl DirectProjection {
         )
     }
 
-    pub(crate) fn mark_stale(&self) {
-        self.shared.pending.lock().unwrap().stale = true;
+    /// Owe a validation, as a turn failing on an intact image does.
+    #[cfg(test)]
+    pub(crate) fn owe_validation_test(&self) {
+        self.shared.pending.lock().unwrap().revalidate = true;
         self.shared.ready.store(false, Ordering::Release);
         self.shared.changed.notify_all();
-        // Source-oriented navigation waits for reconciliation; live queries
-        // can still read the complete committed image.
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_turn_failed_test(&self) -> bool {
+        self.shared.last_turn_failed.load(Ordering::Acquire)
     }
 
     /// A reference read which races an already-queued one-page fact delta is
@@ -2542,184 +2561,6 @@ impl DirectProjection {
         ProjectionProgress::Stale
     }
 
-    /// Wait until the worker has drained its queue and finished its turn, and
-    /// report whether that turn succeeded (`false`: it failed).
-    #[cfg(test)]
-    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
-    pub(crate) fn wait_drained_test(&self) -> bool {
-        let started = std::time::Instant::now();
-        loop {
-            {
-                let pending = self.shared.pending.lock().unwrap();
-                if !pending.has_work() && !self.shared.worker_busy.load(Ordering::Acquire) {
-                    return !self.shared.worker_failed.load(Ordering::Acquire);
-                }
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(15),
-                "projection worker did not drain"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    /// Test diagnostic: the queue and readiness state in one line, for a
-    /// convergence failure that would otherwise be a bare timeout.
-    #[cfg(test)]
-    pub(crate) fn debug_state_test(&self) -> String {
-        let pending = self.shared.pending.lock().unwrap();
-        format!(
-            "ready={} validated={} ready_generation={} latest_generation={} full={} deltas={} warm={} warm_outcome={:?} rebuild={} stop={} page_order={} worker_available={} worker_failed={} worker_busy={} need={:?} stale={} requires_full_rebuild={}",
-            self.shared.ready.load(Ordering::Acquire),
-            self.shared.validated.load(Ordering::Acquire),
-            self.shared.ready_generation.load(Ordering::Acquire),
-            pending.latest_generation,
-            pending.full.is_some(),
-            pending.deltas.len(),
-            pending.warm.is_some(),
-            pending.warm_outcome.as_ref().map(|(_, outcome)| match outcome {
-                WarmOutcome::Clean => "Clean".to_owned(),
-                WarmOutcome::FreshBuildRequired => "FreshBuildRequired".to_owned(),
-                WarmOutcome::Changed {
-                    replacements,
-                    deletions,
-                } => format!(
-                    "Changed(replacements={}, deletions={})",
-                    replacements.len(),
-                    deletions.len()
-                ),
-                WarmOutcome::Superseded => "Superseded".to_owned(),
-                WarmOutcome::Failed => "Failed".to_owned(),
-            }),
-            pending.rebuild,
-            pending.stop,
-            pending.page_order.len(),
-            self.shared.worker_available.load(Ordering::Acquire),
-            self.shared.worker_failed.load(Ordering::Acquire),
-            self.shared.worker_busy.load(Ordering::Acquire),
-            index_need(&self.shared, &pending),
-            pending.stale,
-            pending.requires_full_rebuild,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn indexed_reads(&self) -> u64 {
-        self.shared.indexed_reads.load(Ordering::Relaxed)
-    }
-
-    /// Close this projection's query-job admission, the way `Drop` does when a
-    /// graph is closing. Every later `open_query_job` is `Cancelled`, which is
-    /// the ONE §5.9 state a public query must never repair or retry.
-    #[cfg(test)]
-    pub(crate) fn close_query_jobs_test(&self) {
-        let fence = self.shared.query_jobs.begin_close();
-        self.shared.query_jobs.wait_for_drain(fence);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_next_turn_failure_test(&self) {
-        self.shared
-            .inject_turn_failure
-            .store(true, Ordering::Release);
-    }
-
-    /// Refuse the next statement on an intact image, as SQLite refuses a
-    /// statement past one of its hard limits.
-    #[cfg(test)]
-    pub(crate) fn inject_next_statement_refusal(&self) {
-        self.shared
-            .inject_read_failure
-            .store(true, Ordering::Release);
-    }
-
-    /// The next failed read finds the stored image damaged.
-    #[cfg(test)]
-    pub(crate) fn inject_image_damage_test(&self) {
-        self.shared
-            .inject_image_damage
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_next_statement_failure(&self) {
-        self.shared
-            .inject_read_failure
-            .store(true, Ordering::Release);
-        self.shared
-            .inject_image_damage
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn statement_reads(&self) -> u64 {
-        self.shared.statement_reads.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_registry_capture_attempts(&self) -> u64 {
-        self.shared
-            .registry_capture_attempts
-            .swap(0, Ordering::AcqRel)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fallback_reads(&self) -> u64 {
-        self.shared.fallback_reads.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn referenced_name_reads(&self) -> u64 {
-        self.shared.referenced_name_reads.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn serving_writer_cache_budget_test(&self) -> u64 {
-        self.shared
-            .serving_writer_cache_budget
-            .load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_projection_health_checks_test(&self) {
-        self.shared
-            .projection_health_checks
-            .store(0, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn projection_health_checks_test(&self) -> u64 {
-        self.shared.projection_health_checks.load(Ordering::Relaxed)
-    }
-
-    /// Run `hook` on the worker once, after the next lowering batch it writes.
-    #[cfg(test)]
-    pub(crate) fn after_next_lowering_batch_test(&self, hook: Box<dyn FnOnce() + Send>) {
-        *self.shared.after_fresh_build_batch.lock().unwrap() = Some(hook);
-    }
-
-    /// From-scratch builds this index has started.
-    #[cfg(test)]
-    pub(crate) fn fresh_builds_test(&self) -> u64 {
-        self.shared.fresh_builds.load(Ordering::SeqCst)
-    }
-
-    /// Hold the next fresh build just before it publishes: the first barrier
-    /// releases when it arrives, the second lets it go on.
-    #[cfg(test)]
-    pub(crate) fn hold_fresh_publication_test(
-        &self,
-    ) -> Arc<(std::sync::Barrier, std::sync::Barrier)> {
-        let pair = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
-        let held = Arc::clone(&pair);
-        *self.shared.before_fresh_publication.lock().unwrap() = Some(Box::new(move || {
-            held.0.wait();
-            held.1.wait();
-            Ok(())
-        }));
-        pair
-    }
-
     /// R3: refuse new jobs, interrupt the active ones and wait for their slots
     /// before the worker is told to stop, so no snapshot outlives the
     /// projection that admitted it. Idempotent — `stop` and a closed admission
@@ -3347,9 +3188,19 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             Ok(applied) => applied,
             Err(error) => {
                 shared.ready.store(false, Ordering::Release);
+                // K1: a failed turn owes a new image only when it was building
+                // one or the image is damaged. On an intact image the turn
+                // rolled back; a validation re-derives what it carried, where
+                // a fresh build re-lowered every page for a disk blip (audit
+                // R11-07). Asked before `pending`: the check reads the image.
+                let owes_new_image = matches!(error, ProjectionRefusal::Failed(_))
+                    && (rebuild
+                        || owner::failure_owes_new_image(&shared, owner::IndexFailure::TurnFailed));
                 if matches!(error, ProjectionRefusal::Failed(_)) {
                     // Taken before `pending`: never hold both.
                     shared.committed_registry.lock().unwrap().take();
+                    #[cfg(test)]
+                    shared.last_turn_failed.store(true, Ordering::Release);
                 }
                 let mut pending = shared.pending.lock().unwrap();
                 pending.building = false;
@@ -3362,8 +3213,12 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         pending.requires_full_rebuild = true;
                     }
                     ProjectionRefusal::Failed(_) => {
-                        pending.requires_full_rebuild = true;
-                        shared.worker_failed.store(true, Ordering::Release);
+                        if owes_new_image {
+                            pending.requires_full_rebuild = true;
+                            shared.worker_failed.store(true, Ordering::Release);
+                        } else {
+                            pending.revalidate = true;
+                        }
                         note_unsettled(&mut pending);
                     }
                     ProjectionRefusal::Stopped => {
@@ -3397,6 +3252,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             shared.validated.store(true, Ordering::Release);
         }
         shared.worker_failed.store(false, Ordering::Release);
+        #[cfg(test)]
+        shared.last_turn_failed.store(false, Ordering::Release);
         projection_diag(|| {
             format!(
                 "turn applied in {}ms lowered={} deleted={} fresh_build={fresh_build}",
@@ -3976,6 +3833,8 @@ pub(crate) mod derived_reads;
 mod lowering;
 mod page_order;
 mod repair;
+#[cfg(test)]
+mod test_hooks;
 mod warm_queue;
 pub(crate) use lowering::*;
 use page_order::{adopt_queue_order, reconcile_page_order, settle_unseeded_deltas};

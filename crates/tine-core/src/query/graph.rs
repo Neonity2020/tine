@@ -59,6 +59,7 @@ pub(crate) trait QueryGraph {
         query: &str,
         limit: usize,
     ) -> Result<Vec<RefGroup>, super::QueryExecutionError>;
+    #[cfg(test)]
     fn direct_projection_recover_after_failed_read(&self);
     fn cache_generation(&self) -> u64;
     fn config(&self) -> Arc<Config>;
@@ -166,6 +167,7 @@ impl<G: QueryGraph> QueryGraph for Arc<G> {
         (**self).search(query, limit)
     }
 
+    #[cfg(test)]
     fn direct_projection_recover_after_failed_read(&self) {
         QueryGraph::direct_projection_recover_after_failed_read(&**self)
     }

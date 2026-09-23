@@ -48,11 +48,74 @@ pub(super) fn index_need(shared: &ProjectionShared, pending: &PendingProjection)
         IndexNeed::InHand
     } else if pending.requires_full_rebuild || pending.rebuild {
         IndexNeed::Fresh
-    } else if !shared.validated.load(Ordering::Acquire) || pending.stale {
+    } else if !shared.validated.load(Ordering::Acquire) || pending.revalidate {
         IndexNeed::Validate
     } else {
         IndexNeed::Nothing
     }
+}
+
+/// A failure the index met, as evidence for [`failure_owes_new_image`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexFailure {
+    /// SQLite refused a read statement.
+    StatementRefused,
+    /// A read found rows that contradict each other (`InvalidSnapshot`).
+    ContradictoryRows,
+    /// A worker turn failed and rolled back.
+    TurnFailed,
+}
+
+impl IndexFailure {
+    /// The failure a read that answered `reason` met.
+    pub(crate) fn of_read(reason: crate::query::QueryUnavailableReason) -> Self {
+        match reason {
+            crate::query::QueryUnavailableReason::InvalidSnapshot => Self::ContradictoryRows,
+            _ => Self::StatementRefused,
+        }
+    }
+}
+
+/// The one answer to "does this failure owe the index a new image?" (GH #543,
+/// class K1). Only damage does; every other failure is answered in place.
+///
+/// - `StatementRefused`: only when the image is damaged. A statement SQLite
+///   refuses on an intact image (an expression tree too deep, any hard limit
+///   on an admitted input) fails the same way on a freshly built one, so
+///   rebuilding for it rebuilt the whole index on every retry of that query
+///   (audit R10-01). The check (schema plus `quick_check`) runs once per
+///   ready generation.
+/// - `ContradictoryRows`: the reader's own evidence of damage `quick_check`
+///   cannot see -- rows only a Tine defect writes, such as a page with no
+///   position. Ignoring it left task and reference queries failing for the
+///   rest of the session (audit R11-06). Once per projection: a contradiction
+///   on the rebuilt image is a lowering defect no rebuild fixes.
+/// - `TurnFailed`: only when the image is damaged, checked afresh (the failed
+///   turn may be what damaged it). An intact image owes a validation instead,
+///   which the worker records (audit R11-07).
+pub(super) fn failure_owes_new_image(shared: &ProjectionShared, failure: IndexFailure) -> bool {
+    #[cfg(test)]
+    if shared.inject_image_damage.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    let damaged = !image_is_intact(shared, failure != IndexFailure::TurnFailed);
+    damaged
+        || failure == IndexFailure::ContradictoryRows
+            && !shared.contradiction_rebuilt.swap(true, Ordering::AcqRel)
+}
+
+/// Whether the stored image passes its schema check and `quick_check`;
+/// `memoized`: trust an earlier pass at this ready generation.
+fn image_is_intact(shared: &ProjectionShared, memoized: bool) -> bool {
+    let generation = shared.ready_generation.load(Ordering::Acquire);
+    let mut verified = shared.image_verified_intact_at.lock().unwrap();
+    if memoized && *verified == Some(generation) {
+        return true;
+    }
+    let intact = PhysicalGraphProjectionDatabase::open_read_only(&shared.path)
+        .is_ok_and(|database| database.validate_schema().is_ok() && database.quick_check().is_ok());
+    *verified = intact.then_some(generation);
+    intact
 }
 
 /// Whether the stored image answers for `pending.latest_generation`: nothing
@@ -242,33 +305,10 @@ impl DirectProjection {
         self.shared.changed.notify_all();
     }
 
-    /// Whether a failed read found the stored image damaged: only then does
-    /// it owe a rebuild. A statement SQLite refuses on an intact image (an
-    /// expression tree too deep, any hard limit on an admitted input) fails
-    /// the same way on a freshly built one, so rebuilding for it rebuilt the
-    /// whole index on every retry of that query (GH #543, audit R10-01). The
-    /// check (schema plus `quick_check`) runs once per ready generation.
-    pub(crate) fn failed_read_found_damage(&self) -> bool {
-        #[cfg(test)]
-        if self
-            .shared
-            .inject_image_damage
-            .swap(false, Ordering::AcqRel)
-        {
-            return true;
-        }
-        let generation = self.shared.ready_generation.load(Ordering::Acquire);
-        let mut verified = self.shared.image_verified_intact_at.lock().unwrap();
-        if *verified == Some(generation) {
-            return false;
-        }
-        let intact = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).is_ok_and(
-            |database| database.validate_schema().is_ok() && database.quick_check().is_ok(),
-        );
-        if intact {
-            *verified = Some(generation);
-        }
-        !intact
+    /// Whether `failure` owes the index a new image; see
+    /// [`failure_owes_new_image`].
+    pub(crate) fn failure_owes_new_image(&self, failure: IndexFailure) -> bool {
+        failure_owes_new_image(&self.shared, failure)
     }
 
     /// What whole-graph work the index needs next, once the worker has

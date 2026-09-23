@@ -25,6 +25,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   works (GH #543).
 - Restoring a backup no longer makes the file watcher re-read every restored
   file on top of re-indexing them (GH #543).
+- A write to the search index that fails once (for example a brief disk
+  error) now re-checks the index instead of rebuilding it from scratch, and an
+  index found holding inconsistent entries is rebuilt instead of leaving task
+  and reference queries failing until restart (GH #543).
 - After switching graphs, the previous graph's conflict banners and favourites
   order no longer show on the new graph while it loads (GH #543).
 - Changing `:hidden` (or another setting that reopens the graph) in

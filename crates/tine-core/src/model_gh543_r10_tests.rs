@@ -105,7 +105,7 @@ pub(super) fn r10_settle(graph: &Graph) {
 }
 
 /// A graph with a ready index and its owner running.
-fn r10_ready_graph(tag: &str) -> (PathBuf, Arc<Graph>, R10Owner) {
+pub(super) fn r10_ready_graph(tag: &str) -> (PathBuf, Arc<Graph>, R10Owner) {
     let root = r10_scratch(tag);
     r10_pages(&root, 12);
     let graph = Arc::new(Graph::open(&root));

@@ -187,12 +187,12 @@ impl Graph {
                 result
             }
         };
-        // Whether the repair must ERASE the disposable database before
-        // rebuilding it. A failed read over a damaged image owes that (the
-        // repair checks the image first); an idle projection that has
-        // simply not started yet does not, and erasing it there discarded the
-        // whole persisted index on every launch (GH #543).
-        let reset_before_rebuild = match attempt_captured() {
+        // The failure the read met, if it failed: only a failure can owe a
+        // new image, and whether it does is the one decider's call (K1). An
+        // idle projection that has simply not started yet is validated, never
+        // rebuilt: rebuilding it discarded the whole persisted index on every
+        // launch (GH #543).
+        let failure = match attempt_captured() {
             DirectAttempt::Answered(answer) => return Ok(answer),
             DirectAttempt::Cancelled => return Err(cancelled()),
             DirectAttempt::Unavailable(reason) => return Err(Error::Unavailable(reason)),
@@ -209,12 +209,14 @@ impl Graph {
                 // Idle and stale: nothing is coming, so repair. The repair
                 // still resets when the worker actually failed; it validates
                 // when the projection is merely not started yet.
-                Some(ProjectionProgress::Stale) => false,
+                Some(ProjectionProgress::Stale) => None,
             },
-            DirectAttempt::FailedRead(_) => true,
+            DirectAttempt::FailedRead(reason) => {
+                Some(crate::direct_projection::IndexFailure::of_read(reason))
+            }
         };
         #[cfg(test)]
-        if reset_before_rebuild {
+        if failure.is_some() {
             // Bind first: an `if let` scrutinee would hold the guard across
             // the pause.
             let pause = self
@@ -228,11 +230,7 @@ impl Graph {
                 pause.release.wait();
             }
         }
-        if reset_before_rebuild {
-            self.direct_projection_recover_after_failed_read();
-        } else {
-            self.direct_projection_repair(false);
-        }
+        self.direct_projection_repair(failure);
         match attempt_captured() {
             DirectAttempt::Answered(answer) => Ok(answer),
             DirectAttempt::Cancelled => Err(cancelled()),
@@ -896,21 +894,21 @@ impl Graph {
         })
     }
 
-    /// §5.9/M9: schedule the recovery a FAILED projection read owes.
-    ///
-    /// `mark_stale` alone would strand the projection until another edit. Repair
-    /// validates a complete source inventory, then captures one parsed snapshot
-    /// for a bounded staged build when there is no parsed cache, or reuses an
-    /// already-owned parsed snapshot.
+    /// §5.9/M9: the recovery a failed read owes, for a fixture that drives it
+    /// directly (see `recover_until_ready`). The app's reads reach it through
+    /// the dispatch above, with the failure they met.
+    #[cfg(test)]
     pub(crate) fn direct_projection_recover_after_failed_read(&self) {
-        self.direct_projection_repair(true);
+        self.direct_projection_repair(Some(
+            crate::direct_projection::IndexFailure::StatementRefused,
+        ));
     }
 
-    /// The repair itself. `reset`: a read failed, so a damaged image is erased.
+    /// The repair itself, for the `failure` a read met (`None`: it found the
+    /// index idle and not ready).
     ///
-    /// Erasing is the repair a torn or unreadable file owes, and it is never
-    /// the repair an intact one owes: `reset()` drops every source stamp, so
-    /// the complete inventory that follows re-lowers EVERY page. The app runs
+    /// A new image is the repair a damaged one owes, and it is never the
+    /// repair an intact one owes: it re-lowers EVERY page. The app runs
     /// queries before its background warm reaches the projection — the journal
     /// feed, backlinks, Ctrl-K — and such a query finds the worker idle,
     /// unvalidated and not yet failed, which `progress_at` reports as `Stale`.
@@ -920,24 +918,23 @@ impl Graph {
     /// nobody touching it (GH #543). A projection that has not failed is
     /// repaired by validating it against the source revisions it already
     /// stores, never by erasing it.
-    fn direct_projection_repair(&self, reset: bool) {
+    fn direct_projection_repair(&self, failure: Option<crate::direct_projection::IndexFailure>) {
         let Ok(_repair) = self.projection_recovery.try_lock() else {
             return;
         };
         crate::direct_projection::projection_diag(|| {
             format!(
-                "repair requested reset={reset} parsed_cache={}",
+                "repair requested failure={failure:?} parsed_cache={}",
                 self.cache.read().unwrap().is_some()
             )
         });
         let Some(projection) = self.direct_projection.get() else {
             return;
         };
-        if projection.worker_failed() || reset && projection.failed_read_found_damage() {
-            // A failed worker, or a failed read over a damaged image, owes a
-            // new image. A read refused on an intact image is that query's
-            // own answer (audit R10-01). `request_rebuild` is a no-op while a
-            // fresh build already replaces it (IT-10).
+        if failure.is_some_and(|failure| projection.failure_owes_new_image(failure)) {
+            // A failed worker turn recorded its own need (`Fresh` or
+            // `Validate`) when it failed. `request_rebuild` is a no-op while
+            // a fresh build already replaces the image (IT-10).
             projection.request_rebuild();
         }
         if projection.owner_registered() {
@@ -1319,9 +1316,9 @@ impl Graph {
     }
 
     #[cfg(test)]
-    pub(crate) fn direct_projection_mark_stale_test(&self) {
+    pub(crate) fn direct_projection_owe_validation_test(&self) {
         if let Some(projection) = self.direct_projection.get() {
-            projection.mark_stale();
+            projection.owe_validation_test();
         }
     }
 

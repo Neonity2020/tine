@@ -646,8 +646,16 @@ new generation.
 **A failed read repairs once, then reports the SQL outcome.** The in-scope
 scenarios are §3.1's: a torn or truncated projection file after a crash or power
 loss, a disk error, a resource limit, or a projection whose page set has drifted
-from the current graph generation. Because the projection is disposable,
-`dispatch_direct_query` requests a rebuild only after the failed job and its
+from the current graph generation. Only damage owes a new image, and one
+decider says when (`failure_owes_new_image`, GH #543 class K1): a statement
+SQLite refuses owes one only if the image fails its schema check or
+`quick_check` (memoized per ready generation); rows a read finds contradicting
+each other (`InvalidSnapshot`, damage `quick_check` cannot see) owe one, once
+per projection -- a contradiction on the rebuilt image is a lowering defect no
+rebuild fixes; a worker turn that fails owes one only if it was building one or
+the image is damaged, and on an intact image it rolled back and owes a
+validation instead. Because the projection is disposable,
+`dispatch_direct_query` requests the rebuild only after the failed job and its
 owned snapshot have dropped, then retries the SQL route once. The worker drains
 all old query jobs before it resets the file. If a complete parsed snapshot is
 already resident, recovery may enqueue it; otherwise recovery validates a

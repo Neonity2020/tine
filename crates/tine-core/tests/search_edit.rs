@@ -854,13 +854,14 @@ fn resolve_block_refreshes_after_cache_change() {
     // Prime resolution against the first exact cache generation.
     assert_eq!(g.resolve_block("aaaa-1111").unwrap().page, "A");
 
-    // A new page appears on disk; invalidate the cache as the watcher would.
+    // A new page appears on disk, and the watcher reports it.
     std::fs::write(
         root.join("pages").join("B.md"),
         "- beta\n  id:: bbbb-2222\n",
     )
     .unwrap();
-    g.invalidate_cache();
+    g.sync_file_checked(&root.join("pages").join("B.md"))
+        .unwrap();
     // Resolution must use the fresh cache — not serve a stale "not found" for
     // the new block, nor lose the old one.
     assert_eq!(g.resolve_block("bbbb-2222").unwrap().page, "B");

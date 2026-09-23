@@ -1378,7 +1378,7 @@ fn gh543_a_stale_image_is_not_made_ready_by_a_page_update() {
     assert!(owner.wait_ready(Duration::from_secs(10)));
     // Another graph's pass holds the process-wide permit.
     let held = OWNER_PERMIT.lock().unwrap();
-    graph.direct_projection_mark_stale_test();
+    graph.direct_projection_owe_validation_test();
     // A whole-graph read installs the parsed cache; a save queues a delta.
     graph.try_with_pages(|pages| pages.len()).unwrap();
     save_existing(&graph, "p1", "- edited while stale");
@@ -1420,7 +1420,7 @@ fn gh543_a_validation_that_needs_a_fresh_build_is_not_ready() {
     let passes_before = graph.owner_passes_test();
     // A validation is owed; a read fails on the image while it is queued.
     let pause = graph.pause_next_warm_before_enqueue_test();
-    graph.direct_projection_mark_stale_test();
+    graph.direct_projection_owe_validation_test();
     pause.reached.wait();
     graph
         .direct_projection_test()
@@ -1458,7 +1458,7 @@ fn gh543_a_retired_graphs_owner_runs_no_more_passes() {
     assert!(owner.wait_ready(Duration::from_secs(10)));
     let passes_before = graph.owner_passes_test();
     graph.retire();
-    graph.direct_projection_mark_stale_test();
+    graph.direct_projection_owe_validation_test();
     std::thread::sleep(Duration::from_millis(500));
     let passes = graph.owner_passes_test() - passes_before;
     owner.stop();

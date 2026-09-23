@@ -1341,7 +1341,7 @@ fn search_cache_isolates_one_page_projection_panic() {
     // flight (GH #550), so without that event the query below would be served
     // the parse from before these writes and never reach the panic isolation
     // this test is about. The build is still cold afterwards.
-    g.invalidate_cache();
+    g.invalidate_cache_test();
 
     let execution = crate::query_plan::QueryPlan::friendly(needle, 0, 8).execute_with_explain(
         &g,
@@ -1359,7 +1359,7 @@ fn search_cache_isolates_one_page_projection_panic() {
 
     // Invalidation clears the old diagnostic, and the paced warm-cache path
     // applies the same page-sized isolation when it rebuilds.
-    g.invalidate_cache();
+    g.invalidate_cache_test();
     assert!(g.page_index_failures().is_empty());
     g.warm_cache();
     assert!(crate::query_plan::QueryPlan::friendly(needle, 0, 8)
@@ -4749,7 +4749,7 @@ fn late_page_build_claim_after_completed_install_is_non_owner() {
     assert!(!owner);
     assert_eq!(late_flight.wait(), PageBuildOutcome::AlreadyAvailable);
     assert!(graph.page_build_flight.lock().unwrap().is_none());
-    graph.invalidate_cache();
+    graph.invalidate_cache_test();
     let (drifted_flight, owner) = graph.claim_page_build(expected_generation);
     assert!(!owner);
     assert_eq!(drifted_flight.wait(), PageBuildOutcome::GenerationDrift);
@@ -4998,7 +4998,7 @@ fn broad_invalidation_rebuilds_current_titles_once_before_creation() {
     graph.warm_cache();
     reset_page_build_test_counters(&graph);
     fs::write(&owner, "title:: Current Identity\n\n- owner\n").unwrap();
-    graph.invalidate_cache();
+    graph.invalidate_cache_test();
 
     let collision = graph
         .save_page(

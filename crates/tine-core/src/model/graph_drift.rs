@@ -259,12 +259,6 @@ pub(super) enum IndexEffect<'a> {
     /// every indexed read fell back to parsing the graph (GH #543, audit
     /// R4-03). The projection is fetched before the cache lock is taken.
     Unchanged(Option<&'a Arc<crate::direct_projection::DirectProjection>>),
-    /// The move changes the page set in a way no delta describes: a broad
-    /// external invalidation (`invalidate_cache`). The index must not carry
-    /// readiness past it; the next warm validation or full snapshot
-    /// re-derives the page set. A delete always names its file (or knows it
-    /// had none), so it never needs this (GH #543, audit R7-01).
-    Stale(Option<&'a Arc<crate::direct_projection::DirectProjection>>),
 }
 
 /// A mover's promise that the delta for its generation move follows; see
@@ -302,15 +296,12 @@ impl Graph {
         if let Some(change) = change {
             self.cache_structural_gen.record(change);
         }
-        if let IndexEffect::Stale(Some(projection)) = effect {
-            projection.mark_stale();
-        }
         let generation = self.cache_gen.fetch_add(1, Ordering::Release) + 1;
         match effect {
             IndexEffect::Unchanged(Some(projection)) => projection.advance_generation(generation),
             // The mover holds the promise until it has queued the delta.
             IndexEffect::Sent(_coming) => {}
-            IndexEffect::Unchanged(None) | IndexEffect::Stale(_) => {}
+            IndexEffect::Unchanged(None) => {}
         }
         generation
     }

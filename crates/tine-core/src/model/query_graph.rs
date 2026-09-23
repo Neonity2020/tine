@@ -97,6 +97,7 @@ impl QueryGraph for Graph {
         Graph::search(self, query, limit)
     }
 
+    #[cfg(test)]
     fn direct_projection_recover_after_failed_read(&self) {
         Graph::direct_projection_recover_after_failed_read(self)
     }

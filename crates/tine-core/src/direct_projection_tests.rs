@@ -510,7 +510,7 @@ fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
     page.blocks[0].raw = "TODO newer acquired image".into();
     graph.save_page(&page, baseline.as_deref()).unwrap();
     wait_ready(&graph);
-    projection.mark_stale();
+    projection.owe_validation_test();
     assert!(!projection.ready_at(graph.cache_generation()));
     let QueryJobOpen::Job(mut job) =
         projection.open_current_query_job(RegistrySensitivity::Insensitive)
@@ -565,7 +565,7 @@ fn current_snapshot_requires_initialization_but_not_source_freshness() {
     ));
     graph.warm_cache();
     wait_ready(&graph);
-    projection.mark_stale();
+    projection.owe_validation_test();
     let QueryJobOpen::Job(job) =
         projection.open_current_query_job(RegistrySensitivity::Insensitive)
     else {
@@ -966,7 +966,7 @@ fn b4_page_ref_and_property_facets_record_indexed_reads() {
     );
 
     let fallback_before = graph.direct_projection_fallback_reads_test();
-    graph.direct_projection_mark_stale_test();
+    graph.direct_projection_owe_validation_test();
     assert_eq!(
         graph.property_facets(),
         crate::query::property_facets(&graph)
@@ -1441,8 +1441,8 @@ fn a_failed_statement_read_repairs_and_retries_the_same_statement() {
         "the retry must go through the statement seam again"
     );
 
-    // The recovery obligation: `mark_stale` alone would only clear `ready`
-    // and strand the projection. The full-snapshot enqueue is scheduled from
+    // The recovery obligation: clearing `ready` alone would
+    // strand the projection. The full-snapshot enqueue is scheduled from
     // the already-parsed cache, so it needs no reparse, no disk read, and no
     // user action — `ready` comes back on its own.
     wait_ready(&graph);
@@ -1861,7 +1861,7 @@ fn b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence() {
     // catches up on its own and the same statement then answers.
     let fallback_before = graph.direct_projection_fallback_reads_test();
     let walks_before = crate::query::full_graph_query_evaluations();
-    graph.direct_projection_mark_stale_test();
+    graph.direct_projection_owe_validation_test();
     let stale_query = "(and (page-ref \"B4 Indexed Target\") \"synthetic\")";
     let oracle = crate::query::run_query_bounded(&graph, stale_query, 20_000, 32 * 1024 * 1024);
     let recovered = when_ready(|| graph.run_query_bounded(stale_query, 20_000, 32 * 1024 * 1024));
@@ -1942,7 +1942,7 @@ fn direct_projection_matches_literal_search_and_virtual_reference_names() {
     assert!(graph.direct_projection_referenced_name_reads_test() > 0);
 
     let name_reads = graph.direct_projection_referenced_name_reads_test();
-    graph.direct_projection_mark_stale_test();
+    graph.direct_projection_owe_validation_test();
     assert_eq!(
         signature(&graph.search("characteristically", 20).unwrap()),
         signature(&oracle)
@@ -2167,7 +2167,7 @@ fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
         Some("custom identity\nid:: not-a-uuid".to_string())
     );
 
-    graph.direct_projection_mark_stale_test();
+    graph.direct_projection_owe_validation_test();
     assert_eq!(graph.page_aliases_with_owners(), parser_aliases);
     assert_eq!(
         signature(&crate::query::backlinks(&graph, "target")),
@@ -5456,7 +5456,7 @@ fn edited_page_reload_and_sql_keep_the_same_session_ids() {
     std::fs::write(&entry.path, changed).unwrap();
     graph.sync_file_checked(&entry.path).unwrap();
     // Force a captured full snapshot for the incompatible external revision.
-    graph.invalidate_cache();
+    graph.invalidate_cache_test();
     graph.warm_cache();
     wait_ready(&graph);
     let external = graph.load_by_path(&entry.rel_path).unwrap().unwrap();
@@ -5507,7 +5507,7 @@ fn failed_projection_recovery_uses_one_captured_parsed_snapshot() {
     assert_ne!(expected.groups[0].page, "aaa-added");
     // Page creation may have warmed another feature's cache. Evict it
     // before repair so this gate measures recovery's own source ownership.
-    graph.invalidate_cache();
+    graph.invalidate_cache_test();
     assert!(!graph.has_parsed_cache_test());
     let writer = rusqlite::Connection::open(&database).unwrap();
     writer.execute_batch("DROP TABLE block_text").unwrap();
@@ -5627,7 +5627,7 @@ fn session_identity_survives_parsed_page_eviction() {
     drop(writer);
     let parses = graph.page_build_parses_test();
     let repairs = graph.warm_repair_parses_test();
-    graph.invalidate_cache();
+    graph.invalidate_cache_test();
     assert!(
         projection.session_pages_test().contains(&one),
         "dropping the parsed cache must retain compatible live IDs"
@@ -5668,6 +5668,7 @@ fn empty_projection_shared() -> ProjectionShared {
         commit_waker: Mutex::new(None),
         reader: Mutex::new(None),
         image_verified_intact_at: Mutex::new(None),
+        contradiction_rebuilt: AtomicBool::new(false),
         query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
         session_pages: Mutex::new(Arc::new(HashSet::new())),
         committed_registry: Arc::new(Mutex::new(None)),
@@ -5700,6 +5701,7 @@ fn empty_projection_shared() -> ProjectionShared {
         inject_read_failure: AtomicBool::new(false),
         inject_image_damage: AtomicBool::new(false),
         inject_turn_failure: AtomicBool::new(false),
+        last_turn_failed: AtomicBool::new(false),
         lease_contended: AtomicBool::new(false),
         fallback_reads: AtomicU64::new(0),
         referenced_name_reads: AtomicU64::new(0),

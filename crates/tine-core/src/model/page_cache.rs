@@ -1299,14 +1299,19 @@ impl Graph {
         outcome.installed() && !cancelled()
     }
 
-    /// Discard the cache; it rebuilds on the next whole-graph query. Use when an
-    /// external change may have touched many files.
-    pub fn invalidate_cache(&self) {
+    /// Discard the parsed cache and owe the index a validation, as if many
+    /// files had changed behind the graph with no event naming them. Nothing
+    /// in the app does this: every change reaches the graph by path (audit
+    /// R11-08), so fixtures that need a cold graph use this.
+    #[cfg(test)]
+    pub(crate) fn invalidate_cache_test(&self) {
         self.invalidate_guarded_graph_text_identity(
             "broad external cache invalidation has no exact path generation",
         );
-        let projection = self.direct_projection.get();
-        self.discard_parsed_cache(graph_drift::IndexEffect::Stale(projection.as_ref()));
+        if let Some(projection) = self.direct_projection.get() {
+            projection.owe_validation_test();
+        }
+        self.discard_parsed_cache(graph_drift::IndexEffect::Unchanged(None));
     }
 
     #[cfg(test)]
