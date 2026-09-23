@@ -1575,7 +1575,7 @@ mod tests {
              index owner: {between}"
         );
         let refresh_entry = &state[state
-            .find("pub(crate) fn refresh_graph_for_label")
+            .find("\nfn refresh_graph_for_label")
             .expect("refresh entry")..];
         assert!(
             refresh_entry.find(".commit(&old)") < refresh_entry.find("warm_cache_async("),

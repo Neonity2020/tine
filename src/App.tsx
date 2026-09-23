@@ -44,7 +44,7 @@ import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
-import { applyGraphConfigChange, loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
+import { applyGraphConfigChange, applyGraphReopened, loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
 import { applyObservedAssetChanges } from "./assetRefresh";
 import { favoritesPageChanged } from "./favoritesStore";
 import { checkForUpdate } from "./update";
@@ -1144,6 +1144,11 @@ export function App(): JSX.Element {
     void backend()
       .onGraphConfigChanged((meta) => applyGraphConfigChange(meta))
       .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  onMount(() => {
+    let unsub = () => {};
+    void backend().onGraphReopened(applyGraphReopened).then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
   onMount(() => {

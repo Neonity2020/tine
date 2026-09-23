@@ -1,6 +1,6 @@
 use crate::settings::{settings_path, update_settings};
 use crate::state::{
-    refresh_graph_for_label, slot_for_window, AppState, GraphSlot, RefreshLaneWait, RefreshOutcome,
+    refresh_graph_for_config_change, slot_for_window, AppState, GraphSlot, RefreshOutcome,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1459,7 +1459,7 @@ fn refresh_changed_configs(
             tine_core::config::ConfigReach::Graph => {}
         }
         drop(slot);
-        match refresh_graph_for_label(&state, app, label, RefreshLaneWait::TryOnce) {
+        match refresh_graph_for_config_change(&state, app, label) {
             Ok(RefreshOutcome::Deferred) => {
                 recheck.insert(label.clone());
                 deferred = true;

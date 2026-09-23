@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tauri::ipc::{CommandArg, CommandItem, InvokeBody, InvokeError};
-use tauri::{Manager, Runtime, State, WebviewWindow};
+use tauri::{Emitter, Manager, Runtime, State, WebviewWindow};
 use tine_core::model::Graph;
 
 pub(crate) type WindowKey = String;
@@ -609,11 +609,32 @@ pub(crate) async fn refresh_graph(
     .map_err(CommandError::worker)?
 }
 
-/// Re-read configuration for one window's graph without a `GraphContext`.
+/// Reopen a window's graph because its configuration changed on disk, and tell
+/// the window its graph was rebound.
 ///
-/// The watcher has a window label and an `AppHandle` and no command context, so
-/// this is the shared body; `refresh_graph` is the blocking command-side entry.
-pub(crate) fn refresh_graph_for_label(
+/// A reopen replaces the `Graph` the window's in-flight results and page
+/// inventory belong to. A command that reopens it is announced by the frontend
+/// when the command returns (`REBINDING_COMMANDS`, pinned by
+/// `commands_that_reopen_the_graph`); the watcher has no caller to return to,
+/// so it announces its own reopen here. Without it a `:hidden` change left All
+/// Pages and page links on the old page set (GH #543, audit R9-13).
+/// `refresh_graph_for_label` is private to this module so these two entries
+/// are the only ways to reopen a graph.
+pub(crate) fn refresh_graph_for_config_change(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    label: &str,
+) -> Result<RefreshOutcome, CommandError> {
+    let outcome = refresh_graph_for_label(state, app, label, RefreshLaneWait::TryOnce)?;
+    if outcome == RefreshOutcome::Refreshed {
+        let _ = app.emit_to(label, "graph-rebound", ());
+    }
+    Ok(outcome)
+}
+
+/// Re-read configuration for one window's graph without a `GraphContext`:
+/// the shared body of [`refresh_graph`] and [`refresh_graph_for_config_change`].
+fn refresh_graph_for_label(
     state: &AppState,
     app: &tauri::AppHandle,
     label: &str,

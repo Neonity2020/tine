@@ -43,6 +43,12 @@ export const favoritesLayoutPage = layoutPage;
 /** Revision the arrangement page was loaded at, for the save baseline. */
 let layoutRev: string | null = null;
 
+/** Which arrangement this store holds. Every reset starts a new one, so an
+ *  answer or a write that began under an earlier one — another graph's
+ *  arrangement read still in flight across a switch — lands nowhere (GH #543,
+ *  audit R9-11; I-20). */
+let arrangement = 0;
+
 // Where projected membership goes. A callback rather than an import so this
 // module stays free of any dependency on ui.ts, which imports it.
 let membershipSink: ((names: string[]) => void) | null = null;
@@ -51,6 +57,7 @@ export function setMembershipSink(sink: (names: string[]) => void) {
 }
 
 export function resetFavoritesLayout() {
+  arrangement++;
   setLayoutSignal(emptyLayout());
   setLayoutPage(null);
   layoutRev = null;
@@ -64,10 +71,12 @@ export async function loadFavoritesLayout(
   page: string | null | undefined,
 ): Promise<FavLayout> {
   resetFavoritesLayout();
+  const owner = arrangement;
   if (page) {
     setLayoutPage(page);
     try {
       const dto = await backend().getPage(page, "page");
+      if (owner !== arrangement) return layout();
       if (dto) {
         layoutRev = dto.rev ?? null;
         setLayoutSignal(reconcileLayout(layoutFromBlocks(dto.blocks), membership));
@@ -77,6 +86,7 @@ export async function loadFavoritesLayout(
       // A missing or unreadable arrangement page must never cost the user their
       // favorites: config.edn still has membership, so fall back to a flat list.
     }
+    if (owner !== arrangement) return layout();
   }
   setLayoutSignal(reconcileLayout(emptyLayout(), membership));
   return layout();
@@ -114,13 +124,14 @@ export function adoptExternalMembership(membership: string[]): FavLayout {
 export async function favoritesPageChanged(names: readonly string[]): Promise<void> {
   const page = layoutPage();
   if (!page || !names.includes(page)) return;
+  const owner = arrangement;
   let dto: PageDto | null = null;
   try {
     dto = await backend().getPage(page, "page");
   } catch {
     return; // an unreadable page must never cost the user their favorites
   }
-  if (!dto) return;
+  if (!dto || owner !== arrangement) return;
   const rev = dto.rev ?? null;
   // Tine's own write, echoed back by the watcher. Nothing to adopt.
   if (rev !== null && rev === layoutRev) return;
@@ -162,6 +173,10 @@ function layoutPageDto(name: string, next: FavLayout): PageDto {
  *  and the next reconcile folds the page back into agreement. The reverse order
  *  could leave membership naming pages the arrangement has never heard of. */
 export async function persistFavoritesLayout(next: FavLayout): Promise<void> {
+  const owner = arrangement;
+  // Each write goes to the graph bound NOW; after a switch it would be the
+  // next graph's config.edn and favorites page (audit R9-11).
+  const current = () => owner === arrangement;
   setLayoutSignal(next);
   const names = layoutMembers(next).map((item) => item.name);
   // The flat membership list follows the arrangement's display order, so a
@@ -188,12 +203,14 @@ export async function persistFavoritesLayout(next: FavLayout): Promise<void> {
   }
   try {
     const saved = await backend().savePage(layoutPageDto(page, next), layoutRev);
+    if (!current()) return;
     layoutRev = saved.revision;
     await backend().setFavoritesPage(page);
   } catch {
     // Losing the arrangement is survivable; losing membership is not. Fall
     // through and still project, so the favorites themselves persist.
   }
+  if (!current()) return;
   await backend().setFavorites(names).catch(() => {});
 }
 

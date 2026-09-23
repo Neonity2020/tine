@@ -989,6 +989,10 @@ export interface Backend {
    *  Carries the fresh GraphMeta; a graph whose settings did not move emits
    *  nothing. */
   onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void>;
+  /** The backend reopened this window's graph on its own (a `config.edn`
+   *  change that reaches the graph). A command that reopens it is announced by
+   *  its return instead (`REBINDING_COMMANDS`). */
+  onGraphReopened(cb: () => void): Promise<() => void>;
   /** A committed query image changed; does not reload or replace live editors. */
   onQueryProjectionChanged(cb: () => void): Promise<() => void>;
   /** Direct Markdown folder-watch reconcile failure. */
@@ -2043,6 +2047,10 @@ class TauriBackend implements Backend {
   async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
+  }
+  async onGraphReopened(cb: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen("graph-rebound", () => cb());
   }
   async onQueryProjectionChanged(cb: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");

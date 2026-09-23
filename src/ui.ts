@@ -702,10 +702,30 @@ export async function refreshSyncConflicts(notify: "new" | false = false): Promi
       }
     }
   } catch {
-    // Best-effort: a missing inventory means no badge, never a broken app.
-    // The listings keep their last answer; the Settings fallback still works.
-    if (generation === artifactConflictRefreshGeneration) replaceArtifactConflictQueue([]);
+    // Best-effort: a missing inventory means no badge, never a broken app. The
+    // listings and the queue are one answer, so they go together: a banner
+    // with no queue entry behind it cannot be resolved (audit R9-12).
+    if (generation === artifactConflictRefreshGeneration) clearArtifactConflicts();
   }
+}
+
+function clearArtifactConflicts(): void {
+  setSyncConflicts([]);
+  setVcsMarkerConflicts([]);
+  replaceArtifactConflictQueue([]);
+  retireSettledArtifactArrivalToasts([]);
+}
+
+/** Every conflict listing belongs to the graph it was read from. Opening a
+ *  graph clears them and drops any answer still in flight from the old one, so
+ *  graph A's marker banner never shows on graph B's page at the same path while
+ *  B's inventory is still being read (GH #543, audit R9-12; I-20). Live save
+ *  conflicts are per graph already: `restoreLiveSaveConflicts` replaces them. */
+export function resetGraphConflicts(): void {
+  ++artifactConflictRefreshGeneration;
+  ++journalConflictRefreshGeneration;
+  clearArtifactConflicts();
+  setJournalConflicts([]);
 }
 
 let paneFocusSetter: ((paneId: string, rememberLayout?: boolean) => void) | undefined;

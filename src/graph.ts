@@ -3,8 +3,9 @@
 
 import { backend } from "./backend";
 import { graphBindingRuntime } from "./graphBindingRuntime";
-import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, conflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
+import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, resetGraphConflicts, restoreLiveSaveConflicts, conflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
+import { notifyGraphRebound } from "./modeHooks";
 import { resetStore, flushAll, doc, pageByName, forgetPage, invalidateUndoForPage, reloadPageIfStillSafe } from "./store";
 import { dirtyPages, graphBinding, renameFlushFailureMessage, savingPages } from "./persistence";
 import { clearAssetBlobCache } from "./assetCache";
@@ -191,6 +192,7 @@ export async function loadGraphPath(
   }
   resetStore();
   resetNavigationIndex();
+  resetGraphConflicts();
   clearAssetBlobCache(); // old graph's image blob URLs must not leak into the new one
   if (switching) {
     // A graph switch is a full workspace reset (OG opens one graph at a time):
@@ -322,9 +324,33 @@ function bindNavigationIndex(epoch: number): void {
 
 async function completeNavigationIndex(epoch: number): Promise<void> {
   if (!aliasesLoaded && aliasesRequestedAt !== epoch) await refreshAliases();
-  if (!pageIdentitiesLoaded && pageIdentitiesRequestedAt !== epoch) {
-    await refreshPageIdentities();
-  }
+  await ensurePageIdentities(epoch);
+}
+
+/** Fetch the page identities unless this epoch already has them or is already
+ *  fetching them. Graph open used to list the pages twice when a save's alias
+ *  refresh landed before warm-cache-done and completed the index first
+ *  (audit R9-08). */
+async function ensurePageIdentities(epoch: number): Promise<void> {
+  if (
+    navigationEpoch === epoch
+    && (pageIdentitiesLoaded || pageIdentitiesRequestedAt === epoch)
+  ) return;
+  await refreshPageIdentities();
+}
+
+/** A request answered after the render epoch moved finds the index cleared and
+ *  drops its answer. A repaint-only bump keeps the graph, so unless the new
+ *  epoch has already asked, ask again: nothing else re-requests the index
+ *  loaded at graph open (audit R9-10). A different binding asks for itself. */
+function reaskAfterRepaint(
+  binding: number,
+  requestedAt: () => number,
+  loaded: () => boolean,
+): boolean {
+  if (binding !== graphBinding()) return false;
+  const current = graphEpoch();
+  return navigationEpoch !== current || !(loaded() || requestedAt() === current);
 }
 
 function commitNavigationIndex(): void {
@@ -355,20 +381,31 @@ function aliasMapChanged(
  *  older same-epoch response from overwriting a newer alias edit. */
 export async function refreshAliases(): Promise<void> {
   const epoch = graphEpoch();
+  const binding = graphBinding();
   bindNavigationIndex(epoch);
   aliasesRequestedAt = epoch;
   const request = ++aliasRequest;
   const result = await Promise.allSettled([backend().pageAliases()]);
-  if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== aliasRequest) return;
+  if (epoch !== graphEpoch() || navigationEpoch !== epoch) {
+    if (reaskAfterRepaint(binding, () => aliasesRequestedAt, () => aliasesLoaded)) {
+      await refreshAliases();
+    }
+    return;
+  }
+  if (request !== aliasRequest) return;
+  if (result[0].status !== "fulfilled") {
+    // A failed half stays unloaded, so the next refresh asks again instead of
+    // publishing an empty answer as if it were the graph's (audit R9-09).
+    aliasesRequestedAt = -1;
+    return;
+  }
   aliasEntries = {};
-  if (result[0].status === "fulfilled") {
-    for (const [alias, owner] of result[0].value) {
-      const key = pageIdentityKey(alias);
-      // Core returns owners in deterministic path order; preserve its first-wins
-      // fallback when duplicate owners contribute the same folded alias.
-      if (!Object.prototype.hasOwnProperty.call(aliasEntries, key)) {
-        aliasEntries[key] = owner;
-      }
+  for (const [alias, owner] of result[0].value) {
+    const key = pageIdentityKey(alias);
+    // Core returns owners in deterministic path order; preserve its first-wins
+    // fallback when duplicate owners contribute the same folded alias.
+    if (!Object.prototype.hasOwnProperty.call(aliasEntries, key)) {
+      aliasEntries[key] = owner;
     }
   }
   aliasesLoaded = true;
@@ -381,28 +418,48 @@ export async function refreshAliases(): Promise<void> {
  *  this whole-page-list IPC. Real pages override colliding semantic aliases. */
 export async function refreshPageIdentities(): Promise<void> {
   const epoch = graphEpoch();
+  const binding = graphBinding();
   bindNavigationIndex(epoch);
   pageIdentitiesRequestedAt = epoch;
   const request = ++pageIdentityRequest;
   const result = await Promise.allSettled([backend().listPages()]);
-  if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== pageIdentityRequest) return;
-  pageIdentities = result[0].status === "fulfilled"
-    ? Object.fromEntries(
-        result[0].value
-          .filter((entry) => entry.kind === "page")
-          .map((entry) => [pageIdentityKey(entry.name), entry.name])
-      )
-    : {};
+  if (epoch !== graphEpoch() || navigationEpoch !== epoch) {
+    if (reaskAfterRepaint(binding, () => pageIdentitiesRequestedAt, () => pageIdentitiesLoaded)) {
+      await refreshPageIdentities();
+    }
+    return;
+  }
+  if (request !== pageIdentityRequest) return;
+  if (result[0].status !== "fulfilled") {
+    // Publishing aliases beside an empty identity set is the state R8-08
+    // forbids: every alias would beat the real page of its name (audit R9-09).
+    pageIdentitiesRequestedAt = -1;
+    return;
+  }
+  pageIdentities = Object.fromEntries(
+    result[0].value
+      .filter((entry) => entry.kind === "page")
+      .map((entry) => [pageIdentityKey(entry.name), entry.name])
+  );
   pageIdentitiesLoaded = true;
   commitNavigationIndex();
   await completeNavigationIndex(epoch);
 }
 
+/** Graph open's navigation index, once the warm pass has parsed every alias.
+ *  Warm-cache-done belongs to the binding, not the render epoch: a repaint
+ *  during the wait used to cancel the load, and nothing asked again (audit
+ *  R9-10). Aliases are always re-read here; the page identities only if this
+ *  epoch has not already fetched them (audit R9-08). */
 async function loadAliases(): Promise<void> {
-  const epoch = graphEpoch();
-  if (!(await waitForWarmCache(epoch))) return;
-  if (epoch !== graphEpoch()) return;
-  await Promise.all([refreshAliases(), refreshPageIdentities()]);
+  const binding = graphBinding();
+  await waitForWarmCache(graphEpoch());
+  if (binding !== graphBinding()) return;
+  await loadNavigationIndexAfterWarm();
+}
+
+export async function loadNavigationIndexAfterWarm(): Promise<void> {
+  await Promise.all([refreshAliases(), ensurePageIdentities(graphEpoch())]);
 }
 
 /** What a rename may proceed with after trying to save every pending edit. */
@@ -871,6 +928,15 @@ export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | n
  *  Before this existed, Tine read the file once per graph open, so an edit made
  *  in Logseq — or delivered by Syncthing — was invisible for the rest of the
  *  session, and the next settings write in Tine was based on the stale copy. */
+/** The backend reopened this graph after a `config.edn` change that reaches
+ *  the graph (for example `:hidden`). Everything read from the old `Graph` is
+ *  stale: in-flight results are dropped and the page set, the navigation index
+ *  and what is on screen are read again (GH #543, audit R9-13). */
+export function applyGraphReopened(): void {
+  notifyGraphRebound();
+  bumpGraphEpoch();
+}
+
 export function applyGraphConfigChange(meta: GraphMeta): void {
   const previous = graphMeta();
   if (previous && previous.root !== meta.root) return; // a different graph's window

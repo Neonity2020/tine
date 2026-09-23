@@ -6409,11 +6409,65 @@
  "layer": "integration",
  "status": "covered",
  "coverage": {
-  "tests": ["src-tauri/src/watcher/tests.rs::a_config_write_reaches_only_the_configuration_queue", "crates/tine-core/src/model_tests.rs::a_gone_path_is_a_subtree_only_if_the_index_holds_a_file_under_it", "crates/tine-core/src/projection_producer_census.rs::watch_reach_has_one_producer"],
+  "tests": ["src-tauri/src/watcher/tests.rs::a_config_write_reaches_only_the_configuration_queue", "crates/tine-core/src/model_watch_reach_tests.rs::a_gone_path_is_a_subtree_only_if_the_index_holds_a_file_under_it", "crates/tine-core/src/projection_producer_census.rs::watch_reach_has_one_producer"],
   "scenario": null,
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 9, R9-05 and R9-06. Both watcher deciders read a gone path, or config.edn, as maybe a directory of pages. Fix: one answer, Graph::graph_text_watch_reach, used by the batch queue and the callback: configuration reaches only its own queue, and a gone path is a subtree only when the current identity index holds a file under it (or there is no current index). Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C2-watcher.txt."
+},
+{
+ "id": "REG-ANOTHER-GRAPHS-STATE-NEVER-SHOWS-543",
+ "title": "After switching graphs, the previous graph's conflict banners, conflict listings and favourites arrangement never show on the new graph, even while the new graph's answers are still loading or fail",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src/graphScopedState.test.tsx::does not show graph A's conflicts on graph B, pending or failed", "src/graphScopedState.test.tsx::drops graph A's late favourites arrangement once graph B has its own", "src/graphScopedState.test.tsx::drops graph A's failed favourites read once graph B is flat"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-11 and R9-12 (I-20). Graph open emptied the store but not the conflict listings, and a favourites arrangement read from the old graph could land after the switch. Fix: loadGraphPath clears every conflict listing and revokes its in-flight refreshes (resetGraphConflicts); the favourites store carries an arrangement token that every read and write re-checks after each await. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C3-frontend.txt."
+},
+{
+ "id": "REG-A-GRAPH-REOPENED-BY-A-CONFIG-CHANGE-REFRESHES-THE-PAGE-SET-543",
+ "title": "When config.edn changes outside Tine in a way that reopens the graph (for example :hidden), All Pages, page links and in-flight results follow the reopened graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src/graphScopedState.test.tsx::revokes the old binding and repaints when the backend reopens the graph"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-13. A command that reopens the graph is announced by the frontend when it returns (REBINDING_COMMANDS); the watcher's reopen was announced only when GraphMeta changed, which :hidden does not touch. Fix (shape): refresh_graph_for_label is private to state.rs; the watcher reopens only through refresh_graph_for_config_change, which emits graph-rebound, and the frontend revokes the binding and repaints (applyGraphReopened). Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C3-frontend.txt."
+},
+{
+ "id": "REG-THE-NAVIGATION-INDEX-IS-ASKED-ONCE-AND-COMPLETED-543",
+ "title": "Page links and aliases resolve correctly after launch: the page list is read once, a failed read is asked again rather than letting aliases beat real pages, and a repaint during launch does not leave the index empty",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src/navigationIndex.test.ts::lists the pages once at launch when a save refresh lands before the warm", "src/navigationIndex.test.ts::asks a failed page listing again instead of publishing aliases over no pages", "src/navigationIndex.test.ts::asks again at the new epoch when a repaint lands while the index is in flight"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-08, R9-09 and R9-10. Fix: each half of the navigation index (aliases, page identities) is requested once per epoch (ensurePageIdentities), a failed half stays unloaded so the next refresh asks again, a half answered after a repaint-only epoch bump re-asks at the new epoch for the same binding, and graph open waits for the warm by binding rather than by epoch. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C3-frontend.txt."
 }
 ]
 }

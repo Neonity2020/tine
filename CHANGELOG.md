@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- After switching graphs, the previous graph's conflict banners and favourites
+  order no longer show on the new graph while it loads (GH #543).
+- Changing `:hidden` (or another setting that reopens the graph) in
+  `config.edn` outside Tine now updates All Pages and page links without a
+  restart (GH #543).
+- Page links and aliases resolve correctly after launch even when the page
+  list is read during a repaint or fails once, and the page list is read once
+  instead of twice (GH #543).
 - A page edited while Tine was closed is re-indexed on its own at the next
   launch, instead of the whole graph being re-indexed with search unavailable
   meanwhile (GH #543).
