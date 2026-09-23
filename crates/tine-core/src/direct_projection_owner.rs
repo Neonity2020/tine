@@ -53,6 +53,18 @@ pub(super) fn index_need(shared: &ProjectionShared, pending: &PendingProjection)
     }
 }
 
+/// Whether the stored image answers for `pending.latest_generation`: nothing
+/// whole-graph is owed and no page update is queued. The one test readiness
+/// is published under -- by the worker at the end of a turn and by
+/// `advance_generation` -- so readiness is never claimed over an image the
+/// decider still owes a pass. A turn that ignored a stale mark or a latched
+/// fresh build published readiness beside a `Validate`/`Fresh` need; the
+/// owner's pass then found the image "ready", did nothing, and ran again at
+/// once, millions of times a second (GH #543, audit R7-02).
+pub(super) fn image_is_current(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
+    index_need(shared, pending) == IndexNeed::Nothing && !pending.has_work()
+}
+
 /// Whether a fresh build already owns this image's replacement: one is
 /// running, or a rebuild is queued with the payload that carries it. A
 /// read that failed on the current image owes nothing more then -- the

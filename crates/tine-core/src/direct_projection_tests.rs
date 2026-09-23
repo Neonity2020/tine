@@ -531,10 +531,15 @@ fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
     let baseline = page.rev.clone();
     page.blocks[0].raw = "TODO after snapshot".into();
     graph.save_page(&page, baseline.as_deref()).unwrap();
-    wait_ready(&graph);
+    // The stale mark stands until a validation or a fresh build re-derives
+    // the page set, so the update lands in the image without making it
+    // ready (GH #543, audit R7-02); the current image is still newer.
+    assert!(projection.wait_drained_test());
     assert!(!job.is_cancelled());
     assert_eq!(job.snapshot.query_revision().unwrap(), acquired_revision);
-    let QueryJobOpen::Job(current) = projection.open_query_job(graph.cache_generation()) else {
+    let QueryJobOpen::Job(current) =
+        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+    else {
         panic!("new image job");
     };
     assert!(current.query_revision > acquired_revision);
@@ -1953,6 +1958,10 @@ fn direct_projection_matches_literal_search_and_virtual_reference_names() {
         "a stale generation must not read reference names from SQLite"
     );
 
+    // The stale mark stands until a validation or a fresh build re-derives
+    // the page set; a page update does not (GH #543, audit R7-02).
+    recover_until_ready(&graph);
+
     let entry = graph
         .list_pages()
         .into_iter()
@@ -2165,6 +2174,10 @@ fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
         graph.block_ref_counts().unwrap().as_ref(),
         parser_counts.as_ref()
     );
+
+    // The stale mark stands until a validation or a fresh build re-derives
+    // the page set; a page update does not (GH #543, audit R7-02).
+    recover_until_ready(&graph);
 
     let target_path = root.join("pages/target.md");
     std::fs::write(
@@ -8088,11 +8101,10 @@ fn a_page_cache_by_name_map_is_not_a_lookup() {
 }
 
 /// A file that leaves the graph is retired BY PATH, with the entry the caller
-/// already holds. `cache_remove(name, kind, None)` retires only what it can
-/// find, and with a cold parsed cache and no current page-list memo it finds
-/// nothing — so it falls through to marking the index stale with no producer
-/// queued, and search goes on answering from a file that is now in the trash
-/// (sixth audit A6-N3, where the PDF highlight migration did exactly this).
+/// already holds. `cache_remove(name, kind, None)` says the page had no
+/// file, so with a cold parsed cache it retires nothing and search goes on
+/// answering from a file that is now in the trash (sixth audit A6-N3, where
+/// the PDF highlight migration did exactly this).
 /// The rule is checkable, so it is checked here rather than written in a
 /// comment: a function that MOVES graph text may not retire by name without
 /// handing over the entry it moved. Blessed exemplars:
@@ -8158,9 +8170,9 @@ fn a_moved_file_is_never_retired_by_a_lookup_that_can_come_back_empty() {
         offenders.is_empty(),
         "a function that moves graph text retires the file it moved by PATH \
          (`cache_remove_path`), or by name WITH the entry it holds — never \
-         `cache_remove(name, kind, None)`, which retires nothing when the \
-         parsed cache is cold and leaves search answering from a trashed file \
-         with no producer queued to correct it (GH #543, sixth audit A6-N3). \
+         `cache_remove(name, kind, None)`, which says the page had no file: \
+         with a cold parsed cache it retires nothing and leaves search \
+         answering from a trashed file (GH #543, sixth audit A6-N3). \
          Imitate `journals.rs::trash_journal_file`. Offenders: {offenders:?}"
     );
 }
@@ -10586,4 +10598,63 @@ fn gh543_a_full_turn_with_a_delete_and_a_later_update_applies() {
     );
     assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Readiness has one publication rule: the image answers for the latest
+/// generation only when the decider owes it nothing (`image_is_current`).
+/// Two publishers with their own tests -- one ignoring a stale mark, the
+/// other a latched fresh build -- claimed readiness beside a pass the owner
+/// still owed, and the owner re-ran that pass millions of times a second
+/// (GH #543, audit R7-02). Every store of `ready = true` or of
+/// `ready_generation` must sit under `image_is_current`; imitate the turn end
+/// in `direct_projection.rs` (`if image_is_current(&shared, &pending)`).
+#[test]
+fn readiness_is_published_only_where_the_decider_owes_nothing() {
+    fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    visit(&root, &mut files);
+    files.sort();
+    let mut publications = 0;
+    let mut offenders = Vec::new();
+    for path in files.iter().filter(|path| {
+        let name = path.to_string_lossy();
+        !name.ends_with("_tests.rs") && !name.contains("/tests/")
+    }) {
+        let source = std::fs::read_to_string(path).unwrap();
+        // Cut test modules off: their stores set up fixtures.
+        let source = source.split("#[cfg(test)]\nmod ").next().unwrap();
+        let squeezed: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in ["ready.store(true", "ready_generation .store("] {
+            for (at, _) in squeezed.match_indices(needle) {
+                publications += 1;
+                let window = &squeezed[at.saturating_sub(400)..at];
+                if !window.contains("image_is_current(") {
+                    offenders.push(format!(
+                        "{}: …{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        &squeezed[at.saturating_sub(120)..at + needle.len()]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        publications >= 3,
+        "the scan found {publications} publications: it is blind"
+    );
+    assert!(
+        offenders.is_empty(),
+        "readiness is published only under `image_is_current` (GH #543, audit \
+         R7-02); imitate the turn end in direct_projection.rs. Offenders: {offenders:?}"
+    );
 }

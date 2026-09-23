@@ -6126,6 +6126,42 @@
   "failBefore": "proven"
  },
  "notes": "Found by the seeded harness (seed 1288, about 1 in 100 runs under load). A deletion after a full snapshot was queued left a gap in the queue's page order; the full turn hands storage the order without gaps, so a later page's update taken with it carried a position one past its place and tine-storage refused the turn ('page order differs from complete inventory'). The owner backed off and reads parsed the graph. The full turn now reseeds the queue's order from the inventory it writes and re-places the updates it takes (reseed_order, the same step a warm repair and an incomplete full already take). Fail-before: tine-agents/evidence/gh550-batch/stage4/necessity-full-order-gap.log."
+},
+{
+ "id": "REG-READINESS-IS-NOT-CLAIMED-WHILE-A-PASS-IS-OWED-543",
+ "title": "The search index is not reported ready while it still owes a whole-graph pass, so the index owner cannot spin",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_stale_image_is_not_made_ready_by_a_page_update", "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_validation_that_needs_a_fresh_build_is_not_ready", "crates/tine-core/src/direct_projection_tests.rs::readiness_is_published_only_where_the_decider_owes_nothing"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Round-7 indexing audit R7-02/R7-02b. The worker's turn end published readiness without consulting the stale mark or a latched fresh build, so readiness stood beside a Validate/Fresh need; the owner's pass found the image ready, did nothing, counted itself settled and ran again at once (5.9M passes/s measured), and a damaged image kept answering. Both publishers (turn end, advance_generation) now publish only under image_is_current (index_need == Nothing and no queued work), the turn end withdraws readiness otherwise, and an owner pass counts as settled only if its need moved. Guard: the source scan fails on any readiness store outside image_is_current. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r7/necessity-fail-before.log."
+},
+{
+ "id": "REG-DELETING-A-FILELESS-PAGE-DOES-NOT-WALK-THE-GRAPH-543",
+ "title": "Deleting a page that has no file does not re-check the whole graph against the search index",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_deleting_a_page_with_no_file_does_not_walk_the_graph"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Round-7 indexing audit R7-01. delete_page_expected passes cache_remove the inventory's answer, but cache_remove guessed from the page-list memo and, finding nothing with a cold cache, marked the index stale: the owner walked every page (and during the launch check abandoned and repeated its walk). cache_remove now takes the inventory's answer as authoritative; a page with no file moves the generation with IndexEffect::Unchanged. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r7/necessity-fail-before.log."
 }
 ]
 }

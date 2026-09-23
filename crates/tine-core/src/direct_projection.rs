@@ -28,7 +28,7 @@ use uuid::Uuid;
 mod lease;
 #[path = "direct_projection_owner.rs"]
 mod owner;
-use owner::{backing_off, index_need, note_unsettled};
+use owner::{backing_off, image_is_current, index_need, note_unsettled};
 pub(crate) use owner::{IndexNeed, IndexOwnerRegistration, OwnerStep};
 
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
@@ -1380,11 +1380,9 @@ impl DirectProjection {
             return;
         }
         pending.latest_generation = pending.latest_generation.max(generation);
-        if !pending.has_work()
-            && !pending.rebuild
-            && !self.shared.worker_busy.load(Ordering::Acquire)
+        if !self.shared.worker_busy.load(Ordering::Acquire)
             && self.shared.ready.load(Ordering::Acquire)
-            && self.shared.validated.load(Ordering::Acquire)
+            && image_is_current(&self.shared, &pending)
         {
             self.shared
                 .ready_generation
@@ -2360,7 +2358,7 @@ impl DirectProjection {
     pub(crate) fn debug_state_test(&self) -> String {
         let pending = self.shared.pending.lock().unwrap();
         format!(
-            "ready={} validated={} ready_generation={} latest_generation={} full={} deltas={} warm={} warm_outcome={:?} rebuild={} stop={} page_order={} worker_available={} worker_failed={} worker_busy={}",
+            "ready={} validated={} ready_generation={} latest_generation={} full={} deltas={} warm={} warm_outcome={:?} rebuild={} stop={} page_order={} worker_available={} worker_failed={} worker_busy={} need={:?} stale={} requires_full_rebuild={}",
             self.shared.ready.load(Ordering::Acquire),
             self.shared.validated.load(Ordering::Acquire),
             self.shared.ready_generation.load(Ordering::Acquire),
@@ -2388,6 +2386,9 @@ impl DirectProjection {
             self.shared.worker_available.load(Ordering::Acquire),
             self.shared.worker_failed.load(Ordering::Acquire),
             self.shared.worker_busy.load(Ordering::Acquire),
+            index_need(&self.shared, &pending),
+            pending.stale,
+            pending.requires_full_rebuild,
         )
     }
 
@@ -3157,7 +3158,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         // queued with the generation it moves to, and a turn takes only what
         // was queued before it began. So the turn's image is the image of the
         // latest generation.
-        if !pending.rebuild && !pending.has_work() && shared.validated.load(Ordering::Acquire) {
+        if image_is_current(&shared, &pending) {
             let ready_generation = pending.latest_generation.max(latest_generation);
             shared
                 .ready_generation
@@ -3166,6 +3167,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             pending.unsettled_passes = 0;
             pending.retry_after = None;
             projection_diag(|| format!("ready at generation={ready_generation}"));
+        } else {
+            // A warm that answered "fresh build required" keeps the image it
+            // found; it no longer answers for the pages.
+            shared.ready.store(false, Ordering::Release);
         }
         drop(pending);
         shared.changed.notify_all();

@@ -259,10 +259,11 @@ pub(super) enum IndexEffect<'a> {
     /// every indexed read fell back to parsing the graph (GH #543, audit
     /// R4-03). The projection is fetched before the cache lock is taken.
     Unchanged(Option<&'a Arc<crate::direct_projection::DirectProjection>>),
-    /// The move changes the page set in a way no delta describes, such as a
-    /// deleted file that could not be named. The index must not carry
+    /// The move changes the page set in a way no delta describes: a broad
+    /// external invalidation (`invalidate_cache`). The index must not carry
     /// readiness past it; the next warm validation or full snapshot
-    /// re-derives the page set.
+    /// re-derives the page set. A delete always names its file (or knows it
+    /// had none), so it never needs this (GH #543, audit R7-01).
     Stale(Option<&'a Arc<crate::direct_projection::DirectProjection>>),
 }
 

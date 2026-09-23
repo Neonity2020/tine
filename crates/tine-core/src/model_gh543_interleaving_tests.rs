@@ -1266,3 +1266,130 @@ fn gh543_a_lease_held_by_another_process_is_retried() {
     crate::direct_projection::release_projection(&graph);
     let _ = fs::remove_dir_all(root);
 }
+
+/// GH #543 (audit R7-01): deleting a page that has no file -- one that exists
+/// only through references -- changes nothing the index stores. It marked the
+/// index stale, and the owner walked every page file to re-validate it; during
+/// the launch check the running walk was abandoned and read the graph again.
+#[test]
+fn gh543_deleting_a_page_with_no_file_does_not_walk_the_graph() {
+    const PAGES: usize = 12;
+    let root = scratch("gh543-fileless-delete");
+    write_pages(&root, PAGES);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+
+    // After launch.
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let owner = OwnerRun::start(&graph);
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    let passes_before = graph.owner_passes_test();
+    graph.delete_page("Ghost", PageKind::Page).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    let passes = graph.owner_passes_test() - passes_before;
+    let reads = owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    assert_eq!(passes, 0, "the delete started a whole-graph pass");
+    assert_eq!(reads, PAGES, "the owner read {reads} page files");
+
+    // During the launch check.
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let owner = OwnerRun::start(&graph);
+    pause.reached.wait();
+    let deleted = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.delete_page("Ghost", PageKind::Page))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    pause.release.wait();
+    deleted.join().unwrap().unwrap();
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    let passes = graph.owner_passes_test();
+    let reads = owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(passes, 1, "the launch check ran {passes} passes");
+    assert_eq!(reads, PAGES, "the launch check read {reads} page files");
+}
+
+/// GH #543 (audit R7-02): readiness is never published over an image the
+/// decider still owes a pass. A page update's turn published readiness while
+/// the image was marked stale; the owner's validation then found the image
+/// "ready", did nothing, and ran again at once -- millions of passes a
+/// second for as long as the graph stayed open.
+#[test]
+fn gh543_a_stale_image_is_not_made_ready_by_a_page_update() {
+    const PAGES: usize = 12;
+    let root = scratch("gh543-stale-not-ready");
+    write_pages(&root, PAGES);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let owner = OwnerRun::start(&graph);
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    // Another graph's pass holds the process-wide permit.
+    let held = OWNER_PERMIT.lock().unwrap();
+    graph.direct_projection_mark_stale_test();
+    // A whole-graph read installs the parsed cache; a save queues a delta.
+    graph.try_with_pages(|pages| pages.len()).unwrap();
+    save_existing(&graph, "p1", "- edited while stale");
+    std::thread::sleep(Duration::from_millis(300));
+    let ready_while_stale = graph.direct_projection_ready_test();
+    let passes_before = graph.owner_passes_test();
+    drop(held);
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    std::thread::sleep(Duration::from_millis(300));
+    let passes = graph.owner_passes_test() - passes_before;
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(&root);
+    assert!(!ready_while_stale, "a page update made a stale image ready");
+    assert!(passes <= 2, "the owner ran {passes} passes: it spins");
+}
+
+/// GH #543 (audit R7-02b): a validation that answers "fresh build required"
+/// leaves the image it found, and that image does not answer for the pages.
+/// The turn published readiness over it anyway, the owner's fresh build was
+/// offered to an index that called itself current, and the owner looped on
+/// a need that never cleared -- with the rebuild the failed read asked for
+/// never happening.
+#[test]
+fn gh543_a_validation_that_needs_a_fresh_build_is_not_ready() {
+    const PAGES: usize = 12;
+    let root = scratch("gh543-fresh-not-ready");
+    write_pages(&root, PAGES);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let owner = OwnerRun::start(&graph);
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    let passes_before = graph.owner_passes_test();
+    // A validation is owed; a read fails on the image while it is queued.
+    let pause = graph.pause_next_warm_before_enqueue_test();
+    graph.direct_projection_mark_stale_test();
+    pause.reached.wait();
+    graph.direct_projection_recover_after_failed_read_test();
+    pause.release.wait();
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    std::thread::sleep(Duration::from_millis(300));
+    let passes = graph.owner_passes_test() - passes_before;
+    let parses = graph.page_build_parses_test();
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(&root);
+    assert!(passes <= 3, "the owner ran {passes} passes: it spins");
+    assert!(
+        parses >= PAGES,
+        "the rebuild the failed read asked for never ran ({parses} parses)"
+    );
+}

@@ -691,6 +691,12 @@ impl Graph {
     /// of an image never validated this session settled nothing -- builds and
     /// offers the parsed snapshot. Whether the pass settled the need; `None`
     /// when `cancelled`.
+    ///
+    /// A pass settles its need only if the need has moved on when it ends --
+    /// handed to the worker (`InHand`) or met. A pass that reports success
+    /// while the same need stands did nothing, and counting it settled let
+    /// the owner run it again at once, without the backoff, for as long as
+    /// the graph stayed open (GH #543, audit R7-02).
     pub(super) fn index_pass(
         &self,
         projection: &crate::direct_projection::DirectProjection,
@@ -702,17 +708,20 @@ impl Graph {
         self.page_build_test
             .owner_passes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if need == crate::direct_projection::IndexNeed::Fresh || std::mem::take(escalate) {
-            return Some(self.fresh_index_pass(cancelled));
-        }
-        match self.warm_projection_cancellable(cancelled) {
-            WarmProjectionOutcome::Owned => Some(true),
-            WarmProjectionOutcome::Cancelled => None,
-            WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => {
-                *escalate = !projection.validated();
-                Some(false)
-            }
-        }
+        let reported =
+            if need == crate::direct_projection::IndexNeed::Fresh || std::mem::take(escalate) {
+                self.fresh_index_pass(cancelled)
+            } else {
+                match self.warm_projection_cancellable(cancelled) {
+                    WarmProjectionOutcome::Owned => true,
+                    WarmProjectionOutcome::Cancelled => return None,
+                    WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => {
+                        *escalate = !projection.validated();
+                        false
+                    }
+                }
+            };
+        Some(reported && projection.index_need_now().0 != need)
     }
 
     /// Build the parsed snapshot and offer it to the index. Whether the
@@ -1947,53 +1956,34 @@ impl Graph {
         }
     }
 
-    /// Drop one page from the cache after deleting its file.
-    /// `known` is the exact entry the caller just removed from disk, so the
-    /// projection delete can be named in a session that holds no parsed cache
-    /// (R6). Without it and without a cache, the current page-list memo is the
-    /// remaining inventory; failing both, the projection is only marked stale.
-    pub(super) fn cache_remove(&self, name: &str, kind: PageKind, known: Option<PageEntry>) {
+    /// Drop one page from the cache after a delete. `removed_file` is the
+    /// inventory's answer, read under the identity lock the delete holds: the
+    /// file it moved to the trash, or `None` when the page had no file (a page
+    /// that exists only through references). So the projection delete is
+    /// named in a session that holds no parsed cache (R6), and a page with no
+    /// file changes nothing the index stores: marking the index stale for it
+    /// walked the whole graph for a delete that touched no file (GH #543,
+    /// audit R7-01).
+    pub(super) fn cache_remove(&self, name: &str, kind: PageKind, removed_file: Option<PageEntry>) {
         // A page delete is a page-set change that can affect every backlink
         // and reference result, so drop the whole derived-reference cache.
         *self.derived_cache.write().unwrap() = None;
         let projection = self.direct_projection.get();
         let coming = self.index_delta_coming();
         let mut guard = self.cache.write().unwrap();
-        let mut removed_entries = Vec::new();
-        let cache_built = guard.is_some();
-        if !cache_built {
-            match known {
-                Some(entry) => removed_entries.push(entry),
-                None => {
-                    let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-                    if let Some((memo_generation, entries)) =
-                        self.page_list_cache.read().unwrap().as_ref()
-                    {
-                        if *memo_generation == generation {
-                            removed_entries.extend(
-                                entries
-                                    .iter()
-                                    .filter(|entry| {
-                                        entry.kind == kind
-                                            && crate::refs::same_page(&entry.name, name)
-                                    })
-                                    .cloned(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        let mut removed_entries: Vec<PageEntry> = removed_file.into_iter().collect();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
-            removed_entries.extend(
-                pages
+            for (entry, _) in pages.iter().filter(|(entry, _)| {
+                entry.kind == kind && crate::refs::same_page(&entry.name, name)
+            }) {
+                if !removed_entries
                     .iter()
-                    .filter(|(entry, _)| {
-                        entry.kind == kind && crate::refs::same_page(&entry.name, name)
-                    })
-                    .map(|(entry, _)| entry.clone()),
-            );
+                    .any(|removed| removed.path == entry.path)
+                {
+                    removed_entries.push(entry.clone());
+                }
+            }
             let removed_paths = pages
                 .iter()
                 .filter(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
@@ -2013,26 +2003,25 @@ impl Graph {
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
-        let newgen = self.move_cache_generation(
-            &guard,
-            Some(if removed_entries.is_empty() {
-                graph_drift::StructuralChange::Unnamed
-            } else {
-                graph_drift::StructuralChange::Removed(
+        let newgen = if removed_entries.is_empty() {
+            // No file left the graph: the page set and the index stand.
+            self.move_cache_generation(
+                &guard,
+                None,
+                graph_drift::IndexEffect::Unchanged(projection.as_ref()),
+            )
+        } else {
+            self.move_cache_generation(
+                &guard,
+                Some(graph_drift::StructuralChange::Removed(
                     removed_entries
                         .iter()
                         .map(|entry| entry.path.clone())
                         .collect(),
-                )
-            }),
-            if removed_entries.is_empty() && !cache_built {
-                // The deleted file could not be named; the next warm
-                // validation or full snapshot re-derives the inventory.
-                graph_drift::IndexEffect::Stale(projection.as_ref())
-            } else {
-                graph_drift::IndexEffect::Sent(&coming)
-            },
-        );
+                )),
+                graph_drift::IndexEffect::Sent(&coming),
+            )
+        };
         if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() =
                 Some(Arc::new(build_effective_identity_index(

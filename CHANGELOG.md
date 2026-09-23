@@ -70,6 +70,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Tine could keep one CPU core busy for as long as a graph stayed open after
+  its search index needed re-checking while another window was indexing, or
+  after a query found the index damaged; the damaged index also kept
+  answering. The index is now only reported ready once nothing is owed to it
+  (GH #543).
+
+- Deleting a page that has no file (one that exists only through references)
+  no longer re-checks every page of the graph against the search index
+  (GH #543).
+
 - Renaming or deleting a page while Tine rebuilt its search index could make
   the rebuild fail, leaving search without an index for a while and making
   reads parse every page instead (GH #543).
