@@ -56,9 +56,11 @@ const orphan: SyncConflict = {
 
 function mount(queue: ConflictObject[], copies: SyncConflict[], extra: Partial<Backend> = {}) {
   __setBackendForTest({
-    listSyncConflicts: async () => copies,
-    listVcsMarkerConflicts: async () => [],
-    conflictQueue: async () => queue,
+    conflictInventory: async () => ({
+      sync_conflicts: copies,
+      vcs_markers: [],
+      queue,
+    }),
     ...extra,
   } as unknown as Backend);
   setConflictQueue(queue);

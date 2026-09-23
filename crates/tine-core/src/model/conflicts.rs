@@ -219,6 +219,27 @@ impl Graph {
         }
     }
 
+    /// Everything the conflicts UI shows, from one pass over the graph: the
+    /// conflict copies, the marker-bearing pages, and the queue derived from
+    /// both. The marker scan reads every page file; the UI used to ask for the
+    /// three separately, and the queue asked for both lists again, so each
+    /// refresh read every page twice (GH #543, audit R8-09).
+    pub fn conflict_inventory(&self) -> ConflictInventory {
+        let sync_conflicts = self.list_sync_conflicts();
+        let vcs_markers = self.list_vcs_marker_conflicts();
+        let queue = self.conflict_queue_from(&sync_conflicts, &vcs_markers);
+        ConflictInventory {
+            sync_conflicts,
+            vcs_markers,
+            queue,
+        }
+    }
+
+    /// The queue alone; see [`Graph::conflict_inventory`].
+    pub fn conflict_queue(&self) -> Vec<crate::concord_queue::ConflictObject> {
+        self.conflict_inventory().queue
+    }
+
     /// The Concord conflict queue (L3): ONE derived inventory of everything on
     /// disk that needs the user's judgement, from both artifact sources.
     ///
@@ -226,14 +247,18 @@ impl Graph {
     /// and no cache is consulted, so the queue survives a restart trivially: the
     /// same on-disk state recomputes the same objects with the same ids. Block
     /// counts are computed here because conflicts are few (a handful at most) and
-    /// each costs one parse of two small texts; the two directory walks the
-    /// sources already do dominate.
-    pub fn conflict_queue(&self) -> Vec<crate::concord_queue::ConflictObject> {
+    /// each costs one parse of two small texts; the directory walks that list
+    /// the sources dominate.
+    fn conflict_queue_from(
+        &self,
+        copies: &[SyncConflict],
+        marked_pages: &[VcsMarkerConflict],
+    ) -> Vec<crate::concord_queue::ConflictObject> {
         use crate::concord_queue::{
             decidable_row_count, ConflictObject, ConflictSide, ConflictSource, SideRole,
         };
         let mut out = Vec::new();
-        for copy in self.list_sync_conflicts() {
+        for copy in copies {
             let Some(winner) = copy.base_path.clone() else {
                 // The page it shadowed is gone — it is a stray, not a two-sided
                 // conflict; the Settings panel offers to discard it. Nothing to
@@ -275,7 +300,7 @@ impl Graph {
                 markers: Vec::new(),
             });
         }
-        for marked in self.list_vcs_marker_conflicts() {
+        for marked in marked_pages {
             let parsed = self.vcs_marker_conflict_diff(&marked.path).ok().flatten();
             let label = |pick: fn(&crate::concord_queue::MarkerConflictDiff) -> &str,
                          fallback: &str| {

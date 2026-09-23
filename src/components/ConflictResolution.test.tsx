@@ -119,9 +119,11 @@ function stubBackend(overrides: Partial<Backend>): void {
     syncConflictDiff: async () => null,
     resolveVcsMarkerConflict: async () => {},
     resolveSyncConflict: async () => {},
-    listSyncConflicts: async () => [],
-    listVcsMarkerConflicts: async () => [],
-    conflictQueue: async () => [],
+    conflictInventory: async () => ({
+      sync_conflicts: [],
+      vcs_markers: [],
+      queue: [],
+    }),
     liveSaveConflictDiff: async () => markerDiff.diff,
     captureLiveSaveConflict: async () => ({
       diff: markerDiff.diff,

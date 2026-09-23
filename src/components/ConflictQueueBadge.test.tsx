@@ -93,18 +93,22 @@ describe("the conflict queue badge", () => {
   it("is refreshed from the derived backend queue, and empties safely on failure", async () => {
     const queue = [object("markers:a", "Alpha")];
     __setBackendForTest({
-      listSyncConflicts: async () => [],
-      listVcsMarkerConflicts: async () => [],
-      conflictQueue: async () => queue,
+      conflictInventory: async () => ({
+        sync_conflicts: [],
+        vcs_markers: [],
+        queue,
+      }),
     } as unknown as Backend);
     await refreshSyncConflicts();
     expect(conflictQueue().map((c) => c.id)).toEqual(["markers:a"]);
 
     __setBackendForTest({
-      listSyncConflicts: async () => [],
-      listVcsMarkerConflicts: async () => [],
-      conflictQueue: vi.fn(async () => {
+      conflictInventory: async () => ({
+        sync_conflicts: [],
+        vcs_markers: [],
+        queue: await (vi.fn(async () => {
         throw new Error("backend gone");
+      }))(),
       }),
     } as unknown as Backend);
     await refreshSyncConflicts();
@@ -127,9 +131,11 @@ describe("the queue after an external change", () => {
       block_conflicts: 1,
     };
     __setBackendForTest({
-      listSyncConflicts: async () => [],
-      listVcsMarkerConflicts: async () => [],
-      conflictQueue: async () => [arrived],
+      conflictInventory: async () => ({
+        sync_conflicts: [],
+        vcs_markers: [],
+        queue: [arrived],
+      }),
     } as unknown as Backend);
 
     await refreshSyncConflicts("new");
@@ -142,9 +148,11 @@ describe("the queue after an external change", () => {
     expect(toasts()).toHaveLength(1);
 
     __setBackendForTest({
-      listSyncConflicts: async () => [],
-      listVcsMarkerConflicts: async () => [],
-      conflictQueue: async () => [],
+      conflictInventory: async () => ({
+        sync_conflicts: [],
+        vcs_markers: [],
+        queue: [],
+      }),
     } as unknown as Backend);
     await refreshSyncConflicts();
     expect(conflictQueue()).toEqual([]);
@@ -168,9 +176,11 @@ describe("the queue after an external change", () => {
     let publishOlder!: (queue: ConflictObject[]) => void;
     const older = new Promise<ConflictObject[]>((resolve) => { publishOlder = resolve; });
     __setBackendForTest({
-      listSyncConflicts: async () => [],
-      listVcsMarkerConflicts: async () => [],
-      conflictQueue: async () => older,
+      conflictInventory: async () => ({
+        sync_conflicts: [],
+        vcs_markers: [],
+        queue: older,
+      }),
       // Full-suite graph setup may finish its independent warm-cache probe while
       // this deliberately delayed inventory is active. Keep that unrelated
       // callback inside the backend contract instead of leaking an unhandled
@@ -191,9 +201,11 @@ describe("the queue after an external change", () => {
   it("re-derives only when the change touched something queued", async () => {
     const conflictQueueFn = vi.fn(async () => [] as ConflictObject[]);
     __setBackendForTest({
-      listSyncConflicts: async () => [],
-      listVcsMarkerConflicts: async () => [],
-      conflictQueue: conflictQueueFn,
+      conflictInventory: async () => ({
+        sync_conflicts: [],
+        vcs_markers: [],
+        queue: await (conflictQueueFn)(),
+      }),
     } as unknown as Backend);
 
     // Empty queue: an external change must cost nothing at all.

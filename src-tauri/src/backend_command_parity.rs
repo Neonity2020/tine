@@ -909,7 +909,7 @@ mod tests {
     /// (GH #332 measured 10-16 s; GH #543 R6-02 waited out a whole index
     /// pass). Anything that walks the graph, waits on the index, a lane or a
     /// subprocess, or reads a file the call did not size is `async` +
-    /// `spawn_blocking` instead (exemplar: `conflict_queue` in commands.rs).
+    /// `spawn_blocking` instead (exemplar: `conflict_inventory` in commands.rs).
     const SYNC_COMMANDS: &[(&str, &str)] = {
         const CONFIG: &str =
             "one config.edn write; fire-and-forget callers rely on main-thread order";
@@ -1057,7 +1057,7 @@ mod tests {
             unlisted.is_empty(),
             "these sync #[tauri::command]s run on the main thread and freeze every window \
              until they return. Make each `async` + `spawn_blocking` (exemplar: \
-             conflict_queue in commands.rs), or add it to SYNC_COMMANDS with the reason \
+             conflict_inventory in commands.rs), or add it to SYNC_COMMANDS with the reason \
              it is bounded (GH #543, R6-02): {unlisted:?}"
         );
         let stale: Vec<&String> = listed.difference(&sync).collect();

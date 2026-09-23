@@ -222,6 +222,14 @@ pub struct VcsMarkerConflict {
     pub markers: Vec<String>,
 }
 
+/// Everything the conflicts UI shows; see [`Graph::conflict_inventory`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictInventory {
+    pub sync_conflicts: Vec<SyncConflict>,
+    pub vcs_markers: Vec<VcsMarkerConflict>,
+    pub queue: Vec<crate::concord_queue::ConflictObject>,
+}
+
 /// Exact asset-side result of one PDF-highlight merge. The annotation page is
 /// a separate authority boundary, committed through the guarded file writer.
 /// Keeping the sidecar receipt typed lets the caller compensate a rejected page

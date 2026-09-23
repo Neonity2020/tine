@@ -419,13 +419,18 @@ impl Graph {
                 return None;
             }
             // With an index owner registered, whether work is coming is the
-            // one predicate the owner itself runs on: a rebuild it will run
-            // or a validation it owes is coming even before it starts, and a
-            // backoff is not. Parsing here instead reads every page to answer
-            // what that pass is about to settle (GH #543). Without an owner,
-            // only work already handed to the worker is coming.
-            let coming = projection.coming()
-                || match projection.progress_at(generation) {
+            // one predicate the owner itself runs on, and only that one: a
+            // rebuild it will run or a validation it owes is coming even
+            // before it starts, and a backoff or a foreign lease is not. A
+            // second rule ORed beside it (the worker's progress) outvoted the
+            // owner's answer (GH #543, audit R8-13). Parsing here instead
+            // reads every page to answer what that pass is about to settle.
+            // Without an owner, only work already handed to the worker is
+            // coming.
+            let coming = if projection.owner_registered() {
+                projection.coming()
+            } else {
+                match projection.progress_at(generation) {
                     // `Busy`: the worker has taken the queued warm or edit and is
                     // applying it.
                     ProjectionProgress::Working(Reason::Indexing | Reason::Busy) => true,
@@ -436,7 +441,8 @@ impl Graph {
                     // waits for an inventory, so it is not by itself coming.
                     ProjectionProgress::Working(Reason::PendingEdits) => projection.validated(),
                     _ => false,
-                };
+                }
+            };
             let cached = self.cache.read().unwrap().is_some();
             if !coming || cached {
                 if projection.ready_at(generation) {

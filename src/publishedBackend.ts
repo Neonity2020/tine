@@ -766,11 +766,8 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     async graphSourceFiles() {
       return [];
     },
-    async listSyncConflicts() {
-      return [];
-    },
-    async listVcsMarkerConflicts() {
-      return [];
+    async conflictInventory() {
+      return { sync_conflicts: [], vcs_markers: [], queue: [] };
     },
     async listJournalConflicts() {
       return [];
@@ -783,9 +780,6 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     },
     async assetTrashStats() {
       return { count: 0, bytes: 0, pages: 0, journals: 0, conflicts: 0, other: 0 };
-    },
-    async conflictQueue() {
-      return [];
     },
     async clipboardFiles() {
       return { files: [], skipped: 0, truncated: false };
@@ -929,13 +923,11 @@ export const PUBLISHED_CONSTANT_METHODS = [
   "bindCaptureGraph",
   "defaultGraphParent",
   "graphSourceFiles",
-  "listSyncConflicts",
-  "listVcsMarkerConflicts",
+  "conflictInventory",
   "listJournalConflicts",
   "listJournalFilenameMigrations",
   "listOrphanAssets",
   "assetTrashStats",
-  "conflictQueue",
   "clipboardFiles",
   "detectMediaEditor",
   "pasteImage",

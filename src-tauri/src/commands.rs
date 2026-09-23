@@ -2246,66 +2246,27 @@ pub(crate) async fn apply_journal_filename_migrations(
     .map_err(CommandError::worker)?
 }
 
-/// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
-/// user to review + reconcile instead of them showing as garbage pages.
+/// Everything the conflicts UI shows, from one pass over the graph: sync-tool
+/// conflict copies (Syncthing/Dropbox), pages whose bytes carry unresolved VCS
+/// merge markers (saves to them are refused, so the panel and the page banner
+/// explain why), and the Concord conflict queue (L3) derived from both --
+/// derived on every call from what is on disk, so it survives restarts
+/// without storing anything. One command, so a refresh reads every page once
+/// rather than twice (GH #543, audit R8-09).
 ///
-/// Async + `spawn_blocking` (GH #332): this reads every page file. As a sync
-/// command it ran on the main thread and froze every other command for
-/// 10-16 s on a large Windows graph.
+/// Async + `spawn_blocking` (GH #332; audit 2026-08-24, finding A3): the
+/// marker scan reads every page file and the queue block-diffs every
+/// conflicted page. As a sync command it ran on the main thread and froze
+/// every other command for 10-16 s on a large Windows graph.
 #[tauri::command]
-pub(crate) async fn list_sync_conflicts(
+pub(crate) async fn conflict_inventory(
     state: GraphContext<'_>,
-) -> Result<Vec<tine_core::model::SyncConflict>, CommandError> {
+) -> Result<tine_core::model::ConflictInventory, CommandError> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         display_read(&state, &label, binding_generation, |graph| {
-            Ok(graph.list_sync_conflicts())
-        })?
-    })
-    .await
-    .map_err(CommandError::worker)?
-}
-
-/// Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
-/// (git/Fossil). They stay readable but saves to them are refused, so the
-/// conflicts panel and the page banner can explain why.
-///
-/// Async + `spawn_blocking` (GH #332): this reads every page file. As a sync
-/// command it ran on the main thread and froze every other command for
-/// 10-16 s on a large Windows graph.
-#[tauri::command]
-pub(crate) async fn list_vcs_marker_conflicts(
-    state: GraphContext<'_>,
-) -> Result<Vec<tine_core::model::VcsMarkerConflict>, CommandError> {
-    let (app, label, binding_generation) = owned_graph_context(state)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        display_read(&state, &label, binding_generation, |graph| {
-            Ok(graph.list_vcs_marker_conflicts())
-        })?
-    })
-    .await
-    .map_err(CommandError::worker)?
-}
-
-/// The Concord conflict queue (L3): ONE derived inventory of everything on disk
-/// that needs the user's judgement — conflict copies AND marker-bearing pages —
-/// behind the calm badge and the in-page resolver. Derived on every call from
-/// what is on disk, so it survives restarts without storing anything.
-///
-/// Async + `spawn_blocking`: deriving the queue block-diffs every conflicted
-/// page, so a pathological page must stall a worker thread, never the main
-/// IPC thread (audit 2026-08-24, finding A3).
-#[tauri::command]
-pub(crate) async fn conflict_queue(
-    state: GraphContext<'_>,
-) -> Result<Vec<tine_core::concord_queue::ConflictObject>, CommandError> {
-    let (app, label, binding_generation) = owned_graph_context(state)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        display_read(&state, &label, binding_generation, |graph| {
-            Ok(graph.conflict_queue())
+            Ok(graph.conflict_inventory())
         })?
     })
     .await

@@ -1822,32 +1822,81 @@ export function mockBackend(): Backend {
     async renameFileToPage(): Promise<void> {
       // no-op in the browser mock
     },
-    async listSyncConflicts() {
+    async conflictInventory() {
       // Gated on the same `?conflicts` flag as the journal-day demo, so the
-      // reconcile area stays out of the marketing screenshots by default.
-      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
-      return [
-        {
-          path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
-          base_name: "Project Plan",
-          base_path: "pages/Project Plan.md",
-          kind: "page" as const,
-          tag: "sync-conflict-20260705-141233-A2B2C3D",
-          preview: "Milestones for the launch",
-        },
-      ];
-    },
-    async listVcsMarkerConflicts() {
-      // Same `?conflicts` demo flag as listSyncConflicts above.
-      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
-      return [
-        {
-          path: "pages/Tine.md",
-          name: "Tine",
-          kind: "page" as const,
-          markers: ["<<<<<<<", "=======", ">>>>>>>"],
-        },
-      ];
+      // reconcile area stays out of the marketing screenshots by default. The
+      // queue is derived from exactly the two listings, as in core.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) {
+        return { sync_conflicts: [], vcs_markers: [], queue: [] };
+      }
+      return {
+        sync_conflicts: [
+          {
+            path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+            base_name: "Project Plan",
+            base_path: "pages/Project Plan.md",
+            kind: "page" as const,
+            tag: "sync-conflict-20260705-141233-A2B2C3D",
+            preview: "Milestones for the launch",
+          },
+        ],
+        vcs_markers: [
+          {
+            path: "pages/Tine.md",
+            name: "Tine",
+            kind: "page" as const,
+            markers: ["<<<<<<<", "=======", ">>>>>>>"],
+          },
+        ],
+        queue: [
+          {
+            id: "copy:pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+            source: "sync-copy" as const,
+            page_name: "Project Plan",
+            page_path: "pages/Project Plan.md",
+            kind: "page" as const,
+            sides: [
+              { role: "mine" as const, label: "This device", path: "pages/Project Plan.md" },
+              {
+                role: "theirs" as const,
+                label: "sync-conflict-20260705-141233-A2B2C3D",
+                path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+              },
+              { role: "base" as const, label: "Last agreed version" },
+            ],
+            block_conflicts: 4,
+          },
+          {
+            id: "markers:pages/Tine.md",
+            source: "vcs-markers" as const,
+            page_name: "Tine",
+            page_path: "pages/Tine.md",
+            kind: "page" as const,
+            sides: [
+              { role: "mine" as const, label: "HEAD" },
+              { role: "theirs" as const, label: "feature/concord" },
+            ],
+            block_conflicts: 1,
+            markers: ["<<<<<<<", "=======", ">>>>>>>"],
+          },
+          {
+            id: "journal:journals/2026_06_26.org",
+            source: "duplicate-journal" as const,
+            page_name: "Friday, 26-06-2026",
+            page_path: "journals/2026_06_26.org",
+            kind: "journal" as const,
+            sides: [
+              { role: "mine" as const, label: "2026_06_26.org", path: "journals/2026_06_26.org" },
+              {
+                role: "theirs" as const,
+                label: "Friday, 26-06-2026.org",
+                path: "journals/Friday, 26-06-2026.org",
+              },
+            ],
+            block_conflicts: 2,
+          },
+        ],
+      };
     },
     async syncConflictDiff() {
       const v = (text: string) => ({ uuid: "", text, child_count: 0 });
@@ -1943,59 +1992,6 @@ export function mockBackend(): Backend {
     },
     async resolveLiveSaveConflict(page) {
       return { ...page, rev: "mock-live-resolved" };
-    },
-    async conflictQueue() {
-      // Same `?conflicts` demo flag as the two listings above; the queue is
-      // derived from exactly them, so the demo stays consistent.
-      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
-      return [
-        {
-          id: "copy:pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
-          source: "sync-copy" as const,
-          page_name: "Project Plan",
-          page_path: "pages/Project Plan.md",
-          kind: "page" as const,
-          sides: [
-            { role: "mine" as const, label: "This device", path: "pages/Project Plan.md" },
-            {
-              role: "theirs" as const,
-              label: "sync-conflict-20260705-141233-A2B2C3D",
-              path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
-            },
-            { role: "base" as const, label: "Last agreed version" },
-          ],
-          block_conflicts: 4,
-        },
-        {
-          id: "markers:pages/Tine.md",
-          source: "vcs-markers" as const,
-          page_name: "Tine",
-          page_path: "pages/Tine.md",
-          kind: "page" as const,
-          sides: [
-            { role: "mine" as const, label: "HEAD" },
-            { role: "theirs" as const, label: "feature/concord" },
-          ],
-          block_conflicts: 1,
-          markers: ["<<<<<<<", "=======", ">>>>>>>"],
-        },
-        {
-          id: "journal:journals/2026_06_26.org",
-          source: "duplicate-journal" as const,
-          page_name: "Friday, 26-06-2026",
-          page_path: "journals/2026_06_26.org",
-          kind: "journal" as const,
-          sides: [
-            { role: "mine" as const, label: "2026_06_26.org", path: "journals/2026_06_26.org" },
-            {
-              role: "theirs" as const,
-              label: "Friday, 26-06-2026.org",
-              path: "journals/Friday, 26-06-2026.org",
-            },
-          ],
-          block_conflicts: 2,
-        },
-      ];
     },
     async vcsMarkerConflictDiff(path: string) {
       if (path !== "pages/Tine.md") return null;

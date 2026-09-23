@@ -13,9 +13,11 @@ vi.mock("../backend", async (importOriginal) => {
     ...actual,
     isTauri: () => false,
     backend: () => ({
-      listSyncConflicts: async () => inventory.copies,
-      listVcsMarkerConflicts: async () => inventory.markers,
-      conflictQueue: async () => inventory.queue,
+      conflictInventory: async () => ({
+        sync_conflicts: inventory.copies,
+        vcs_markers: inventory.markers,
+        queue: inventory.queue,
+      }),
       listJournalConflicts: async () => [],
       listJournalFilenameMigrations: async () => [],
       confirm: async () => false,

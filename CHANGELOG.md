@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- Refreshing the conflict badge and overview now reads the graph's conflict
+  copies and version-control markers once, instead of three separate listings
+  that each rescanned the graph (GH #543).
 - Diagnostic reports now record when Tine was closed through the
   unsaved-changes warning with the user choosing to discard, with the reason
   (a failed save or one still running) and the number of affected pages, but

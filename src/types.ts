@@ -410,6 +410,14 @@ export interface ConflictObject {
   live?: LiveSaveConflictSnapshot;
 }
 
+/** Everything the conflicts UI shows, from one pass over the graph
+ *  (`conflict_inventory`); mirrors core's `ConflictInventory`. */
+export interface ConflictInventory {
+  sync_conflicts: SyncConflict[];
+  vcs_markers: VcsMarkerConflict[];
+  queue: ConflictObject[];
+}
+
 /** A marker-bearing page's own conflict, parsed out of its `<<<<<<<` sections
  *  and diffed with the same block machinery as a conflict copy (Concord L5). */
 export interface MarkerConflictDiff {

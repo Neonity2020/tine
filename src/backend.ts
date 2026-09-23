@@ -45,10 +45,9 @@ import type {
   TrashStats,
   JournalConflict,
   JournalFilenameMigration,
-  SyncConflict,
   SyncConflictDiff,
-  VcsMarkerConflict,
   ConflictObject,
+  ConflictInventory,
   LiveSaveConflictCapture,
   MarkerConflictDiff,
   MergeDecision,
@@ -785,12 +784,14 @@ export interface Backend {
   /** Move a stray file (graph-root-relative path) to a uniquely-named page so it
    *  stops colliding and becomes normally navigable (#21). */
   renameFileToPage(path: string, newName: string): Promise<void>;
-  /** Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
-   *  user to review + merge instead of them showing as garbage pages. */
-  listSyncConflicts(): Promise<SyncConflict[]>;
-  /** Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
-   *  (git/Fossil): readable, but quarantined from saves. */
-  listVcsMarkerConflicts(): Promise<VcsMarkerConflict[]>;
+  /** Everything the conflicts UI shows, from one pass over the graph: sync-tool
+   *  conflict copies (Syncthing/Dropbox) to review + merge instead of them
+   *  showing as garbage pages; pages whose on-disk bytes carry unresolved VCS
+   *  merge-conflict markers (git/Fossil: readable, but quarantined from
+   *  saves); and the Concord conflict queue (L3) derived from both, from disk
+   *  on every call — nothing is stored, so it survives a restart by being
+   *  recomputed. One call, so a refresh reads every page once (GH #543). */
+  conflictInventory(): Promise<ConflictInventory>;
   /** Block-level diff of a conflict copy against its winner (graph-root-relative
    *  paths). Read-only; null if a path is invalid or the file is gone. */
   syncConflictDiff(winner: string, conflict: string): Promise<SyncConflictDiff | null>;
@@ -840,11 +841,6 @@ export interface Backend {
     decisions: Record<string, MergeDecision>,
     preChoice?: "mine" | "theirs" | "union",
   ): Promise<PageDto>;
-  /** The Concord conflict queue (L3): one derived inventory of every page that
-   *  needs the user's judgement, from BOTH artifact sources (conflict copies and
-   *  VCS-marker pages). Derived from disk on every call — nothing is stored, so
-   *  it survives a restart by being recomputed. */
-  conflictQueue(): Promise<ConflictObject[]>;
   /** A marker-bearing page's own conflict: its `<<<<<<<` sections parsed into
    *  complete page texts and run through the same block diff (Concord L5).
    *  Read-only; null when the page has no (parseable) markers. */
@@ -1787,17 +1783,11 @@ class TauriBackend implements Backend {
   renameFileToPage(path: string, newName: string) {
     return this.call<void>("rename_file_to_page", { path, newName });
   }
-  listSyncConflicts() {
-    return this.call<SyncConflict[]>("list_sync_conflicts");
-  }
-  listVcsMarkerConflicts() {
-    return this.call<VcsMarkerConflict[]>("list_vcs_marker_conflicts");
+  conflictInventory() {
+    return this.call<ConflictInventory>("conflict_inventory");
   }
   syncConflictDiff(winner: string, conflict: string) {
     return this.call<SyncConflictDiff | null>("sync_conflict_diff", { winner, conflict });
-  }
-  conflictQueue() {
-    return this.call<ConflictObject[]>("conflict_queue");
   }
   vcsMarkerConflictDiff(path: string) {
     return this.call<MarkerConflictDiff | null>("vcs_marker_conflict_diff", { path });

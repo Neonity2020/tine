@@ -667,23 +667,13 @@ export async function refreshConflictQueueIfTouched(
 export async function refreshSyncConflicts(notify: "new" | false = false): Promise<void> {
   const generation = ++artifactConflictRefreshGeneration;
   try {
-    const c = await backend().listSyncConflicts();
-    if (generation !== artifactConflictRefreshGeneration) return;
-    setSyncConflicts(c);
-  } catch {
-    /* best-effort */
-  }
-  try {
-    const m = await backend().listVcsMarkerConflicts();
-    if (generation !== artifactConflictRefreshGeneration) return;
-    setVcsMarkerConflicts(m);
-  } catch {
-    /* best-effort */
-  }
-  try {
     const previousIds = new Set(artifactConflictQueue.map((conflict) => conflict.id));
-    const queue = await backend().conflictQueue();
+    // One call: the marker scan reads every page, and asking for the two
+    // listings and the queue separately read them twice (GH #543).
+    const { sync_conflicts, vcs_markers, queue } = await backend().conflictInventory();
     if (generation !== artifactConflictRefreshGeneration) return;
+    setSyncConflicts(sync_conflicts);
+    setVcsMarkerConflicts(vcs_markers);
     replaceArtifactConflictQueue(queue);
     retireSettledArtifactArrivalToasts(queue);
     if (notify === "new") {
@@ -712,8 +702,8 @@ export async function refreshSyncConflicts(notify: "new" | false = false): Promi
       }
     }
   } catch {
-    // Best-effort like the two listings above: a missing queue means no badge,
-    // never a broken app. The Settings fallback surface still works.
+    // Best-effort: a missing inventory means no badge, never a broken app.
+    // The listings keep their last answer; the Settings fallback still works.
     if (generation === artifactConflictRefreshGeneration) replaceArtifactConflictQueue([]);
   }
 }

@@ -73,10 +73,12 @@ function stub(overrides: Partial<Backend>): void {
   __setBackendForTest({
     duplicateJournalDiff: async () => disjointDiff,
     resolveDuplicateJournalDay: async () => ({ name: "Friday, 26-06-2026", blocks: [], rev: "r" }),
-    listSyncConflicts: async () => [],
-    listVcsMarkerConflicts: async () => [],
+    conflictInventory: async () => ({
+      sync_conflicts: [],
+      vcs_markers: [],
+      queue: [],
+    }),
     listJournalConflicts: async () => inventory,
-    conflictQueue: async () => [],
     confirm: async () => true,
     trashJournalFile: async () => {},
     renameFileToPage: async () => {},
