@@ -396,9 +396,12 @@ impl PendingProjection {
         }
     }
 
-    /// After a warm repair reconciled the image to `order`, make the queue's
-    /// order that same list and re-place every queued update against it.
-    fn reseed_after_repair(&mut self, order: &[String]) {
+    /// The image is (or is about to be) written in `order` -- a warm repair or
+    /// reconcile, or a full turn's inventory -- so make the queue's order that
+    /// same dense list and re-place every queued update against it. A queue
+    /// left with the gaps its deletions made would hand the next update a
+    /// position that is not its place in the image (GH #543).
+    fn reseed_order(&mut self, order: &[String]) {
         self.order_seeded = true;
         self.next_page_order = order.len() as u64;
         self.page_order = order
@@ -2741,9 +2744,17 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             } else {
                 pending.warm.take()
             };
-            let deltas = std::mem::take(&mut pending.deltas);
+            let mut deltas = std::mem::take(&mut pending.deltas);
             let full = pending.full.take();
-            let inventory = full.as_ref().map(|_| pending.ordered_inventory());
+            // A full turn writes its pages at their places in this inventory,
+            // without the gaps deletions since the snapshot left in the
+            // queue's order; the updates taken with it go by the same list.
+            let inventory = full.as_ref().map(|_| {
+                let inventory = pending.ordered_inventory();
+                pending.reseed_order(&inventory);
+                pending.place_taken(&mut deltas);
+                inventory
+            });
             WorkerTurn {
                 full,
                 warm,
@@ -2909,7 +2920,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         // The image now keeps the order's positions; so does
                         // the queue, and so do the updates taken with it.
                         let mut pending = shared.pending.lock().unwrap();
-                        pending.reseed_after_repair(&order);
+                        pending.reseed_order(&order);
                         pending.place_taken(&mut deltas);
                         validate_warm(database, warm).map_err(ProjectionRefusal::Failed)?
                     } else {
@@ -2937,7 +2948,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                             )
                             .map_err(ProjectionRefusal::Failed)?;
                             let mut pending = shared.pending.lock().unwrap();
-                            pending.reseed_after_repair(&order);
+                            pending.reseed_order(&order);
                             pending.place_taken(&mut deltas);
                         }
                         outcome
@@ -3704,7 +3715,7 @@ fn apply_incomplete_full(
     )?;
     {
         let mut pending = shared.pending.lock().unwrap();
-        pending.reseed_after_repair(&order);
+        pending.reseed_order(&order);
         pending.place_taken(&mut deltas);
     }
     apply_deltas(database, deltas)

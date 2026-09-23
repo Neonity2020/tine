@@ -308,6 +308,9 @@ fn watcher_reconcile(graph: &Graph, uncertain: bool, paths: Vec<PathBuf>) -> Res
 
 /// Run one seed; returns its findings (empty = the seed converged).
 fn run_seed(seed: u64, steps: usize) -> Vec<String> {
+    if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
+        crate::backend_error::set_runtime_debug_diagnostics(true);
+    }
     let mut rng = Rng::new(seed);
     let root = scratch(&format!("gh543-interleave-{seed}"));
     let database = root.join("private/projection.sqlite");
@@ -529,7 +532,12 @@ fn gh543_seeded_interleavings_converge() {
         Ok(seed) => vec![seed.parse().unwrap()],
         Err(_) => (1..=12).collect(),
     };
-    run_seeds(seeds, 30);
+    // A long-run seed replays with `TINE_INTERLEAVING_STEPS=60`.
+    let steps = std::env::var("TINE_INTERLEAVING_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    run_seeds(seeds, steps);
 }
 
 /// The long local run: `TINE_INTERLEAVING_SEEDS=500 cargo test -p tine-core

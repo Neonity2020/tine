@@ -10501,3 +10501,89 @@ fn a_ready_index_does_not_hide_a_consumer_parse_from_the_progress_bar() {
     );
     assert!(after.is_none(), "the finished parse left progress behind");
 }
+
+/// GH #543 (harness seed 1288): a page deleted after a full snapshot was
+/// queued leaves a gap in the queue's page order. The full turn hands storage
+/// the order without the gap, so an update of a later page taken with it
+/// carried a position one past its place, and storage refused the turn
+/// ("page order differs from complete inventory"). The owner then backed off
+/// and reads parsed the graph.
+#[test]
+fn gh543_a_full_turn_with_a_delete_and_a_later_update_applies() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-full-order-gap");
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+    let mut pages = Vec::new();
+    let mut revisions = HashMap::new();
+    for entry in graph.list_pages() {
+        revisions.insert(
+            entry.path.clone(),
+            graph.load_page(&entry).unwrap().rev.unwrap(),
+        );
+        let mut document = crate::doc::parse(&std::fs::read_to_string(&entry.path).unwrap());
+        crate::model::assign_doc_runtime_ids(&mut document.roots, &entry.rel_path);
+        pages.push((entry, Arc::new(document)));
+    }
+    let config = Arc::clone(
+        &projection
+            .shared
+            .committed_registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .config,
+    );
+    let generation = graph.cache_generation();
+    // Hold the worker inside a turn so the snapshot and the updates after it
+    // are taken together, as they are when a rename lands during a rebuild.
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+        paused_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+    }));
+    let (first, first_doc) = pages[0].clone();
+    projection.enqueue_replace(
+        generation + 1,
+        first.clone(),
+        Arc::clone(&first_doc),
+        revisions[&first.path].clone(),
+        Arc::clone(&config),
+    );
+    paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (deleted, _) = pages[1].clone();
+    let (later, later_doc) = pages.last().unwrap().clone();
+    // The image failed a check, so the snapshot rebuilds it from scratch.
+    projection.request_rebuild();
+    assert!(projection.enqueue_full(
+        generation + 2,
+        Arc::new(pages.clone()),
+        Arc::new(revisions.clone()),
+        Arc::clone(&config),
+        true,
+        Vec::new(),
+    ));
+    projection.enqueue_delete(generation + 3, deleted);
+    projection.enqueue_replace(
+        generation + 3,
+        later.clone(),
+        later_doc,
+        revisions[&later.path].clone(),
+        Arc::clone(&config),
+    );
+    resume_tx.send(()).unwrap();
+    assert!(
+        projection.wait_drained_test(),
+        "the full turn failed: {}",
+        projection.debug_state_test()
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    let _ = std::fs::remove_dir_all(root);
+}

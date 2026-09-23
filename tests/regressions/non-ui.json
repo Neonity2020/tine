@@ -6108,6 +6108,24 @@
   "failBefore": "proven"
  },
  "notes": "Design v4 stage 4 (R6-03). The worker tried the writer lease once and went terminal, so a quick switch back to a graph whose old writer had not yet exited, or a second instance, left the session with no index. It now waits: for an in-process holder it retries the moment that holder releases (a registry of writers per database path, changed under one lock with the lease), for another process on a 1 s doubling backoff capped at 30 min. While it waits nothing is coming (IndexNeed::LeaseWait), so readers take their ordinary route. Switching a window to a different graph now detaches the displaced graph's writer at once. Fail-before: tine-agents/evidence/gh550-batch/stage4/necessity-lease-retry.log."
+},
+{
+ "id": "REG-A-DELETE-DURING-A-FULL-REBUILD-DOES-NOT-FAIL-IT-543",
+ "title": "A page deleted or renamed while the index rebuilds from scratch does not make the rebuild fail",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/direct_projection_tests.rs::gh543_a_full_turn_with_a_delete_and_a_later_update_applies", "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_long_interleaving_run"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Found by the seeded harness (seed 1288, about 1 in 100 runs under load). A deletion after a full snapshot was queued left a gap in the queue's page order; the full turn hands storage the order without gaps, so a later page's update taken with it carried a position one past its place and tine-storage refused the turn ('page order differs from complete inventory'). The owner backed off and reads parsed the graph. The full turn now reseeds the queue's order from the inventory it writes and re-places the updates it takes (reseed_order, the same step a warm repair and an incomplete full already take). Fail-before: tine-agents/evidence/gh550-batch/stage4/necessity-full-order-gap.log."
 }
 ]
 }

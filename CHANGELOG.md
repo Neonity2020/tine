@@ -70,6 +70,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Renaming or deleting a page while Tine rebuilt its search index could make
+  the rebuild fail, leaving search without an index for a while and making
+  reads parse every page instead (GH #543).
+
 - Switching to another graph and back quickly, or opening a graph that another
   Tine instance is still indexing, no longer leaves search and queries without
   an index for the rest of the session. Tine now waits for the other writer to
