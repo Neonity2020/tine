@@ -48,7 +48,7 @@ Tine 是一款大纲笔记软件，外观和操作体验与 [Logseq](https://log
 - **Linux** —— **AppImage** 无需安装，可在任何发行版上运行：先执行 `chmod +x Tine_*.AppImage`，然后启动它。也可使用 **`.deb`**（Debian/Ubuntu）或 **`.rpm`**（Fedora/openSUSE）。
 - **macOS** —— 打开通用版 **`.dmg`**，将 Tine 拖入“应用程序”文件夹。
 - **Windows** —— 运行 **`.exe`** 安装程序；如果出现 SmartScreen 提示，请点击**更多信息 → 仍要运行**。若不想安装，也可以下载便携版 **`Tine_*_x64-portable.zip`**，解压后直接运行 `Tine.exe`。Tine 需要 WebView2 运行时，而 Windows 10/11 已预装该运行时。
-- **Android** —— 从 Releases 页面安装 **`.apk`**（如有提示，请允许浏览器或文件管理器安装应用）。
+- **Android** —— 从 **[F-Droid](https://f-droid.org/packages/page.tine.app/)** 安装，或从 Releases 页面侧载 **`.apk`**。
 - **iPhone / iPad** —— 通过 **[TestFlight](https://testflight.apple.com/join/rpGGpTVW)** 加入公开测试版（先安装 Apple 的 TestFlight 应用，再打开该链接）。目前尚未上架 App Store。
 
 （想参与 Tine 开发？请从源码构建——参见[构建与运行](#build--run)。）
@@ -184,7 +184,7 @@ npm test                     # 前端：Vitest（编辑操作、大纲、自动�
 
 ## 社区
 
-欢迎在 Reddit 社区 **[r/TineOutline](https://www.reddit.com/r/TineOutline/)** 分享问题、想法、截图和错误报告——这里是关注发布动态、参与规划后续方向的最佳地点。对于具体错误或功能请求，也可以[提交 issue](https://github.com/martinkoutecky/tine/issues)。
+所有交流都在 GitHub 上进行。问题、想法、截图和作品分享请发到 **[GitHub Discussions](https://github.com/martinkoutecky/tine/discussions)**；具体错误和功能请求请[提交 issue](https://github.com/martinkoutecky/tine/issues)。
 
 ## 贡献
 

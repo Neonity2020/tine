@@ -63,8 +63,8 @@ warn the first time — here's how to get past it:
 - **Windows** — run the **`.exe`** installer; if SmartScreen appears, click **More info → Run
   anyway**. Prefer no installer? Grab the portable **`Tine_*_x64-portable.zip`**, unzip, and run
   `Tine.exe` — it needs the WebView2 runtime, which is preinstalled on Windows 10/11.
-- **Android** — install the **`.apk`** from the Releases page (allow installs from your browser or
-  file manager when asked).
+- **Android** — install from **[F-Droid](https://f-droid.org/packages/page.tine.app/)**, or sideload the **`.apk`** from the Releases
+  page.
 - **iPhone / iPad** — join the public beta on **[TestFlight](https://testflight.apple.com/join/rpGGpTVW)** (install Apple's TestFlight
   app, then open the link). There is no App Store listing yet.
 
@@ -265,10 +265,9 @@ without reading note content.
 
 ## Community
 
-Questions, ideas, screenshots, and bug reports are welcome on the subreddit:
-**[r/TineOutline](https://www.reddit.com/r/TineOutline/)** — the best place to follow what's
-shipping and help shape what's next. For concrete bugs or feature requests you can also
-[open an issue](https://github.com/martinkoutecky/tine/issues).
+Everything happens on GitHub. Questions, ideas, screenshots and show-and-tell go to
+**[GitHub Discussions](https://github.com/martinkoutecky/tine/discussions)**; concrete bugs and feature requests go to
+[issues](https://github.com/martinkoutecky/tine/issues).
 
 ## Contributing
 

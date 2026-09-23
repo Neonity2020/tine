@@ -660,9 +660,9 @@ within a column; merged cells are still v2+.
   close control, press Escape, or press Android Back to dismiss them safely. At
   640 px and wider—including tablets—they remain persistent desktop-style panes,
   can be open together, and retain their resize controls.
-- **Distribution** — sideloaded, release-signed APK attached to each GitHub
-  release (built and signed in CI). Play Store / F-Droid are planned; iOS is
-  being scoped.
+- **Distribution** — on [F-Droid](https://f-droid.org/packages/page.tine.app/), plus a release-signed APK attached to
+  each GitHub release (built and signed in CI). iOS is a public
+  [TestFlight](https://testflight.apple.com/join/rpGGpTVW) beta.
 
 ## Customization & output
 
