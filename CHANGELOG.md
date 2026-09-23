@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- Changing a setting while one page file cannot be read (a sync conflict, a
+  locked file, a disk error) now re-indexes in about a fifth of the time,
+  shows progress, and stops promptly when Tine closes; the unreadable page
+  stays searchable until it can be read again. External changes to many pages
+  at once likewise index in steps that closing can interrupt (GH #543).
 - After switching graphs, the previous graph's conflict banners and favourites
   order no longer show on the new graph while it loads (GH #543).
 - Changing `:hidden` (or another setting that reopens the graph) in

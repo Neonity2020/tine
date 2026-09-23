@@ -6810,6 +6810,33 @@
   "failBefore": "structural"
  },
  "notes": "GH #543 indexing audit round 10, R10-13 (PLAUSIBLE, fixed by rule). During a restore's rewrite the watcher lowered the restored files into the graph about to be retired. The reconcile loop now try-locks the root's transition lane, skips the graph when it is held and carries a full diff to the next cycle. Substitute evidence: the runtime loop needs an AppHandle, so a source guard pins the order and the never-wait rule; not reproduced on a 10k graph."
+},
+{
+ "id": "REG-A-REINDEX-OVER-AN-UNREADABLE-PAGE-IS-STOPPABLE-543",
+ "title": "Re-indexing the graph while one page cannot be read builds fresh, keeps that page searchable, and stops promptly on close",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r11_tests.rs::gh543_a_config_change_over_an_unreadable_page_rebuilds_and_keeps_it",
+   "crates/tine-core/src/model_gh543_r11_tests.rs::gh543_a_close_stops_an_in_place_repair_between_batches",
+   "crates/tine-core/src/model_gh543_r11_tests.rs::gh543_a_carried_page_lowers_as_its_file_parses",
+   "crates/tine-core/src/projection_producer_census.rs::page_lowering_has_one_loop"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-01 (decision DK4). An incomplete snapshot (one unreadable page) was never built fresh: the owner re-lowered the whole graph in place as one repair turn, ~4x slower per page than a staged build (10k pages: 74 s) and unstoppable (close waited 71 s). Fix: one lowering loop, lower_in_batches, for the fresh build, its carried pages, the in-place repair and queued deltas; it commits in batches, checks the stop flag between them and reports progress. A fresh build carries the unreadable pages by re-lowering them from the rows the old image stored (raw block text + tree + preamble), with their stored source revision, so they are re-read once readable. 10k scale: turn 74.0 s -> 16.8 s, close 71.3 s -> 6.6 ms. Fail-before: both model tests fail on 08dbc570 (evidence gh550-batch/indexing-audit-r11/necessity-R11-01.txt)."
 }
 ]
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 static R10_PERMIT: Mutex<()> = Mutex::new(());
 
 /// An index owner on its own thread, as the app runs one.
-struct R10Owner {
+pub(super) struct R10Owner {
     graph: Arc<Graph>,
     stop: Arc<AtomicBool>,
     settled: Arc<AtomicU64>,
@@ -17,7 +17,7 @@ struct R10Owner {
 }
 
 impl R10Owner {
-    fn start(graph: &Arc<Graph>) -> Self {
+    pub(super) fn start(graph: &Arc<Graph>) -> Self {
         let registration = graph.register_index_owner();
         let stop = Arc::new(AtomicBool::new(false));
         let settled = Arc::new(AtomicU64::new(0));
@@ -44,7 +44,7 @@ impl R10Owner {
     }
 
     #[must_use]
-    fn wait_settled(&self, bound: Duration) -> bool {
+    pub(super) fn wait_settled(&self, bound: Duration) -> bool {
         let started = Instant::now();
         while self.settled.load(Ordering::Acquire) == 0 {
             if started.elapsed() > bound {
@@ -56,7 +56,7 @@ impl R10Owner {
     }
 
     #[must_use]
-    fn wait_ready(&self, bound: Duration) -> bool {
+    pub(super) fn wait_ready(&self, bound: Duration) -> bool {
         let started = Instant::now();
         while !self.graph.direct_projection_ready_test() {
             if started.elapsed() > bound {
@@ -67,13 +67,13 @@ impl R10Owner {
         true
     }
 
-    fn stop(mut self) {
+    pub(super) fn stop(mut self) {
         self.stop.store(true, Ordering::Release);
         self.handle.take().unwrap().join().unwrap();
     }
 }
 
-fn r10_scratch(tag: &str) -> PathBuf {
+pub(super) fn r10_scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "tine-gh543-r10-{tag}-{}-{}",
         std::process::id(),
@@ -84,7 +84,7 @@ fn r10_scratch(tag: &str) -> PathBuf {
     dir
 }
 
-fn r10_pages(root: &Path, count: usize) {
+pub(super) fn r10_pages(root: &Path, count: usize) {
     for index in 0..count {
         fs::write(
             root.join("pages").join(format!("p{index}.md")),
@@ -95,7 +95,7 @@ fn r10_pages(root: &Path, count: usize) {
 }
 
 /// Wait until the worker has drained and the index is ready again.
-fn r10_settle(graph: &Graph) {
+pub(super) fn r10_settle(graph: &Graph) {
     let projection = graph.direct_projection_test().unwrap();
     assert!(projection.wait_drained_test(), "the worker turn failed");
     let started = Instant::now();
@@ -119,7 +119,7 @@ fn r10_ready_graph(tag: &str) -> (PathBuf, Arc<Graph>, R10Owner) {
     (root, graph, owner)
 }
 
-fn r10_finish(root: PathBuf, graph: Arc<Graph>, owner: R10Owner) {
+pub(super) fn r10_finish(root: PathBuf, graph: Arc<Graph>, owner: R10Owner) {
     owner.stop();
     crate::direct_projection::release_projection(&graph);
     let _ = fs::remove_dir_all(&root);
@@ -198,7 +198,7 @@ fn gh543_a_read_refused_on_an_intact_image_does_not_rebuild_it() {
 }
 
 /// Build and release a stored index for `root`, as a previous session would.
-fn r10_prebuild(root: &Path, database: &Path) {
+pub(super) fn r10_prebuild(root: &Path, database: &Path) {
     let graph = Graph::open(root);
     graph
         .attach_direct_projection(database.to_path_buf())

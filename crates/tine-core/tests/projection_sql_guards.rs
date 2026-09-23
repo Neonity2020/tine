@@ -62,6 +62,9 @@ fn projection_statement_sites_are_pinned() {
     let expected: BTreeMap<String, usize> = [
         // P3B unified the page/block plain-reference candidates at one statement site.
         ("crates/tine-core/src/direct_projection.rs", 3),
+        // GH #543 (decision DK4): a fresh build reads back the pages it
+        // carries over from the image it replaces.
+        ("crates/tine-core/src/direct_projection/carried.rs", 2),
         // GH #543 (audit R4-02): a page open asks whether the ready image
         // already holds the opened bytes.
         ("crates/tine-core/src/direct_projection/derived_reads.rs", 7),

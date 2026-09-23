@@ -29,16 +29,9 @@ pub(super) fn full_repair_delta(
     // A page under an unreadable directory is as unread as an unreadable
     // page: deleting its rows would empty the index for as long as the
     // directory stays unreadable, and publish that as ready.
-    let unread = |path: &str| {
-        full.retained.iter().any(|retained| {
-            retained.is_empty()
-                || path == retained
-                || path
-                    .strip_prefix(retained.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
-    };
-    delta.deletions.retain(|path| !unread(path));
+    delta
+        .deletions
+        .retain(|path| !carried::is_unread(&full.retained, path));
     Ok(delta)
 }
 
@@ -131,7 +124,7 @@ pub(super) fn apply_full_repair(
     full: &PendingFull,
     delta: tine_storage::sqlite::PhysicalGraphProjectionSourceDelta,
     mut deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<AppliedTurn, String> {
+) -> Result<AppliedTurn, LoweringError> {
     let documents = full
         .pages
         .iter()
@@ -150,7 +143,8 @@ pub(super) fn apply_full_repair(
                 .ok_or_else(|| format!("snapshot has no revision for {path}"))?;
             Ok(((*entry).clone(), Arc::clone(document), revision.clone()))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(LoweringError::Failed)?;
     projection_diag(|| {
         format!(
             "full repair: relowering {} page(s), deleting {}, keeping the rows under {} unread source(s)",
@@ -173,49 +167,62 @@ pub(super) fn apply_full_repair(
         .lock()
         .unwrap()
         .adopt_order(&order, &mut deltas);
-    apply_deltas(database, deltas)
+    apply_deltas(database, shared, deltas)
 }
 
-/// Apply a `WarmRepair` in one transaction and reconcile every stored page's
-/// position to the queue's order (the walk, then pages this session created),
-/// restricted to the pages the image holds afterwards. Returns that order.
+/// Apply a `WarmRepair` to the live image through the one batched lowering
+/// loop: each batch of re-lowered pages committed with its source revisions
+/// (the deletions with the first), so a close stops it between batches and the next
+/// validation resumes from what it wrote. Then reconcile every stored page's
+/// position to the queue's order (the walk, then pages this session
+/// created), restricted to the pages the image holds afterwards, and return
+/// that order.
 pub(super) fn apply_warm_repair(
     database: &mut PhysicalGraphProjectionDatabase,
     shared: &ProjectionShared,
     repair: WarmRepair,
     parse_config: &Arc<ParseConfig>,
-) -> Result<Vec<String>, String> {
-    let mut deltas = BTreeMap::new();
-    for (entry, document, revision) in repair.replacements {
-        deltas.insert(
-            entry.rel_path.clone(),
-            (
-                0,
-                PageDelta::Replace {
-                    entry,
-                    document,
-                    revision,
-                    parse_config: Arc::clone(parse_config),
-                    page_position: None,
-                },
-            ),
-        );
-    }
-    let lowered = lower_deltas(deltas)?;
-    let mut change = lowered.change;
-    change.deletions = repair.deletions;
+) -> Result<Vec<String>, LoweringError> {
     projection_diag(|| {
         format!(
             "warm repair: relowering {} page(s), deleting {}",
-            change.replacements.len(),
-            change.deletions.len()
+            repair.replacements.len(),
+            repair.deletions.len()
         )
     });
+    let config_digest = parse_config.digest();
+    let inputs = repair
+        .replacements
+        .into_iter()
+        .map(|(entry, document, revision)| LoweringInput {
+            entry,
+            document,
+            revision: projection_source_revision(&revision, config_digest),
+            parse_config: Arc::clone(parse_config),
+            position: None,
+        })
+        .collect();
+    lower_in_batches(
+        shared,
+        inputs,
+        repair.deletions,
+        |change, revisions, aliases| {
+            database
+                .apply_with_source_revisions_and_aliases(&change, &revisions, &aliases)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+    )?;
     reconcile_page_order(
         database,
         shared,
-        &change,
-        &lowered.revisions,
-        &lowered.aliases,
+        &PhysicalGraphProjectionChange {
+            replacements: Vec::new(),
+            deletions: Vec::new(),
+            reference_postings: Vec::new(),
+        },
+        &[],
+        &[],
     )
+    .map_err(LoweringError::Failed)
 }

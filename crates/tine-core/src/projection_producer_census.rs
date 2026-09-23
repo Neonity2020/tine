@@ -1591,9 +1591,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `apply_warm_repair`) unchanged from direct_projection.rs to
     // direct_projection/repair.rs: two `source_delta` reads change file,
     // nothing else.
+    // 2026-09-23: GH #543 (audit R11-01, decision DK4) a fresh build carries
+    // the pages a snapshot could not read by re-lowering them from the image
+    // it replaces: `carried.rs` opens one read-only derived SQL snapshot. The
+    // in-place repair writes each batch through `lower_in_batches`, so
+    // repair.rs gains one `apply_with_source_revisions_and_aliases` call (an
+    // existing write kind). No new write kind, schema or dependency pin.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "288ba72a8400437fe477c7be81fe40398e213fa07268a9bba197aa574263a585",
+        "0d21701efc751d62963525e25423e25e979241467fa619cbefdbbc9e77918e3c",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -2166,6 +2172,33 @@ fn watch_reach_has_one_producer() {
             "src-tauri/src/watcher/runtime.rs graph_text_watch_reach 1",
         ],
         "watch reach gained a decider; see this test's doc comment"
+    );
+}
+
+/// "Who lowers pages into the index?" has one answer: `lower_in_batches`
+/// (`crates/tine-core/src/direct_projection/lowering.rs`), the only
+/// production caller of `physical_page`. It writes in batches, checks the stop
+/// flag between them and reports progress, so every page source (a full
+/// snapshot, the pages a fresh build carries over, an in-place repair, queued
+/// updates) is stoppable by `close` and visible to the user. Before, four sites
+/// lowered on their own, and a whole-graph repair over one unreadable page ran
+/// as one unstoppable 70 s turn (GH #543, audit R11-01, decision DK4; I-12,
+/// I-24). A new source builds `LoweringInput`s and hands them to that loop;
+/// it does not call `physical_page`.
+#[test]
+fn page_lowering_has_one_loop() {
+    let mut sites = Vec::new();
+    for file in production_rust() {
+        let uses = identifier_occurrences(&file.code, "physical_page(")
+            - identifier_occurrences(&file.code, "fn physical_page(");
+        if uses != 0 {
+            sites.push(format!("{} physical_page {uses}", file.relative));
+        }
+    }
+    assert_eq!(
+        sites,
+        ["crates/tine-core/src/direct_projection/lowering.rs physical_page 1"],
+        "page lowering gained a caller outside `lower_in_batches`; see this test's doc comment"
     );
 }
 

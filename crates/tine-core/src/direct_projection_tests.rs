@@ -637,7 +637,6 @@ fn same_config_inventory_preserves_jobs_but_changed_config_cancels_them() {
         Arc::clone(&pages),
         Arc::clone(&revisions),
         Arc::clone(&config),
-        true,
         Vec::new(),
     );
     wait_generation(generation + 1);
@@ -661,7 +660,6 @@ fn same_config_inventory_preserves_jobs_but_changed_config_cancels_them() {
         pages,
         revisions,
         Arc::new(changed),
-        true,
         Vec::new(),
     );
     let started = Instant::now();
@@ -3435,7 +3433,6 @@ fn ordinary_graph_edits_never_run_whole_image_health_checks() {
         pages,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     wait_ready(&other_graph);
@@ -3472,7 +3469,6 @@ fn ordinary_graph_edits_never_run_whole_image_health_checks() {
         pages,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     wait_ready(&graph);
@@ -3545,7 +3541,8 @@ fn each_queued_page_lowers_under_the_config_it_was_queued_with() {
         queued("alpha.md", &default_config),
         queued("beta.md", &edited_config),
     ]);
-    apply_deltas(&mut database, deltas).unwrap();
+    let shared = empty_projection_shared();
+    assert!(apply_deltas(&mut database, &shared, deltas).is_ok());
 
     let stamped = |alpha: &Arc<ParseConfig>, beta: &Arc<ParseConfig>| {
         database
@@ -7099,7 +7096,6 @@ fn an_incomplete_snapshot_keeps_the_rows_beneath_what_it_could_not_read() {
             Arc::new(Vec::new()),
             Arc::new(HashMap::new()),
             Arc::new(graph.config().parse_config()),
-            false,
             vec![retained.to_owned()],
         ));
         assert!(projection.wait_drained_test(), "{case}: the turn failed");
@@ -7217,7 +7213,6 @@ fn an_unreadable_page_with_no_old_rows_does_not_fail_the_readable_graph() {
         pages,
         Arc::new(revisions),
         config,
-        false,
         Vec::new(),
     );
     wait_ready(&graph);
@@ -7276,7 +7271,7 @@ fn a_full_snapshot_older_than_the_queue_does_not_roll_it_back() {
     assert!(saved_generation > stale_generation);
 
     // The delayed snapshot arrives, naming the generation it was built for.
-    projection.enqueue_full(stale_generation, pages, revisions, config, true, Vec::new());
+    projection.enqueue_full(stale_generation, pages, revisions, config, Vec::new());
     // Read the queue OUT of the lock: a panic while holding it wedges the
     // worker on the poisoned mutex and the failure shows up as a hang.
     let latest = projection.shared.pending.lock().unwrap().latest_generation;
@@ -7397,7 +7392,7 @@ fn a_rebuild_does_not_discard_a_save_newer_than_its_snapshot() {
     // next pass, or with no owner the next query's repair; design v4 NG3).
     projection.request_rebuild();
     assert!(
-        !projection.enqueue_full(stale_generation, pages, revisions, config, true, Vec::new()),
+        !projection.enqueue_full(stale_generation, pages, revisions, config, Vec::new()),
         "a snapshot older than the queue was accepted: {}",
         projection.debug_state_test()
     );
@@ -7595,7 +7590,6 @@ fn cancellation_before_publication_keeps_the_old_image_and_discards_the_stage() 
         pages,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     reached.wait();
@@ -7727,7 +7721,6 @@ fn cancellation_between_fresh_build_batches_discards_the_partial_stage() {
         pages,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     reached.wait();
@@ -7786,7 +7779,6 @@ fn edit_delete_and_rename_during_staged_build_reconcile_after_publication() {
         pages,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     reached.wait();
@@ -7851,7 +7843,6 @@ fn cancellation_after_publication_keeps_the_installed_complete_image() {
         pages,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     reached.wait();
@@ -7917,7 +7908,7 @@ fn held_alias_reader_is_drained_before_fresh_publication() {
         .lock()
         .unwrap() = Some(Box::new(move || after_tx.send(()).unwrap()));
     projection.request_rebuild();
-    projection.enqueue_full(generation, pages, revisions, config, true, Vec::new());
+    projection.enqueue_full(generation, pages, revisions, config, Vec::new());
     before_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(
         after_rx.recv_timeout(Duration::from_millis(100)).is_err(),
@@ -7976,7 +7967,7 @@ fn delayed_shared_reader_rechecks_readiness_before_opening_a_connection() {
         }
     }));
     projection.request_rebuild();
-    projection.enqueue_full(generation, pages, revisions, config, true, Vec::new());
+    projection.enqueue_full(generation, pages, revisions, config, Vec::new());
     publication_reached.wait();
 
     release.wait();
@@ -8021,7 +8012,6 @@ fn failures_on_either_side_of_publication_preserve_the_boundary_image() {
             pages,
             revisions,
             config,
-            true,
             Vec::new(),
         );
         let started = Instant::now();
@@ -9766,7 +9756,6 @@ fn gh543_indexing_progress_counts_each_whole_graph_pass() {
         pages,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     reached.wait();
@@ -10186,7 +10175,6 @@ fn the_same_full_snapshot_offered_twice_is_taken_once() {
         snapshot,
         revisions,
         config,
-        true,
         Vec::new(),
     );
     assert!(
@@ -10599,7 +10587,6 @@ fn gh543_a_full_turn_with_a_delete_and_a_later_update_applies() {
         Arc::new(pages.clone()),
         Arc::new(revisions.clone()),
         Arc::clone(&config),
-        true,
         Vec::new(),
     ));
     projection.enqueue_delete(generation + 3, deleted);

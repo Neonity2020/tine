@@ -201,14 +201,11 @@ struct PendingFull {
     pages: PageSnapshot,
     revisions: PageRevisions,
     parse_config: Arc<ParseConfig>,
-    /// Whether every physical page in the captured inventory was readable and
-    /// parsed. A partial cache may still be useful to the app, but it must not
-    /// replace a healthy complete projection and silently erase retained rows.
-    source_complete: bool,
     /// Sources that exist but could not be read, listed or parsed for this
     /// snapshot, as graph-relative paths: a page, or a directory whose pages
     /// all count as unread (`""` is the whole graph). Over a healthy image
-    /// they keep their stored rows (see `apply_full_repair`).
+    /// their pages keep their stored rows: a repair leaves them in place and
+    /// a fresh build carries them (see `carried`).
     retained: Vec<String>,
 }
 
@@ -600,6 +597,15 @@ impl PendingProjection {
                     }
                 });
             }
+        }
+    }
+
+    /// Give `path` a place at the end of the order unless it has one.
+    fn place(&mut self, path: &str) {
+        if !self.page_order.contains_key(path) {
+            self.page_order
+                .insert(path.to_owned(), self.next_page_order);
+            self.next_page_order += 1;
         }
     }
 
@@ -1283,7 +1289,6 @@ impl DirectProjection {
         pages: PageSnapshot,
         revisions: PageRevisions,
         parse_config: Arc<ParseConfig>,
-        source_complete: bool,
         retained: Vec<String>,
     ) -> bool {
         let mut pending = self.shared.pending.lock().unwrap();
@@ -1368,7 +1373,6 @@ impl DirectProjection {
             pages,
             revisions,
             parse_config,
-            source_complete,
             retained,
         });
         pending.deltas.clear();
@@ -2688,6 +2692,12 @@ impl DirectProjection {
         self.shared.projection_health_checks.load(Ordering::Relaxed)
     }
 
+    /// Run `hook` on the worker once, after the next lowering batch it writes.
+    #[cfg(test)]
+    pub(crate) fn after_next_lowering_batch_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.shared.after_fresh_build_batch.lock().unwrap() = Some(hook);
+    }
+
     /// From-scratch builds this index has started.
     #[cfg(test)]
     pub(crate) fn fresh_builds_test(&self) -> u64 {
@@ -2741,6 +2751,12 @@ impl DirectProjection {
     ///
     /// A `stop` turn is taken as soon as the worker reaches the top of its
     /// loop, so the bound is one in-flight apply, never a queue.
+    /// [`DirectProjection::close`] without waiting: callable from the worker.
+    #[cfg(test)]
+    pub(crate) fn close_test(&self) {
+        self.close();
+    }
+
     pub(crate) fn close_and_wait_for_worker(&self, timeout: std::time::Duration) -> bool {
         self.close();
         let started = std::time::Instant::now();
@@ -3063,10 +3079,14 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         // differs by. Rebuilding from scratch whenever any page differed
         // turned one edit made while Tine was closed, met by an escalated
         // launch validation, into re-lowering the whole graph with search
-        // withdrawn meanwhile (GH #543, audit R9-01). Only a rebuild owed, or
-        // an image that is absent or damaged, starts from scratch. An
-        // incomplete snapshot never does: it would erase the rows of every
-        // page it could not read. A changed parse configuration differs on
+        // withdrawn meanwhile (GH #543, audit R9-01). Only a rebuild owed, a
+        // share of the pages past the repair bound, or an image that is
+        // absent or damaged, starts from scratch. Both go through the one
+        // batched lowering loop, and both keep the pages the snapshot could
+        // not read, so completeness picks neither (decision DK4): an
+        // incomplete snapshot once always repaired, and a config change over
+        // one unreadable page re-lowered the whole graph in one turn nothing
+        // could stop (audit R11-01). A changed parse configuration differs on
         // every page, so it is a fresh build, which also cancels the open
         // query jobs before it publishes.
         let config_changed = registry_config.as_ref().is_some_and(|config| {
@@ -3078,8 +3098,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 .is_some_and(|owner| owner.config.digest() != config.digest())
         });
         let full_repair = full.as_ref().and_then(|full| {
-            let repairable = existing_image_healthy
-                && (!full.source_complete || !rebuild && !requires_full_rebuild && !config_changed);
+            let repairable =
+                existing_image_healthy && !rebuild && !requires_full_rebuild && !config_changed;
             let delta = repairable
                 .then(|| full_repair_delta(writer_slot.as_ref().expect("healthy writer"), full))
                 .and_then(Result::ok)?;
@@ -3087,12 +3107,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             // the parse configuration's digest, so a configuration changed
             // while Tine was closed differs on every page and is built fresh
             // here, though `config_changed` only sees this session's changes.
-            // An incomplete snapshot is repaired whatever its share: a fresh
-            // build would erase the pages it could not read.
             let changed = delta.replacements.len() + delta.deletions.len();
-            (!full.source_complete
-                || repair_is_proportionate(changed, full.pages.len() + full.retained.len()))
-            .then_some(delta)
+            repair_is_proportionate(changed, full.pages.len() + full.retained.len())
+                .then_some(delta)
         });
         let fresh_build = had_full && full_repair.is_none();
         let registry_reset = fresh_build
@@ -3145,10 +3162,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         // reused image keeps the positions it was written with.
                         adopt_queue_order(database, &shared, &mut deltas)
                             .map_err(ProjectionRefusal::Failed)?;
-                        apply_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?
+                        apply_deltas(database, &shared, deltas).map_err(ProjectionRefusal::from)?
                     } else {
                         apply_full_repair(database, &shared, &full, delta, deltas)
-                            .map_err(ProjectionRefusal::Failed)?
+                            .map_err(ProjectionRefusal::from)?
                     }
                 } else {
                     let (database, applied) = build_and_publish_fresh_projection(
@@ -3157,11 +3174,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         full,
                         deltas,
                         &inventory,
+                        existing_image_healthy,
                     )
-                    .map_err(|error| match error {
-                        FreshBuildError::Stopped => ProjectionRefusal::Stopped,
-                        FreshBuildError::Failed(error) => ProjectionRefusal::Failed(error),
-                    })?;
+                    .map_err(ProjectionRefusal::from)?;
                     writer_slot = Some(database);
                     applied
                 }
@@ -3188,7 +3203,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         });
                         let order =
                             apply_warm_repair(database, &shared, repair, &warm.parse_config)
-                                .map_err(ProjectionRefusal::Failed)?;
+                                .map_err(ProjectionRefusal::from)?;
                         // The image now keeps the order's positions; so does
                         // the queue, and so do the updates taken with it.
                         shared
@@ -3247,9 +3262,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         writer_slot
                             .as_mut()
                             .ok_or(ProjectionRefusal::AwaitingFullInventory)?,
+                        &shared,
                         deltas,
                     )
-                    .map_err(ProjectionRefusal::Failed)?
+                    .map_err(ProjectionRefusal::from)?
                 };
                 applied.warm_outcome = Some(outcome);
                 applied
@@ -3265,7 +3281,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 if !unplaced.is_empty() {
                     shared.pending.lock().unwrap().park_unplaced(unplaced);
                 }
-                apply_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?
+                apply_deltas(database, &shared, deltas).map_err(ProjectionRefusal::from)?
             };
 
             let (revision, registry_after) = {
@@ -3564,128 +3580,157 @@ fn remove_projection_sidecar(directory: &Dir, name: &str) -> Result<(), String> 
         .map_err(|error| error.to_string())
 }
 
-enum FreshBuildError {
-    Stopped,
-    Failed(String),
+use lowering::{delta_inputs, lower_in_batches, LoweringError, LoweringInput};
+
+impl From<LoweringError> for ProjectionRefusal {
+    fn from(error: LoweringError) -> Self {
+        match error {
+            LoweringError::Stopped => ProjectionRefusal::Stopped,
+            LoweringError::Failed(error) => ProjectionRefusal::Failed(error),
+        }
+    }
 }
 
 fn fresh_build_stopped(shared: &ProjectionShared) -> bool {
     shared.pending.lock().unwrap().stop
 }
 
+/// Build `full` into a staged file and publish it over the image. The pages
+/// `full` could not read are lowered from what `old_writer`'s image stored for
+/// them when `carry` says that image is healthy (see `carried`), so an
+/// incomplete snapshot is built fresh like any other.
 fn build_and_publish_fresh_projection(
     shared: &ProjectionShared,
     old_writer: Option<PhysicalGraphProjectionDatabase>,
     full: PendingFull,
     deltas: BTreeMap<String, (u64, PageDelta)>,
     inventory: &[String],
-) -> Result<(PhysicalGraphProjectionDatabase, AppliedTurn), FreshBuildError> {
-    const BUILD_BATCH: usize = 32;
+    carry: bool,
+) -> Result<(PhysicalGraphProjectionDatabase, AppliedTurn), LoweringError> {
     #[cfg(test)]
     shared.fresh_builds.fetch_add(1, Ordering::SeqCst);
 
     let (parent, stage_name, destination_name) =
-        projection_publication_names(&shared.path).map_err(FreshBuildError::Failed)?;
+        projection_publication_names(&shared.path).map_err(LoweringError::Failed)?;
     let directory = Dir::open_ambient_dir(&parent, ambient_authority())
-        .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-    cleanup_projection_stages(&directory, &destination_name).map_err(FreshBuildError::Failed)?;
+        .map_err(|error| LoweringError::Failed(error.to_string()))?;
+    cleanup_projection_stages(&directory, &destination_name).map_err(LoweringError::Failed)?;
     let stage_path = parent.join(&stage_name);
 
     let build = (|| {
         if fresh_build_stopped(shared) {
-            return Err(FreshBuildError::Stopped);
+            return Err(LoweringError::Stopped);
         }
-        let stage_publication = tine_storage::DurableDirectoryPublication::open(&directory)
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-        let mut database =
-            PhysicalGraphProjectionDatabase::create_fresh_build(&stage_path, stage_publication)
-                .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-
         let PendingFull {
             pages,
             revisions,
             parse_config,
-            source_complete: _,
-            retained: _,
+            retained,
         } = full;
         let config_digest = parse_config.digest();
+        let mut inputs = pages
+            .iter()
+            .map(|(entry, document)| {
+                let revision = revisions.get(&entry.path).ok_or_else(|| {
+                    LoweringError::Failed(format!(
+                        "parsed page has no exact source revision: {}",
+                        entry.rel_path
+                    ))
+                })?;
+                Ok(LoweringInput {
+                    entry: entry.clone(),
+                    document: Arc::clone(document),
+                    revision: projection_source_revision(revision, config_digest),
+                    parse_config: Arc::clone(&parse_config),
+                    position: None,
+                })
+            })
+            .collect::<Result<Vec<_>, LoweringError>>()?;
+        // The order turn must name every page the stage holds, so carried
+        // pages take places after the snapshot's own.
+        let mut inventory = inventory.to_vec();
+        if carry && !retained.is_empty() {
+            let superseded = pages
+                .iter()
+                .map(|(entry, _)| entry.rel_path.as_str())
+                .chain(deltas.keys().map(String::as_str))
+                .collect::<HashSet<_>>();
+            // A read that fails keeps the build going without them rather
+            // than refusing to rebuild: the pages come back when their files
+            // can be read again, and a build that cannot run keeps nothing.
+            match carried::stored_unread_pages(&shared.path, &retained, &superseded, &parse_config)
+            {
+                Ok(carried) => {
+                    projection_diag(|| {
+                        format!("fresh build: carrying {} unread page(s)", carried.len())
+                    });
+                    let listed = inventory.iter().cloned().collect::<HashSet<_>>();
+                    let mut pending = shared.pending.lock().unwrap();
+                    for page in &carried {
+                        if !listed.contains(&page.entry.rel_path) {
+                            inventory.push(page.entry.rel_path.clone());
+                        }
+                        pending.place(&page.entry.rel_path);
+                    }
+                    inputs.extend(carried);
+                }
+                Err(error) => report_projection_failure("could not carry unread pages", &error),
+            }
+        }
+        drop(pages);
+        let stage_publication = tine_storage::DurableDirectoryPublication::open(&directory)
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        let mut database =
+            PhysicalGraphProjectionDatabase::create_fresh_build(&stage_path, stage_publication)
+                .map_err(|error| LoweringError::Failed(error.to_string()))?;
         let mut applied = AppliedTurn::default();
         let mut text_bytes = 0u64;
-        let progress = shared.build_progress.begin(
-            crate::indexing_progress::IndexingPhase::Indexing,
-            pages.len(),
-        );
-        for chunk in pages.chunks(BUILD_BATCH) {
-            progress.advance(chunk.len());
-            if fresh_build_stopped(shared) {
-                return Err(FreshBuildError::Stopped);
-            }
-            let mut replacements = Vec::with_capacity(chunk.len());
-            let mut postings = Vec::new();
-            let mut aliases = Vec::new();
-            let mut sources = Vec::with_capacity(chunk.len());
-            for (entry, document) in chunk {
-                let (mut page, mut page_postings, mut page_aliases) =
-                    physical_page(entry, document, &parse_config)
-                        .map_err(FreshBuildError::Failed)?;
-                page.position = None;
-                text_bytes =
-                    text_bytes.saturating_add(projected_text_bytes(std::slice::from_ref(&page)));
-                sources.push(PhysicalGraphProjectionSourceRevision {
-                    path: entry.rel_path.clone(),
-                    revision: projection_source_revision(
-                        revisions.get(&entry.path).ok_or_else(|| {
-                            FreshBuildError::Failed(format!(
-                                "parsed page has no exact source revision: {}",
-                                entry.rel_path
-                            ))
-                        })?,
-                        config_digest,
-                    ),
-                });
-                applied.pages.lowered.push(entry.rel_path.clone());
-                replacements.push(page);
-                postings.append(&mut page_postings);
-                aliases.append(&mut page_aliases);
-            }
-            database
-                .set_page_cache_budget(crate::projection_budget::build_page_cache_budget(
-                    text_bytes,
-                    crate::projection_budget::physical_memory_bytes(),
-                ))
-                .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-            database
-                .append_with_source_revisions_and_aliases(
-                    &PhysicalGraphProjectionChange {
-                        replacements,
-                        deletions: Vec::new(),
-                        reference_postings: postings,
-                    },
-                    &sources,
-                    &aliases,
-                )
-                .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-            #[cfg(test)]
-            {
-                let hook = shared.after_fresh_build_batch.lock().unwrap().take();
-                if let Some(hook) = hook {
-                    hook();
-                }
-            }
-            if fresh_build_stopped(shared) {
-                return Err(FreshBuildError::Stopped);
-            }
-        }
+        applied.pages.lowered =
+            lower_in_batches(shared, inputs, Vec::new(), |change, revisions, aliases| {
+                text_bytes = text_bytes.saturating_add(projected_text_bytes(&change.replacements));
+                database
+                    .set_page_cache_budget(crate::projection_budget::build_page_cache_budget(
+                        text_bytes,
+                        crate::projection_budget::physical_memory_bytes(),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                database
+                    .append_with_source_revisions_and_aliases(&change, &revisions, &aliases)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })?;
 
-        let delta = lower_deltas(deltas).map_err(FreshBuildError::Failed)?;
-        applied.pages.lowered.extend(delta.applied.pages.lowered);
-        applied.pages.deleted.extend(delta.applied.pages.deleted);
+        // The updates taken with the snapshot land in `finish`, as one tail.
+        let (tail, tail_deletions) = delta_inputs(deltas);
+        let mut tail_change = PhysicalGraphProjectionChange {
+            replacements: Vec::new(),
+            deletions: Vec::new(),
+            reference_postings: Vec::new(),
+        };
+        let (mut tail_revisions, mut tail_aliases) = (Vec::new(), Vec::new());
+        applied.pages.deleted.extend(tail_deletions.iter().cloned());
+        let tail_lowered = lower_in_batches(
+            shared,
+            tail,
+            tail_deletions,
+            |change, revisions, aliases| {
+                tail_change.replacements.extend(change.replacements);
+                tail_change.deletions.extend(change.deletions);
+                tail_change
+                    .reference_postings
+                    .extend(change.reference_postings);
+                tail_revisions.extend(revisions);
+                tail_aliases.extend(aliases);
+                Ok(())
+            },
+        )?;
+        applied.pages.lowered.extend(tail_lowered);
         if fresh_build_stopped(shared) {
-            return Err(FreshBuildError::Stopped);
+            return Err(LoweringError::Stopped);
         }
         let finalized = database
-            .finish(&delta.change, &delta.revisions, &delta.aliases, inventory)
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+            .finish(&tail_change, &tail_revisions, &tail_aliases, &inventory)
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
         Ok((finalized, applied, text_bytes))
     })();
 
@@ -3699,7 +3744,7 @@ fn build_and_publish_fresh_projection(
 
     let publication = (|| {
         if fresh_build_stopped(shared) {
-            return Err(FreshBuildError::Stopped);
+            return Err(LoweringError::Stopped);
         }
         let fence = shared.cancel_queued_captures(false);
         shared.query_jobs.wait_for_drain(fence);
@@ -3727,64 +3772,64 @@ fn build_and_publish_fresh_projection(
         if let Some(database) = old_writer {
             database
                 .checkpoint_truncate()
-                .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+                .map_err(|error| LoweringError::Failed(error.to_string()))?;
             drop(database);
         }
         remove_projection_sidecar(&directory, &format!("{destination_name}-wal"))
-            .map_err(FreshBuildError::Failed)?;
+            .map_err(LoweringError::Failed)?;
         remove_projection_sidecar(&directory, &format!("{destination_name}-shm"))
-            .map_err(FreshBuildError::Failed)?;
+            .map_err(LoweringError::Failed)?;
 
         #[cfg(test)]
         {
             let hook = shared.before_fresh_publication.lock().unwrap().take();
             if let Some(hook) = hook {
-                hook().map_err(FreshBuildError::Failed)?;
+                hook().map_err(LoweringError::Failed)?;
             }
         }
         // This is the cancellation boundary. Once the storage primitive below
         // starts, its atomic name operation owns the outcome; a stop arriving
         // after this check may leave the complete new image installed.
         if fresh_build_stopped(shared) {
-            return Err(FreshBuildError::Stopped);
+            return Err(LoweringError::Stopped);
         }
 
         finalized
             .publish_replace_single_writer(&destination_name)
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
 
         #[cfg(test)]
         {
             let hook = shared.after_fresh_publication.lock().unwrap().take();
             if let Some(hook) = hook {
-                hook().map_err(FreshBuildError::Failed)?;
+                hook().map_err(LoweringError::Failed)?;
             }
         }
         if fresh_build_stopped(shared) {
-            return Err(FreshBuildError::Stopped);
+            return Err(LoweringError::Stopped);
         }
 
         let database = PhysicalGraphProjectionDatabase::open_writable(&shared.path)
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
         database
             .validate_schema()
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
         database
             .quick_check()
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
         database
             .checkpoint_truncate()
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
         database
             .shrink_page_cache_budget(crate::projection_budget::resting_page_cache_budget(
                 text_bytes,
             ))
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
         #[cfg(test)]
         shared.serving_writer_cache_budget.store(
             database
                 .page_cache_budget()
-                .map_err(|error| FreshBuildError::Failed(error.to_string()))?,
+                .map_err(|error| LoweringError::Failed(error.to_string()))?,
             Ordering::Release,
         );
         Ok(database)
@@ -3792,7 +3837,7 @@ fn build_and_publish_fresh_projection(
     match publication {
         Ok(database) => {
             cleanup_projection_stage_artifacts(&directory, &stage_name)
-                .map_err(FreshBuildError::Failed)?;
+                .map_err(LoweringError::Failed)?;
             Ok((database, applied))
         }
         Err(error) => {
@@ -3821,20 +3866,20 @@ struct AppliedTurn {
 
 fn apply_deltas(
     database: &mut PhysicalGraphProjectionDatabase,
+    shared: &ProjectionShared,
     deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<AppliedTurn, String> {
-    if deltas.is_empty() {
-        return Ok(AppliedTurn::default());
-    }
-    let lowered = lower_deltas(deltas)?;
-    database
-        .apply_with_source_revisions_and_aliases(
-            &lowered.change,
-            &lowered.revisions,
-            &lowered.aliases,
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(lowered.applied)
+) -> Result<AppliedTurn, LoweringError> {
+    let (pages, deletions) = delta_inputs(deltas);
+    let mut applied = AppliedTurn::default();
+    applied.pages.deleted = deletions.clone();
+    applied.pages.lowered =
+        lower_in_batches(shared, pages, deletions, |change, revisions, aliases| {
+            database
+                .apply_with_source_revisions_and_aliases(&change, &revisions, &aliases)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })?;
+    Ok(applied)
 }
 
 /// Whether this graph's worker has found the writer lease held.
@@ -3926,6 +3971,7 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
     }
 }
 
+mod carried;
 pub(crate) mod derived_reads;
 mod lowering;
 mod page_order;

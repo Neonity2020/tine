@@ -310,6 +310,13 @@ fn every_projection_statement_shape_is_blessed() {
     graph.save_page(&page, baseline.as_deref()).unwrap();
     wait_ready(&graph);
     exercise_every_surface(&graph);
+    // A fresh build carries the pages a snapshot could not read from the
+    // image it replaces (GH #543, decision DK4).
+    crate::direct_projection::carried_physical_pages_test(
+        &root.path().join("private/projection.sqlite"),
+        &std::sync::Arc::new(crate::config::ParseConfig::default()),
+    )
+    .expect("the census image's pages are carried");
 
     let recorded: BTreeSet<String> = census::recorded().into_keys().collect();
     let assert_shape = |label: &str, required: &[&str], forbidden: &[&str]| {

@@ -246,7 +246,6 @@ impl Graph {
             pages,
             revisions,
             Arc::new(self.config().parse_config()),
-            source_complete,
             retained,
         ) {
             FullOfferOutcome::Queued

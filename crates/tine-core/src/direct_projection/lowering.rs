@@ -4,21 +4,12 @@
 
 use super::*;
 
-pub(super) struct LoweredDeltas {
-    pub(super) applied: AppliedTurn,
-    pub(super) change: PhysicalGraphProjectionChange,
-    pub(super) revisions: Vec<PhysicalGraphProjectionSourceRevision>,
-    pub(super) aliases: Vec<PhysicalAliasDeclaration>,
-}
-
-pub(super) fn lower_deltas(
+/// Queued page updates as the loop's input: the pages to lower and the
+/// pages to delete.
+pub(super) fn delta_inputs(
     deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<LoweredDeltas, String> {
-    let mut turn = AppliedTurn::default();
-    let mut replacements = Vec::new();
-    let mut reference_postings = Vec::new();
-    let mut aliases = Vec::new();
-    let mut replacement_sources = Vec::new();
+) -> (Vec<LoweringInput>, Vec<String>) {
+    let mut pages = Vec::new();
     let mut deletions = Vec::new();
     for (_, (_, delta)) in deltas {
         match delta {
@@ -28,36 +19,129 @@ pub(super) fn lower_deltas(
                 revision,
                 parse_config,
                 page_position,
-            } => {
-                replacement_sources.push(PhysicalGraphProjectionSourceRevision {
-                    path: entry.rel_path.clone(),
-                    revision: projection_source_revision(&revision, parse_config.digest()),
-                });
-                let (mut page, mut postings, mut page_aliases) =
-                    physical_page(&entry, &document, &parse_config)?;
-                page.position = page_position;
-                turn.pages.lowered.push(page.path.clone());
-                replacements.push(page);
-                reference_postings.append(&mut postings);
-                aliases.append(&mut page_aliases);
-            }
-            PageDelta::Delete { entry } => {
-                let id = entry.rel_path;
-                turn.pages.deleted.push(id.clone());
-                deletions.push(id);
-            }
+            } => pages.push(LoweringInput {
+                revision: projection_source_revision(&revision, parse_config.digest()),
+                entry,
+                document,
+                parse_config,
+                position: page_position,
+            }),
+            PageDelta::Delete { entry } => deletions.push(entry.rel_path),
         }
     }
-    Ok(LoweredDeltas {
-        applied: turn,
-        change: PhysicalGraphProjectionChange {
-            replacements,
-            deletions,
-            reference_postings,
-        },
-        revisions: replacement_sources,
-        aliases,
-    })
+    (pages, deletions)
+}
+
+/// One page for [`lower_in_batches`] and the exact source revision stored
+/// with its rows.
+pub(super) struct LoweringInput {
+    pub(super) entry: PageEntry,
+    pub(super) document: Arc<Document>,
+    pub(super) revision: String,
+    pub(super) parse_config: Arc<ParseConfig>,
+    /// The page's place in the order, or `None` to leave it to the order
+    /// turn (a stored page keeps its own).
+    pub(super) position: Option<u64>,
+}
+
+/// Why a batched lowering ended early.
+pub(super) enum LoweringError {
+    /// The projection is closing; nothing more is written.
+    Stopped,
+    Failed(String),
+}
+
+/// Pages lowered per batch: the stop check's granularity.
+const LOWERING_BATCH: usize = 32;
+
+/// The ONE lowering loop (GH #543, decision DK4). Every page the projection
+/// writes goes through here -- a fresh build's, a repair's, a queued update's
+/// -- `LOWERING_BATCH` at a time: each batch is lowered and handed to `write`
+/// whole, and a close stops it between batches. There were several loops,
+/// and only the fresh build's could be stopped: a config change over one
+/// unreadable page took the in-place repair over the whole graph, 74 s on 10k
+/// pages with a close waiting all of it (audit R11-01), and a bulk external
+/// change queued as page updates was the same one turn. `write` is the only
+/// thing that differs: append to a staged build, or apply to the live image,
+/// where each batch commits its rows with their source revisions, so a
+/// stopped turn resumes from what it wrote. `deletions` go with the first
+/// batch. Progress is reported for work of more than one batch: a single
+/// batch is done before a bar could help.
+pub(super) fn lower_in_batches(
+    shared: &ProjectionShared,
+    pages: Vec<LoweringInput>,
+    deletions: Vec<String>,
+    mut write: impl FnMut(
+        PhysicalGraphProjectionChange,
+        Vec<PhysicalGraphProjectionSourceRevision>,
+        Vec<PhysicalAliasDeclaration>,
+    ) -> Result<(), String>,
+) -> Result<Vec<String>, LoweringError> {
+    let stopped = || shared.pending.lock().unwrap().stop;
+    let progress = (pages.len() > LOWERING_BATCH).then(|| {
+        shared.build_progress.begin(
+            crate::indexing_progress::IndexingPhase::Indexing,
+            pages.len(),
+        )
+    });
+    let mut deletions = Some(deletions);
+    let mut lowered = Vec::with_capacity(pages.len());
+    // Deletions alone still make one write.
+    let nothing: &[LoweringInput] = &[];
+    let batches = pages
+        .chunks(LOWERING_BATCH)
+        .chain(pages.is_empty().then_some(nothing));
+    for chunk in batches {
+        if let Some(progress) = &progress {
+            progress.advance(chunk.len());
+        }
+        if stopped() {
+            return Err(LoweringError::Stopped);
+        }
+        let mut replacements = Vec::with_capacity(chunk.len());
+        let mut reference_postings = Vec::new();
+        let mut aliases = Vec::new();
+        let mut revisions = Vec::with_capacity(chunk.len());
+        for page in chunk {
+            let (mut physical, mut postings, mut page_aliases) =
+                physical_page(&page.entry, &page.document, &page.parse_config)
+                    .map_err(LoweringError::Failed)?;
+            physical.position = page.position;
+            revisions.push(PhysicalGraphProjectionSourceRevision {
+                path: page.entry.rel_path.clone(),
+                revision: page.revision.clone(),
+            });
+            lowered.push(page.entry.rel_path.clone());
+            replacements.push(physical);
+            reference_postings.append(&mut postings);
+            aliases.append(&mut page_aliases);
+        }
+        let deletions = deletions.take().unwrap_or_default();
+        if replacements.is_empty() && deletions.is_empty() {
+            continue;
+        }
+        write(
+            PhysicalGraphProjectionChange {
+                replacements,
+                deletions,
+                reference_postings,
+            },
+            revisions,
+            aliases,
+        )
+        .map_err(LoweringError::Failed)?;
+        #[cfg(test)]
+        {
+            let hook = shared.after_fresh_build_batch.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        if stopped() {
+            return Err(LoweringError::Stopped);
+        }
+    }
+    Ok(lowered)
 }
 
 /// The revision Direct Files compares to decide whether a page's rows are still
@@ -107,6 +191,29 @@ pub(crate) fn physical_page_for_test(
     parse_config: &ParseConfig,
 ) -> Result<PhysicalPage, String> {
     physical_page(entry, document, parse_config).map(|(page, _, _)| page)
+}
+
+/// Every page the image at `image` stores, rebuilt from its rows as a fresh
+/// build carries an unreadable page (`carried::stored_unread_pages`) and
+/// lowered again, keyed by path: what a carried page becomes in the next
+/// image. The round-trip guard compares it with the lowering of a parse.
+#[cfg(test)]
+pub(crate) fn carried_physical_pages_test(
+    image: &Path,
+    parse_config: &Arc<ParseConfig>,
+) -> Result<Vec<(String, PhysicalPage)>, String> {
+    super::carried::stored_unread_pages(
+        image,
+        &[String::new()],
+        &std::collections::HashSet::new(),
+        parse_config,
+    )?
+    .into_iter()
+    .map(|page| {
+        physical_page(&page.entry, &page.document, &page.parse_config)
+            .map(|(physical, _, _)| (page.entry.rel_path, physical))
+    })
+    .collect()
 }
 
 pub(super) fn physical_page(
