@@ -6814,6 +6814,8 @@ fn a_torn_projection_is_replaced_only_by_a_complete_fresh_build() {
 /// GH #543 (audit finding F4): a page the launch survey cannot READ is not a
 /// page that is GONE. It keeps the rows it had: a live page must not vanish
 /// from search over a transient disk error or a sharing violation.
+// Unix-only: the unreadable page is made with a 0o000 permission mode.
+#[cfg(unix)]
 #[test]
 fn a_page_the_walk_could_not_read_keeps_the_rows_it_already_had() {
     use std::os::unix::fs::PermissionsExt;
@@ -6868,6 +6870,8 @@ fn a_page_the_walk_could_not_read_keeps_the_rows_it_already_had() {
 /// `path: error`, and the build carries its stored rows only if that failure
 /// is read as naming the path; the whole text named no file, so the page
 /// vanished from search.
+// Unix-only: the unreadable page is made with a 0o000 permission mode.
+#[cfg(unix)]
 #[test]
 fn an_unreadable_page_keeps_its_rows_through_a_fresh_build() {
     use std::os::unix::fs::PermissionsExt;

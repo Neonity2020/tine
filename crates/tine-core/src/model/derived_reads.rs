@@ -147,7 +147,8 @@ impl Graph {
             if !CACHE_DECLINED.with(|declined| declined.replace(false)) {
                 return Err(PageFallback::Parse);
             }
-            if let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) {
+            let cached = self.cache.read().unwrap().as_ref().map(Arc::clone);
+            if let Some(pages) = cached {
                 return Err(PageFallback::Cache(pages));
             }
         }

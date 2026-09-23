@@ -214,6 +214,12 @@ jobs:
       - name: Committed lsdoc WASM contract is current
         run: node scripts/check-wasm-pin.mjs
 
+      # The Guide bundles the committed lsdoc WASM, so it is checked before the
+      # rebuild below replaces that artifact: wasm-opt output is host-variable,
+      # and a Guide built from the rebuilt bytes gets different chunk hashes.
+      - name: Canonical Guide is generated and current
+        run: npm run docs:check
+
       - name: F-Droid clean-source WASM rebuild succeeds
         run: |
           npm run build:wasm
@@ -260,9 +266,6 @@ jobs:
         run: |
           npm run check:regressions
           npm run check:release-readiness
-
-      - name: Canonical Guide is generated and current
-        run: npm run docs:check
 
       # The pin guard otherwise only runs inside `npm run build`, which fast CI
       # skips — a Cargo lsdoc bump with stale vendored WASM must fail HERE, not
