@@ -86,13 +86,10 @@ html[data-editable-emoji="apple"] {
 html[data-editable-emoji="android"] {
   --tine-editable-emoji-font: "Noto Color Emoji", "Noto Emoji Variable";
 }
-/* A published export runs in an ordinary browser and ships no Twemoji SVGs,
-   so emoji are text. Without this rule the monochrome crash-guard face above
-   drew every emoji on the public Guide. Browsers paint system color faces
-   safely; the #76 crash is a WebKitGTK text-control problem inside the app. */
+/* Exports ship no Twemoji and run in ordinary browsers, which paint color
+   faces safely (#76 is WebKitGTK-in-app only); skip the monochrome guard. */
 html[data-editable-emoji="published"] {
-  --tine-editable-emoji-font: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji",
-    "Noto Emoji Variable";
+  --tine-editable-emoji-font: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Noto Emoji Variable";
 }
 /* Native display runs share the entire editable stack, including typography
    presets and text faces that cover some symbols. Keep ordinary text outside
