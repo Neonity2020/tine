@@ -18,6 +18,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - Page links and aliases resolve correctly after launch even when the page
   list is read during a repaint or fails once, and the page list is read once
   instead of twice (GH #543).
+- Changing the journal title format or restoring a backup restarts indexing
+  once, not twice (GH #543).
 - A page edited while Tine was closed is re-indexed on its own at the next
   launch, instead of the whole graph being re-indexed with search unavailable
   meanwhile (GH #543).

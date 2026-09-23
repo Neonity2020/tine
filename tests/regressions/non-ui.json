@@ -6468,6 +6468,24 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 9, R9-08, R9-09 and R9-10. Fix: each half of the navigation index (aliases, page identities) is requested once per epoch (ensurePageIdentities), a failed half stays unloaded so the next refresh asks again, a half answered after a repaint-only epoch bump re-asks at the new epoch for the same binding, and graph open waits for the warm by binding rather than by epoch. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r9/necessity-C3-frontend.txt."
+},
+{
+ "id": "REG-ONE-CONFIG-CHANGE-REOPENS-THE-GRAPH-ONCE-543",
+ "title": "Changing the journal title format or restoring a backup reopens the graph once, so indexing restarts once rather than twice",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src-tauri/src/state.rs::a_command_rewrite_runs_under_the_lane_its_reopen_holds", "src-tauri/src/backend_command_parity.rs::settings_commands_leave_reopening_to_the_config_reach", "src/instanceReplacement.test.ts::keeps the binding for a settings change (GH #543)"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 9, R9-15b. set_journal_title_format wrote config.edn and then called refresh_graph, while the watcher also reopened the graph for the same graph-reaching change; its claimed reason (a title-named journal migration) is performed by no refresh (Concord invariant 4). It now only writes; the watcher reopens once and announces graph-rebound. restore_backup rewrote the graph before taking the transition lane, so the watcher could reopen between the restore and the command's reopen; refresh_graph now runs the command's rewrite under the lane, before the reopen, so the watcher's try-once reopen defers and then finds the configuration taken in. Fail-before: at the parent commit refresh_graph_for_label runs no rewrite, restore_backup calls restore_from_backup_source before refresh_graph, and the settings guard pinned set_journal_title_format as a reopening settings command. No Tauri app mock exists, so the duplicate itself is argued from the watcher's served-config comparison (a graph-reaching write stays untaken until a reopen, state.rs a_config_refresh_keeps_queries_answering), not counted at runtime."
 }
 ]
 }

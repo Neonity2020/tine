@@ -594,8 +594,13 @@ pub(crate) async fn restore_backup(
     let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
     let graph = slot.graph();
     let source = BackupSource::from_graph(&graph);
+    drop(graph);
+    drop(slot);
     let restore_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let (app, label, _) = crate::state::owned_graph_context(state)?;
+    // The restore rewrites graph text and config.edn under the transition
+    // lane, so the reopen below is the only one (GH #543, audit R9-15b).
+    crate::state::refresh_graph(app, label, move || {
         let base = backup_base_for_root(&restore_app, &source.root)
             .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
         restore_from_backup_source(&stamp, &base, source, |source| {
@@ -603,9 +608,6 @@ pub(crate) async fn restore_backup(
         })
     })
     .await
-    .map_err(crate::command_error::CommandError::worker)??;
-    let (app, label, _) = crate::state::owned_graph_context(state)?;
-    crate::state::refresh_graph(app, label).await
 }
 
 fn restore_from_backup_source(

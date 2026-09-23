@@ -224,6 +224,8 @@ function mockReferencedPageNames(pages: PageDto[]): string[] {
 
 let _id = 0;
 const nid = () => `mock-${_id++}`;
+/** `onGraphReopened` subscribers: the mock's stand-in for the watcher's `graph-rebound`. */
+const graphReopenedListeners = new Set<() => void>();
 const mockPlugins: InstalledPluginRecord[] = [];
 const mockPluginEntries = new Map<string, Uint8Array>();
 let mockPluginRegistryCache: PluginRegistryCacheEnvelope | null = null;
@@ -1423,12 +1425,16 @@ export function mockBackend(): Backend {
     async setPreferredFormat(): Promise<void> {
       // Taken in place: the real backend keeps the Graph (GH #543).
     },
-    // This setting reaches `refresh_graph` in the real backend, which installs a
-    // FRESH Graph with an empty editor-activation registry. Not a no-op even
-    // here: a mock that silently omits a contract lets every test that uses it
-    // prove the wrong thing. (GH #254 increment 3, round 15.)
+    // This setting reaches the graph in the real backend: the watcher reopens
+    // it, installing a FRESH Graph with an empty editor-activation registry,
+    // and announces that as `graph-rebound` -- not the command's return
+    // (GH #543, audit R9-15b). Not a no-op even here: a mock that silently
+    // omits a contract lets every test that uses it prove the wrong thing.
+    // (GH #254 increment 3, round 15.)
     async setJournalTitleFormat(): Promise<void> {
-      notifyGraphRebound();
+      queueMicrotask(() => {
+        for (const listener of [...graphReopenedListeners]) listener();
+      });
     },
     async setDefaultJournalTemplate(): Promise<void> {
       // no-op in the browser mock
@@ -2103,8 +2109,9 @@ export function mockBackend(): Backend {
     async onGraphConfigChanged(): Promise<() => void> {
       return () => {};
     },
-    async onGraphReopened(): Promise<() => void> {
-      return () => {};
+    async onGraphReopened(cb: () => void): Promise<() => void> {
+      graphReopenedListeners.add(cb);
+      return () => graphReopenedListeners.delete(cb);
     },
     async onQueryProjectionChanged(): Promise<() => void> {
       return () => {};

@@ -699,7 +699,7 @@ mod tests {
         // whole packet exists to make unwritable.
         assert_eq!(
             (site_count, site_fingerprint),
-            (241, 6_215_336_380_717_418_217),
+            (240, 3_095_691_140_800_970_953),
             "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
              sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
              genuinely moved, changed family, appeared or disappeared. Diff these against \
@@ -995,6 +995,7 @@ mod tests {
             ("set_logical_outdenting", CONFIG),
             ("set_plugin_enabled", APP_FILE),
             ("set_preferred_format", CONFIG),
+            ("set_journal_title_format", CONFIG),
             ("set_preferred_workflow", CONFIG),
             ("set_show_brackets", CONFIG),
             ("set_smooth_scroll", APP_FILE),
@@ -1170,9 +1171,10 @@ mod tests {
     /// decide to reopen the graph; `Config::reach` does, inside
     /// `GraphSlot::apply_config_write`. `refresh_graph` retires the index
     /// worker and restarts the launch check, so a settings command that calls
-    /// it by hand restarts indexing for a toggle. The one exception reopens
-    /// for more than configuration: a new journal title format migrates
-    /// title-named journal files.
+    /// it by hand restarts indexing for a toggle, and for a change that does
+    /// reach the graph the watcher reopens it as well, so indexing restarts
+    /// twice. There is no exception: `set_journal_title_format` claimed one
+    /// for a journal-file migration no refresh performs (audit R9-15b).
     #[test]
     fn settings_commands_leave_reopening_to_the_config_reach() {
         let reopening = commands_that_reopen_the_graph();
@@ -1186,7 +1188,7 @@ mod tests {
         }
         assert_eq!(
             settings_that_reopen,
-            BTreeSet::from(["set_journal_title_format".to_owned()]),
+            BTreeSet::new(),
             "a settings command calls refresh_graph itself; let apply_config_write \
              take the change in (see set_show_brackets in commands.rs)"
         );

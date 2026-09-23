@@ -4,7 +4,7 @@ use crate::debug::diag;
 #[cfg(desktop)]
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
-    capture_display_read, display_read, owned_graph_context, refresh_graph, slot_for_bound_window,
+    capture_display_read, display_read, owned_graph_context, slot_for_bound_window,
     slot_for_context, with_filesystem_graph, with_trash_graph, AppState, GraphContext,
 };
 use serde::{Deserialize, Serialize};
@@ -1428,15 +1428,16 @@ pub(crate) fn set_preferred_format(
 }
 
 /// Set the graph's `:journal/page-title-format` (journal display-title format,
-/// e.g. "MMM do, yyyy"). Display-only — does not rename journal files.
+/// e.g. "MMM do, yyyy"). Display-only — does not rename journal files. Like
+/// every setting that reaches the graph, the watcher reopens it
+/// (`Config::reach`) and announces `graph-rebound`; reopening here as well
+/// restarted indexing twice (GH #543, audit R9-15b).
 #[tauri::command]
-pub(crate) async fn set_journal_title_format(
+pub(crate) fn set_journal_title_format(
     format: String,
     state: GraphContext<'_>,
 ) -> Result<(), CommandError> {
-    slot_for_context(&state)?.apply_config_write(|g| g.set_journal_page_title_format(&format))?;
-    let (app, label, _) = owned_graph_context(state)?;
-    refresh_graph(app, label).await // pick up the new format + migrate any title-named journals
+    slot_for_context(&state)?.apply_config_write(|g| g.set_journal_page_title_format(&format))
 }
 
 #[tauri::command]

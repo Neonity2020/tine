@@ -123,7 +123,7 @@ describe("config live-reload contract matches the source", () => {
     expect(watcher).toContain("refresh_graph_for_config_change(&state, app, label)");
     const state = readFileSync("src-tauri/src/state.rs", "utf8");
     expect(state).toContain(
-      "refresh_graph_for_label(state, app, label, RefreshLaneWait::TryOnce)?"
+      "refresh_graph_for_label(state, app, label, RefreshLaneWait::TryOnce, || Ok(()))?"
     );
     expect(state).toContain(
       "RefreshLaneWait::TryOnce => match transition_gate.try_lock()"

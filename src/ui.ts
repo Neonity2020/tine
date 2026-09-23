@@ -1,6 +1,5 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createMemo, createSignal, useContext } from "solid-js";
-import { notifyGraphRebound } from "./modeHooks";
 import { isPublishedExport } from "./publishedBackend";
 import { graphBinding } from "./persistence";
 import type {
@@ -324,20 +323,12 @@ export function changeJournalTitleFormat(fmt: string) {
   setGraphMeta({ ...m, journal_page_title_format: next });
   setJournalTitleFormat(next);
   bumpGraphEpoch(); // immediate: re-render open journal titles with the new format
-  // The backend rewrites config.edn AND reopens the graph (so its journal_format
-  // + the title-named-journal migration take effect). Bump again once that's done
-  // so the feed reloads against the refreshed backend — otherwise a reload racing
-  // the reopen could re-query the old format.
+  // The backend writes config.edn; the format reaches the graph, so the
+  // watcher reopens it and announces `graph-rebound` (applyGraphReopened),
+  // which rebinds and repaints against the reopened graph. No journal file is
+  // renamed (GH #543, audit R9-15b).
   void backend()
     .setJournalTitleFormat(next)
-    .then(() => {
-      bumpGraphEpoch();
-      // The reopen may have MIGRATED journal filenames, so this is a genuine
-      // rebind and not just a repaint: anything still in flight against the old
-      // binding is now aimed at paths that may not exist.
-      notifyGraphRebound();
-      void refreshJournalConflicts(); // the queue surfaces any day the migration couldn't merge
-    })
     .catch(() => {});
 }
 

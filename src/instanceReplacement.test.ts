@@ -447,22 +447,17 @@ describe("replacing a loaded instance (GH #304)", () => {
   });
 
   it("treats a backend graph reopen as a rebind, not a repaint", async () => {
-    // `changeJournalTitleFormat` rewrites config.edn, reopens the graph, and may
-    // MIGRATE journal filenames. Keying cross-graph guards off the render epoch
-    // covered this by accident; keying them off the binding is only correct if
-    // every real rebind moves the binding. Drives the real entry point, so the
-    // test fails if that call site stops announcing.
+    // A configuration change that reaches the graph (a new journal title
+    // format, `:hidden`) is reopened by the watcher, which announces
+    // `graph-reopened`. Keying cross-graph guards off the render epoch covered
+    // this by accident; keying them off the binding is only correct if every
+    // real rebind moves the binding. Drives the real event handler.
     const { graphBinding } = await import("./persistence");
-    const { changeJournalTitleFormat, setGraphMeta } = await import("./ui");
-    setGraphMeta({ root: "/g", journal_page_title_format: "MMM do, yyyy" } as never);
-    const reopen = vi.spyOn(backend(), "setJournalTitleFormat").mockResolvedValue(undefined);
+    const { applyGraphReopened } = await import("./graph");
 
     const before = graphBinding();
-    changeJournalTitleFormat("yyyy-MM-dd");
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    applyGraphReopened();
 
-    expect(reopen).toHaveBeenCalledWith("yyyy-MM-dd");
     expect(graphBinding()).not.toBe(before);
   });
 
@@ -475,12 +470,10 @@ describe("replacing a loaded instance (GH #304)", () => {
     // epoch, which is what this pins.
     const { loadRoutedPage } = await import("./store");
     const { markDirty, flushPage, isDirty } = await import("./persistence");
-    const { changeJournalTitleFormat, setGraphMeta } = await import("./ui");
+    const { applyGraphReopened } = await import("./graph");
 
     await loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
     markDirty("Target");
-    setGraphMeta({ root: "/g", journal_page_title_format: "MMM do, yyyy" } as never);
-    vi.spyOn(backend(), "setJournalTitleFormat").mockResolvedValue(undefined);
 
     let failSave: (e: unknown) => void = () => {};
     vi.spyOn(backend(), "savePage").mockReturnValue(
@@ -493,7 +486,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     // The graph is reopened while that save is in flight.
-    changeJournalTitleFormat("yyyy-MM-dd");
+    applyGraphReopened();
     await new Promise((r) => setTimeout(r, 0));
     await new Promise((r) => setTimeout(r, 0));
 
@@ -527,16 +520,12 @@ describe("replacing a loaded instance (GH #304)", () => {
     // Most `refresh_graph` producers once failed to announce; the one initially
     // covered only did because it was under review. Announced at the command
     // boundary now, so a caller cannot forget.
-    vi.restoreAllMocks(); // earlier tests stub setJournalTitleFormat
+    vi.restoreAllMocks();
     const { graphBinding } = await import("./persistence");
     const before = graphBinding();
 
-    await backend().setJournalTitleFormat("yyyy-MM-dd");
-    expect(graphBinding(), "setJournalTitleFormat reopens the graph").not.toBe(before);
-
-    const afterFormat = graphBinding();
     await backend().restoreBackup("2026-08-10_12-00-00");
-    expect(graphBinding(), "restoreBackup reopens the graph").not.toBe(afterFormat);
+    expect(graphBinding(), "restoreBackup reopens the graph").not.toBe(before);
   });
 
   it("keeps the binding for a settings change (GH #543)", async () => {
@@ -553,6 +542,9 @@ describe("replacing a loaded instance (GH #304)", () => {
     await backend().setGuideAnnounced(true);
     await backend().setPreferredFormat("org");
     await backend().setDefaultHome("Home");
+    // Reaches the graph, but the watcher reopens it and announces that itself
+    // (graph-reopened); the command's return is not a rebind (R9-15b).
+    await backend().setJournalTitleFormat("yyyy-MM-dd");
 
     expect(graphBinding()).toBe(before);
   });

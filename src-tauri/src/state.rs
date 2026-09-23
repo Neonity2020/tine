@@ -593,17 +593,26 @@ pub(crate) enum RefreshOutcome {
     Deferred,
 }
 
-/// Reopen a window's graph for a command. Async so that no sync command can
-/// call it: a refresh waits for the storage transition lane, walks the graph
-/// and waits up to 15 s for the index worker to stop, and a sync command does
-/// all of that on the main thread, freezing every window (GH #543, R6-02).
+/// Rewrite a window's graph on disk and reopen it, for a command. Async so
+/// that no sync command can call it: a refresh waits for the storage
+/// transition lane, walks the graph and waits up to 15 s for the index worker
+/// to stop, and a sync command does all of that on the main thread, freezing
+/// every window (GH #543, R6-02).
+///
+/// `rewrite` runs under the transition lane, before the reopen. The watcher's
+/// configuration reopen takes the same lane without waiting, so while the
+/// command rewrites it defers, and afterwards it finds the configuration
+/// already taken in by the reopened graph. One change, one reopen: a rewrite
+/// outside the lane let the watcher reopen the graph and the command reopen
+/// it again, restarting indexing twice (GH #543, audit R9-15b).
 pub(crate) async fn refresh_graph(
     app: tauri::AppHandle,
     label: String,
+    rewrite: impl FnOnce() -> Result<(), CommandError> + Send + 'static,
 ) -> Result<(), CommandError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        refresh_graph_for_label(&state, &app, &label, RefreshLaneWait::Block).map(|_| ())
+        refresh_graph_for_label(&state, &app, &label, RefreshLaneWait::Block, rewrite).map(|_| ())
     })
     .await
     .map_err(CommandError::worker)?
@@ -625,7 +634,7 @@ pub(crate) fn refresh_graph_for_config_change(
     app: &tauri::AppHandle,
     label: &str,
 ) -> Result<RefreshOutcome, CommandError> {
-    let outcome = refresh_graph_for_label(state, app, label, RefreshLaneWait::TryOnce)?;
+    let outcome = refresh_graph_for_label(state, app, label, RefreshLaneWait::TryOnce, || Ok(()))?;
     if outcome == RefreshOutcome::Refreshed {
         let _ = app.emit_to(label, "graph-rebound", ());
     }
@@ -639,6 +648,7 @@ fn refresh_graph_for_label(
     app: &tauri::AppHandle,
     label: &str,
     wait: RefreshLaneWait,
+    rewrite: impl FnOnce() -> Result<(), CommandError>,
 ) -> Result<RefreshOutcome, CommandError> {
     let label = label.to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
@@ -659,6 +669,7 @@ fn refresh_graph_for_label(
             "graph changed while refresh waited for its transition lane",
         ));
     }
+    rewrite()?;
     let approved = crate::settings::approved_external_assets(app, &old.root_key);
     let services = crate::graph::direct_files_service_paths(app, &old.root_key);
     let prepared = prepare_legacy_refresh(&old, approved.as_deref(), services)?;
@@ -747,6 +758,48 @@ mod tests {
 
     use crate::test_support::rust_module_source;
     use std::time::Instant;
+
+    /// GH #543, audit R9-15b: one change, one reopen. A command's rewrite
+    /// runs under the transition lane, before the reopen, so the watcher's
+    /// configuration reopen (which only tries the lane) defers during it and
+    /// then finds the change taken in. `restore_backup` is the one command
+    /// that rewrites and reopens; its rewrite must be that closure, not a
+    /// write before the call.
+    #[test]
+    fn a_command_rewrite_runs_under_the_lane_its_reopen_holds() {
+        let state = include_str!("state.rs");
+        let entry = &state[state
+            .find("\nfn refresh_graph_for_label")
+            .expect("refresh entry")..];
+        let entry = &entry[..entry.find("\n}\n").expect("refresh entry ends")];
+        let lane = entry
+            .find("transition_gate.lock()")
+            .expect("refresh takes the lane");
+        let rewrite = entry.find("rewrite()?").expect("refresh runs the rewrite");
+        let reopen = entry
+            .find("prepare_legacy_refresh(")
+            .expect("refresh reopens");
+        assert!(
+            lane < rewrite && rewrite < reopen,
+            "the rewrite runs after the lane is held and before the reopen"
+        );
+        let backup = include_str!("backup.rs");
+        let restore = &backup[backup
+            .find("pub(crate) async fn restore_backup(")
+            .expect("restore command")..];
+        let restore = &restore[..restore.find("\n}\n").expect("restore ends")];
+        let reopen = restore
+            .find("refresh_graph(")
+            .expect("restore reopens the graph");
+        let rewrite = restore
+            .find("restore_from_backup_source(")
+            .expect("restore rewrites the graph");
+        assert!(
+            reopen < rewrite,
+            "restore_backup rewrites the graph inside refresh_graph's rewrite, under \
+             the lane; a rewrite before the call lets the watcher reopen too"
+        );
+    }
 
     /// A reload that fails leaves the bound graph serving. It used to retire
     /// the graph before reopening the root, so a transient failure left the

@@ -1179,7 +1179,6 @@ export function isTauri(): boolean {
  * `refresh_graph(` call and fails on any difference in either direction.
  */
 const REBINDING_COMMANDS = new Set([
-  "set_journal_title_format",
   "restore_backup",
 ]);
 
