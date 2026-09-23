@@ -2501,19 +2501,88 @@ fn a_reopened_graph_is_diffed_against_its_own_baseline() {
 /// for the same root, the watcher takes that graph's baseline.
 #[test]
 fn the_watcher_rebaselines_a_replaced_graph() {
-    let runtime = include_str!("runtime.rs");
-    let reuse = &runtime[runtime
-        .find("Some(current) if current.root == root =>")
-        .expect("the same-root reuse arm")..];
-    let reuse = &reuse[..reuse
-        .find("current.graph = slot_graph;")
-        .expect("the arm installs")];
-    assert!(
-        reuse.contains("!Arc::ptr_eq(&current.graph, &slot_graph)")
-            && reuse.contains("current.baseline = false;")
-            && reuse.contains("current.snap.clear();"),
-        "a replaced graph must be diffed against its own baseline, not the old graph's"
+    let graph_dir = TempGraph::new("watcher-rebind-replaced-graph");
+    graph_dir.write("pages/Anchor.md", "- anchor\n");
+    let old = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone()).graph();
+    let replacement = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone()).graph();
+    let stale = old.note_graph_text_external_observation();
+    let mut watched = WatchedGraph::new(
+        Arc::clone(&old),
+        graph_dir.root.clone(),
+        Some(old.assets_path()),
     );
+    watched.baseline = true;
+    watched.snap.insert(
+        graph_dir.root.join("pages/Anchor.md"),
+        FileStamp {
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            len: 1,
+            identity: 1,
+            changed: 1,
+        },
+    );
+    watched.last_reconcile_error = Some("the old graph's failure".to_owned());
+    watched.retry.failed(Instant::now());
+    watched.pending_observation_epoch = Some(stale);
+    watched.transition_skipped = true;
+
+    watched.rebind(Arc::clone(&replacement), None);
+
+    assert!(Arc::ptr_eq(&watched.graph, &replacement));
+    assert_eq!(watched.root, graph_dir.root);
+    assert!(
+        !watched.baseline && watched.snap.is_empty() && !watched.transition_skipped,
+        "a replaced graph must be diffed against its own baseline, not the old graph's \
+         (GH #543, audit R11-05)"
+    );
+    assert!(
+        watched.last_reconcile_error.is_none()
+            && watched.retry.remaining(Instant::now()).is_none()
+            && watched.pending_observation_epoch.is_none()
+            && watched.assets.active_root().is_none(),
+        "no part of the old graph's watch outlives its replacement (GH #543, audit R12-03)"
+    );
+}
+
+/// R12-03's shape: the same-root arms of the watcher cycle and of frontier
+/// routing each took a replaced graph on by hand, and reset different
+/// fields. Every replacement now goes through `WatchedGraph::rebind`, and
+/// every new watch through `WatchedGraph::new`.
+#[test]
+fn a_replaced_graph_is_taken_on_in_one_place() {
+    let runtime = include_str!("runtime.rs");
+    let body = &runtime[runtime.find("pub(super) fn rebind(").expect("rebind")..];
+    let body = &body[..body.find("\n    }\n").unwrap()];
+    assert!(
+        body.contains("*self = Self::new("),
+        "rebind resets the whole watch through the constructor"
+    );
+    assert_eq!(
+        runtime.matches(".rebind(").count(),
+        2,
+        "both same-root arms rebind"
+    );
+    assert_eq!(
+        runtime.matches("WatchedGraph::new(").count(),
+        2,
+        "both inserts construct"
+    );
+    let literals = runtime
+        .lines()
+        .filter(|line| line.contains("WatchedGraph {"))
+        .filter(|line| !line.contains("struct WatchedGraph") && !line.contains("impl WatchedGraph"))
+        .count();
+    assert_eq!(
+        literals, 0,
+        "a struct literal names the watch's fields by hand; construct through WatchedGraph::new"
+    );
+    for assignment in [".graph = ", ".snap.clear()", ".baseline = false"] {
+        assert!(
+            !runtime.contains(&format!("current{assignment}")),
+            "a same-root arm edits the watch by hand ({assignment}); use WatchedGraph::rebind \
+             (GH #543, audit R12-03)"
+        );
+    }
 }
 
 /// GH #543, audit R11-04: "who notices changes to a graph root the OS is not
@@ -2540,8 +2609,19 @@ fn an_unwatched_root_is_polled_and_diffed_when_watched() {
         .expect("need_full")..];
     let need_full = &need_full[..need_full.find(';').unwrap()];
     assert!(
-        need_full.contains("polled") && need_full.contains("handed_over(&graph.root)"),
+        need_full.contains("rewalk"),
         "an unwatched root must diff in full, and a newly watched one once"
+    );
+    let rewalk = &runtime[runtime.find("let rewalk =").expect("rewalk")..];
+    let rewalk = &rewalk[..rewalk.find(';').unwrap()];
+    assert!(
+        rewalk.contains("polled") && rewalk.contains("handed_over(&graph.root)"),
+        "an unwatched root must diff in full, and a newly watched one once"
+    );
+    assert!(
+        rewalk.contains("!initial_cycle &&"),
+        "a first cycle already walked the root for its baseline; it must not walk it \
+         twice (GH #543, audit R12-07)"
     );
     assert!(
         runtime.contains("&owned, need_full, polled)"),

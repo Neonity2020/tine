@@ -1,4 +1,4 @@
-//! Module map: debug startup logging; state graph lock; watcher external changes;
+//! Module map: debug startup logging; state graph slots; watcher external changes;
 //! graph open/create/warm cache; backup snapshots; settings/session prefs;
 //! spellcheck WebKit integration; platform OS bridges; commands thin IPC.
 

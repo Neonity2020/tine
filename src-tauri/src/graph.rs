@@ -1047,7 +1047,7 @@ pub(crate) fn default_graph_parent(
 }
 
 /// Run the graph's index owner off the hot path. We let the frontend's first
-/// journal load grab the graph lock first, then the owner validates or builds
+/// journal load get ahead of it, then the owner validates or builds
 /// the index in the background, and keeps answering what the index needs for
 /// as long as this graph is bound to the window. When nothing is coming any
 /// more (and this graph is still the current one — generation check), flip
@@ -1070,9 +1070,9 @@ pub(crate) fn warm_cache_async(
     } = warm;
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
-        // grabs the lock first; then build the whole-graph cache in the
-        // background so the first search / query / `g j` agenda doesn't pay for
-        // parsing every file synchronously under the lock.
+        // is not competing with a whole-graph pass for cores and storage; then
+        // index in the background so the first search / query / `g j` agenda
+        // doesn't pay for parsing every file in the foreground.
         std::thread::sleep(std::time::Duration::from_millis(250));
         if warm_revoked(&slot, warm_generation) {
             return; // the graph was switched while we slept — a newer warm owns it

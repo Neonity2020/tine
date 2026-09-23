@@ -214,6 +214,39 @@ pub(super) struct WatchedGraph {
     pub(super) transition_skipped: bool,
 }
 
+impl WatchedGraph {
+    pub(super) fn new(graph: Arc<Graph>, root: PathBuf, asset_root: Option<PathBuf>) -> Self {
+        Self {
+            assets: asset_root.map(AssetWatchState::new).unwrap_or_default(),
+            graph,
+            root,
+            snap: HashMap::new(),
+            baseline: false,
+            last_reconcile_error: None,
+            retry: RetrySchedule::default(),
+            pending_observation_epoch: None,
+            transition_skipped: false,
+        }
+    }
+
+    /// A reopen (a restore, a config change) replaced the graph at this
+    /// root: it read the files itself, and its owner indexes them. Watch it
+    /// as a new graph, from its own baseline. Diffing the old graph's stamps
+    /// against the new one re-synced every file a restore rewrote, identical
+    /// bytes included (GH #543, audit R11-05). The one place a replaced graph
+    /// is taken on, so no field of the old watch outlives it (audit R12-03),
+    /// except a drained frontier the new graph owns: it is still owed its
+    /// acknowledgement.
+    pub(super) fn rebind(&mut self, graph: Arc<Graph>, asset_root: Option<PathBuf>) {
+        let owed = self
+            .pending_observation_epoch
+            .filter(|ticket| graph.owns_graph_text_external_observation_ticket(*ticket));
+        let root = std::mem::take(&mut self.root);
+        *self = Self::new(graph, root, asset_root);
+        self.pending_observation_epoch = owed;
+    }
+}
+
 fn asset_root_for_slot(app: &tauri::AppHandle, slot: &GraphSlot) -> Option<PathBuf> {
     let root = &slot.root_key;
     match Graph::external_assets_target(root) {
@@ -249,36 +282,11 @@ pub(super) fn route_drained_direct_frontiers(
                     .graph
                     .owns_graph_text_external_observation_ticket(ticket)
                 {
-                    current.assets = asset_root
-                        .clone()
-                        .map(AssetWatchState::new)
-                        .unwrap_or_default();
-                    current.graph = latest_graph;
-                    current.snap.clear();
-                    current.baseline = false;
-                    current.last_reconcile_error = None;
-                    current.retry = RetrySchedule::default();
-                    current.pending_observation_epoch = None;
+                    current.rebind(latest_graph, asset_root);
                 }
             }
             _ => {
-                graphs.insert(
-                    label,
-                    WatchedGraph {
-                        assets: asset_root
-                            .clone()
-                            .map(AssetWatchState::new)
-                            .unwrap_or_default(),
-                        graph: latest_graph,
-                        root,
-                        snap: HashMap::new(),
-                        baseline: false,
-                        last_reconcile_error: None,
-                        retry: RetrySchedule::default(),
-                        pending_observation_epoch: None,
-                        transition_skipped: false,
-                    },
-                );
+                graphs.insert(label, WatchedGraph::new(latest_graph, root, asset_root));
             }
         }
     }
@@ -297,7 +305,8 @@ pub(super) fn route_drained_direct_frontiers(
 ///     wakeups. Use this only when inotify misses external edits.
 ///
 /// In both modes the reconcile is identical and suppresses Tine's *own* writes
-/// via the cache comparison inside `sync_file`. A control channel (poked by
+/// by comparing each file with the revision Tine last wrote or read
+/// (`page_revision_current`, inside `sync_file`). A control channel (poked by
 /// `load_graph` on a graph switch and by `set_watch_mode`) lets the thread
 /// re-target or switch mechanism at once, without polling for those either.
 pub(crate) fn start_watcher(app: tauri::AppHandle) {
@@ -355,19 +364,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             current.pending_observation_epoch = None;
                         }
                         if !Arc::ptr_eq(&current.graph, &slot_graph) {
-                            // A reopen (a restore, a config change) replaced
-                            // the graph: it read the files itself, and its
-                            // owner indexes them. Diffing the old graph's
-                            // stamps against them re-synced every file a
-                            // restore rewrote, identical bytes included
-                            // (GH #543, audit R11-05). Take the new graph's
-                            // baseline instead, as for a new window.
-                            current.baseline = false;
-                            current.snap.clear();
-                            current.transition_skipped = false;
-                        }
-                        current.graph = slot_graph;
-                        if asset_root.as_ref() != current.assets.active_root() {
+                            current.rebind(slot_graph, asset_root);
+                        } else if asset_root.as_ref() != current.assets.active_root() {
                             current.assets = asset_root
                                 .clone()
                                 .map(AssetWatchState::new)
@@ -375,23 +373,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         }
                     }
                     _ => {
-                        graphs.insert(
-                            label,
-                            WatchedGraph {
-                                assets: asset_root
-                                    .clone()
-                                    .map(AssetWatchState::new)
-                                    .unwrap_or_default(),
-                                graph: slot_graph,
-                                root,
-                                snap: HashMap::new(),
-                                baseline: false,
-                                last_reconcile_error: None,
-                                retry: RetrySchedule::default(),
-                                pending_observation_epoch: None,
-                                transition_skipped: false,
-                            },
-                        );
+                        graphs.insert(label, WatchedGraph::new(slot_graph, root, asset_root));
                     }
                 }
             }
@@ -686,9 +668,15 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let mut owned = pending_for_graph(&paths, &graph.graph);
                 owned.extend(exact_owned);
                 let polled = unwatched(&graph.root);
+                // A root that is polled, or newly watched, is walked in full
+                // because events for it may have been missed -- but a first
+                // cycle just walked it for its baseline. Walking it again
+                // cost every newly watched graph two whole-graph stat walks
+                // (GH #543, audit R12-07). Events drained this cycle still
+                // diff, so their observation is still acknowledged.
+                let rewalk = !initial_cycle && (polled || handed_over(&graph.root));
                 let need_full = event_need_full
-                    || polled
-                    || handed_over(&graph.root)
+                    || rewalk
                     || !full_owned.is_empty()
                     || retry_due
                     || graph.transition_skipped;

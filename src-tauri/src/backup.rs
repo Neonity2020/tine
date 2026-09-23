@@ -15,7 +15,7 @@ use tine_core::{model::Graph, GraphTextScope, GRAPH_TEXT_SCOPE_VERSION};
 // Snapshot the graph's Markdown/Org into the OS app-data dir on open, keeping the
 // last few. Local-only (outside the graph, so Syncthing never sees it); a safety
 // net against a bad write or accidental edit. Best-effort and fully detached so
-// it never blocks startup or holds the graph lock during file copies.
+// it never blocks startup or competes with it for storage during file copies.
 const BACKUP_KEEP_DEFAULT: usize = 12;
 const ASSET_RESTORE_RECOVERY_DIR: &str = ".tine-restore-recovery";
 static BACKUP_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
