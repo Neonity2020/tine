@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- Spell-check language names in Settings now use the standard
+  "Language (Region)" form, e.g. "English (United States)" and "Spanish
+  (Mexico)" instead of "American English" and "Mexican Spanish", so regional
+  variants of one language sort together. Contributed by mikob (GH #580).
 - Diagnostic reports now record when Tine was closed through the
   unsaved-changes warning with the user choosing to discard, with the reason
   (a failed save or one still running) and the number of affected pages, but

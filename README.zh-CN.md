@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
   <img src="https://img.shields.io/badge/SolidJS-1.9-2C4F7C?logo=solid&logoColor=white" alt="SolidJS">
   <img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust">
-  <img src="https://img.shields.io/badge/platform-Linux%20(WebKitGTK)-555" alt="Linux">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-555" alt="Platforms">
   <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="AGPL-3.0">
 </p>
 
@@ -43,28 +43,15 @@ Tine 是一款大纲笔记软件，外观和操作体验与 [Logseq](https://log
 
 ## 安装
 
-可前往 **[Releases](https://github.com/martinkoutecky/tine/releases)** 页面下载预编译安装包。当前发布版本尚未进行代码签名，因此首次运行时，操作系统可能会弹出安全警告。可按以下方式继续安装或启动：
+可前往 **[Releases](https://github.com/martinkoutecky/tine/releases)** 页面下载预编译安装包。macOS 构建已签名并经过公证；Windows 构建尚未进行代码签名，因此首次运行时 Windows 可能会弹出安全警告。可按以下方式继续安装或启动：
 
 - **Linux** —— **AppImage** 无需安装，可在任何发行版上运行：先执行 `chmod +x Tine_*.AppImage`，然后启动它。也可使用 **`.deb`**（Debian/Ubuntu）或 **`.rpm`**（Fedora/openSUSE）。
-- **macOS** —— 打开 **`.dmg`**；首次启动时 macOS 会提示“*身份不明的开发者*”，请**右键点按应用 → 打开**（仅需一次），之后即可正常打开。若 Tine 随后**每次启动都反复请求访问“文稿”文件夹**，请参阅下方的[解决办法](#macos-repeated-documents-permission-prompt)。
+- **macOS** —— 打开通用版 **`.dmg`**，将 Tine 拖入“应用程序”文件夹。
 - **Windows** —— 运行 **`.exe`** 安装程序；如果出现 SmartScreen 提示，请点击**更多信息 → 仍要运行**。若不想安装，也可以下载便携版 **`Tine_*_x64-portable.zip`**，解压后直接运行 `Tine.exe`。Tine 需要 WebView2 运行时，而 Windows 10/11 已预装该运行时。
+- **Android** —— 从 Releases 页面安装 **`.apk`**（如有提示，请允许浏览器或文件管理器安装应用）。
 - **iPhone / iPad** —— 通过 **[TestFlight](https://testflight.apple.com/join/rpGGpTVW)** 加入公开测试版（先安装 Apple 的 TestFlight 应用，再打开该链接）。目前尚未上架 App Store。
 
 （想参与 Tine 开发？请从源码构建——参见[构建与运行](#build--run)。）
-
-<a id="macos-repeated-documents-permission-prompt"></a>
-### macOS：反复请求“文稿”访问权限
-
-如果你的 Logseq 图谱位于 `~/Documents`（常见的默认位置），macOS 会通过权限提示限制应用访问该文件夹。由于当前构建尚未完成公证，并且仍带有下载文件的“隔离”标记，系统每次启动 Tine 时，都会通过 [Gatekeeper App Translocation](https://developer.apple.com/library/archive/technotes/tn2206/_index.html) 将它放到一个随机的临时位置运行。这样一来，macOS 无法记住此前授予的权限，因此每次启动时都会再次询问。要让这项授权长期生效，请按以下步骤操作：
-
-1. 将 `Tine.app` **移至 `/Applications`**（从磁盘映像或“下载”文件夹中拖出）。
-2. 在终端中清除隔离标记：
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Tine.app
-   ```
-3. 从 `/Applications` 启动 Tine，并在“文稿”权限提示中点击一次**允许**——之后便不会再询问。
-
-（当 Tine 发布经过公证的 macOS 构建后，上述问题及“未识别的开发者”警告都会消失。）
 
 ---
 
@@ -130,7 +117,7 @@ Tine 是一款大纲笔记软件，外观和操作体验与 [Logseq](https://log
 | 核心 | `crates/tine-core`（纯 Rust） | 解析/序列化、模型、索引、查询、引用、日期、PDF/EDN、HTML 发布 |
 | 渲染 | [pdf.js](https://mozilla.github.io/pdf.js/)、[KaTeX](https://katex.org)、highlight.js | PDF、数学公式、代码 |
 
-Rust 核心不依赖 GUI，可单独进行单元测试；Tauri 层只是在其上提供约 41 个 IPC 命令的轻量封装。前端维护实时编辑树（规范化状态库），以防抖方式触发保留格式的保存；全图谱读取则命中按图谱版本计数器区分的内存页面缓存（`RwLock<Arc<Graph>>`——读取命令会克隆 Arc 并立即释放锁）。
+Rust 核心不依赖 GUI，可单独进行单元测试；Tauri 层只是在其上提供一层 IPC 命令的轻量封装。前端维护实时编辑树（规范化状态库），以防抖方式触发保留格式的保存；全图谱读取则命中按图谱版本计数器区分的内存页面缓存（`RwLock<Arc<Graph>>`——读取命令会克隆 Arc 并立即释放锁）。
 
 更重要的架构选择——以 Tauri/WebKitGTK 取代 Electron、采用纯 Rust 核心、在浏览器内进行 WASM 解析，以及数据安全不变量——均已写成简短的架构决策记录，位于 [`docs/adr/`](docs/adr/)。
 
@@ -159,10 +146,6 @@ npx tauri build --no-bundle
 # 对你的图谱运行：
 TINE_GRAPH=/path/to/your/graph ./target/release/tine
 ```
-
-### 发布检查清单
-
-在创建发布标签前，请对发布版二进制文件运行 `npm run e2e:caret`，防止 ADR 0013 所规定的重复实例光标/焦点行为出现回归。
 
 - 将 `TINE_GRAPH` 指向你与 Logseq 共用的同一个 `journals/` + `pages/` + `logseq/config.edn` 目录树。对于同一图谱，**一次只运行一个应用**。
 - **GPU 合成（平滑滚动）默认开启。** 在极少数 GPU/合成器组合上，WebKitGTK 的 DMABUF 渲染器可能会中止（窗口无法显示，或控制台出现 `EGL_BAD_PARAMETER`）；请设置 `TINE_GPU=0` 回退到软件渲染——速度会较慢，但始终可以启动。如果 Tine 检测到绘制发生在 CPU 上，会显示横幅提示。

@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
   <img src="https://img.shields.io/badge/SolidJS-1.9-2C4F7C?logo=solid&logoColor=white" alt="SolidJS">
   <img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust">
-  <img src="https://img.shields.io/badge/platform-Linux%20(WebKitGTK)-555" alt="Linux">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-555" alt="Platforms">
   <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="AGPL-3.0">
 </p>
 
@@ -54,18 +54,17 @@ instead of re-parsing.
 ## Install
 
 Grab a prebuilt installer from the **[Releases](https://github.com/martinkoutecky/tine/releases)**
-page. The builds aren't code-signed yet, so your OS may warn the first time — here's how to get past
-it:
+page. macOS builds are signed and notarized; Windows builds aren't code-signed yet, so Windows may
+warn the first time — here's how to get past it:
 
 - **Linux** — the **AppImage** runs on any distro with no install: `chmod +x Tine_*.AppImage`, then
   run it. Or use the **`.deb`** (Debian/Ubuntu) or **`.rpm`** (Fedora/openSUSE).
-- **macOS** — open the **`.dmg`**; on first launch macOS says *"unidentified developer"*, so
-  **right-click the app → Open** (just once) and it opens normally after that. If Tine then
-  **keeps asking to access your Documents folder on every launch**, see the
-  [workaround](#macos-repeated-documents-permission-prompt) below.
+- **macOS** — open the universal **`.dmg`** and drag Tine into Applications.
 - **Windows** — run the **`.exe`** installer; if SmartScreen appears, click **More info → Run
   anyway**. Prefer no installer? Grab the portable **`Tine_*_x64-portable.zip`**, unzip, and run
   `Tine.exe` — it needs the WebView2 runtime, which is preinstalled on Windows 10/11.
+- **Android** — install the **`.apk`** from the Releases page (allow installs from your browser or
+  file manager when asked).
 - **iPhone / iPad** — join the public beta on **[TestFlight](https://testflight.apple.com/join/rpGGpTVW)** (install Apple's TestFlight
   app, then open the link). There is no App Store listing yet.
 
@@ -87,24 +86,6 @@ tine export live ~/notes --all-pages --output public-site --name "My notes"
 Exports select pages using the graph's publication settings. Output directories are relative to
 the graph, and existing output is retained unless you explicitly pass `--replace`. Linux `.deb`
 and `.rpm` packages install the generated `man tine` page.
-
-### macOS: repeated "Documents" permission prompt
-
-If your Logseq graph lives in `~/Documents` (the common default), macOS gates access to that
-folder behind a permission prompt. Because the build isn't notarized yet **and** is run with the
-download "quarantine" flag, macOS launches it from a randomized temporary location each time
-([Gatekeeper App Translocation](https://developer.apple.com/library/archive/technotes/tn2206/_index.html)),
-so it can't remember your answer — and re-asks on every launch. To make the grant stick:
-
-1. **Move `Tine.app` into `/Applications`** (drag it out of the disk image / Downloads).
-2. Clear the quarantine flag in Terminal:
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Tine.app
-   ```
-3. Launch Tine from `/Applications` and **Allow** the Documents prompt once — it won't ask again.
-
-(Both this and the "unidentified developer" warning disappear once Tine ships notarized macOS
-builds.)
 
 ---
 
@@ -185,7 +166,7 @@ comparison: parity, scoped, not-yet, and what Tine deliberately doesn't do.
 | Core | `crates/tine-core` (pure Rust) | parse/serialize, model, indexing, queries, refs, dates, PDF/EDN, HTML publish |
 | Rendering | [pdf.js](https://mozilla.github.io/pdf.js/), [KaTeX](https://katex.org), highlight.js | PDF, math, code |
 
-The Rust core is GUI-free and unit-tested in isolation; the Tauri layer is a thin set of ~41 IPC
+The Rust core is GUI-free and unit-tested in isolation; the Tauri layer is a thin set of IPC
 commands over it. The frontend owns the live editing tree (normalized store) and pushes debounced,
 format-preserving saves; whole-graph reads hit an in-memory page cache (`RwLock<Arc<Graph>>` — read
 commands clone the Arc and release the lock immediately) keyed by a graph generation counter.
@@ -218,11 +199,6 @@ npx tauri build --no-bundle
 # Run it against your graph:
 TINE_GRAPH=/path/to/your/graph ./target/release/tine
 ```
-
-### Release checklist
-
-Before tagging a release, run `npm run e2e:caret` against the release binary to
-guard the ADR 0013 duplicate-instance caret/focus invariant.
 
 - Point `TINE_GRAPH` at the same `journals/` + `pages/` + `logseq/config.edn` tree you use with
   Logseq. **Run one app at a time** on a given graph.
@@ -349,10 +325,9 @@ expectations, no obligations, either way. 🌱
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/martinkoutecky)
 · [GitHub Sponsors](https://github.com/sponsors/martinkoutecky)
 
-## Unofficial Tine Resources
+## Unofficial Tine resources
 
-* [Tana to Tine](https://github.com/mikob/tine/tree/converters) - Convert Tana workspaces to Tine.
-
+- [Tana to Tine](https://github.com/mikob/tine/tree/converters) — convert Tana workspaces to Tine.
 
 ## Acknowledgements
 
