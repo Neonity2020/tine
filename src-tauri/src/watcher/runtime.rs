@@ -216,8 +216,16 @@ pub(super) struct WatchedGraph {
 
 impl WatchedGraph {
     pub(super) fn new(graph: Arc<Graph>, root: PathBuf, asset_root: Option<PathBuf>) -> Self {
+        Self::with_assets(
+            graph,
+            root,
+            asset_root.map(AssetWatchState::new).unwrap_or_default(),
+        )
+    }
+
+    fn with_assets(graph: Arc<Graph>, root: PathBuf, assets: AssetWatchState) -> Self {
         Self {
-            assets: asset_root.map(AssetWatchState::new).unwrap_or_default(),
+            assets,
             graph,
             root,
             snap: HashMap::new(),
@@ -229,22 +237,48 @@ impl WatchedGraph {
         }
     }
 
-    /// A reopen (a restore, a config change) replaced the graph at this
-    /// root: it read the files itself, and its owner indexes them. Watch it
-    /// as a new graph, from its own baseline. Diffing the old graph's stamps
-    /// against the new one re-synced every file a restore rewrote, identical
-    /// bytes included (GH #543, audit R11-05). The one place a replaced graph
-    /// is taken on, so no field of the old watch outlives it (audit R12-03),
-    /// except a drained frontier the new graph owns: it is still owed its
-    /// acknowledgement.
-    pub(super) fn rebind(&mut self, graph: Arc<Graph>, asset_root: Option<PathBuf>) {
+    /// The slot at this root handed the watcher `graph` and `asset_root`:
+    /// the one place a same-root watch takes them on (GH #543, audit R12-03).
+    ///
+    /// Which state belongs to what? The graph-text half belongs to the
+    /// graph. A reopen (a restore, a config change) that replaced the graph
+    /// read the files itself, and its owner indexes them, so the watch
+    /// starts from the new graph's own baseline. Diffing the old graph's
+    /// stamps against it re-synced every file a restore rewrote, identical
+    /// bytes included (audit R11-05). Only a drained frontier the new graph
+    /// owns carries over: it is still owed its acknowledgement.
+    ///
+    /// The asset half belongs to the asset folder, which a reopen does not
+    /// replace. Re-snapshotting it took an asset change still queued for
+    /// this cycle into the baseline, and the old image stayed on screen
+    /// (audit R13-02). It is started afresh only when the folder changes.
+    pub(super) fn take_on(&mut self, graph: Arc<Graph>, asset_root: Option<PathBuf>) {
+        let assets = if asset_root.as_ref() == self.assets.active_root() {
+            std::mem::take(&mut self.assets)
+        } else {
+            asset_root.map(AssetWatchState::new).unwrap_or_default()
+        };
+        if Arc::ptr_eq(&self.graph, &graph) {
+            self.assets = assets;
+            return;
+        }
         let owed = self
             .pending_observation_epoch
             .filter(|ticket| graph.owns_graph_text_external_observation_ticket(*ticket));
         let root = std::mem::take(&mut self.root);
-        *self = Self::new(graph, root, asset_root);
+        *self = Self::with_assets(graph, root, assets);
         self.pending_observation_epoch = owed;
     }
+}
+
+/// Whether this cycle walks a root in full. A root that is polled, or newly
+/// watched, is walked because events for it may have been missed; but a
+/// first cycle just walked it for its baseline. Walking it again cost every
+/// newly watched graph two whole-graph stat walks (GH #543, audit R12-07).
+/// Events drained this cycle still diff, so their observation is still
+/// acknowledged.
+pub(super) fn rewalks_root(initial_cycle: bool, polled: bool, handed_over: bool) -> bool {
+    !initial_cycle && (polled || handed_over)
 }
 
 fn asset_root_for_slot(app: &tauri::AppHandle, slot: &GraphSlot) -> Option<PathBuf> {
@@ -282,7 +316,7 @@ pub(super) fn route_drained_direct_frontiers(
                     .graph
                     .owns_graph_text_external_observation_ticket(ticket)
                 {
-                    current.rebind(latest_graph, asset_root);
+                    current.take_on(latest_graph, asset_root);
                 }
             }
             _ => {
@@ -363,14 +397,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         }) {
                             current.pending_observation_epoch = None;
                         }
-                        if !Arc::ptr_eq(&current.graph, &slot_graph) {
-                            current.rebind(slot_graph, asset_root);
-                        } else if asset_root.as_ref() != current.assets.active_root() {
-                            current.assets = asset_root
-                                .clone()
-                                .map(AssetWatchState::new)
-                                .unwrap_or_default();
-                        }
+                        current.take_on(slot_graph, asset_root);
                     }
                     _ => {
                         graphs.insert(label, WatchedGraph::new(slot_graph, root, asset_root));
@@ -668,13 +695,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let mut owned = pending_for_graph(&paths, &graph.graph);
                 owned.extend(exact_owned);
                 let polled = unwatched(&graph.root);
-                // A root that is polled, or newly watched, is walked in full
-                // because events for it may have been missed -- but a first
-                // cycle just walked it for its baseline. Walking it again
-                // cost every newly watched graph two whole-graph stat walks
-                // (GH #543, audit R12-07). Events drained this cycle still
-                // diff, so their observation is still acknowledged.
-                let rewalk = !initial_cycle && (polled || handed_over(&graph.root));
+                let rewalk = rewalks_root(initial_cycle, polled, handed_over(&graph.root));
                 let need_full = event_need_full
                     || rewalk
                     || !full_owned.is_empty()

@@ -2526,7 +2526,7 @@ fn the_watcher_rebaselines_a_replaced_graph() {
     watched.pending_observation_epoch = Some(stale);
     watched.transition_skipped = true;
 
-    watched.rebind(Arc::clone(&replacement), None);
+    watched.take_on(Arc::clone(&replacement), None);
 
     assert!(Arc::ptr_eq(&watched.graph, &replacement));
     assert_eq!(watched.root, graph_dir.root);
@@ -2544,23 +2544,75 @@ fn the_watcher_rebaselines_a_replaced_graph() {
     );
 }
 
+/// GH #543, audit R13-02: the asset half of a watch belongs to the asset
+/// folder, not to the graph. A reopen of the same root that replaced the
+/// graph re-snapshotted the folder over an asset change still queued for that
+/// cycle, and the old image stayed on screen.
+#[test]
+fn a_replaced_graph_keeps_a_queued_asset_change() {
+    let graph_dir = TempGraph::new("watcher-rebind-keeps-asset-change");
+    graph_dir.write("pages/Anchor.md", "- anchor\n");
+    graph_dir.write("assets/a.png", "one");
+    let old = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone()).graph();
+    let replacement = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone()).graph();
+    let mut watched = WatchedGraph::new(
+        Arc::clone(&old),
+        graph_dir.root.clone(),
+        Some(old.assets_path()),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    graph_dir.write("assets/a.png", "two, longer");
+    watched.take_on(Arc::clone(&replacement), Some(replacement.assets_path()));
+    assert!(Arc::ptr_eq(&watched.graph, &replacement));
+    let exact: HashSet<PathBuf> = [graph_dir.root.join("assets/a.png")].into_iter().collect();
+    let changed = reconcile_asset_observation(
+        "main",
+        &mut watched.assets,
+        &exact,
+        &HashSet::new(),
+        false,
+        false,
+    );
+    assert_eq!(
+        changed,
+        vec!["a.png".to_owned()],
+        "the rebind took a queued asset change into its baseline (GH #543, audit R13-02)"
+    );
+}
+
+/// The other half of R13-02's rule: a new asset folder, on the same graph or
+/// a replaced one, is watched from its own snapshot.
+#[test]
+fn a_moved_asset_folder_is_watched_afresh() {
+    let graph_dir = TempGraph::new("watcher-moved-asset-folder");
+    graph_dir.write("pages/Anchor.md", "- anchor\n");
+    graph_dir.write("assets/a.png", "one");
+    graph_dir.write("elsewhere/b.png", "two");
+    let graph = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone()).graph();
+    let mut watched = WatchedGraph::new(
+        Arc::clone(&graph),
+        graph_dir.root.clone(),
+        Some(graph.assets_path()),
+    );
+    let elsewhere = graph_dir.root.join("elsewhere");
+    watched.take_on(Arc::clone(&graph), Some(elsewhere.clone()));
+    assert_eq!(watched.assets.active_root(), Some(&elsewhere));
+    watched.take_on(Arc::clone(&graph), None);
+    assert!(watched.assets.active_root().is_none());
+}
+
 /// R12-03's shape: the same-root arms of the watcher cycle and of frontier
 /// routing each took a replaced graph on by hand, and reset different
-/// fields. Every replacement now goes through `WatchedGraph::rebind`, and
-/// every new watch through `WatchedGraph::new`.
+/// fields. Every same-root hand-over now goes through `WatchedGraph::take_on`,
+/// and every new watch through `WatchedGraph::new`. What each half keeps is
+/// pinned by the behavioural tests above.
 #[test]
 fn a_replaced_graph_is_taken_on_in_one_place() {
     let runtime = include_str!("runtime.rs");
-    let body = &runtime[runtime.find("pub(super) fn rebind(").expect("rebind")..];
-    let body = &body[..body.find("\n    }\n").unwrap()];
-    assert!(
-        body.contains("*self = Self::new("),
-        "rebind resets the whole watch through the constructor"
-    );
     assert_eq!(
-        runtime.matches(".rebind(").count(),
+        runtime.matches(".take_on(").count(),
         2,
-        "both same-root arms rebind"
+        "both same-root arms hand the slot's graph to take_on"
     );
     assert_eq!(
         runtime.matches("WatchedGraph::new(").count(),
@@ -2576,11 +2628,16 @@ fn a_replaced_graph_is_taken_on_in_one_place() {
         literals, 0,
         "a struct literal names the watch's fields by hand; construct through WatchedGraph::new"
     );
-    for assignment in [".graph = ", ".snap.clear()", ".baseline = false"] {
+    for assignment in [
+        ".graph = ",
+        ".snap.clear()",
+        ".baseline = false",
+        ".assets = ",
+    ] {
         assert!(
             !runtime.contains(&format!("current{assignment}")),
-            "a same-root arm edits the watch by hand ({assignment}); use WatchedGraph::rebind \
-             (GH #543, audit R12-03)"
+            "a same-root arm edits the watch by hand ({assignment}); use WatchedGraph::take_on \
+             (GH #543, audits R12-03, R13-02)"
         );
     }
 }
@@ -2612,17 +2669,31 @@ fn an_unwatched_root_is_polled_and_diffed_when_watched() {
         need_full.contains("rewalk"),
         "an unwatched root must diff in full, and a newly watched one once"
     );
-    let rewalk = &runtime[runtime.find("let rewalk =").expect("rewalk")..];
-    let rewalk = &rewalk[..rewalk.find(';').unwrap()];
     assert!(
-        rewalk.contains("polled") && rewalk.contains("handed_over(&graph.root)"),
-        "an unwatched root must diff in full, and a newly watched one once"
+        runtime.contains(
+            "let rewalk = rewalks_root(initial_cycle, polled, handed_over(&graph.root));"
+        ),
+        "the cycle asks rewalks_root whether to walk a root in full"
     );
-    assert!(
-        rewalk.contains("!initial_cycle &&"),
-        "a first cycle already walked the root for its baseline; it must not walk it \
-         twice (GH #543, audit R12-07)"
-    );
+    // GH #543, audits R12-07 and R13-08: the rule itself, by behaviour.
+    for (initial_cycle, polled, handed_over, walks) in [
+        (true, false, false, false),
+        (true, true, false, false),
+        (true, false, true, false),
+        (true, true, true, false),
+        (false, false, false, false),
+        (false, true, false, true),
+        (false, false, true, true),
+        (false, true, true, true),
+    ] {
+        assert_eq!(
+            rewalks_root(initial_cycle, polled, handed_over),
+            walks,
+            "initial_cycle={initial_cycle} polled={polled} handed_over={handed_over}: an \
+             unwatched root diffs in full and a newly watched one once, but a first cycle \
+             already walked the root for its baseline (GH #543, audit R12-07)"
+        );
+    }
     assert!(
         runtime.contains("&owned, need_full, polled)"),
         "an unwatched root publishes a poll observation"

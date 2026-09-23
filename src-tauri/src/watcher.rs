@@ -1525,6 +1525,8 @@ fn observe_graph_text_event(graph: &Graph, root: &Path, event: Option<&notify::E
 
 mod runtime;
 
+#[cfg(test)]
+use runtime::rewalks_root;
 pub(crate) use runtime::start_watcher;
 #[cfg(test)]
 use runtime::{default_watch_mode, route_drained_direct_frontiers, WatchedGraph};
