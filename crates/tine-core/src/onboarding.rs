@@ -1698,7 +1698,9 @@ mod tests {
         assert!(page
             .markdown
             .contains("updating Safari through Software Update"));
-        assert!(page.markdown.contains("no public iOS app"));
+        assert!(page.markdown.contains("testflight.apple.com/join/rpGGpTVW"));
+        assert!(page.markdown.contains("Plugins do not run on iOS yet"));
+        assert!(page.markdown.contains("f-droid.org/packages/page.tine.app"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Workflows/Extend Tine]]"));
 

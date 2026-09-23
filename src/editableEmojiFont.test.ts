@@ -21,6 +21,8 @@ describe("editable emoji crash guard", () => {
     expect(css).toContain('--tine-editable-emoji-font: "Noto Emoji Variable"');
     expect(css).toContain('--tine-editable-emoji-font: "Segoe UI Emoji", "Noto Emoji Variable"');
     expect(css).toContain('--tine-editable-emoji-font: "Apple Color Emoji", "Noto Emoji Variable"');
+    // A published export (the public Guide) is read in ordinary browsers: color first.
+    expect(css).toMatch(/html\[data-editable-emoji="published"\]\s*\{\s*--tine-editable-emoji-font:\s*"Apple Color Emoji",\s*"Segoe UI Emoji",\s*"Noto Color Emoji",\s*"Noto Emoji Variable"/s);
     expect(css).toMatch(/font-family:\s*var\(--tine-editable-font,\s*"Inter",\s*var\(--tine-editable-emoji-font\)/s);
     expect(css).toMatch(/--tine-editable-font:[^;]*"Courier New",\s*var\(--tine-editable-emoji-font\),\s*monospace/s);
 

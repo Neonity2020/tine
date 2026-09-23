@@ -24,7 +24,7 @@ icon:: 📱
   - **Context menus open from the bullet affordance** rather than a right-click anywhere; long-press on text stays with the system, so text selection works natively.
   - In the PDF reader, highlight recolor and remove work, but the highlight menu's **Copy ref** and **Linked references** entries appear only on desktop.
   - **Export to PDF is desktop-only** — printing is unavailable inside a mobile WebView, so the page menu does not offer it here. **Export graph to HTML** (Settings → **Graph**) works on Android just as on desktop, publishing the pages you marked `public:: true`.
-  - **Updates come from you.** The in-app update checker and installer are off on mobile; take each new release-signed APK from the GitHub releases page and sideload it. Distribution today is a sideloaded, release-signed APK attached to each GitHub release; Play Store and F-Droid are planned, and the F-Droid build will omit the network plugin/theme catalogue while keeping local sideloading.
+  - **Updates come from F-Droid or from you.** The in-app update checker and installer are off on mobile. Install Tine from [F-Droid](https://f-droid.org/packages/page.tine.app/) and it updates like any other F-Droid app; if you sideloaded the release-signed APK from a GitHub release instead, take each new APK from the releases page. The F-Droid build omits the network plugin/theme catalogue and keeps local sideloading.
 - ## On desktop (Linux, macOS, Windows)
   - Everything the phone skips is here: tabs with pin, reorder, and reopen, split panes, saved workspaces, multiple windows, the modifier-click gestures, and global quick capture.
   - **In-app updates** run on Windows and Linux — the app checks once per launch and Settings → **About** → **Check for updates** downloads, installs, and relaunches in place. On macOS the same notice opens the releases page instead, because today's unsigned app bundle cannot safely replace itself.
@@ -32,7 +32,8 @@ icon:: 📱
   - **On macOS, Tine draws its window with the system's web engine** — the same one Safari uses — and needs the engine of **Safari 15.4 or later**. On an older one (for example Big Sur or Catalina with Safari never updated) Tine says so at startup instead of opening half-working; updating Safari through Software Update updates that engine too. Opening PDFs needs Safari 17.4 or later; the rest of Tine does not.
   - Releases also include an **experimental 32-bit Windows** installer and portable ZIP for older Windows 10 tablets. It is a manual-download pilot, not offered by automatic updates; ordinary Windows users should keep using the x64 package.
 - ## iOS today
-  - There is **no public iOS app** — public releases ship the desktop apps and the Android APK, and iOS is being scoped.
-  - Some iOS words already exist in the source so a future app is prepared for — the folder-picker handling and the plugin manifest's `ios` platform value — but that is checked-in scaffolding and developer vocabulary, not an installable app. A plugin declaring only `ios` has no host to run on today.
+  - A **public beta** is on [TestFlight](https://testflight.apple.com/join/rpGGpTVW): install Apple's TestFlight app, then open that link. There is no App Store listing yet.
+  - The iPhone and iPad app uses the same mobile interface as Android, so the notes above about one route at a time, bullet context menus and desktop-only features apply there too.
+  - **Plugins do not run on iOS yet.** Themes work; downloadable WebAssembly plugins stay off until Tine has the extra review surface Apple requires for them.
 - ## Where next
   - [[Workflows/Keep context visible]] for tabs, panes, sidebars and workspaces (desktop), [[Features/Quick capture]] for the desktop capture window, [[Workflows/Extend Tine]] for the per-platform plugin and theme lifecycle, and [[Features/PDF annotation]] for the full reader tour.

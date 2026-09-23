@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- The Guide's platform pages now describe the iOS TestFlight beta (themes
+  work, plugins do not run yet) and F-Droid updates for Android.
+
 - Spell-check language names in Settings now use the standard
   "Language (Region)" form, e.g. "English (United States)" and "Spanish
   (Mexico)" instead of "American English" and "Mexican Spanish", so regional
@@ -50,6 +53,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   (compact-projection campaign P0; no user-visible change).
 
 ### Added
+
+- The online Guide now includes three sample journal days, so the Journals
+  view shows tasks, scheduled items, a live query and quick-capture notes
+  instead of an empty page.
+
 - Clicking **N conflicts** opens a **Conflicts** page listing every page that needs a decision, grouped by source, with how many blocks are left on each. Click a page to resolve it, or shift-click to keep the list in view beside it; rows disappear as pages are resolved. The conflict lists in Settings → Backups & recovery moved there, including **Discard copy** for a sync copy whose page no longer exists. Suggested by EllisMorrow (GH #536).
 
 - Live exports now have shareable page and block links. With one pane and one
@@ -68,6 +76,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+
+- The online Guide at tine.page showed emoji in a monochrome outline font.
+  Published pages now use the browser's color emoji font; the desktop editor
+  on Linux keeps its crash-safe monochrome font (GH #76).
 
 - On a Mac whose web engine is older than Safari 15.4 (for example Big Sur
   with Safari never updated), Tine now says so at startup and explains that
