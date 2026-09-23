@@ -5687,6 +5687,7 @@ fn empty_projection_shared() -> ProjectionShared {
         registry_capture_attempts: AtomicU64::new(0),
         inject_read_failure: AtomicBool::new(false),
         inject_turn_failure: AtomicBool::new(false),
+        lease_contended: AtomicBool::new(false),
         fallback_reads: AtomicU64::new(0),
         referenced_name_reads: AtomicU64::new(0),
     }

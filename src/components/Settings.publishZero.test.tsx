@@ -81,3 +81,36 @@ describe("Settings → Graph → Export graph to HTML while indexing (GH #543)",
     }
   }, 10_000);
 });
+
+// GH #543, audit R8-10: every retry asks the backend to export the CURRENT
+// graph, so opening another graph while the export waited for the index
+// exported that other graph. The export belongs to the graph it started on.
+describe("Settings → Graph → Export graph to HTML across a graph switch (GH #543)", () => {
+  it("does not export the graph opened while it waited", async () => {
+    const { bumpGraphBinding } = await import("../persistence");
+    let ready = false;
+    const publish = vi.spyOn(backend(), "publishHtml").mockImplementation(async () => {
+      if (!ready) throw new QueryNotReadyError("indexing");
+      return ["/mock/other-graph/publish", 5];
+    });
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <Settings />, root);
+    try {
+      openSettings("graph");
+      await tick();
+      [...root.querySelectorAll("button")]
+        .find((candidate) => candidate.textContent?.includes("Export graph to HTML"))!
+        .click();
+      await vi.waitFor(() => expect(root.textContent).toContain("Waiting for the index"));
+      const attempts = publish.mock.calls.length;
+      bumpGraphBinding(); // another graph is opened in this window
+      ready = true;
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      expect(publish.mock.calls.length, "a retry exported the newly opened graph").toBe(attempts);
+      expect(root.textContent).not.toContain("Exported 5 pages");
+    } finally {
+      dispose();
+    }
+  }, 10_000);
+});

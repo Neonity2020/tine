@@ -1576,9 +1576,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `source_delta` call; its write goes through the existing
     // `apply_warm_repair`. No new storage import, write kind, schema or
     // dependency pin.
+    // 2026-09-23: GH #543 (audit R8, file-size budget B1) moves the page-order
+    // functions (`reconcile_page_order`, `settle_unseeded_deltas`) unchanged
+    // from direct_projection.rs to direct_projection/page_order.rs: three
+    // `source_delta` reads and one page-order apply change file, nothing else.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1c3ff2a049a52015ee850cafeaf883a7e878f5ce808305eab7f577e24ad76979",
+        "e325a18ccea31f41a8ebee351966b9a6e52c210c21b3b949b2e910d1ab7609ac",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

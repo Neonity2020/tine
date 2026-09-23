@@ -175,24 +175,13 @@ impl Graph {
                     // memoized whole-graph result and can invalidate an
                     // inventory read that was in flight.
                     let disk_rev = content_rev(content);
-                    let parse_config = self.config().parse_config().digest();
-                    // `disk_revs` records a revision only once the parsed cache
-                    // is built; the session record is written by every
-                    // publication, warm or cold, so it is the one that answers
-                    // "have I already published exactly these bytes for this
-                    // path, under this parse configuration".
-                    let unchanged = self
-                        .session_page_ids
-                        .read()
-                        .unwrap()
-                        .get(path)
-                        .is_some_and(|ids| ids.revision == disk_rev && ids.config == parse_config)
-                        || self
-                            .disk_revs
-                            .read()
-                            .unwrap()
-                            .get(path)
-                            .is_some_and(|known| *known == disk_rev);
+                    // The parsed cache reflecting the bytes is not the index
+                    // having them (audit R8-02).
+                    let unchanged = self.page_revision_current(
+                        self.cache.read().unwrap().is_none(),
+                        path,
+                        &disk_rev,
+                    );
                     if !unchanged {
                         self.cache_upsert(entry, newdoc, disk_rev);
                     }
@@ -233,32 +222,15 @@ impl Graph {
         // the guard is dropped before the reconcile path below re-locks the cache.
         // A missing/mismatched entry falls through to the exact comparison, so this
         // can only ever save work, never serve stale content.
+        //
+        // The cache reflecting these bytes is not the index having them: a
+        // whole-graph read installs revisions it never sent
+        // (`page_revision_current`, audit R8-02). With no parsed cache, the
+        // session record cache_upsert writes stands in for it, so a repeated
+        // watcher delivery still enqueues nothing.
         {
             let cache_guard = self.cache.read().unwrap();
-            if self
-                .disk_revs
-                .read()
-                .unwrap()
-                .get(path)
-                .is_some_and(|r| *r == disk_rev)
-            {
-                return Ok(None);
-            }
-            // With no parsed cache, the existing session identity owner still
-            // records the exact revision/config admitted by cache_upsert.
-            // Repeated watcher delivery must not enqueue the same delta again.
-            // The cache lock pairs this read with that producer's publication.
-            if cache_guard.is_none()
-                && self
-                    .session_page_ids
-                    .read()
-                    .unwrap()
-                    .get(path)
-                    .is_some_and(|ids| {
-                        ids.revision == disk_rev
-                            && ids.config == self.config().parse_config().digest()
-                    })
-            {
+            if self.page_revision_current(cache_guard.is_none(), path, &disk_rev) {
                 return Ok(None);
             }
         }
@@ -287,7 +259,7 @@ impl Graph {
                             Some(content),
                         )),
                     };
-                    if cached_norm == newdoc {
+                    if cached_norm == newdoc && self.index_has_revision(path, &disk_rev) {
                         return Ok(None); // unchanged / our own write
                     }
                 }

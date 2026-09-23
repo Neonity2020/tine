@@ -70,6 +70,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- While Tine finished indexing a graph, a failed index update could leave it
+  waiting for itself, so page lists and searches never loaded until a restart
+  (GH #543).
+
+- An edit made outside Tine that its file watcher first missed could stay out
+  of search and queries for the rest of the session if an export, the asset
+  list or another whole-graph read ran before the watcher's rescan (GH #543).
+
+- After a page was deleted in an earlier session, creating a page could make
+  every later search-index update fail when the index had been reopened from
+  a full snapshot (GH #543).
+
+- Renaming a page whose content could not be read no longer leaves search and
+  queries waiting without an index (GH #543).
+
+- Switching back to a graph that Tine was still releasing no longer makes
+  page lists parse the whole graph while the index waits; they wait for the
+  index instead (GH #543).
+
+- Refreshing a graph no longer reports indexing as finished before the
+  refreshed graph has started indexing (GH #543).
+
+- After a display change such as typography or the journal title format, a
+  link to a page could open another page that declares that name as an alias
+  instead of the page itself (GH #543).
+
+- An HTML export waiting for the search index could export a different graph
+  if the window switched graphs meanwhile; it now stops (GH #543).
+
 - Closing a window and opening its graph again could leave search and queries
   without an index until Tine finished releasing the old window. The closed
   window's graph now lets go of its index at once, as switching graphs

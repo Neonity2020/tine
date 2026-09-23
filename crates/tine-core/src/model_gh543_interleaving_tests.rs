@@ -665,9 +665,9 @@ fn gh543_a_page_created_after_reopening_a_graph_with_a_deleted_page_is_indexed()
 }
 
 /// GH #543 (stage-0 harness, seed 6): the launch warm announced "a warm is
-/// coming" for its whole thread, its derived-map prefetch included. When a
+/// coming" for its whole thread, its settle included. When a
 /// turn failed after the warm had validated, nothing was queued, so the
-/// prefetch waited for the warm -- itself -- forever, the window never heard
+/// settle waited for the warm -- itself -- forever, the window never heard
 /// `warm-cache-done`, and every page list waited with it.
 #[test]
 fn gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm() {
@@ -693,7 +693,7 @@ fn gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm() {
     graph.attach_direct_projection(database).unwrap();
     // The app announces the launch warm before its thread starts.
     let announcement = graph.register_index_owner();
-    let pause = graph.pause_next_warm_before_derived_maps_test();
+    let pause = graph.pause_next_warm_before_settle_test();
     let warm = {
         let graph = Arc::clone(&graph);
         std::thread::spawn(move || graph.warm_cache_owned(announcement, || false))
@@ -713,7 +713,7 @@ fn gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm() {
     }
     assert!(
         warm.is_finished(),
-        "the warm's derived-map prefetch waited for the warm itself: {}",
+        "the warm's settle waited for the warm itself: {}",
         projection.debug_state_test()
     );
     warm.join().unwrap();
@@ -1234,11 +1234,12 @@ fn gh543_an_unlistable_graph_backs_the_owner_off() {
     let _ = fs::remove_file(database);
 }
 
-/// GH #543 (design v4 stage 4, R6-03): a second writer for the same index --
-/// switching back to a graph whose previous writer is still finishing --
-/// waits for the lease instead of giving the session's index up. Nothing is
-/// coming meanwhile, so the owner settles and reads answer from the pages;
-/// once the first writer lets go the index comes back.
+/// GH #543 (design v4 stage 4, R6-03; audit R8-04): a second writer for the
+/// same index -- switching back to a graph whose previous writer is still
+/// finishing -- waits for the lease instead of giving the session's index
+/// up. An in-process holder is on its way out, so the index counts as coming:
+/// the owner does not settle and nothing parses the graph meanwhile; once the
+/// first writer lets go the index comes back.
 #[test]
 fn gh543_a_writer_waiting_for_an_in_process_lease_takes_it_when_released() {
     let root = scratch("gh543-lease-in-process");
@@ -1254,19 +1255,20 @@ fn gh543_a_writer_waiting_for_an_in_process_lease_takes_it_when_released() {
     second.attach_direct_projection(database).unwrap();
     let owner = OwnerRun::start(&second);
     assert!(
-        owner.wait_settled(Duration::from_secs(10)),
-        "the owner waited for an index whose lease another writer holds"
+        !owner.wait_settled(Duration::from_millis(1500)),
+        "the owner gave up an index that an in-process writer is about to release"
+    );
+    assert!(first.detach_direct_projection(Duration::from_secs(5)));
+    assert!(
+        owner.wait_ready(Duration::from_secs(5)),
+        "the index did not come back once the first writer released the lease"
+    );
+    assert!(
+        owner.wait_settled(Duration::from_secs(5)),
+        "the owner did not settle after taking the released lease"
     );
     let names = crate::query::real_page_names(&*second);
     assert!(names.contains_key("p1"), "a read answered {names:?}");
-    // Past the backoff's 1 s and 2 s retries: the next one would be at 7 s,
-    // so an index back within 2 s of the release was handed the lease.
-    std::thread::sleep(Duration::from_millis(3200));
-    assert!(first.detach_direct_projection(Duration::from_secs(5)));
-    assert!(
-        owner.wait_ready(Duration::from_secs(2)),
-        "the index did not come back as soon as the first writer released the lease"
-    );
     owner.stop();
     crate::direct_projection::release_projection(&second);
     let _ = fs::remove_dir_all(root);

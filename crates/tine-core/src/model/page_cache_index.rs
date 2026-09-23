@@ -176,9 +176,9 @@ pub(super) struct PageBuildTestState {
     pub(super) warm_read_done_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// Pause the next warm right before it offers its validation.
     pub(super) before_warm_enqueue: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
-    /// Pause the next warm after its index phase, before it prefetches the
-    /// derived maps.
-    pub(super) before_derived_maps: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause the next owner (or inline warm) just before it reports its
+    /// launch completion.
+    pub(super) before_settle: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) derived_read_wait: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) after_parsed_cache_discard: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     /// Pause one page publication right after it releases the cache lock,

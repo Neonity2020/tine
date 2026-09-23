@@ -11,9 +11,11 @@ pub(crate) enum IndexNeed {
     SettingUp,
     /// The worker is gone for good. Nothing enqueued is ever taken.
     Terminal,
-    /// Another writer holds the index database's lease. The worker takes it
-    /// when that writer lets go (or on a backoff when it is another process);
-    /// nothing is coming meanwhile, so readers take their ordinary route.
+    /// Another process holds the index database's lease (or a writer in
+    /// this process has held it longer than a retired one would): the worker
+    /// retries on a backoff, and nothing is coming meanwhile, so readers take
+    /// their ordinary route. A retired predecessor in this process that is
+    /// letting go reads as `SettingUp` (see `direct_projection_lease`).
     LeaseWait,
     /// A full snapshot or a warm validation is queued or being applied.
     InHand,

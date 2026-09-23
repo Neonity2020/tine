@@ -281,6 +281,14 @@ let aliasEntries: Record<string, string> = {};
  *  `aliasRev` (GH #484). Cleared with the rest of the index. */
 let committedAliasMap: Record<string, string> = {};
 let pageIdentities: Record<string, string> = {};
+/** Whether `pageIdentities` holds this epoch's answer. Until it does, no alias
+ *  is published: an alias published beside an empty identity set beats the
+ *  real page it collides with (audit R8-08). */
+let pageIdentitiesLoaded = false;
+let aliasesLoaded = false;
+/** The epoch each half was last requested for; see `bindNavigationIndex`. */
+let aliasesRequestedAt = -1;
+let pageIdentitiesRequestedAt = -1;
 let aliasRequest = 0;
 let pageIdentityRequest = 0;
 
@@ -288,24 +296,39 @@ function resetNavigationIndex(): void {
   navigationEpoch = -1;
   aliasEntries = {};
   pageIdentities = {};
+  pageIdentitiesLoaded = false;
+  aliasesLoaded = false;
+  aliasesRequestedAt = -1;
+  pageIdentitiesRequestedAt = -1;
   aliasRequest++;
   pageIdentityRequest++;
   committedAliasMap = {};
   setAliasMap({});
 }
 
+/** Bind the index to `epoch`. The index is keyed by the render epoch because
+ *  a journal-title format change renames pages; a repaint-only bump
+ *  (typography) clears it too. So a refresh that finds the other half of this
+ *  epoch neither loaded nor requested fetches it too (`completeNavigationIndex`):
+ *  an epoch bump followed by a save used to refresh the aliases alone, and
+ *  every alias then beat the real page of the same name until the next
+ *  create, delete or rename (audit R8-08). Graph open requests both halves
+ *  itself, so it still lists the pages once. */
 function bindNavigationIndex(epoch: number): void {
   if (navigationEpoch === epoch) return;
+  resetNavigationIndex();
   navigationEpoch = epoch;
-  aliasEntries = {};
-  pageIdentities = {};
-  aliasRequest++;
-  pageIdentityRequest++;
-  committedAliasMap = {};
-  setAliasMap({});
+}
+
+async function completeNavigationIndex(epoch: number): Promise<void> {
+  if (!aliasesLoaded && aliasesRequestedAt !== epoch) await refreshAliases();
+  if (!pageIdentitiesLoaded && pageIdentitiesRequestedAt !== epoch) {
+    await refreshPageIdentities();
+  }
 }
 
 function commitNavigationIndex(): void {
+  if (!pageIdentitiesLoaded) return;
   // Existing files win a colliding alias, matching core `load_named`.
   const next = { ...aliasEntries, ...pageIdentities };
   // An alias edit changes which NAMES resolve to a page without creating or
@@ -333,6 +356,7 @@ function aliasMapChanged(
 export async function refreshAliases(): Promise<void> {
   const epoch = graphEpoch();
   bindNavigationIndex(epoch);
+  aliasesRequestedAt = epoch;
   const request = ++aliasRequest;
   const result = await Promise.allSettled([backend().pageAliases()]);
   if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== aliasRequest) return;
@@ -347,7 +371,9 @@ export async function refreshAliases(): Promise<void> {
       }
     }
   }
+  aliasesLoaded = true;
   commitNavigationIndex();
+  await completeNavigationIndex(epoch);
 }
 
 /** Refresh the real-page identity inventory only after graph bind, create,
@@ -356,6 +382,7 @@ export async function refreshAliases(): Promise<void> {
 export async function refreshPageIdentities(): Promise<void> {
   const epoch = graphEpoch();
   bindNavigationIndex(epoch);
+  pageIdentitiesRequestedAt = epoch;
   const request = ++pageIdentityRequest;
   const result = await Promise.allSettled([backend().listPages()]);
   if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== pageIdentityRequest) return;
@@ -366,7 +393,9 @@ export async function refreshPageIdentities(): Promise<void> {
           .map((entry) => [pageIdentityKey(entry.name), entry.name])
       )
     : {};
+  pageIdentitiesLoaded = true;
   commitNavigationIndex();
+  await completeNavigationIndex(epoch);
 }
 
 async function loadAliases(): Promise<void> {

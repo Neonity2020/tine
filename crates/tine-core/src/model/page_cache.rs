@@ -505,12 +505,10 @@ impl Graph {
     /// One inline index pass under a registered owner, for callers that run
     /// no owner loop (the CLI, headless runs, tests): validate the image, or
     /// build and offer the parsed snapshot when it cannot be validated, wait
-    /// for the index, then prefetch the derived maps. The registration makes
-    /// readers wait for this pass instead of parsing the graph beside it; it
-    /// ends with the index phase, because the prefetch after it is an
-    /// ordinary reader, and prefetching under it waited for the pass itself
-    /// -- forever, once a turn failed with nothing queued (GH #543).
+    /// for the index. The registration makes readers wait for this pass
+    /// instead of parsing the graph beside it, and ends with the index phase.
     pub fn warm_cache_owned(&self, owner: IndexOwner, cancelled: impl Fn() -> bool) -> bool {
+        let _owner_thread = super::derived_reads::OwnerThread::enter();
         let passed = match self.direct_projection.get() {
             Some(projection) => {
                 let need = projection.wait_index_need(&cancelled);
@@ -531,11 +529,9 @@ impl Graph {
             // No index: the parsed cache is all there is.
             None => self.warm_page_cache_cancellable(&cancelled),
         };
-        if !passed || cancelled() {
-            return false;
-        }
         drop(owner);
-        self.prefetch_derived_maps(&cancelled)
+        self.before_settle_test_point();
+        passed && !cancelled()
     }
 
     /// One owner iteration inline, for callers that run no owner loop (the
@@ -560,34 +556,17 @@ impl Graph {
         self.index_pass(projection, IndexNeed::Fresh, &mut escalate, cancelled)
     }
 
-    /// Warm the derived maps the frontend fetches right after `warm-cache-done`
-    /// (aliases + block-ref counts), so those fetches are pure cache hits.
-    /// Returns false when cancelled.
-    fn prefetch_derived_maps(&self, cancelled: &impl Fn() -> bool) -> bool {
-        if cancelled() {
-            return false;
-        }
+    /// Test pause point: the owner (or an inline warm) is about to report
+    /// its launch completion.
+    fn before_settle_test_point(&self) {
         #[cfg(test)]
         {
-            let pause = self
-                .page_build_test
-                .before_derived_maps
-                .lock()
-                .unwrap()
-                .take();
+            let pause = self.page_build_test.before_settle.lock().unwrap().take();
             if let Some(pause) = pause {
                 pause.reached.wait();
                 pause.release.wait();
             }
         }
-        let _ = self.page_aliases();
-        if cancelled() {
-            return false;
-        }
-        if self.block_ref_counts().is_err() {
-            return false;
-        }
-        !cancelled()
     }
 
     /// The graph's index owner (GH #543): the one place that starts
@@ -600,8 +579,12 @@ impl Graph {
     /// deterministic failure cannot repeat whole-graph passes back to back.
     ///
     /// `settle` is the launch completion: it is called once, the first time
-    /// nothing is coming any more -- the index is ready, backing off, or gone
-    /// -- after the derived maps are prefetched. The owner keeps running
+    /// nothing is coming any more -- the index is ready, backing off, or gone.
+    /// The owner reads nothing for it: every read goes through the readiness
+    /// wait, which waits while the owner has work to do, so an owner that
+    /// read waited on itself -- forever, once a turn failed while it read
+    /// (GH #543, audit R8-01). The frontend's own fetches after
+    /// `warm-cache-done` are ordinary reads. The owner keeps running
     /// after it, answering later needs (a failed read, an unnamed deletion,
     /// a failed turn), until `cancelled` or the worker is gone.
     pub fn run_index_owner(
@@ -617,6 +600,7 @@ impl Graph {
         // it cancels the old owner, which could otherwise walk the retired
         // graph once in between (GH #543, audit R7-06).
         let cancelled = || cancelled() || self.is_retired();
+        let _owner_thread = super::derived_reads::OwnerThread::enter();
         let lock = || {
             permit
                 .lock()
@@ -628,7 +612,8 @@ impl Graph {
                 let _permit = lock();
                 self.warm_page_cache_cancellable(&cancelled)
             };
-            if built && self.prefetch_derived_maps(&cancelled) {
+            if built && !cancelled() {
+                self.before_settle_test_point();
                 settle();
             }
             drop(owner);
@@ -649,7 +634,8 @@ impl Graph {
                             let _permit = lock();
                             self.warm_page_cache_cancellable(&cancelled)
                         };
-                        if built && self.prefetch_derived_maps(&cancelled) {
+                        if built && !cancelled() {
+                            self.before_settle_test_point();
                             settle();
                         }
                     }
@@ -657,9 +643,7 @@ impl Graph {
                 }
                 OwnerStep::Settle => {
                     settle_owed = false;
-                    if !self.prefetch_derived_maps(&cancelled) {
-                        return;
-                    }
+                    self.before_settle_test_point();
                     settle();
                 }
                 OwnerStep::Pass(_) => {
@@ -1494,12 +1478,12 @@ impl Graph {
         pause
     }
 
-    /// Pause the next warm after its index phase, before it prefetches the
-    /// derived maps.
+    /// Pause the next owner (or inline warm) just before it reports its
+    /// launch completion.
     #[cfg(test)]
-    pub(crate) fn pause_next_warm_before_derived_maps_test(&self) -> Arc<PageBuildTestPause> {
+    pub(crate) fn pause_next_warm_before_settle_test(&self) -> Arc<PageBuildTestPause> {
         let pause = Arc::new(PageBuildTestPause::new());
-        *self.page_build_test.before_derived_maps.lock().unwrap() = Some(Arc::clone(&pause));
+        *self.page_build_test.before_settle.lock().unwrap() = Some(Arc::clone(&pause));
         pause
     }
 

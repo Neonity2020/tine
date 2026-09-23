@@ -1082,9 +1082,7 @@ pub(crate) fn warm_cache_async(
         // background so the first search / query / `g j` agenda doesn't pay for
         // parsing every file synchronously under the lock.
         std::thread::sleep(std::time::Duration::from_millis(250));
-        if slot.background_cancelled.load(Ordering::Acquire)
-            || slot.warm_generation.load(Ordering::Acquire) != warm_generation
-        {
+        if warm_revoked(&slot, warm_generation) {
             return; // the graph was switched while we slept — a newer warm owns it
         }
         // At most one process-wide whole-graph index pass reads files at a
@@ -1093,10 +1091,7 @@ pub(crate) fn warm_cache_async(
         // between page parses.
         static WARM_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         let permit = WARM_WORK.get_or_init(|| std::sync::Mutex::new(()));
-        let cancelled = || {
-            slot.background_cancelled.load(Ordering::Acquire)
-                || slot.warm_generation.load(Ordering::Acquire) != warm_generation
-        };
+        let cancelled = || warm_revoked(&slot, warm_generation);
         settle_launch_warm(
             |settle| graph.run_index_owner(owner, permit, cancelled, settle),
             cancelled,
@@ -1110,6 +1105,19 @@ pub(crate) fn warm_cache_async(
         );
     });
     Ok(())
+}
+
+/// Whether the launch warm `warm_generation` of `slot` no longer owns the
+/// window: the slot's background work was cancelled (switch, close), a newer
+/// warm replaced it, or its graph was retired. A refresh retires the old
+/// graph before it swaps the slot -- it cannot cancel the background work the
+/// two slots share -- and a check without retirement let the old owner's
+/// launch completion announce `warm-cache-done` for a pass that never
+/// finished (GH #543, audit R8-05).
+fn warm_revoked(slot: &GraphSlot, warm_generation: u64) -> bool {
+    slot.background_cancelled.load(Ordering::Acquire)
+        || slot.warm_generation.load(Ordering::Acquire) != warm_generation
+        || slot.graph().is_retired()
 }
 
 /// Mark indexing finished for the window, if this warm still owns it. Only
@@ -1343,6 +1351,63 @@ mod tests {
             .graph()
             .detach_direct_projection(std::time::Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GH #543: a refresh retires the old graph in `commit` but moves the old
+    /// slot's warm generation only in `swap_refreshed`. In between, the old
+    /// owner is cancelled by retirement; the launch-settle guard and
+    /// `finish_warm` must treat that as revoked (`warm_revoked`) rather than
+    /// consult only the slot, or the retired warm announces `warm-cache-done`
+    /// before the replacement's pass has begun.
+    #[test]
+    fn a_refresh_does_not_announce_the_retired_warm() {
+        let root =
+            std::env::temp_dir().join(format!("tine-refresh-retired-warm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["pages", "journals", "logseq"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("logseq/config.edn"), "{}\n").unwrap();
+        std::fs::write(root.join("pages/Source.md"), "- [[OnlyReferenced]]\n").unwrap();
+        let root_key = std::fs::canonicalize(&root).unwrap();
+        let state = direct_test_state();
+        let (old, old_warm) =
+            publish_direct_files_slot(&state, "main", Graph::open(&root), root_key.clone())
+                .unwrap();
+        let old_generation = old_warm.generation;
+        let services = DirectFilesServicePaths {
+            projection: Ok(root.join("private/projection.sqlite")),
+            concord_ledger: None,
+        };
+        let prepared = crate::state::prepare_legacy_refresh(&old, None, services).unwrap();
+        let replacement = Arc::new(prepared.commit(&old));
+        // Between commit and swap: the old graph is retired, so its owner's
+        // own `cancelled` is true and it returns without settling.
+        let slot_cancelled = || warm_revoked(&old, old_generation);
+        let mut announced = false;
+        settle_launch_warm(
+            |_settle| { /* owner returned: cancelled by retirement, never settled */ },
+            slot_cancelled,
+            || {
+                let current = state.graphs.read().unwrap().slot("main");
+                announced = finish_warm(current, &old, old_generation);
+            },
+        );
+        let _ = begin_warm_cache(&replacement);
+        let _ =
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .swap_refreshed("main", &old, Arc::clone(&replacement));
+        replacement
+            .graph()
+            .detach_direct_projection(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !announced,
+            "a retired owner's launch settle emitted warm-cache-done for the window before the replacement's pass began"
+        );
     }
 
     fn direct_test_state() -> AppState {

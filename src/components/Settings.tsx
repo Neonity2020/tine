@@ -133,6 +133,7 @@ import {
   type BackupInfo,
 } from "../backend";
 import { runQueryWhenCurrent } from "../queryReadiness";
+import { graphBinding } from "../persistence";
 import type { AssetInfo, TrashStats, JournalFile, PageEntry } from "../types";
 import { ConflictFileRow } from "./JournalConflictFileRow";
 import { formatJournal } from "../journal";
@@ -323,12 +324,16 @@ export function Settings(): JSX.Element {
   });
   const doPublish = async () => {
     setPublishMsg("Exporting…");
+    // The export belongs to the graph it was started on: each retry asks the
+    // backend for the CURRENT graph, so a switch while waiting used to export
+    // the other graph (GH #543, audit R8-10).
+    const binding = graphBinding();
     try {
       // Publication reads its queries from the index; while the index is
       // being built it waits for it rather than failing (GH #543, audit R6-05).
       const [dir, n] = await runQueryWhenCurrent(
         () => backend().publishHtml(),
-        () => !publishDisposed,
+        () => !publishDisposed && graphBinding() === binding,
         (pending) => setPublishMsg(pending ? "Waiting for the index to be ready…" : "Exporting…"),
       );
       // A zero is a successful export of nothing, which reads as a broken

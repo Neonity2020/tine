@@ -392,6 +392,11 @@ impl Graph {
     ) -> Option<u64> {
         use crate::direct_projection::ProjectionProgress;
         use crate::query::QueryReadinessReason as Reason;
+        debug_assert!(
+            !super::derived_reads::OwnerThread::current(),
+            "an index owner read through the readiness wait, which waits for the owner itself \
+             (GH #543, audit R8-01)"
+        );
         #[cfg(test)]
         {
             let pause = self

@@ -335,6 +335,60 @@ impl Graph {
         self.session_page_ids.write().unwrap().insert(path, ids);
     }
 
+    /// Whether `revision` of `path` is already everywhere a reconcile would
+    /// put it, so a delivery of those bytes may publish nothing: the parsed
+    /// cache reflects it (with no parsed cache, the session record written by
+    /// every publication stands in for it) and the index has it too. The
+    /// cache alone is not enough: a whole-graph read installs the revisions it
+    /// parsed without sending them to the index (its snapshot is refused
+    /// while the index is current or a warm owns readiness), and the watcher
+    /// that took the parsed cache for the index left an external edit out of
+    /// search and queries for the session (GH #543, audit R8-02). The caller
+    /// passes the cache state it holds the lock for.
+    pub(super) fn page_revision_current(
+        &self,
+        cache_is_none: bool,
+        path: &Path,
+        revision: &str,
+    ) -> bool {
+        let published = self.session_published(path, revision);
+        let cached = self
+            .disk_revs
+            .read()
+            .unwrap()
+            .get(path)
+            .is_some_and(|known| known == revision)
+            || (cache_is_none && published);
+        cached && (published || self.index_has_revision(path, revision))
+    }
+
+    /// Whether the index has `revision` of `path` or was sent it: no index is
+    /// attached, this session published those bytes under the current parse
+    /// configuration, or the ready image holds them.
+    pub(super) fn index_has_revision(&self, path: &Path, revision: &str) -> bool {
+        let Some(projection) = self.direct_projection.get() else {
+            return true;
+        };
+        self.session_published(path, revision)
+            || projection.holds_source_revision(
+                self.cache_gen.load(Ordering::Acquire),
+                &self.rel_path(path),
+                &crate::direct_projection::projection_source_revision(
+                    revision,
+                    self.config().parse_config().digest(),
+                ),
+            )
+    }
+
+    fn session_published(&self, path: &Path, revision: &str) -> bool {
+        let config = self.config().parse_config().digest();
+        self.session_page_ids
+            .read()
+            .unwrap()
+            .get(path)
+            .is_some_and(|ids| ids.revision == revision && ids.config == config)
+    }
+
     /// Publish the ids of a page opened at bytes the ready index already
     /// holds, with no delta: the claim a publication makes is true, and a
     /// delta would re-send bytes the index has, moving the generation under

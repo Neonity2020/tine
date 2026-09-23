@@ -6103,11 +6103,11 @@
  "layer": "integration",
  "status": "covered",
  "coverage": {
-  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_writer_waiting_for_an_in_process_lease_takes_it_when_released", "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_lease_held_by_another_process_is_retried", "src-tauri/src/state.rs::a_graph_switch_detaches_the_displaced_graphs_index_writer"],
+  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_writer_waiting_for_an_in_process_lease_takes_it_when_released", "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_lease_held_by_another_process_is_retried", "src-tauri/src/state.rs::a_graph_switch_detaches_the_displaced_graphs_index_writer", "crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_a_reader_waits_for_a_retired_predecessor_to_release_the_index"],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "Design v4 stage 4 (R6-03). The worker tried the writer lease once and went terminal, so a quick switch back to a graph whose old writer had not yet exited, or a second instance, left the session with no index. It now waits: for an in-process holder it retries the moment that holder releases (a registry of writers per database path, changed under one lock with the lease), for another process on a 1 s doubling backoff capped at 30 min. While it waits nothing is coming (IndexNeed::LeaseWait), so readers take their ordinary route. Switching a window to a different graph now detaches the displaced graph's writer at once. Fail-before: tine-agents/evidence/gh550-batch/stage4/necessity-lease-retry.log."
+ "notes": "Design v4 stage 4 (R6-03). The worker tried the writer lease once and went terminal, so a quick switch back to a graph whose old writer had not yet exited, or a second instance, left the session with no index. It now waits: for an in-process holder it retries the moment that holder releases (a registry of writers per database path, changed under one lock with the lease), for another process on a 1 s doubling backoff capped at 30 min. While it waits nothing is coming (IndexNeed::LeaseWait), so readers take their ordinary route. Switching a window to a different graph now detaches the displaced graph's writer at once. Fail-before: tine-agents/evidence/gh550-batch/stage4/necessity-lease-retry.log. Round 8 (R8-04): an in-process holder is on its way out, so while the worker waits for it (up to 20 s) the index counts as coming and readers wait instead of parsing the whole graph; only a foreign holder, or an in-process one past the bound, is LeaseWait. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-04-lease.log."
 },
 {
  "id": "REG-A-DELETE-DURING-A-FULL-REBUILD-DOES-NOT-FAIL-IT-543",
@@ -6216,6 +6216,132 @@
   "failBefore": "proven"
  },
  "notes": "Round-7 indexing audit R7-06. A refresh retires the old graph before swap_refreshed cancels its owner; in between the owner could run one pass over the retired graph. run_index_owner now treats the graph's own retirement as cancellation, for every caller. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r7/necessity-retired-owner.log."
+},
+{
+ "id": "REG-THE-INDEX-OWNER-NEVER-WAITS-ON-ITSELF-543",
+ "title": "An index turn that fails while the indexing owner finishes its pass does not hang the owner, and with it every page listing",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_a_turn_failure_while_the_owner_settles_does_not_hang_it", "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_turn_that_fails_after_the_launch_check_does_not_hang_the_warm"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 8, R8-01 (seed 1023). The owner prefetched derived maps at Settle through the ordinary readiness wait; a turn failure in that window made the need Fresh -- work coming only because the owner will run it -- and the owner waited for itself forever. Fix (shape): the prefetch is deleted (it memoized nothing), and the owner never reads through the readiness wait: its thread is marked (OwnerThread) and wait_for_derived_read debug-asserts it is not on it. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-01-settle-self-wait.log (auditor probe on pre-fix 560db0e0)."
+},
+{
+ "id": "REG-A-MISSED-EXTERNAL-EDIT-REACHES-THE-INDEX-AFTER-A-WHOLE-GRAPH-READ-543",
+ "title": "An external edit the watcher first missed reaches search and queries on the rescan, even if a whole-graph read (publish, asset listing, Guide copy) parsed the page in between",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_an_acting_read_does_not_hide_a_missed_external_edit", "src-tauri/src/watcher.rs::incremental_create_is_identified_as_inventory_change"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 8, R8-02 (seeds 1066/1141). A whole-graph read installs the parsed cache without sending it to the index; the watcher's unchanged checks (disk_revs, cached document equality, the shadow-journal branch) took the parsed cache for the index and skipped the page for the session. Fix: all three sites ask Graph::page_revision_current / index_has_revision -- the cache reflects the bytes AND the index has them (session publication or the ready image's stored source revision). The first cut treated a graph with no index and no parsed cache as always current; five src-tauri watcher tests caught it before commit. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-02-acting-read.log."
+},
+{
+ "id": "REG-A-REUSED-SNAPSHOT-ON-A-REOPENED-INDEX-TAKES-THE-QUEUE-ORDER-543",
+ "title": "A page created after a full snapshot was reused on a reopened index does not fail every later index turn",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_a_reused_snapshot_on_a_reopened_image_takes_the_queue_order"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 8, R8-03 (seed 1023's first half). The seed-6 fix gave a reopened image the queue's dense order only on a clean warm validation; the worker's reuse_full branch applied deltas alone, so the image kept a deleted page's gap and the next new page took a stored page's position (UNIQUE constraint failed: pages.position). Fix (shape): every image-reuse path adopts the queue order through one helper (adopt_queue_order / PendingProjection::adopt_order), now in direct_projection/page_order.rs. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-03-reuse-full.log."
+},
+{
+ "id": "REG-A-RENAME-WITH-NOTHING-TO-SEND-LEAVES-THE-INDEX-CURRENT-543",
+ "title": "Renaming a page whose content cannot be parsed does not leave search and queries without an index",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_lifecycle_tests.rs::gh543_a_rename_with_nothing_to_send_leaves_the_index_current"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 8, R8-07. A mover that claimed IndexEffect::Sent but queued an empty page set left the index behind the generation with nothing owed; the owner saw Nothing and derived reads had no producer. Fix: enqueue_page_set with no changes advances the index generation. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-07-empty-send.log."
+},
+{
+ "id": "REG-A-REFRESH-DOES-NOT-ANNOUNCE-THE-RETIRED-WARM-543",
+ "title": "Refreshing a graph does not tell the window indexing finished before the replacement graph's pass has begun",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src-tauri/src/graph.rs::a_refresh_does_not_announce_the_retired_warm"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 8, R8-05. A refresh retires the old graph in commit but moves the slot's warm generation only in swap_refreshed; the launch-settle guard and finish_warm consulted only the slot, so the retired owner announced warm-cache-done. Fix: one predicate, warm_revoked (cancelled, superseded, or retired), for both the early return and the owner's cancellation. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-05-refresh-warm.log."
+},
+{
+ "id": "REG-ALIASES-NEVER-BEAT-A-REAL-PAGE-AFTER-A-REPAINT-543",
+ "title": "After a display change that repaints pages (typography, journal title format) and a save, a link to a real page still opens that page rather than another page that declares its name as an alias",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src/navigationIndexEpoch.test.ts", "src/graph.test.tsx"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 8, R8-08. The navigation index is keyed by the render epoch; a repaint-only bump cleared it and the next save refreshed the aliases alone, so every alias beat the real page of the same name until the next create, delete or rename. Fix: no alias map is published until this epoch's page identities are loaded, and a refresh that finds the other half neither loaded nor requested fetches it (graph open still lists pages once; graph.test.tsx pins that). Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-08-alias.log."
+},
+{
+ "id": "REG-AN-HTML-EXPORT-RETRY-STOPS-AT-A-GRAPH-SWITCH-543",
+ "title": "An HTML export waiting for the index stops when the window switches graphs instead of exporting the other graph",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": ["src/components/Settings.publishZero.test.tsx"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 8, R8-10. Settings' export retry checked only that the dialog was open, so a switch during the wait exported the newly bound graph. Fix: the retry is bound to graphBinding() at the click. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r8/necessity-r8-10-export.log."
 }
 ]
 }

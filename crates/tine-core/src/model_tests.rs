@@ -15964,3 +15964,6 @@ mod gh543_parse_passes;
 
 #[path = "model_gh543_interleaving_tests.rs"]
 mod gh543_interleaving;
+
+#[path = "model_gh543_lifecycle_tests.rs"]
+mod gh543_lifecycle;

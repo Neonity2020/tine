@@ -417,6 +417,13 @@ impl PendingProjection {
         self.place_unseeded_deltas();
     }
 
+    /// The image was just written in `order`: the queue takes that order,
+    /// and so do the updates the turn took beside it.
+    fn adopt_order(&mut self, order: &[String], taken: &mut BTreeMap<String, (u64, PageDelta)>) {
+        self.reseed_order(order);
+        self.place_taken(taken);
+    }
+
     /// Positions for updates a worker turn has already taken, from the
     /// queue's current order.
     fn place_taken(&mut self, taken: &mut BTreeMap<String, (u64, PageDelta)>) {
@@ -596,6 +603,9 @@ struct ProjectionShared {
     /// Fail the worker's next turn, as a disk error or a SQLite fault would.
     #[cfg(test)]
     inject_turn_failure: AtomicBool,
+    /// The worker found the writer lease held at least once.
+    #[cfg(test)]
+    pub(super) lease_contended: AtomicBool,
     #[cfg(test)]
     fallback_reads: AtomicU64,
     #[cfg(test)]
@@ -1063,6 +1073,8 @@ impl DirectProjection {
             #[cfg(test)]
             inject_turn_failure: AtomicBool::new(false),
             #[cfg(test)]
+            lease_contended: AtomicBool::new(false),
+            #[cfg(test)]
             fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
             referenced_name_reads: AtomicU64::new(0),
@@ -1334,7 +1346,13 @@ impl DirectProjection {
         changes: Vec<PageSetChange>,
         parse_config: Arc<ParseConfig>,
     ) {
+        // A mover that claimed `IndexEffect::Sent` and then had nothing to
+        // send (every replacement failed to parse) still owes the index its
+        // generation: returning here left the index behind with nothing
+        // queued or owed, and the next derived read parsed the whole graph
+        // (GH #543, audit R8-07).
         if changes.is_empty() {
+            self.advance_generation(generation);
             return;
         }
         self.shared.ready.store(false, Ordering::Release);
@@ -2752,8 +2770,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             // queue's order; the updates taken with it go by the same list.
             let inventory = full.as_ref().map(|_| {
                 let inventory = pending.ordered_inventory();
-                pending.reseed_order(&inventory);
-                pending.place_taken(&mut deltas);
+                pending.adopt_order(&inventory, &mut deltas);
                 inventory
             });
             WorkerTurn {
@@ -2864,13 +2881,14 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     )
                 })?;
                 if reuse_full {
-                    apply_deltas(
-                        writer_slot
-                            .as_mut()
-                            .ok_or(ProjectionRefusal::AwaitingFullInventory)?,
-                        deltas,
-                    )
-                    .map_err(ProjectionRefusal::Failed)?
+                    let database = writer_slot
+                        .as_mut()
+                        .ok_or(ProjectionRefusal::AwaitingFullInventory)?;
+                    // The snapshot seeded the queue's order densely; the
+                    // reused image keeps the positions it was written with.
+                    adopt_queue_order(database, &shared, &mut deltas)
+                        .map_err(ProjectionRefusal::Failed)?;
+                    apply_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?
                 } else if !full.source_complete && existing_image_healthy {
                     apply_incomplete_full(
                         writer_slot.as_mut().expect("healthy writer"),
@@ -2920,37 +2938,19 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                                 .map_err(ProjectionRefusal::Failed)?;
                         // The image now keeps the order's positions; so does
                         // the queue, and so do the updates taken with it.
-                        let mut pending = shared.pending.lock().unwrap();
-                        pending.reseed_order(&order);
-                        pending.place_taken(&mut deltas);
+                        shared
+                            .pending
+                            .lock()
+                            .unwrap()
+                            .adopt_order(&order, &mut deltas);
                         validate_warm(database, warm).map_err(ProjectionRefusal::Failed)?
                     } else {
                         let outcome =
                             validate_warm(database, warm).map_err(ProjectionRefusal::Failed)?;
                         if matches!(outcome, WarmOutcome::Clean) {
-                            // The queue was seeded from the walk, but a
-                            // reopened image keeps the positions it was
-                            // written with: a page deleted last session left
-                            // a gap, and the next new page took a stored
-                            // page's position (`UNIQUE constraint failed:
-                            // pages.position`), failing every later turn
-                            // (GH #543). Give the image the queue's order; an
-                            // image already in that order is not written.
-                            let order = reconcile_page_order(
-                                database,
-                                &shared,
-                                &PhysicalGraphProjectionChange {
-                                    replacements: Vec::new(),
-                                    deletions: Vec::new(),
-                                    reference_postings: Vec::new(),
-                                },
-                                &[],
-                                &[],
-                            )
-                            .map_err(ProjectionRefusal::Failed)?;
-                            let mut pending = shared.pending.lock().unwrap();
-                            pending.reseed_order(&order);
-                            pending.place_taken(&mut deltas);
+                            // The queue was seeded from the walk.
+                            adopt_queue_order(database, &shared, &mut deltas)
+                                .map_err(ProjectionRefusal::Failed)?;
                         }
                         outcome
                     }
@@ -3718,11 +3718,11 @@ fn apply_incomplete_full(
         },
         &full.parse_config,
     )?;
-    {
-        let mut pending = shared.pending.lock().unwrap();
-        pending.reseed_order(&order);
-        pending.place_taken(&mut deltas);
-    }
+    shared
+        .pending
+        .lock()
+        .unwrap()
+        .adopt_order(&order, &mut deltas);
     apply_deltas(database, deltas)
 }
 
@@ -3770,115 +3770,6 @@ fn apply_warm_repair(
     )
 }
 
-/// Apply `change` and give every page the image holds afterwards its place in
-/// the queue's order (the walk, then pages this session created). Returns
-/// that order. Positions that already match are not written.
-fn reconcile_page_order(
-    database: &mut PhysicalGraphProjectionDatabase,
-    shared: &ProjectionShared,
-    change: &PhysicalGraphProjectionChange,
-    revisions: &[PhysicalGraphProjectionSourceRevision],
-    aliases: &[PhysicalAliasDeclaration],
-) -> Result<Vec<String>, String> {
-    // Against an empty inventory every stored page reads as a deletion: that
-    // is the set of paths the image holds.
-    let mut after = database
-        .source_delta(&[])
-        .map_err(|error| error.to_string())?
-        .deletions
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    for path in &change.deletions {
-        after.remove(path);
-    }
-    after.extend(change.replacements.iter().map(|page| page.path.clone()));
-    let mut order = shared
-        .pending
-        .lock()
-        .unwrap()
-        .ordered_inventory()
-        .into_iter()
-        .filter(|path| after.remove(path))
-        .collect::<Vec<_>>();
-    // Nothing should be left; anything that is still gets a place at the end.
-    order.extend(after);
-    database
-        .apply_with_source_revisions_aliases_and_page_order(change, revisions, aliases, &order)
-        .map_err(|error| error.to_string())?;
-    Ok(order)
-}
-
-/// GH #550: settle the deltas a session published before it had seeded its
-/// page order (they carry no position). Launch reads -- the Journals feed
-/// loading its first days -- publish every page they read, and they arrive
-/// before the warm has validated the reopened image.
-///
-/// - A page the image already holds at this exact source revision is
-///   dropped: re-lowering it writes rows identical to the ones stored.
-/// - A changed page the image holds is applied without a position, so it
-///   keeps its stored one.
-/// - A page the image does not hold cannot be placed without the session's
-///   inventory. It is returned second, to wait for that inventory instead of
-///   inventing a position (`PendingProjection::unplaced`).
-#[allow(clippy::type_complexity)]
-fn settle_unseeded_deltas(
-    database: &PhysicalGraphProjectionDatabase,
-    mut deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<
-    (
-        BTreeMap<String, (u64, PageDelta)>,
-        BTreeMap<String, (u64, PageDelta)>,
-    ),
-    String,
-> {
-    let unseeded = deltas
-        .values()
-        .filter_map(|(_, delta)| match delta {
-            PageDelta::Replace {
-                entry,
-                revision,
-                parse_config,
-                page_position: None,
-                ..
-            } => Some(PhysicalGraphProjectionSourceRevision {
-                path: entry.rel_path.clone(),
-                revision: projection_source_revision(revision, parse_config.digest()),
-            }),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let mut unplaced = BTreeMap::new();
-    if unseeded.is_empty() {
-        return Ok((deltas, unplaced));
-    }
-    // Against an empty inventory every stored page reads as a deletion: that
-    // is the set of paths the image holds.
-    let stored = database
-        .source_delta(&[])
-        .map_err(|error| error.to_string())?
-        .deletions
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let changed = database
-        .source_delta(&unseeded)
-        .map_err(|error| error.to_string())?
-        .replacements
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    for source in unseeded {
-        if !stored.contains(&source.path) {
-            if let Some(update) = deltas.remove(&source.path) {
-                unplaced.insert(source.path, update);
-            }
-            continue;
-        }
-        if !changed.contains(&source.path) {
-            deltas.remove(&source.path);
-        }
-    }
-    Ok((deltas, unplaced))
-}
-
 fn apply_deltas(
     database: &mut PhysicalGraphProjectionDatabase,
     deltas: BTreeMap<String, (u64, PageDelta)>,
@@ -3895,6 +3786,14 @@ fn apply_deltas(
         )
         .map_err(|error| error.to_string())?;
     Ok(lowered.applied)
+}
+
+/// Whether this graph's worker has found the writer lease held.
+#[cfg(test)]
+pub(crate) fn lease_wait_started_test<G: crate::query::graph::QueryGraph>(graph: &G) -> bool {
+    graph
+        .direct_projection_test()
+        .is_some_and(|projection| projection.shared.lease_contended.load(Ordering::Acquire))
 }
 
 #[cfg(test)]
@@ -3980,8 +3879,10 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
 
 pub(crate) mod derived_reads;
 mod lowering;
+mod page_order;
 mod warm_queue;
 pub(crate) use lowering::*;
+use page_order::{adopt_queue_order, reconcile_page_order, settle_unseeded_deltas};
 pub(crate) use warm_queue::WarmRefusal;
 #[cfg(test)]
 #[path = "direct_projection_tests.rs"]

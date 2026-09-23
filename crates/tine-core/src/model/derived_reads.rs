@@ -14,6 +14,30 @@ enum DisplayRead {
 
 thread_local! {
     static DISPLAY_READ: std::cell::Cell<DisplayRead> = const { std::cell::Cell::new(DisplayRead::Off) };
+    /// Set while this thread runs an index owner; see [`OwnerThread`].
+    static INDEX_OWNER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the current thread as running an index owner for its lifetime.
+/// The readiness wait waits while the owner has work to do, so a read on the
+/// owner's own thread waits on itself: in debug builds, entering it there
+/// panics (GH #543, audit R8-01).
+pub(super) struct OwnerThread(bool);
+
+impl OwnerThread {
+    pub(super) fn enter() -> Self {
+        Self(INDEX_OWNER_THREAD.with(|owner| owner.replace(true)))
+    }
+
+    pub(super) fn current() -> bool {
+        INDEX_OWNER_THREAD.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for OwnerThread {
+    fn drop(&mut self) {
+        INDEX_OWNER_THREAD.with(|owner| owner.set(self.0));
+    }
 }
 
 impl Graph {
@@ -25,7 +49,7 @@ impl Graph {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub(super) fn is_retired(&self) -> bool {
+    pub fn is_retired(&self) -> bool {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
