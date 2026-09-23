@@ -520,7 +520,7 @@ impl Graph {
                         // parse the whole graph (GH #543). Nothing is owed if
                         // readiness is no longer coming at this generation.
                         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-                        projection.wait_until_ready_at(generation, &cancelled);
+                        let _ = projection.wait_until_ready_at(generation, &cancelled);
                         true
                     }
                     Some(false) => true,

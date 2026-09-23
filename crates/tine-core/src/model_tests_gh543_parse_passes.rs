@@ -472,7 +472,7 @@ fn gh543_listing_with_an_unreadable_page_does_not_reparse_healthy_pages() {
     let graph = Graph::open(&dir);
     graph.attach_direct_projection(database).unwrap();
     graph.warm_cache();
-    graph.direct_projection_test().unwrap().wait_drained_test();
+    assert!(graph.direct_projection_test().unwrap().wait_drained_test());
 
     let first_listing = graph.list_pages();
     assert!(first_listing.iter().all(|entry| entry.name != "healthy1"));

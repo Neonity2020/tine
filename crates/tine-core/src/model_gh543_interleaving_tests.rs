@@ -876,6 +876,7 @@ impl OwnerRun {
         true
     }
 
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     fn wait_ready(&self, bound: Duration) -> bool {
         let started = Instant::now();
         while !self.graph.direct_projection_ready_test() {

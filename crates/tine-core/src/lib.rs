@@ -2,6 +2,11 @@
 //! Logseq-compatible outliner. Pure Rust, no GUI dependencies — fully unit
 //! testable without the Tauri shell.
 
+// A discarded `#[must_use]` result is an error, not a warning: a readiness
+// wait whose timeout a test ignored let a query run before the index was
+// ready and fail as a flake, not as a finding (GH #543, audit R9-15e).
+#![deny(unused_must_use)]
+
 pub mod backend_error;
 pub mod concord_ledger;
 pub mod concord_queue;

@@ -57,6 +57,7 @@ impl TestOwner {
         true
     }
 
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     fn wait_ready(&self, bound: Duration) -> bool {
         let started = Instant::now();
         while !self.graph.direct_projection_ready_test() {
@@ -375,8 +376,14 @@ fn missed_edit_then_rescan(acting_read: bool) -> (Vec<String>, Vec<String>, Stri
     let synced = graph.sync_file_checked(&path).unwrap().is_some();
     graph.acknowledge_graph_text_external_observations(ticket);
     let projection = graph.direct_projection_test().unwrap();
-    projection.wait_drained_test();
-    owner.wait_ready(Duration::from_secs(10));
+    assert!(
+        projection.wait_drained_test(),
+        "the sync's index turn failed"
+    );
+    assert!(
+        owner.wait_ready(Duration::from_secs(10)),
+        "the index was not ready before the query ran (R9-15e)"
+    );
     let answer = |groups: &[crate::model::RefGroup]| {
         let mut raws = groups
             .iter()
@@ -425,7 +432,7 @@ fn gh543_an_acting_read_does_not_hide_a_missed_external_edit() {
 
 fn settle_index(graph: &Graph) {
     let projection = graph.direct_projection_test().unwrap();
-    projection.wait_drained_test();
+    assert!(projection.wait_drained_test(), "the index turn failed");
     let started = Instant::now();
     while !graph.direct_projection_ready_test() && started.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(5));

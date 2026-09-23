@@ -1397,6 +1397,7 @@ impl DirectProjection {
     /// reads that would otherwise fall to a full parse in the milliseconds
     /// after a save or a warm turn wait for that bounded worker turn first.
     /// Same ceiling and same non-authority as `wait_for_reference_generation`.
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     pub(crate) fn wait_ready_at(&self, generation: u64) -> bool {
         self.wait_for_reference_generation(generation)
     }
@@ -1407,6 +1408,7 @@ impl DirectProjection {
     /// readiness at this generation is no longer coming: a newer generation,
     /// the worker gone or failed, an idle queue that did not publish, or
     /// `cancelled`.
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     pub(crate) fn wait_until_ready_at(
         &self,
         generation: u64,
@@ -1558,6 +1560,7 @@ impl DirectProjection {
     /// every parsed page. The timeout is a latency ceiling, not an authority:
     /// failure, worker loss, a newer generation, or expiry all return `false`
     /// and the caller uses the exact parser fallback.
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     pub(crate) fn wait_for_reference_generation(&self, generation: u64) -> bool {
         if self.ready_at(generation) {
             return true;
@@ -2486,8 +2489,9 @@ impl DirectProjection {
     }
 
     /// Wait until the worker has drained its queue and finished its turn, and
-    /// report whether that turn failed.
+    /// report whether that turn succeeded (`false`: it failed).
     #[cfg(test)]
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     pub(crate) fn wait_drained_test(&self) -> bool {
         let started = std::time::Instant::now();
         loop {
