@@ -20,7 +20,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const EXCLUDED_FROM_BUILD_INPUTS = /include_(?:str|bytes)!\s*\(\s*"([^"]*(?:docs\/|src-tauri\/gen\/schemas\/)[^"]*)"/g;
+// The root READMEs (README.md, README.zh-CN.md) are waived by `--test-only` too.
+const EXCLUDED_FROM_BUILD_INPUTS =
+  /include_(?:str|bytes)!\s*\(\s*"([^"]*(?:docs\/|src-tauri\/gen\/schemas\/|README[^"\/]*\.md(?="))[^"]*)"/g;
 
 /** Byte ranges of every `#[cfg(test)]`-attributed `mod … { … }` block. */
 export function testModuleRanges(source: string): [number, number][] {
@@ -90,6 +92,10 @@ describe("docs are not a product input", () => {
       "}",
     ].join("\n");
     expect(productionEmbeds(regression)).toEqual(["../../../docs/storage-sync-contract.md"]);
+  });
+
+  it("detects a production embed of the root README", () => {
+    expect(productionEmbeds('const ABOUT: &str = include_str!("../../../README.md");')).toEqual(["../../../README.md"]);
   });
 
   it("accepts the house pattern: a contract pinned from a test module", () => {
