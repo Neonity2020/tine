@@ -5264,7 +5264,7 @@ dependencies = [
 
 [[package]]
 name = "tine"
-version = "0.6.984"
+version = "0.6.985"
 dependencies = [
  "base64 0.22.1",
  "cap-std",
@@ -5304,7 +5304,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.6.984"
+version = "0.6.985"
 dependencies = [
  "ahash",
  "ammonia",
@@ -5342,7 +5342,7 @@ dependencies = [
 
 [[package]]
 name = "tine-ios-folder-picker-native"
-version = "0.6.984"
+version = "0.6.985"
 dependencies = [
  "tauri",
  "tauri-plugin",
@@ -5358,7 +5358,7 @@ dependencies = [
 
 [[package]]
 name = "tine-search"
-version = "0.6.984"
+version = "0.6.985"
 dependencies = [
  "regex",
  "serde_json",

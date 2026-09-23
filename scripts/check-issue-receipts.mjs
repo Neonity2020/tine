@@ -41,7 +41,7 @@ export function claimedIssues(section) {
 export function hasReceipt(comments, maintainers) {
   return comments.some((comment) =>
     maintainers.has(comment.author)
-    && /fixed on master|fixed-on-master|expected in the next release|should be fixed in v/i.test(comment.body ?? ""));
+    && /fixed on `?master`?|fixed-on-master|expected in the next release|should be fixed in v/i.test(comment.body ?? ""));
 }
 
 function gh(args) {

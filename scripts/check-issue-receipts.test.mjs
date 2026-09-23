@@ -27,6 +27,9 @@ const maintainers = new Set(["martinkoutecky"]);
 test("recognises the receipt wording the working agreement asks for", () => {
   for (const body of [
     "Fixed on master; expected in the next release (usually 1-2 days).",
+    // House style puts the branch in code: the v0.6.985 close-out missed a real
+    // receipt ("Fixed on `master` (`c1b14a85`) ...") until this was matched.
+    "Fixed on `master` (`c1b14a85`, integrated at `adb3d362`).",
     "This is now fixed-on-master: the root cause was ...",
     "Closing, should be fixed in v0.6.984; please report back here if not.",
   ]) {
