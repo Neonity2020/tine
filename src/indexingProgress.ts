@@ -80,9 +80,15 @@ export async function followIndexingProgress(
         failedPolls = 0;
       } catch {
         // A transient IPC failure (the graph rebinding under us) is not
-        // progress. A persistent one means there is no graph to follow.
+        // progress. A persistent one slows the polls to the watch cadence;
+        // it does not end the follower, which nothing would restart while
+        // the binding stands (GH #543, audit R11-12).
         failedPolls += 1;
-        if (failedPolls >= 10) return;
+        if (failedPolls >= 10) {
+          publish(null);
+          await deps.sleep(WATCH_MS);
+          continue;
+        }
       }
       if (deps.binding() !== binding || signal?.aborted) return;
       if (progress && settled) {

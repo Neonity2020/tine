@@ -1905,9 +1905,11 @@ export async function pruneSidebarBlocks(): Promise<void> {
   const blocks = rightSidebar().filter((i): i is SidebarBlock => i.kind === "block");
   if (!blocks.length) return;
   const binding = graphBinding();
-  const alive = await Promise.all(
-    blocks.map((b) => backend().resolveBlock(b.uuid).then((block) => Boolean(block), () => true))
-  );
+  // One command for every pin: one resolve_block each waited in the backend
+  // side by side through the launch index pass (GH #543, audit R11-10).
+  const alive = await backend()
+    .resolveBlocks(blocks.map((b) => b.uuid))
+    .then((found) => blocks.map((_, i) => Boolean(found[i])), () => blocks.map(() => true));
   if (graphBinding() !== binding) return;
   const dead = new Set(blocks.filter((_, i) => !alive[i]).map((b) => b.uuid));
   if (dead.size) {

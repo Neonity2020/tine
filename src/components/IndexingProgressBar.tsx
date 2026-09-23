@@ -24,7 +24,11 @@ export function IndexingProgressBar() {
       (next) => { if (!stop.signal.aborted) setProgress(next); },
       undefined,
       stop.signal,
-    );
+    ).finally(() => {
+      // A follower that ended is not following: the next epoch starts one
+      // (audit R11-12).
+      if (following?.stop === stop) following = null;
+    });
   }));
   onCleanup(() => following?.stop.abort());
   return (

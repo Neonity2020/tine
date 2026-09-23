@@ -23,7 +23,7 @@ describe("pruneSidebarBlocks", () => {
   it("keeps a restored block when resolving it is refused for indexing", async () => {
     setRightSidebar([pin(1)]);
     __setBackendForTest({
-      resolveBlock: async () => { throw new QueryNotReadyError("indexing"); },
+      resolveBlocks: async () => { throw new QueryNotReadyError("indexing"); },
     } as unknown as Backend);
     await pruneSidebarBlocks();
     expect(pinnedBlocks()).toHaveLength(1);
@@ -32,7 +32,7 @@ describe("pruneSidebarBlocks", () => {
   it("keeps a restored block when resolving it fails outright", async () => {
     setRightSidebar([pin(2)]);
     __setBackendForTest({
-      resolveBlock: async () => { throw new Error("stale-graph-binding"); },
+      resolveBlocks: async () => { throw new Error("stale-graph-binding"); },
     } as unknown as Backend);
     await pruneSidebarBlocks();
     expect(pinnedBlocks()).toHaveLength(1);
@@ -41,7 +41,7 @@ describe("pruneSidebarBlocks", () => {
   it("does not act on answers from a binding that has since moved", async () => {
     setRightSidebar([pin(3)]);
     __setBackendForTest({
-      resolveBlock: async () => { bumpGraphBinding(); return null; },
+      resolveBlocks: async (ids: string[]) => { bumpGraphBinding(); return ids.map(() => null); },
     } as unknown as Backend);
     await pruneSidebarBlocks();
     expect(pinnedBlocks()).toHaveLength(1);
@@ -49,7 +49,7 @@ describe("pruneSidebarBlocks", () => {
 
   it("still removes a block the current binding says is gone", async () => {
     setRightSidebar([pin(4)]);
-    __setBackendForTest({ resolveBlock: async () => null } as unknown as Backend);
+    __setBackendForTest({ resolveBlocks: async (ids: string[]) => ids.map(() => null) } as unknown as Backend);
     await pruneSidebarBlocks();
     expect(pinnedBlocks()).toHaveLength(0);
   });

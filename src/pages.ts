@@ -5,6 +5,7 @@ import { waitForWarmCache } from "./warmCache";
 import type { PageEntry } from "./types";
 import { readOr } from "./resourceRead";
 import { listGraphPages } from "./pageList";
+import { readLane } from "./readLane";
 
 // ONE graph-wide physical page list and reference-name list, shared by every
 // namespace + sidebar consumer. Physical entries keep paths/owners for All Pages;
@@ -43,6 +44,7 @@ const pageInventory = createRoot(() => {
   // be JSON-parsed on the UI thread. (Direct Files performance audit 2026-08-09,
   // finding F7.) Reset on a graph switch: digests are per-graph.
   let known: { epoch: number; digest: number; names: string[] } | null = null;
+  const referencedNamesLane = readLane();
   const [referencedNamesResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev(), inventory: pageInventoryRev() }),
     async ({ epoch, revision, inventory }) => {
@@ -52,9 +54,11 @@ const pageInventory = createRoot(() => {
       if (!(await waitForWarmCache(epoch))) return [];
       if (epoch !== graphEpoch() || revision !== dataRev() || inventory !== pageInventoryRev()) return [];
       const carried = known?.epoch === epoch ? known : null;
-      const answer = await backend()
-        .referencedPageNames(carried?.digest ?? null)
-        .catch(() => null);
+      // The warm wait covers the launch pass only; the lane a later one (R11-09).
+      const answer = await referencedNamesLane(
+        () => epoch === graphEpoch() && revision === dataRev() && inventory === pageInventoryRev(),
+        () => backend().referencedPageNames(carried?.digest ?? null).catch(() => null),
+      );
       if (!answer) return carried?.names ?? [];
       // A null `names` means "unchanged", so it may only be honoured against the
       // set that digest described. Without a carried set there is nothing to

@@ -6961,6 +6961,83 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 11, R11-06 (class K1). A read that found contradictory rows answered InvalidSnapshot, but the repair asked only schema + quick_check, which cannot see logical damage, so queries failed for the rest of the session. The reader's own evidence now owes one rebuild per projection; a contradiction on the rebuilt image is a lowering defect and is not rebuilt again. Reachable only through a Tine defect writing such rows (precedent: the stage-0 seed-6 pages.position bug). Evidence gh550-batch/indexing-audit-r11/necessity-R11-06-07.txt."
+},
+{
+ "id": "REG-SAVES-DURING-INDEXING-KEEP-ONE-LOOKUP-WAITING-543",
+ "title": "Saving while the graph indexes keeps one lookup waiting per surface instead of one per save",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/gh543R11Reads.test.tsx::block references keep one read in flight across saves",
+   "src/gh543R11Reads.test.tsx::a visible block ref re-resolved after each save sends one batch at a time",
+   "src/gh543R11Reads.test.tsx::a batch superseded while it queued answers its waiters at the newest revision",
+   "src/gh543R11Reads.test.tsx::a read for a new graph epoch does not wait behind one parked on the old graph",
+   "src/dataRevReads.guard.test.ts::every use of dataRev has a named owner"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-09 (class: who reads the index again on every save?). Block references, block-ref resolution batches, reference counts, the calendar, embeds and the peek preview re-fetched on every dataRev bump; during an index pass each fetch waits in the backend, so a burst of saves parked one read per save. They now read through readLane (src/readLane.ts): one read in flight per source, a read superseded while queued is skipped, and a lane is keyed to graph binding + epoch so a read parked on the old graph never holds up the new one. The guard pins every dataRev use with its owner. Evidence gh550-batch/indexing-audit-r11/necessity-R11-09-12.txt."
+},
+{
+ "id": "REG-RESTORED-SIDEBAR-PINS-CHECKED-IN-ONE-REQUEST-543",
+ "title": "Restored right-sidebar block pins are checked in one request, and a failed check keeps them",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/gh543R11Reads.test.tsx::resolves every restored pin in one command and keeps pins a failed read cannot judge"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-10. pruneSidebarBlocks issued one resolve_block per pin at launch, each waiting on the index pass; it now issues one resolve_blocks and keeps every pin when that read fails. Evidence gh550-batch/indexing-audit-r11/necessity-R11-09-12.txt."
+},
+{
+ "id": "REG-INDEXING-BAR-FOLLOWER-SURVIVES-FAILED-POLLS-543",
+ "title": "The indexing progress bar keeps following after its status reads fail, so a later pass is still shown",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/indexingProgress.test.ts::keeps a failing follower at the watch cadence until its binding ends (GH #543, R11-12)",
+   "src/indexingProgressBarFollower.test.tsx::starts again after its follower ended, within one binding"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 indexing audit round 11, R11-12. Ten failed polls ended the follower, and nothing restarted it while the binding stood, so a later index pass showed no progress for the session; the bar's singleton also kept a reference to the ended follower. The follower now slows to the watch cadence and ends only with its binding, and the bar forgets a follower that ended. The old test 'gives up when every poll fails' pinned the removed behaviour and was rewritten to the new contract. Evidence gh550-batch/indexing-audit-r11/necessity-R11-09-12.txt."
 }
 ]
 }

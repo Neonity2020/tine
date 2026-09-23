@@ -15,8 +15,10 @@ const BROADCASTS: Record<string, string> = {
   "capture-request-shortcuts": "sent by the capture window; the payload names the target window",
   "quick-capture-ack": "heard only by the singleton capture window",
   "capture-apply-theme": "heard only by the singleton capture window",
+  "capture-apply-shortcuts": "heard only by the singleton capture window",
   "capture-shown": "heard only by the singleton capture window",
   "capture-focus-editor": "heard only by the singleton capture window",
+  "history-navigate": "window.emit broadcasts it (native_mouse_history.rs); the payload names the target window",
 };
 
 function files(dir: string, suffixes: string[]): string[] {
@@ -33,7 +35,9 @@ describe("window-addressed events (GH #543, R10-05)", () => {
     for (const path of files("src", [".ts", ".tsx"])) {
       if (/\.test\.tsx?$/.test(path)) continue;
       const source = readFileSync(path, "utf8");
-      for (const match of source.matchAll(/\blisten(?:<[^>]*>)?\("([^"]+)"/g)) {
+      // `\(\s*"`: a long type argument makes the formatter put the event
+      // name on the next line, which `\("` never saw (audit R11-11).
+      for (const match of source.matchAll(/\blisten(?:<(?:[^<>]|<[^<>]*>)*>)?\(\s*"([^"]+)"/g)) {
         if (!(match[1] in BROADCASTS)) bare.push(`${path}: ${match[1]}`);
       }
     }

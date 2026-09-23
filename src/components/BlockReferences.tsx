@@ -10,6 +10,7 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { blockExternalId } from "../store";
 import { readOr } from "../resourceRead";
 import { ResourceFailure } from "./ResourceFailure";
+import { readLane } from "../readLane";
 
 // Block-level "linked references": the blocks that reference THIS block (via
 // `((uuid))` / `[..](((uuid)))` / `{{embed ((uuid))}}`), grouped by page. Toggled
@@ -17,9 +18,16 @@ import { ResourceFailure } from "./ResourceFailure";
 // LinkedReferences, minus the co-reference filter chips (OG doesn't show those on
 // the block-ref panel). Refetches when the graph generation changes.
 export function BlockReferences(props: { id: string }): JSX.Element {
-  const [groupsResource, { refetch }] = createResource(
-    () => ({ id: blockExternalId(props.id) ?? props.id, epoch: graphEpoch(), revision: dataRev() }),
-    ({ id }) => backend().getBlockReferrers(id)
+  const lane = readLane();
+  const source = () => ({ id: blockExternalId(props.id) ?? props.id, epoch: graphEpoch(), revision: dataRev() });
+  const [groupsResource, { refetch }] = createResource(source, (asked) =>
+    lane(
+      () => {
+        const now = source();
+        return now.id === asked.id && now.epoch === asked.epoch && now.revision === asked.revision;
+      },
+      () => backend().getBlockReferrers(asked.id),
+    )
   );
   // Unlike the page-level panels this one has no fetcher wrapper, so it owns
   // both halves: readOr keeps a failed read out of the page's render, and the

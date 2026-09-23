@@ -7,6 +7,7 @@ import { queryExportBudgetBytes } from "../queryExportBudget";
 import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, openQueryExport, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, undo, undoTopTag, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
+import { readLane } from "../readLane";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
@@ -2681,9 +2682,9 @@ export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Eleme
       && pageIdentityKey(sourcePage) === pageIdentityKey(targetPage);
   };
 
-  const [dataResource] = createResource(
-    () => selfPageEmbed() ? null : `${target()} ${graphEpoch()} ${dataRev()}`,
-    async () => {
+  const embedLane = readLane();
+  const embedKey = () => selfPageEmbed() ? null : `${target()} ${graphEpoch()} ${dataRev()}`;
+  const [dataResource] = createResource(embedKey, (key) => embedLane(() => embedKey() === key, async () => {
     const t = target();
     const blockRef = /^\(\(([^)]+)\)\)$/.exec(t);
     if (blockRef) {
@@ -2700,7 +2701,7 @@ export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Eleme
       return p ? { page: p.name, kind: "page" as PageKind, blocks: p.blocks, embedId: undefined } : null;
     }
     return null;
-  });
+  }));
   // An embed whose target could not be resolved shows the embed-missing marker
   // below — the same thing it shows for a target that does not exist.
   const data = () => readOr(dataResource, undefined, "embed target");

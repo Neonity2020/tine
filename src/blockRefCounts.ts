@@ -4,6 +4,7 @@ import { dataRev, graphEpoch } from "./ui";
 import { waitForWarmCache } from "./warmCache";
 import { blockExternalId } from "./store";
 import { readOr } from "./resourceRead";
+import { readLane } from "./readLane";
 
 // One graph-wide `block uuid → referrer count` map, fetched once per graph and
 // after each landed save, and shared by every block's count badge (Block.tsx). Reading
@@ -11,6 +12,9 @@ import { readOr } from "./resourceRead";
 // update together when the graph changes (a new ref is saved → graphEpoch bumps →
 // refetch). Created in its own root: it lives for the app's lifetime by design.
 const countsMap = createRoot(() => {
+  // The warm wait covers the launch pass only; the lane covers a later one
+  // (a repair), where every save used to leave one more read waiting (R11-09).
+  const lane = readLane();
   const [countsResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev() }),
     async ({ epoch, revision }) => {
@@ -19,7 +23,10 @@ const countsMap = createRoot(() => {
       // issuing its own whole-graph read at hand-over cost N+1 of them
       // (GH #543, audit R10-09). Solid drops a superseded fetch's value.
       if (epoch !== graphEpoch() || revision !== dataRev()) return {};
-      return backend().getBlockRefCounts().catch(() => ({}) as Record<string, number>);
+      return lane(
+        () => epoch === graphEpoch() && revision === dataRev(),
+        () => backend().getBlockRefCounts().catch(() => ({}) as Record<string, number>),
+      );
     }
   );
   // Read by `blockRefCount` from inside Block.tsx's render; a throw here would

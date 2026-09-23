@@ -100,17 +100,20 @@ describe("indexing progress", () => {
 });
 
 describe("indexing progress without a graph", () => {
-  it("gives up when every poll fails", async () => {
+  it("keeps a failing follower at the watch cadence until its binding ends (GH #543, R11-12)", async () => {
     let polls = 0;
+    const sleeps: number[] = [];
     const published: (IndexingProgress | null)[] = [];
     await followIndexingProgress(1, (p) => published.push(p), {
-      binding: () => 1,
+      binding: () => (polls < 25 ? 1 : 2),
       async progress() { polls += 1; throw new Error("no graph"); },
       warmDone: () => new Promise(() => {}),
       now: () => 0,
-      async sleep() {},
+      async sleep(ms) { sleeps.push(ms); },
     });
-    expect(polls).toBe(10);
-    expect(published.at(-1)).toBeNull();
+    expect(polls, "a follower that ended after ten failures is never restarted while the binding stands").toBe(25);
+    expect(sleeps.at(-1)).toBe(Math.max(...sleeps));
+    expect(sleeps.at(-1)).toBeGreaterThan(sleeps[0]);
+    expect(published.every((p) => p === null)).toBe(true);
   });
 });

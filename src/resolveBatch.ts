@@ -2,6 +2,7 @@ import { backend } from "./backend";
 import { resolveGuideBlockRef } from "./store";
 import { dataRev, graphEpoch } from "./ui";
 import type { RefGroup } from "./types";
+import { readLane } from "./readLane";
 
 // Batches inline ((uuid)) reference / embed resolutions: every request made in the
 // same microtask tick is coalesced into ONE resolve_blocks IPC instead of one per
@@ -13,6 +14,9 @@ const cache = new Map<string, Promise<RefGroup | null>>();
 const resolvedCache = new Map<string, RefGroup>();
 let pending = new Map<string, (v: RefGroup | null) => void>();
 let scheduled = false;
+// One resolve_blocks in flight (GH #543, audit R11-09): a save landing while a
+// batch is out re-keys the cache, and each re-resolve used to send its own.
+const lane = readLane();
 
 function ensureCacheRev() {
   const revision = `${graphEpoch()}\0${dataRev()}`;
@@ -31,9 +35,18 @@ function flush() {
   const resolvers = pending;
   const batchRev = cacheRev;
   pending = new Map();
-  void backend()
-    .resolveBlocks(batch)
+  const current = () => ensureCacheRev() === batchRev;
+  void lane(current, () => backend().resolveBlocks(batch))
+    .then((results) => {
+      if (!results) {
+        // Superseded while it queued: its waiters get the newest answer.
+        batch.forEach((id) => void resolveBlockBatched(id).then((group) => resolvers.get(id)?.(group)));
+        return;
+      }
+      return results;
+    })
     .then((results) =>
+      results &&
       batch.forEach((id, i) => {
         // Backend miss → try the virtual in-app Guide (never on disk). No-op for
         // real graphs, so disk resolutions always win.

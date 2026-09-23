@@ -38,6 +38,7 @@ import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { resolveBlockBatched } from "../resolveBatch";
+import { readLane } from "../readLane";
 import { doc, setRaw, formatForPage, formatForBlock, blockRef } from "../store";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro, YoutubeTimestamp, ClozeMacro, ZoteroMacro } from "../components/Macro";
@@ -1341,9 +1342,10 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
   // Summary resolution stays shallow and graph-lifetime cached. Fetch the
   // descendant tree only after the hover dwell, through a backend operation
   // that applies the cap before DTO allocation and IPC serialization.
-  const [previewResource] = createResource(
-    () => (peek.open() && grp() ? `${props.id}\0${graphEpoch()}\0${dataRev()}` : null),
-    () => backend().previewBlock(props.id, PEEK_BLOCK_CAP),
+  const previewLane = readLane();
+  const previewKey = () => (peek.open() && grp() ? `${props.id}\0${graphEpoch()}\0${dataRev()}` : null);
+  const [previewResource] = createResource(previewKey, (key) =>
+    previewLane(() => previewKey() === key, () => backend().previewBlock(props.id, PEEK_BLOCK_CAP)),
   );
   const preview = () => readOr(previewResource, undefined, "block reference peek");
   const capped = createMemo(() => capBlockTree(preview()?.group.blocks ?? [], PEEK_BLOCK_CAP));

@@ -5,6 +5,7 @@ import { dataRev, firstDayOfWeek } from "../ui";
 import { backend } from "../backend";
 import { registerTransientLayer } from "../transientLayers";
 import { readOr } from "../resourceRead";
+import { readLane } from "../readLane";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -63,9 +64,10 @@ export function CalendarJump(props: { onOpenReady?: (open: () => void) => void; 
 
   // Journal days that have content, fetched while the popup is open (re-fetched
   // on dataRev so adding content updates the dots). yyyymmdd keys, month 1-based.
-  const [contentDaysResource] = createResource(
-    () => (open() ? dataRev() : null),
-    () => backend().journalContentDays()
+  const contentDaysLane = readLane();
+  const contentDaysKey = () => (open() ? dataRev() : null);
+  const [contentDaysResource] = createResource(contentDaysKey, (key) =>
+    contentDaysLane(() => contentDaysKey() === key, () => backend().journalContentDays())
   );
   // No dots rather than no calendar: the popup's job is jumping to a day, and
   // the content dots are a hint on top of it.

@@ -29,6 +29,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   error) now re-checks the index instead of rebuilding it from scratch, and an
   index found holding inconsistent entries is rebuilt instead of leaving task
   and reference queries failing until restart (GH #543).
+- While the graph is being indexed, saving no longer queues one more
+  block-reference, reference-count, calendar or embed lookup per save: each
+  keeps one lookup waiting and answers for the newest content. Restored
+  right-sidebar pins are checked in one request instead of one per pin, and
+  the indexing progress bar keeps watching after its status reads fail
+  instead of stopping for the rest of the session (GH #543).
 - After switching graphs, the previous graph's conflict banners and favourites
   order no longer show on the new graph while it loads (GH #543).
 - Changing `:hidden` (or another setting that reopens the graph) in
