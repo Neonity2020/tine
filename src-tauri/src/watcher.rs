@@ -255,6 +255,16 @@ pub(crate) struct WatcherDiagnosticReceipt {
 static FULL_RESCAN_REQUESTED: AtomicU64 = AtomicU64::new(0);
 static FULL_RESCAN_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
+/// Tell the window which pages Tine newly could not read. Such a page is left
+/// out of search, queries and references while the rest of the graph works;
+/// its file stays untouched until the user fixes or restores it.
+pub(crate) fn announce_unreadable_pages(app: &tauri::AppHandle, label: &str, graph: &Graph) {
+    let paths = graph.take_unannounced_page_failures();
+    if !paths.is_empty() {
+        let _ = app.emit_to(label, "graph-unreadable-pages", paths);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 struct GraphRescanComplete {
     sequence: u64,

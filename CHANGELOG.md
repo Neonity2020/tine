@@ -17,8 +17,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   becoming ready; a journal migrated or a page rescued while a check runs, or a
   page saved during that check, is no longer dropped from search; and an index
   holding contradictory rows is rebuilt once instead of retrying forever. A
-  page created at launch beside a page Tine cannot parse is refused without
-  reading the whole graph first. Query
+  page deleted while Tine was closed now leaves the page list once the launch
+  check confirms it, and a query asked the moment the index becomes ready no
+  longer reports the index as unreadable. Query
   results now list pages in file-path order, so a page created this session
   takes its place instead of appearing last (GH #543).
 - A query block, the query export dialog, or a publish waiting for the index
@@ -145,6 +146,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- One page file Tine cannot read (not valid UTF-8, or text the parser
+  rejects) no longer blocks creating every new page for the session, and the
+  folder watcher no longer retries it forever while warning that it "will keep
+  retrying". Tine now says once which file it could not read; only a new page
+  whose name that file could hold (its file name, or a name written in it) is
+  refused, and the refusal names the file. Fixing or restoring the file clears
+  it (GH #543).
 - Deleting or renaming a page outside Tine (another editor, Syncthing, a
   file manager) no longer makes Tine rescan the whole graph folder. Only a
   removed folder that held pages still does (GH #543).

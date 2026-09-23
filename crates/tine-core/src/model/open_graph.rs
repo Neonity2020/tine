@@ -447,6 +447,7 @@ impl Graph {
             session_page_ids: RwLock::new(std::collections::HashMap::new()),
             projection_recovery: std::sync::Mutex::new(()),
             page_index_failures: RwLock::new(Vec::new()),
+            announced_page_failures: std::sync::Mutex::new(Vec::new()),
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),

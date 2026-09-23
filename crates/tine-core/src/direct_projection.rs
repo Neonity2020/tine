@@ -127,6 +127,14 @@ pub(crate) enum PageSetChange {
     },
 }
 
+impl PageSetChange {
+    pub(crate) fn entry(&self) -> &PageEntry {
+        match self {
+            PageSetChange::Replace { entry, .. } | PageSetChange::Delete { entry } => entry,
+        }
+    }
+}
+
 impl PageDelta {
     fn entry(&self) -> &PageEntry {
         match self {
@@ -1296,8 +1304,9 @@ impl DirectProjection {
     }
 
     /// The graph moved to `generation` without changing anything this index
-    /// holds: a page became unreadable, or readable again before its mark,
-    /// and its rows stay as they are. An index ready at the previous
+    /// holds beyond what is already queued: a page became unreadable, or
+    /// readable again before its mark, and its rows stay as they are; or a
+    /// survey announced the findings it has recorded as marks. An index ready at the previous
     /// generation is ready at this one; one with work queued publishes
     /// readiness at the latest generation when the work drains. Without this
     /// the index stayed not-ready with nothing coming, and every indexed read
@@ -2230,10 +2239,14 @@ impl DirectProjection {
     ///   clears it. That is a repair, not a wait.
     pub(crate) fn progress_at(&self, generation: u64) -> ProjectionProgress {
         use crate::query::QueryReadinessReason as Reason;
+        // Readiness is published under this lock, by the turn that empties
+        // the queue. Read before the lock, "not ready" and "nothing queued"
+        // came from either side of that publication, and a projection that
+        // had just become ready read as stale (GH #543).
+        let pending = self.shared.pending.lock().unwrap();
         if self.ready_at(generation) {
             return ProjectionProgress::Ready;
         }
-        let pending = self.shared.pending.lock().unwrap();
         // A writer waiting for the lease takes nothing meanwhile: the
         // caller takes today's route, as for a stopped one (GH #543).
         if pending.stop

@@ -248,8 +248,8 @@ fn gh543_r14_a_page_saved_during_a_validation_walk_stays_indexed() {
 /// once woken, which identities are unknown: it read no failure, and either
 /// trusted the stored identity of a page whose content it never parsed, or
 /// found the failure a moment later and parsed the whole graph only to
-/// refuse. Name-only creation refuses on an unknown identity, without the
-/// parse.
+/// refuse. Name-only creation refuses on an unknown identity that could be
+/// the requested page, without the parse.
 #[test]
 fn gh543_a_creation_waiting_for_the_survey_refuses_without_parsing() {
     let root = r10_scratch("r14-create-during-survey");
@@ -258,7 +258,7 @@ fn gh543_a_creation_waiting_for_the_survey_refuses_without_parsing() {
     r10_prebuild(&root, &database);
     fs::write(
         root.join("pages/p3.md"),
-        format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n"),
+        format!("title:: fresh\n\n- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n"),
     )
     .unwrap();
     let graph = Arc::new(Graph::open(&root));
@@ -293,12 +293,74 @@ fn gh543_a_creation_waiting_for_the_survey_refuses_without_parsing() {
     assert!(
         created
             .as_ref()
-            .is_err_and(|error| error.contains("unreadable or unparseable")
-                || error.contains("failure-bearing")),
+            .is_err_and(|error| error.contains("could not read pages/p3.md")),
         "a creation beside an unparseable page was not refused: {created:?} {state}"
     );
     assert_eq!(
         parsed, 0,
         "the creation parsed the graph to refuse: {created:?} {state}"
+    );
+}
+
+/// A survey finding confirmed after readiness changed what the index says
+/// without a new generation, so an answer cached at that generation outlived
+/// it: with a writer holding the identity gate at launch, the survey confirms
+/// a page deleted while Tine was closed only once it has announced readiness,
+/// and a page list cached in between listed the page for the whole session
+/// (interleaving seed 2503). Every survey finding is announced as a new
+/// generation, as any other change is.
+#[test]
+fn gh543_a_page_deleted_while_closed_leaves_the_cached_page_list() {
+    let root = r10_scratch("r14-deferred-absence");
+    r10_pages(&root, 12);
+    let graph = r14_warm_open(&root);
+    fs::remove_file(root.join("pages/p4.md")).unwrap();
+    let gate_held = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let writer = {
+        let graph = Arc::clone(&graph);
+        let gate_held = Arc::clone(&gate_held);
+        let release = Arc::clone(&release);
+        std::thread::spawn(move || {
+            let _gate = graph.lock_graph_text_identity_mutation().unwrap();
+            gate_held.wait();
+            release.wait();
+        })
+    };
+    gate_held.wait();
+    let owner = R10Owner::start(&graph);
+    assert!(owner.wait_ready(Duration::from_secs(20)));
+    let listed = |graph: &Graph| {
+        graph
+            .list_pages()
+            .iter()
+            .any(|entry| entry.rel_path == "pages/p4.md")
+    };
+    // Cached while the absence waits for the gate.
+    let listed_before = listed(&graph);
+    release.wait();
+    writer.join().unwrap();
+    // The survey pass ends with the deferred confirmation; the owner settles
+    // only after it.
+    assert!(owner.wait_settled(Duration::from_secs(20)));
+    super::gh543_r10::r10_settle(&graph);
+    let indexed = graph
+        .direct_projection_page_inventory()
+        .as_ref()
+        .is_some_and(|(_, entries)| entries.iter().any(|entry| entry.rel_path == "pages/p4.md"));
+    let still_listed = listed(&graph);
+    let state = graph.direct_projection_test().unwrap().debug_state_test();
+    r10_finish(root, graph, owner);
+    assert!(
+        listed_before,
+        "precondition: the absence waited for the gate: {state}"
+    );
+    assert!(
+        !indexed,
+        "the survey did not delete the page's rows: {state}"
+    );
+    assert!(
+        !still_listed,
+        "the page list still lists a page deleted while Tine was closed: {state}"
     );
 }

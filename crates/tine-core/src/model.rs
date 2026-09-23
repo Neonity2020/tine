@@ -352,6 +352,9 @@ pub struct Graph {
     /// build because their parse/projection panicked. Kept retrievable so an
     /// lsdoc ownership gap can never degrade search completeness invisibly.
     page_index_failures: RwLock<Vec<String>>,
+    /// The `page_index_failures` already announced to the user, so each
+    /// unreadable page is announced once per breakage.
+    announced_page_failures: std::sync::Mutex<Vec<String>>,
     /// Companion indexes for `cache`: the logical `(kind, page_key(name)) -> Vec
     /// slot` index preserves deterministic first-wins lookup, while the exact-path
     /// index keeps cache ownership physical. The Vec stays the source of truth for

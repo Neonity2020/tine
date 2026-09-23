@@ -864,6 +864,8 @@ impl Graph {
                             #[cfg(test)]
                             self.pause_warm_read_done_test();
                             projection.survey_owes_fresh_build();
+                            let paths = to_parse.iter().map(|(entry, _)| entry.path.clone());
+                            self.announce_survey_findings(&projection, generation, paths.collect());
                             return SurveyOutcome::Owned;
                         }
                     }
@@ -910,6 +912,12 @@ impl Graph {
             total,
         ) {
             projection.survey_owes_fresh_build();
+            let paths = changes
+                .iter()
+                .map(|change| change.entry().path.clone())
+                .chain(to_parse.iter().map(|(entry, _)| entry.path.clone()))
+                .chain(absent.iter().map(|rel_path| self.root.join(rel_path)));
+            self.announce_survey_findings(&projection, generation, paths.collect());
             return SurveyOutcome::Owned;
         }
         for (entry, content) in to_parse {
@@ -947,6 +955,10 @@ impl Graph {
                 pause.release.wait();
             }
         }
+        let mut findings = changes
+            .iter()
+            .map(|change| change.entry().path.clone())
+            .collect::<Vec<_>>();
         projection.record_survey_marks(generation, changes, Arc::clone(&parse_config));
         // Absences are confirmed before readiness when no writer holds the
         // gate, so a page deleted while closed is gone once the index is
@@ -954,21 +966,62 @@ impl Graph {
         // then they are confirmed after it (design §4.6).
         let absent = match self.try_lock_graph_text_identity_mutation() {
             Some(gate) if !absent.is_empty() => {
-                self.confirm_absences(&projection, &permit, absent, &parse_config, gate);
+                findings.extend(self.confirm_absences(
+                    &projection,
+                    &permit,
+                    absent,
+                    &parse_config,
+                    gate,
+                ));
                 Vec::new()
             }
             _ => absent,
         };
+        let generation = self.announce_survey_findings(&projection, generation, findings);
         // The failures first: a reader woken by readiness asks them which
         // identities are unknown (name-only creation refuses on any).
         self.publish_page_index_failures(generation, failures);
         projection.survey_validated(generation, Arc::clone(&parse_config));
         if !absent.is_empty() {
             if let Ok(gate) = self.lock_graph_text_identity_mutation() {
-                self.confirm_absences(&projection, &permit, absent, &parse_config, gate);
+                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                let gone = self.confirm_absences(&projection, &permit, absent, &parse_config, gate);
+                self.announce_survey_findings(&projection, generation, gone);
             }
         }
         SurveyOutcome::Owned
+    }
+
+    /// Announce what the survey found as a generation of its own, once its
+    /// marks are recorded, so readiness at the new generation waits for
+    /// them. A finding changes what the index says, and an answer cached at
+    /// the generation the survey read (the page list, an entry lookup) would
+    /// otherwise outlive it: nothing else moves the generation for a change
+    /// Tine did not make (interleaving seed 2503). Returns the generation the
+    /// graph is at after the announcement.
+    fn announce_survey_findings(
+        &self,
+        projection: &Arc<crate::direct_projection::DirectProjection>,
+        generation: u64,
+        paths: Vec<PathBuf>,
+    ) -> u64 {
+        if paths.is_empty() {
+            return generation;
+        }
+        let cache = self.cache.write().unwrap();
+        let previous = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let next = self.move_cache_generation(
+            &cache,
+            Some(graph_drift::StructuralChange::Reread(paths)),
+            graph_drift::IndexEffect::Unchanged(Some(projection)),
+        );
+        // The parsed cache, if any, is unchanged: its identities hold at
+        // the new generation.
+        if let Some(index) = self.effective_identity_index.read().unwrap().as_ref() {
+            let _ = index.retag_generation(previous, next);
+        }
+        drop(cache);
+        next
     }
 
     /// Delete the rows of stored pages the survey did not find, each only
@@ -982,7 +1035,7 @@ impl Graph {
         absent: Vec<String>,
         parse_config: &Arc<crate::config::ParseConfig>,
         _gate: GraphTextIdentityMutationGuard<'_>,
-    ) {
+    ) -> Vec<PathBuf> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let deletions = absent
             .into_iter()
@@ -1004,7 +1057,12 @@ impl Graph {
                 })
             })
             .collect::<Vec<_>>();
+        let gone = deletions
+            .iter()
+            .map(|change| change.entry().path.clone())
+            .collect();
         projection.record_survey_marks(generation, deletions, Arc::clone(parse_config));
+        gone
     }
 
     fn publish_page_index_failures(&self, generation: u64, mut failures: Vec<String>) {

@@ -140,6 +140,25 @@ impl Graph {
         self.page_index_failures.read().unwrap().clone()
     }
 
+    /// The page failures not yet announced, marking them announced. A failure
+    /// that clears and later recurs is announced again. Tine indexes the rest
+    /// of the graph around a page it cannot read, so nothing else tells the
+    /// user that page is missing from search, queries and references.
+    pub fn take_unannounced_page_failures(&self) -> Vec<String> {
+        let current = self.page_index_failures();
+        let mut announced = self
+            .announced_page_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        announced.retain(|failure| current.contains(failure));
+        let fresh: Vec<String> = current
+            .into_iter()
+            .filter(|failure| !announced.contains(failure))
+            .collect();
+        announced.extend(fresh.iter().cloned());
+        fresh
+    }
+
     pub fn journals_path(&self) -> PathBuf {
         self.root.join(&self.config().journals_dir)
     }

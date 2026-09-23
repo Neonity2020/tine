@@ -3218,6 +3218,53 @@ fn a_query_before_the_warm_keeps_a_clean_reopen_clean() {
     let _ = std::fs::remove_dir_all(database.parent().unwrap());
 }
 
+/// Readiness is published under the queue lock, at the end of the worker
+/// turn that empties the queue. A caller that read "not ready" before taking
+/// the lock and "nothing queued" after it reported a projection that had just
+/// become ready as stale, and a query in that window failed as unreadable
+/// (GH #543; `a_listing_overtaken_by_an_edit_reads_the_index_instead_of_parsing`
+/// under full-suite load).
+#[test]
+fn readiness_published_while_asking_is_not_reported_stale() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("progress-publish-race");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/one.md"), "- one\n").unwrap();
+    let database = scratch("progress-publish-race-db").join("projection.sqlite");
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    graph
+        .wait_for_direct_projection_for_test(std::time::Duration::from_secs(10))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let next = graph.cache_generation() + 1;
+
+    // The worker's turn end, held open: the queue is empty and readiness at
+    // `next` is about to be published.
+    let mut pending = projection.shared.pending.lock().unwrap();
+    let asker = {
+        let projection = Arc::clone(&projection);
+        std::thread::spawn(move || projection.progress_at(next))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    pending.latest_generation = next;
+    publish_if_current(&projection.shared, &mut pending);
+    assert!(
+        projection.ready_at(next),
+        "precondition: the image is current"
+    );
+    drop(pending);
+
+    let progress = asker.join().unwrap();
+    assert!(
+        matches!(progress, ProjectionProgress::Ready),
+        "a projection that became ready while asked was reported {progress:?}"
+    );
+    drop(graph);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_repair_in_flight_reports_work_in_progress_not_a_stale_projection() {
     let _serial = serialize_projection_tests();
@@ -10041,7 +10088,7 @@ fn a_warm_keeps_a_watcher_failure_recorded_while_it_ran() {
     pause.reached.wait();
     let failed = root.join("pages/two.md");
     std::fs::write(&failed, [0xff, 0xfe]).unwrap();
-    assert!(graph.sync_file_checked(&failed).is_err());
+    assert!(graph.sync_file_checked(&failed).unwrap().is_none());
     let before = graph.page_index_failures();
     pause.release.wait();
     warmer.join().unwrap();
@@ -10254,7 +10301,7 @@ fn a_page_recovered_during_a_warm_reaches_the_index() {
     graph.orphan_assets().unwrap();
     let changed = root.join("pages/two.md");
     std::fs::write(&changed, [0xff, 0xfe]).unwrap();
-    assert!(graph.sync_file_checked(&changed).is_err());
+    assert!(graph.sync_file_checked(&changed).unwrap().is_none());
     std::fs::write(&changed, "- TODO r5recoveryunique\n").unwrap();
     graph.sync_file_checked(&changed).unwrap();
     assert!(graph.page_index_failures().is_empty());

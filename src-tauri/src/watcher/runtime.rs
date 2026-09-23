@@ -778,6 +778,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     if conflicts_dirty {
                         let _ = app.emit_to(label, "conflicts-changed", ());
                     }
+                    super::announce_unreadable_pages(&app, label, &graph.graph);
                 }
                 if cycle_failed {
                     graph.retry.failed(Instant::now());

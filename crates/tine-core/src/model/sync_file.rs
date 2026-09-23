@@ -63,10 +63,7 @@ impl Graph {
                     self.record_watcher_identity_failure(path);
                     return Ok(None);
                 }
-                Err(error) => {
-                    self.record_watcher_identity_failure(path);
-                    return Err(error);
-                }
+                Err(error) => return self.watcher_failure(path, error),
             };
         let current = match self.graph_text_read_optional_text_with_identity(&write, path) {
             Ok(Some(snapshot)) => snapshot,
@@ -74,10 +71,7 @@ impl Graph {
                 self.record_watcher_identity_failure(path);
                 return Ok(None);
             }
-            Err(error) => {
-                self.record_watcher_identity_failure(path);
-                return Err(error);
-            }
+            Err(error) => return self.watcher_failure(path, error),
         };
         if current.1 != identity || current.0 != content {
             self.record_watcher_identity_failure(path);
@@ -92,24 +86,35 @@ impl Graph {
         // bounded to in-flight writes.
         let reconciled = match self.sync_file_content(Some(&write), path, &content, true) {
             Ok(reconciled) => reconciled,
-            Err(error) => {
-                self.record_watcher_identity_failure(path);
-                return Err(error);
-            }
+            Err(error) => return self.watcher_failure(path, error),
         };
         let entry = if let Some(entry) = reconciled.as_ref() {
             entry.clone()
         } else {
             let physical = self.entry_for_path(path).ok_or_else(bad_path)?;
-            let (effective, _, _) =
-                parse_exact_page(self, &physical, &content).map_err(|error| {
-                    self.record_watcher_identity_failure(path);
-                    error
-                })?;
-            effective
+            match parse_exact_page(self, &physical, &content) {
+                Ok((effective, _, _)) => effective,
+                Err(error) => return self.watcher_failure(path, error),
+            }
         };
         self.clear_watcher_identity_failure_after_reconciliation(&entry);
         Ok(reconciled)
+    }
+
+    /// Record a page the watcher could not reconcile. Content Tine cannot
+    /// accept (a parser rejection, text that is not UTF-8) is the file's
+    /// reconciled state: the failure is recorded and the path is done until
+    /// the file changes, so one such file neither fails every watcher cycle
+    /// nor keeps its observation unacknowledged, which refused every
+    /// name-only creation for the session. Any other error may pass, and the
+    /// watcher retries it.
+    fn watcher_failure(&self, path: &Path, error: io::Error) -> io::Result<Option<PageEntry>> {
+        self.record_watcher_identity_failure(path);
+        if is_page_content_rejection(&error) {
+            Ok(None)
+        } else {
+            Err(error)
+        }
     }
 
     /// Reconcile the cache for `path` given its already-read `content` — so a

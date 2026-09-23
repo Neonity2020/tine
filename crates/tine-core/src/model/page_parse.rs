@@ -275,11 +275,36 @@ pub(super) fn parse_external_document(
         }
     })) {
         Ok(parsed) => Ok(parsed),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        Err(_) => Err(page_content_rejected(
             "external document parser rejected present graph text",
         )),
     }
+}
+
+/// A page file Tine read but cannot accept as a page: the parser rejected
+/// it, or it is not UTF-8. Reading the same bytes again fails the same way,
+/// so the failure is a state of the file, not an interruption: it lasts
+/// until the file changes.
+#[derive(Debug)]
+struct PageContentRejected(&'static str);
+
+impl std::fmt::Display for PageContentRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PageContentRejected {}
+
+pub(super) fn page_content_rejected(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, PageContentRejected(reason))
+}
+
+/// Whether `error` is a [`page_content_rejected`] failure.
+pub(super) fn is_page_content_rejection(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PageContentRejected>())
 }
 
 pub(crate) fn parse_exact_page(

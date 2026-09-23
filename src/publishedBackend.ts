@@ -810,6 +810,7 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     onGraphReopened: unsubscribed,
     onQueryProjectionChanged: unsubscribed,
     onGraphWatchError: unsubscribed,
+    onGraphUnreadablePages: unsubscribed,
     onGraphVerificationProgress: unsubscribed,
   } satisfies Partial<Backend>;
 
@@ -946,6 +947,7 @@ export const PUBLISHED_CONSTANT_METHODS = [
   "onGraphReopened",
   "onQueryProjectionChanged",
   "onGraphWatchError",
+  "onGraphUnreadablePages",
   "onGraphVerificationProgress",
 ] as const;
 

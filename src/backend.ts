@@ -998,6 +998,8 @@ export interface Backend {
   onQueryProjectionChanged(cb: () => void): Promise<() => void>;
   /** Direct Markdown folder-watch reconcile failure. */
   onGraphWatchError(cb: (message: string) => void): Promise<() => void>;
+  /** Graph-relative paths of pages Tine newly could not read or parse. */
+  onGraphUnreadablePages(cb: (paths: string[]) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
   getBackupKeep(): Promise<number>;
   setBackupKeep(keep: number): Promise<void>;
@@ -2052,6 +2054,9 @@ class TauriBackend implements Backend {
   }
   async onGraphWatchError(cb: (message: string) => void): Promise<() => void> {
     return listenHere<string>("graph-watch-error", (e) => cb(e.payload));
+  }
+  async onGraphUnreadablePages(cb: (paths: string[]) => void): Promise<() => void> {
+    return listenHere<string[]>("graph-unreadable-pages", (e) => cb(e.payload));
   }
   getBackupKeep() {
     return this.call<number>("get_backup_keep");

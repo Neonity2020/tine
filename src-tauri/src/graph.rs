@@ -1092,6 +1092,7 @@ pub(crate) fn warm_cache_async(
                 let current = state.graphs.read().unwrap().slot(&window_label);
                 if finish_warm(current, &slot, warm_generation) {
                     let _ = app.emit_to(&window_label, "warm-cache-done", ());
+                    crate::watcher::announce_unreadable_pages(&app, &window_label, &graph);
                 }
             },
         );

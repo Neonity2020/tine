@@ -33,7 +33,7 @@ fn a_failed_page_in_a_warm_sql_session_does_not_parse_the_graph() {
     assert!(!graph.has_parsed_cache_test());
     let failed = dir.join("pages/p0.md");
     fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
-    assert!(graph.sync_file_checked(&failed).is_err());
+    assert!(graph.sync_file_checked(&failed).unwrap().is_none());
     GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
     let listed = graph.list_pages().len();
     let parses = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
@@ -68,7 +68,7 @@ fn repeated_listings_with_a_failed_page_parse_it_at_most_once() {
         .unwrap();
     let failed = dir.join("pages/p0.md");
     fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
-    assert!(graph.sync_file_checked(&failed).is_err());
+    assert!(graph.sync_file_checked(&failed).unwrap().is_none());
     GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
     for _ in 0..4 {
         assert_eq!(graph.list_pages().len(), 7);
@@ -99,7 +99,7 @@ fn a_capture_that_started_earlier_cannot_erase_a_later_watcher_failure() {
     );
     let built = graph.load_all_pages_with_permit(&permit);
     fs::write(&failed, [0xff, 0xfe, 0xfd]).unwrap();
-    assert!(graph.sync_file_checked(&failed).is_err());
+    assert!(graph.sync_file_checked(&failed).unwrap().is_none());
     let before = graph.page_index_failures();
     let installed = graph.install_reconciled(&flight, &permit, built);
     let after = graph.page_index_failures();
@@ -172,7 +172,7 @@ fn a_page_that_fails_to_parse_does_not_reparse_its_healthy_siblings() {
         .unwrap();
     let failed = dir.join("pages/p0.md");
     fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
-    assert!(graph.sync_file_checked(&failed).is_err());
+    assert!(graph.sync_file_checked(&failed).unwrap().is_none());
     GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
     let listed = graph.list_pages().len();
     let parses = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
@@ -579,14 +579,14 @@ fn the_structural_event_log_keeps_only_what_running_passes_need() {
     for index in 0..300 {
         let path = dir.join(format!("pages/bad{index}.md"));
         fs::write(&path, [0xff, 0xfe]).unwrap();
-        assert!(graph.sync_file_checked(&path).is_err());
+        assert!(graph.sync_file_checked(&path).unwrap().is_none());
     }
     let idle = graph.cache_structural_gen.logged_paths_test();
     let pass = graph.cache_structural_gen.begin_pass();
     for index in 300..600 {
         let path = dir.join(format!("pages/bad{index}.md"));
         fs::write(&path, [0xff, 0xfe]).unwrap();
-        assert!(graph.sync_file_checked(&path).is_err());
+        assert!(graph.sync_file_checked(&path).unwrap().is_none());
     }
     let running = graph.cache_structural_gen.logged_paths_test();
     drop(pass);
@@ -751,7 +751,7 @@ fn a_failed_page_after_a_rename_does_not_parse_the_graph() {
     assert!(!graph.has_parsed_cache_test());
     let failed = dir.join("pages/p0.md");
     fs::write(&failed, format!("- {TEST_PAGE_PARSE_PANIC_SENTINEL}\n")).unwrap();
-    assert!(graph.sync_file_checked(&failed).is_err());
+    assert!(graph.sync_file_checked(&failed).unwrap().is_none());
     GRAPH_TEXT_PARSE_ATTEMPTS.with(|count| count.set(0));
     let listed = graph.list_pages().len();
     let parses = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);

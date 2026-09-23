@@ -15,6 +15,7 @@ import { WorkspaceSwitcher } from "./components/WorkspaceSwitcher";
 import { TopbarOverflowMenu } from "./components/TopbarOverflowMenu";
 import { ContextMenu } from "./components/ContextMenu";
 import { Toasts, Lightbox } from "./components/Toasts";
+import { unreadablePagesMessage } from "./lib/unreadablePages";
 import { AudioOverlay } from "./components/AudioOverlay";
 import { CalendarJump } from "./components/CalendarJump";
 import { IndexingProgressBar } from "./components/IndexingProgressBar";
@@ -1170,6 +1171,15 @@ export function App(): JSX.Element {
       .onGraphWatchError(() =>
         pushToast("Tine couldn't finish checking the graph folder for outside changes. It will keep retrying.", "error"),
       )
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  // A page Tine could not read or parse. The rest of the graph is indexed
+  // around it and the file is left as it is, so say which page and what to do.
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onGraphUnreadablePages((paths) => pushToast(unreadablePagesMessage(paths), "error"))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });

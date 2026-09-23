@@ -597,7 +597,7 @@
      "crates/tine-core/src/model.rs::late_page_build_claim_after_completed_install_is_non_owner",
      "crates/tine-core/src/model.rs::generation_drift_before_direct_install_refuses_without_retry_or_census",
      "crates/tine-core/src/model.rs::broad_invalidation_rebuilds_current_titles_once_before_creation",
-     "crates/tine-core/src/model.rs::cold_malformed_owner_refuses_without_census_or_mutation"
+     "crates/tine-core/src/model_tests_unreadable_pages.rs::cold_malformed_owner_refuses_without_census_or_mutation"
     ],
     "scenario": "direct-files.cold-generation-safe-page-and-journal-creation",
     "failBefore": "proven"
@@ -1941,7 +1941,7 @@
      "crates/tine-core/src/model.rs::external_portable_symlink_alias_refuses_creation_publication",
      "crates/tine-core/src/model.rs::unsafe_page_titles_save_and_reopen_through_one_safe_identity",
      "crates/tine-core/src/model.rs::generation_bound_identity_validation_avoids_save_time_graph_reparse",
-     "crates/tine-core/src/model.rs::failed_and_stale_effective_identity_evidence_blocks_name_only_creation",
+     "crates/tine-core/src/model_tests_unreadable_pages.rs::failed_and_stale_effective_identity_evidence_blocks_name_only_creation",
      "crates/tine-core/src/model.rs::changed_existing_save_has_one_portable_traversal_and_no_graph_capture",
      "crates/tine-core/src/model.rs::invalidated_graph_index_does_not_expand_an_existing_save",
      "crates/tine-core/src/model.rs::existing_save_allows_portable_ancestor_neighbor_but_refuses_colliding_leaf",
@@ -7401,7 +7401,7 @@
 },
 {
  "id": "REG-CREATION-DURING-SURVEY-NO-PARSE-543",
- "title": "Creating a page at launch beside an unparseable page is refused without parsing the whole graph",
+ "title": "Creating a page at launch beside an unparseable page that could be it is refused without parsing the whole graph",
  "family": "direct-files-performance",
  "sources": {
   "issues": [
@@ -7423,6 +7423,82 @@
   "failBefore": "proven"
  },
  "notes": "GH #543, found by the extended interleaving harness (seed 4, panicking-page op). The launch survey published readiness before its parse failures, so a creation waiting for it read no failure, then found it and parsed the whole graph only to refuse. Failures are now published before readiness, and a creation whose index answer was withheld by a failure re-checks the evidence and refuses without the parse. Fail-before tine-agents/evidence/gh550-batch/reconciler/creation-during-survey-fail-before.log (3/3)."
+},
+{
+ "id": "REG-SURVEY-FINDINGS-MOVE-GENERATION-543",
+ "title": "A page deleted while Tine was closed leaves the page list when the launch survey confirms it",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh543_r14_tests.rs::gh543_a_page_deleted_while_closed_leaves_the_cached_page_list",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543, interleaving seed 2503. With a writer holding the identity gate at launch, the survey confirmed a deletion only after publishing readiness and without moving the cache generation, so a page list memoized at that generation kept listing the page for the session. Every survey finding (marks, confirmed deletions, an owed fresh build) now moves the generation as any other change does. Fail-before tine-agents/evidence/gh550-batch/reconciler/deferred-absence-page-list-fail-before.log (3/3)."
+},
+{
+ "id": "REG-ONE-UNREADABLE-PAGE-BLOCKS-CREATION-543",
+ "title": "One page Tine cannot read no longer blocks creating unrelated pages or makes the watcher retry forever",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests_unreadable_pages.rs::one_unreadable_page_blocks_neither_unrelated_creation_nor_the_watcher",
+   "crates/tine-core/src/model_tests_unreadable_pages.rs::an_unreadable_page_is_announced_once_per_breakage",
+   "crates/tine-core/src/model_tests_unreadable_pages.rs::cold_malformed_owner_refuses_without_census_or_mutation",
+   "src/lib/unreadablePages.test.ts"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Found while reconciling the GH #543 harness. A page whose bytes were not UTF-8 or that the parser rejected refused every name-only page creation for the session, and the watcher treated the deterministic rejection as a failed cycle: it retried forever, never acknowledged the observation, and toasted that it would keep retrying. Creation now refuses only a name the failed file could be (its file name, or a name its folded bytes contain), naming the file; the watcher records the rejection as reconciled state and the app announces the page once (graph-unreadable-pages). Refusal scenario DIRECT-REF-CREATE-UNREADABLE-OWNER. Fail-before tine-agents/evidence/gh550-batch/reconciler/one-unreadable-page-fail-before.log; the old refusal was pinned by the previous forms of the cold/warm creation tests."
+},
+{
+ "id": "REG-PROGRESS-PUBLISH-RACE-543",
+ "title": "A query asking while the index becomes ready is not told the index is unreadable",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::readiness_published_while_asking_is_not_reported_stale"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543, seen as a full-suite-only failure of a_listing_overtaken_by_an_edit_reads_the_index_instead_of_parsing. progress_at read readiness before taking the queue lock under which the worker publishes it, so a turn ending in between read as 'not ready, nothing queued' = Stale, which a query reports as ReadFailed. Readiness is now read under the lock. Fail-before tine-agents/evidence/gh550-batch/reconciler/progress-publish-race-fail-before.log (3/3)."
 }
 ]
 }

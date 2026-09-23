@@ -56,12 +56,8 @@ impl Graph {
         #[cfg(test)]
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let identity = canonical_projection_file_resource_id(&file)?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "graph text file is not valid UTF-8",
-            )
-        })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| page_content_rejected("graph text file is not valid UTF-8"))?;
         Ok(Some((text, identity)))
     }
 
@@ -101,12 +97,8 @@ impl Graph {
         #[cfg(test)]
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let identity = canonical_projection_file_resource_id(&file)?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "graph text file is not valid UTF-8",
-            )
-        })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| page_content_rejected("graph text file is not valid UTF-8"))?;
         Ok(Some((text, identity)))
     }
 
@@ -498,10 +490,11 @@ impl Graph {
         Ok(index)
     }
 
-    /// Read the parsed ownership evidence once. A clean missing page cache is
-    /// repairable; failure-bearing cold evidence and partial or incoherent warm
-    /// publication remain hard refusals rather than authority to rebuild around
-    /// an unexplained gap.
+    /// Read the parsed ownership evidence once. A missing page cache is
+    /// repairable; partial or incoherent warm publication remains a hard
+    /// refusal rather than authority to rebuild around an unexplained gap.
+    /// Recorded failures travel with the evidence: whether one could own the
+    /// requested name is the creation's question, not the evidence's.
     pub(super) fn direct_creation_evidence(&self) -> io::Result<DirectCreationEvidence> {
         if self.graph_text_external_observation_pending() {
             return Err(io::Error::new(
@@ -512,19 +505,6 @@ impl Graph {
         let cache = self.cache.read().unwrap();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(_pages) = cache.as_ref() else {
-            let published_failures = !self.page_index_failures.read().unwrap().is_empty();
-            let retained_failures = self
-                .effective_identity_index
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|index| !index.failures.is_empty());
-            if published_failures || retained_failures {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "failure-bearing cold identity evidence cannot authorize name-only creation",
-                ));
-            }
             return Ok(DirectCreationEvidence::Cold);
         };
         let identity_index = self
@@ -545,15 +525,6 @@ impl Graph {
                 "parsed identity evidence is not one coherent generation",
             ));
         }
-        if !identity_index.failures.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
-                    identity_index.failures.len()
-                ),
-            ));
-        }
         Ok(DirectCreationEvidence::Warm {
             generation,
             identity_index,
@@ -565,14 +536,12 @@ impl Graph {
     /// generation. Without it a graph that was never parsed -- every clean
     /// reopen -- ran a whole-graph parse for its first creation, ahead of the
     /// launch check when one was running. Like any graph-wide read this waits
-    /// for a launch check in flight. `None` when no ready index answers, or
-    /// when a published parse failure leaves an identity unknown; the caller
-    /// then falls back to the parsed evidence.
+    /// for a launch check in flight. `None` when no ready index answers; the
+    /// caller then falls back to the parsed evidence. The recorded failures
+    /// travel with it, as with the parsed evidence.
     fn indexed_creation_evidence(&self) -> Option<DirectCreationEvidence> {
         let (generation, entries) = self.direct_projection_page_inventory()?;
-        if !self.page_index_failures.read().unwrap().is_empty() {
-            return None;
-        }
+        let failures = self.page_index_failures.read().unwrap().clone();
         let mut owners = std::collections::HashMap::with_capacity(entries.len());
         let mut physical_paths = std::collections::HashSet::with_capacity(entries.len());
         for entry in entries {
@@ -588,7 +557,7 @@ impl Graph {
                 generation: std::sync::atomic::AtomicU64::new(generation),
                 owners,
                 physical_paths,
-                failures: Vec::new(),
+                failures,
             }),
         })
     }
@@ -615,9 +584,7 @@ impl Graph {
             DirectCreationEvidence::Cold => match self.indexed_creation_evidence() {
                 Some(evidence) => evidence,
                 // Asking the index waited for the launch survey, which may
-                // have published a parse failure since: that is
-                // failure-bearing evidence, refused above, and parsing the
-                // whole graph would not settle it (GH #543).
+                // have installed parsed evidence since (GH #543).
                 None => match self.direct_creation_evidence()? {
                     DirectCreationEvidence::Cold => {
                         let outcome = self.repair_page_cache_once(permit);
@@ -644,6 +611,16 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
+        let owners_unknown = self.failures_that_could_own(permit, &identity_index.failures, name);
+        if !owners_unknown.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "cannot create {name:?}: Tine could not read {}, which may already be that page",
+                    owners_unknown.join(", ")
+                ),
+            ));
+        }
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -660,120 +637,50 @@ impl Graph {
         ))
     }
 
-    fn current_effective_identity_index(&self) -> io::Result<Arc<EffectiveIdentityIndex>> {
-        loop {
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            if let Some(index) = self.effective_identity_index.read().unwrap().as_ref() {
-                if index.generation() == generation {
-                    return Ok(Arc::clone(index));
-                }
-            }
-            let pages = self
-                .cache
-                .read()
-                .unwrap()
-                .as_ref()
-                .map(Arc::clone)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "effective page identities are not warm for name-only creation",
-                    )
-                })?;
-            let failures = self.page_index_failures.read().unwrap().clone();
-            let built = Arc::new(build_effective_identity_index(
-                generation,
-                pages.as_slice(),
-                failures,
-            ));
-            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                continue;
-            }
-            *self.effective_identity_index.write().unwrap() = Some(Arc::clone(&built));
-            return Ok(built);
-        }
-    }
-
-    pub(super) fn validate_name_only_effective_identity(
+    /// The recorded failures that could be a page named `name`. A page Tine
+    /// could not read or parse has an unknown effective name. It can have
+    /// that name only through its file name or a title written in its text,
+    /// so a failed file whose file name is another page's and whose text,
+    /// folded as page names are, never contains the name is not that page.
+    /// A failure that names no single page file (the graph-text scope, a
+    /// directory, a listing skip), or a file that cannot be read now, could
+    /// be any page. One unparseable page used to refuse every name-only
+    /// creation for the session.
+    ///
+    /// Refusal scenario `DIRECT-REF-CREATE-UNREADABLE-OWNER`
+    /// (`docs/storage-sync-contract.md` §3.1).
+    fn failures_that_could_own(
         &self,
-        current_entries: &[PageEntry],
-        kind: PageKind,
+        permit: &GraphTextWritePermit,
+        failures: &[String],
         name: &str,
-    ) -> io::Result<bool> {
-        let index = if self.cache.read().unwrap().is_none() {
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            let failures = self.page_index_failures.read().unwrap().clone();
-            let retained = self
-                .effective_identity_index
-                .read()
-                .unwrap()
-                .as_ref()
-                .map(Arc::clone);
-            if let Some(index) = retained {
-                if index.generation() == generation {
-                    index
-                } else if !current_entries.is_empty() || !failures.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "cold graph has stale effective identities; name-only creation requires warm evidence",
-                    ));
-                } else {
-                    let index = Arc::new(EffectiveIdentityIndex {
-                        generation: std::sync::atomic::AtomicU64::new(generation),
-                        owners: std::collections::HashMap::new(),
-                        physical_paths: std::collections::HashSet::new(),
-                        failures: Vec::new(),
-                    });
-                    *self.effective_identity_index.write().unwrap() = Some(Arc::clone(&index));
-                    index
-                }
-            } else if !current_entries.is_empty() || !failures.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "cold graph has unknown effective identities; name-only creation requires warm evidence",
-                ));
-            } else {
-                let index = Arc::new(EffectiveIdentityIndex {
-                    generation: std::sync::atomic::AtomicU64::new(generation),
-                    owners: std::collections::HashMap::new(),
-                    physical_paths: std::collections::HashSet::new(),
-                    failures: Vec::new(),
-                });
-                *self.effective_identity_index.write().unwrap() = Some(Arc::clone(&index));
-                index
-            }
-        } else {
-            self.current_effective_identity_index()?
-        };
-        if !index.failures.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
-                    index.failures.len()
-                ),
-            ));
-        }
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != index.generation() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "effective page identity evidence changed during name-only creation",
-            ));
-        }
-        let current_paths = current_entries
+    ) -> Vec<String> {
+        let key = crate::refs::page_key(name);
+        failures
             .iter()
-            .map(|entry| entry.path.clone())
-            .collect::<std::collections::HashSet<_>>();
-        if current_paths != index.physical_paths {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "effective page identity evidence is stale or incomplete for name-only creation",
-            ));
-        }
-        Ok(index
-            .owners
-            .get(&page_cache_key(kind, name))
-            .is_some_and(|owners| !owners.is_empty()))
+            .filter(|failure| {
+                let path = self.root.join(failure.as_str());
+                let Some(entry) = self
+                    .entry_for_path(&path)
+                    .filter(|_| !failure.starts_with(super::page_cache::GRAPH_TEXT_SCOPE_FAILURE))
+                else {
+                    return true;
+                };
+                if crate::refs::page_key(&entry.name) == key {
+                    return true;
+                }
+                // Bytes, not text: a title written as UTF-8 survives a lossy
+                // decoding of a file that is not UTF-8 throughout.
+                match self.graph_text_read_optional(permit, &path) {
+                    Ok(None) => false,
+                    Ok(Some(bytes)) => {
+                        crate::refs::page_key(&String::from_utf8_lossy(&bytes)).contains(&key)
+                    }
+                    Err(_) => true,
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     pub(super) fn advance_effective_identity_after_upsert(
@@ -946,32 +853,10 @@ impl Graph {
                 creation_proof: Some(creation_proof),
             });
         }
-        let index = self.validate_current_graph_text_collision_strict(permit, target, None)?;
-        let requested_identity_elsewhere = match (loaded_target.as_ref(), requested_identity) {
-            (None, Some((kind, name))) => {
-                let retained_collision = index
-                    .paths_by_semantic_key
-                    .get(&(
-                        match kind {
-                            PageKind::Page => 0,
-                            PageKind::Journal => 1,
-                        },
-                        crate::refs::page_key(name),
-                    ))
-                    .is_some_and(|members| !members.is_empty());
-                let entries = index
-                    .files_by_exact_path
-                    .iter()
-                    .map(|(_, record)| record.semantic.clone())
-                    .collect::<Vec<_>>();
-                retained_collision
-                    || self.validate_name_only_effective_identity(&entries, kind, name)?
-            }
-            _ => false,
-        };
+        self.validate_current_graph_text_collision_strict(permit, target, None)?;
         Ok(ExactGraphValidation {
-            target: loaded_target,
-            requested_identity_elsewhere,
+            target: None,
+            requested_identity_elsewhere: false,
             creation_proof: None,
         })
     }

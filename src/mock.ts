@@ -2119,6 +2119,9 @@ export function mockBackend(): Backend {
     async onGraphWatchError(): Promise<() => void> {
       return () => {};
     },
+    async onGraphUnreadablePages(): Promise<() => void> {
+      return () => {};
+    },
     async getBackupKeep(): Promise<number> {
       return 12;
     },

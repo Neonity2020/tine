@@ -339,13 +339,21 @@ fn watcher_reconcile(graph: &Graph, uncertain: bool, paths: Vec<PathBuf>) -> Res
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .map_err(|e| e.to_string())?;
     }
+    // Like the watcher's reconcile, one failed path does not stop the rest;
+    // the batch is acknowledged only when every path reconciled.
+    let mut errors = Vec::new();
     for path in paths {
         let synced = if path.exists() {
             graph.sync_file_checked(&path).map(|_| ())
         } else {
             graph.sync_deleted_file(&path).map(|_| ())
         };
-        synced.map_err(|e| e.to_string())?;
+        if let Err(error) = synced {
+            errors.push(error.to_string());
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
     }
     graph.acknowledge_graph_text_external_observations(ticket);
     Ok(())
@@ -635,7 +643,11 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
     // Settle: report the missed changes as the watcher's rescan would.
     let graph = Arc::clone(&session.graph);
     if !missed.is_empty() {
-        let _ = watcher_reconcile(&graph, true, missed.drain(..).collect());
+        let missed_now: Vec<PathBuf> = missed.drain(..).collect();
+        let settled = watcher_reconcile(&graph, true, missed_now.clone());
+        if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
+            eprintln!("  settle reconcile {missed_now:?} -> {settled:?}");
+        }
     }
     if session.quiesce(&mut findings) {
         check_settled(&root, &graph, &bad, &mut findings);
