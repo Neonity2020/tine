@@ -612,6 +612,11 @@ impl Graph {
         mut settle: impl FnMut(),
     ) {
         use crate::direct_projection::{IndexNeed, OwnerStep};
+        // A retired graph is never read again: its owner stops whatever the
+        // caller's own revocation says. A refresh retires the old graph before
+        // it cancels the old owner, which could otherwise walk the retired
+        // graph once in between (GH #543, audit R7-06).
+        let cancelled = || cancelled() || self.is_retired();
         let lock = || {
             permit
                 .lock()

@@ -1431,3 +1431,28 @@ fn gh543_a_validation_that_needs_a_fresh_build_is_not_ready() {
         "the rebuild the failed read asked for never ran ({parses} parses)"
     );
 }
+
+/// GH #543 (audit R7-06): the owner of a retired graph runs no more passes.
+/// A refresh retires the old graph before it cancels the old owner, and in
+/// between the owner could walk the retired graph for a need that arose.
+#[test]
+fn gh543_a_retired_graphs_owner_runs_no_more_passes() {
+    let root = scratch("gh543-retired-owner");
+    write_pages(&root, 6);
+    let database = root.join("private/projection.sqlite");
+    prebuild_index(&root, &database);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let owner = OwnerRun::start(&graph);
+    assert!(owner.wait_settled(Duration::from_secs(10)));
+    assert!(owner.wait_ready(Duration::from_secs(10)));
+    let passes_before = graph.owner_passes_test();
+    graph.retire();
+    graph.direct_projection_mark_stale_test();
+    std::thread::sleep(Duration::from_millis(500));
+    let passes = graph.owner_passes_test() - passes_before;
+    owner.stop();
+    crate::direct_projection::release_projection(&graph);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(passes, 0, "the owner walked a retired graph");
+}

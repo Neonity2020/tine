@@ -6198,6 +6198,24 @@
   "failBefore": "structural"
  },
  "notes": "Round-7 indexing audit R7-03 (reasoned, not reproduced: needs a failing settings write). publish_prepared_direct_files returned remember_graph's error after the slot was published, dropping the warm ticket: no owner, no launch completion, and the open reported as failed. The owner now starts right after publication and remembering is non-fatal (a fixed diag line). The source-order guard fails if anything fallible sits between publication and warm_cache_async."
+},
+{
+ "id": "REG-A-RETIRED-GRAPHS-INDEX-OWNER-RUNS-NO-PASS-543",
+ "title": "A graph replaced by a settings refresh is not re-read by its old index owner",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "integration",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_a_retired_graphs_owner_runs_no_more_passes"],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Round-7 indexing audit R7-06. A refresh retires the old graph before swap_refreshed cancels its owner; in between the owner could run one pass over the retired graph. run_index_owner now treats the graph's own retirement as cancellation, for every caller. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r7/necessity-retired-owner.log."
 }
 ]
 }
