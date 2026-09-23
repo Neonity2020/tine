@@ -250,7 +250,6 @@ pub(crate) fn capture_graph_binding(
 
 struct LoadedGraph {
     graph: Graph,
-    meta: GraphMeta,
 }
 
 fn open_graph_for_load(
@@ -260,7 +259,6 @@ fn open_graph_for_load(
     let graph = Graph::open_checked_with_assets(root, approved_assets).map_err(|e| {
         crate::command_error::CommandError::graph(format!("unsafe graph layout: {e}"))
     })?;
-    let meta = graph.meta();
     // Concord invariant 4 (write-shyness). Opening a graph used to RENAME every
     // title-named journal file to its date stem, behind a synchronous launch
     // backup. It is a genuine repair — such a file cannot be parsed back to a
@@ -270,7 +268,7 @@ fn open_graph_for_load(
     // (`journal_filename_migrations`) and applied only by the explicit
     // `apply_journal_filename_migrations` command, which takes the same
     // pre-migration snapshot first. Opening touches nothing.
-    Ok(LoadedGraph { graph, meta })
+    Ok(LoadedGraph { graph })
 }
 
 #[derive(serde::Serialize)]
@@ -516,7 +514,6 @@ fn direct_files_projection_path(
 
 pub(crate) struct PreparedDirectFilesOpen {
     graph: Graph,
-    meta: GraphMeta,
     root_key: PathBuf,
 }
 
@@ -548,13 +545,9 @@ pub(crate) fn prepare_direct_files_open(
                 .to_string(),
         ),
     }
-    let LoadedGraph { graph, meta } = open_graph_for_load(&root, approved_assets.as_deref())?;
+    let LoadedGraph { graph } = open_graph_for_load(&root, approved_assets.as_deref())?;
     attach_direct_files_services(&graph, direct_files_service_paths(app, &root_key));
-    Ok(PreparedDirectFilesOpen {
-        graph,
-        meta,
-        root_key,
-    })
+    Ok(PreparedDirectFilesOpen { graph, root_key })
 }
 
 /// The app-private locations of the services a Direct Files `Graph` carries:
@@ -616,12 +609,10 @@ pub(crate) fn publish_prepared_direct_files(
     state: &AppState,
     prepared: PreparedDirectFilesOpen,
 ) -> Result<DirectFilesOpen, crate::command_error::CommandError> {
-    let PreparedDirectFilesOpen {
-        graph,
-        meta,
-        root_key,
-    } = prepared;
+    let PreparedDirectFilesOpen { graph, root_key } = prepared;
     let (slot, warm) = publish_direct_files_slot(state, window_label, graph, root_key)?;
+    crate::state::serve_disk_config(app, window_label, &slot);
+    let meta = slot.graph_meta();
     let binding_generation = slot.binding_generation;
     let application_page_admission = slot.application_page_admission();
     // The graph is published: its index owner starts now, before anything
@@ -686,6 +677,7 @@ pub(crate) fn load_graph_for_label(
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)
                 .map_err(crate::command_error::CommandError::from)?;
+            crate::state::serve_disk_config(app, window_label, &slot);
             state.storage_supervisor.finish_transition(
                 app,
                 lookup_id,
@@ -1695,7 +1687,7 @@ mod tests {
             .expect("inert legacy-v1 bytes must not reject a checked Direct Files open");
         let root_key = std::fs::canonicalize(&dir).unwrap();
         let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
-        assert_eq!(loaded.meta.root, dir.display().to_string());
+        assert_eq!(loaded.graph.meta().root, dir.display().to_string());
         let state = direct_test_state();
         let (slot, warm) =
             publish_direct_files_slot(&state, "ordinary", loaded.graph, root_key.clone()).unwrap();
@@ -1791,7 +1783,7 @@ mod tests {
         let started = std::time::Instant::now();
         let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
         let elapsed = started.elapsed();
-        assert_eq!(loaded.meta.root, dir.display().to_string());
+        assert_eq!(loaded.graph.meta().root, dir.display().to_string());
         eprintln!(
             "direct open: pages={page_count}, assets={asset_count}, apparent_asset_gib={:.1}, elapsed={elapsed:?}",
             asset_count as f64 * 2.0 / 1024.0

@@ -637,17 +637,47 @@ pub(crate) fn apply_config_write(
     let slot = slot_for_context(ctx)?;
     slot.apply_config_write(write)?;
     if slot.config_pending() {
-        let app = ctx.window.app_handle().clone();
-        let label = ctx.window.label().to_string();
-        tauri::async_runtime::spawn_blocking(move || {
-            let state = app.state::<AppState>();
-            if let Err(error) = take_in_config_change(&state, &app, &label, RefreshLaneWait::Block)
-            {
-                let _ = app.emit_to(&label, "graph-watch-error", error.to_string());
-            }
-        });
+        spawn_config_decider(ctx.window.app_handle(), ctx.window.label());
     }
     Ok(())
+}
+
+/// Run [`take_in_config_change`] for `label` off the calling thread, waiting
+/// for the transition lane: a change only a reopen takes in.
+fn spawn_config_decider(app: &tauri::AppHandle, label: &str) {
+    let app = app.clone();
+    let label = label.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        if let Err(error) = take_in_config_change(&state, &app, &label, RefreshLaneWait::Block) {
+            let _ = app.emit_to(&label, "graph-watch-error", error.to_string());
+        }
+    });
+}
+
+/// Make a slot just handed to a window serve what `config.edn` holds now.
+/// Called wherever a window is given a graph: an open's bind, a reopen's
+/// swap, and a same-root load answering `AlreadyCurrent`.
+///
+/// A graph reads its configuration when it is opened, and a change that
+/// arrives before the window holds it is taken in by whichever graph the
+/// window held then: a settings command writes through the slot being
+/// replaced, and the watcher takes an outside edit into it. The replacement
+/// then served the older value, nothing asked again, and the frontend, which
+/// writes `:favorites` as a whole list, dropped a favorite from disk at the
+/// next toggle (GH #543, audit R11-03). A change to settings is taken in
+/// here; one that reaches the graph goes to the one decider.
+pub(crate) fn serve_disk_config(app: &tauri::AppHandle, label: &str, slot: &GraphSlot) {
+    let before = slot.graph_meta();
+    match take_in_config_now(slot) {
+        ConfigTakeIn::Current => {
+            let after = slot.graph_meta();
+            if after != before {
+                let _ = app.emit_to(label, "graph-config-changed", after);
+            }
+        }
+        ConfigTakeIn::Reopen => spawn_config_decider(app, label),
+    }
 }
 
 /// Rewrite a window's graph on disk and reopen it, for a command. Async so
@@ -806,6 +836,7 @@ fn refresh_graph_for_label(
         // caller asked for is done on disk; there is nothing left to reopen.
         return Ok(RefreshOutcome::Current);
     }
+    serve_disk_config(app, &label, &replacement);
     crate::graph::warm_cache_async(app.clone(), label, replacement, warm)?;
     poke_watcher(state);
     Ok(RefreshOutcome::Refreshed)
@@ -1072,8 +1103,14 @@ mod tests {
             .find("\npub(crate) fn apply_config_write(")
             .expect("settings front door")..];
         let front = &front[..front.find("\n}\n").expect("front door ends")];
+        let decider = &state[state
+            .find("\nfn spawn_config_decider(")
+            .expect("the decider spawn")..];
+        let decider = &decider[..decider.find("\n}\n").expect("the decider spawn ends")];
         assert!(
-            front.contains("config_pending()") && front.contains("take_in_config_change("),
+            front.contains("config_pending()")
+                && front.contains("spawn_config_decider(")
+                && decider.contains("take_in_config_change("),
             "a settings write that reaches the graph must reopen it itself"
         );
         assert!(
@@ -1088,6 +1125,106 @@ mod tests {
             !watcher.contains(".take_in_config()"),
             "the watcher decides a config change itself again; ask take_in_config_change"
         );
+    }
+
+    /// GH #543, audit R11-03: a settings write that lands on the slot a reopen
+    /// is replacing is taken in by that slot, and the replacement, opened
+    /// before the write, serves the older value. Asking the replacement once
+    /// it is the window's graph (`serve_disk_config`) takes the write in. The
+    /// guard below pins that every hand-over asks.
+    #[test]
+    fn a_settings_write_during_a_reopen_reaches_the_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("gh543-r11-reopen-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("logseq")).unwrap();
+        std::fs::write(root.join("logseq/config.edn"), "{}\n").unwrap();
+        std::fs::write(root.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        let services = || crate::graph::DirectFilesServicePaths {
+            projection: Ok(root.join("private/projection.sqlite")),
+            concord_ledger: None,
+        };
+        let old = GraphSlot::new(Graph::open_checked(&root).unwrap(), root.clone());
+        let prepared = prepare_legacy_refresh(&old, None, services()).unwrap();
+        old.apply_config_write(|g| g.set_favorites(&["Alpha".to_string()]))
+            .unwrap();
+        assert!(
+            !old.config_pending(),
+            "precondition: the slot being replaced took the write in, so no decider runs"
+        );
+        let replacement = prepared.commit(&old);
+        assert!(
+            replacement.graph_meta().favorites.is_empty(),
+            "precondition: the replacement was opened before the write"
+        );
+        assert_eq!(take_in_config_now(&replacement), ConfigTakeIn::Current);
+        assert_eq!(replacement.graph_meta().favorites, ["Alpha"]);
+        assert!(!replacement.config_pending());
+        let _ = replacement
+            .graph()
+            .detach_direct_projection(Duration::from_secs(15));
+        drop(replacement);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// GH #543, audit R11-03: "does a graph handed to a window serve what
+    /// `config.edn` holds?" has one answer, `serve_disk_config`, asked at
+    /// every hand-over: a reopen's swap, an open's bind, and a same-root load
+    /// that answers with the slot it already has. Each asks before the meta
+    /// it hands the frontend is read. A new way to hand a window a graph asks
+    /// too (exemplar: `refresh_graph_for_label`).
+    #[test]
+    fn every_graph_handover_serves_the_config_on_disk() {
+        let body = |source: &str, start: &str| -> String {
+            let from = &source[source.find(start).unwrap_or_else(|| panic!("{start}"))..];
+            from[..from.find("\n}\n").expect("item ends")].to_owned()
+        };
+        let state = crate::test_support::rust_module_production_source("state.rs");
+        let graph = crate::test_support::rust_module_production_source("graph.rs");
+        let refresh = body(&state, "\nfn refresh_graph_for_label(");
+        let swap = refresh.find(".swap_refreshed(").expect("the reopen swaps");
+        let serve = refresh
+            .find("serve_disk_config(")
+            .expect("the reopen serves");
+        assert!(swap < serve, "the reopen asks before the swap");
+        let publish = body(&graph, "\npub(crate) fn publish_prepared_direct_files(");
+        let bind = publish
+            .find("publish_direct_files_slot(")
+            .expect("the open binds");
+        let serve = publish.find("serve_disk_config(").expect("the open serves");
+        let meta = publish
+            .find("slot.graph_meta()")
+            .expect("the open reads meta");
+        assert!(
+            bind < serve && serve < meta,
+            "the open serves after its bind, before its meta"
+        );
+        let load = body(&graph, "\npub(crate) fn load_graph_for_label(");
+        let serve = load
+            .find("serve_disk_config(")
+            .expect("the same-root load serves");
+        let current = load
+            .find("LoadGraphResult::AlreadyCurrent {")
+            .expect("the same-root answer");
+        assert!(
+            serve < current,
+            "the same-root load serves before it answers"
+        );
+        let calls = [
+            "state.rs",
+            "graph.rs",
+            "commands.rs",
+            "backup.rs",
+            "watcher.rs",
+        ]
+        .iter()
+        .map(|file| {
+            crate::test_support::rust_module_production_source(file)
+                .matches("serve_disk_config(")
+                .count()
+        })
+        .sum::<usize>();
+        assert_eq!(calls, 4, "one definition and three hand-overs");
     }
 
     /// GH #543, audit R10-07: a failure to create the OS watcher is surfaced

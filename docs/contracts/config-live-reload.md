@@ -56,6 +56,16 @@ calls the decider off the main thread when its write left a change the graph
 must reopen for. The command does not leave that to the watcher, which may not
 be running (GH #543, audit R10-07).
 
+Every hand-over of a graph to a window asks too: a reopen's swap, an open's
+bind, and a same-root load that answers with the slot it already has
+(`AlreadyCurrent`) each call `state::serve_disk_config` before the meta they
+hand the frontend is read. A graph reads its configuration when it is opened,
+and a change arriving before the window holds it is taken in by the graph the
+window held then: a settings command writes through the slot being replaced,
+and the watcher takes an outside edit into it. The replacement then served the
+older value, and the frontend, which writes `:favorites` as a whole list,
+dropped a favorite from disk at its next toggle (GH #543, audit R11-03).
+
 `Graph::write_config` is therefore the single funnel every setter publishes
 through, and it takes in what it wrote, so a star toggled in the sidebar costs
 no reopen. A change that reaches the graph is never taken in, so it leaves the
@@ -67,7 +77,9 @@ missed one of those.)
 Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`,
 `config::tests::the_watcher_gate_matches_disk_only_when_disk_was_taken_in`,
 `config::tests::only_the_graph_s_own_config_edn_is_recognized_as_configuration`
-and `state::tests::a_settings_write_decides_its_own_reopen`.
+`state::tests::a_settings_write_decides_its_own_reopen`,
+`state::tests::a_settings_write_during_a_reopen_reaches_the_replacement` and
+`state::tests::every_graph_handover_serves_the_config_on_disk`.
 
 ## 4. What reaches the frontend
 
