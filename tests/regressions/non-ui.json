@@ -7664,7 +7664,7 @@
    "src/components/LinkedReferences.test.tsx::shows a failed index with its code, Retry and the diagnostic report",
    "src/components/LinkedReferences.test.tsx::says it is indexing while the index is not ready, then shows the references",
    "src/components/UnlinkedReferences.test.tsx::shows a failed index with its code, Retry and the diagnostic report",
-   "src/components/QueryMacro.currentPage.test.tsx::a query block over a failed index (GH #594) shows the failure code, Retry and the diagnostic report"
+   "src/components/QueryMacro.currentPage.test.tsx::shows the failure code, Retry and the diagnostic report"
   ],
   "scenario": null,
   "failBefore": "tine-agents/evidence/batch-gh594/necessity-liveness.txt (derived-read and reference-panel tests hang at c2afaaa0; the stuck-state diagnosis showed Working(Recovering) for 70 s across 8 failed builds; the four render tests fail against the pre-change LinkedReferences/UnlinkedReferences/Macro components)"
