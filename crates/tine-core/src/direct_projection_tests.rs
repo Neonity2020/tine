@@ -10603,6 +10603,16 @@ fn gh597_a_case_variant_name_opens_the_file_under_its_disk_spelling() {
     graph.warm_cache();
     wait_ready(&graph);
 
+    // An editor activated by the name alone (a page not yet found, a link
+    // target) resolves the same file, spelled as on disk.
+    let by_name = graph
+        .activate_absent_editor("Contents", PageKind::Page)
+        .expect("a case-variant name resolves");
+    assert_eq!(
+        by_name.target, "pages/contents.md",
+        "activated under an alias spelling"
+    );
+
     let page = graph
         .load_named("Contents", PageKind::Page)
         .unwrap()
