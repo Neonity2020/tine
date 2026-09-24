@@ -1665,12 +1665,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // and schema; fewer transactions and no fsync inside a turn.
     // 2026-09-25: GH #543 reopen regression pins tine-storage v0.28.2:
     // `checkpoint_passive_at` also empties a fully copied WAL when nothing
-    // holds it, and the background checkpoint retries that briefly. No import
-    // or call-surface change.
+    // holds it, and the background checkpoint retries that briefly. The retry
+    // reads the checkpoint's result (`outcome.is_err`), which the census counts
+    // as a storage-receiver use; no new storage import or call.
     let digest = inventory_digest(&dependency_surface);
     assert_eq!(
         digest,
-        "2f62b2b0d2a53880a737ee6c1791d616eb0b9b661e8c919b06a0da213289090e",
+        "ee34a2700508480a4855efb84fcc87c12a9f3265ccf75609bbb5b2d929573910",
         "the complete tine-storage import/direct-call surface changed (digest now {digest}): {dependency_surface:#?}"
     );
 }
