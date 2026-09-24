@@ -135,6 +135,12 @@ impl Graph {
                         "snapshot query projection worker is unavailable",
                     ))
                 }
+                ProjectionProgress::Failed(class) => {
+                    return Err(io::Error::other(format!(
+                        "snapshot query projection failed: {}",
+                        class.as_str()
+                    )))
+                }
             }
             if started.elapsed() >= timeout {
                 return Err(io::Error::new(
@@ -368,8 +374,10 @@ impl Graph {
             if projection.wait_ready_at(generation) {
                 return Some(generation);
             }
-            // A replaced graph's reads are no longer anyone's to wait for.
-            if self.is_retired() {
+            // A replaced graph's reads are no longer anyone's to wait for,
+            // and no read waits past its deadline: it answers from the
+            // parsed pages then, as when nothing is coming (GH #594 L3).
+            if self.is_retired() || super::derived_reads::ReadDeadline::passed() {
                 return None;
             }
             // With an index owner registered, whether work is coming is the

@@ -203,6 +203,10 @@ impl Graph {
                     return Err(Error::NotReady(Readiness::PendingEdits))
                 }
                 Some(ProjectionProgress::Working(reason)) => return Err(Error::NotReady(reason)),
+                // Stopped trying this session: no repair, no retry loop (GH #594).
+                Some(ProjectionProgress::Failed(class)) => {
+                    return Err(Error::Unavailable(Reason::IndexFailed(class)))
+                }
                 Some(ProjectionProgress::Stopped) | None => {
                     return Err(Error::Unavailable(Reason::ProjectionUnavailable))
                 }
@@ -240,6 +244,9 @@ impl Graph {
             DirectAttempt::NotReady => match self.direct_projection_progress() {
                 Some(ProjectionProgress::Ready) => Err(Error::NotReady(Readiness::PendingEdits)),
                 Some(ProjectionProgress::Working(reason)) => Err(Error::NotReady(reason)),
+                Some(ProjectionProgress::Failed(class)) => {
+                    Err(Error::Unavailable(Reason::IndexFailed(class)))
+                }
                 Some(ProjectionProgress::Stopped) | None => {
                     Err(Error::Unavailable(Reason::ProjectionUnavailable))
                 }

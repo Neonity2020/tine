@@ -60,6 +60,16 @@ pub(crate) trait QueryGraph {
         self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, super::QueryExecutionError>;
+    /// Whether a reference read of `target` can be answered now: `NotReady`
+    /// while the index is working on it, `IndexFailed` once it failed. Asked
+    /// before anything else the read does; see `Graph::reference_readiness`.
+    fn reference_readiness(
+        &self,
+        _target: &str,
+        _kind: ReferenceKind,
+    ) -> Result<(), super::QueryExecutionError> {
+        Ok(())
+    }
     fn backlink_filter_scope(
         &self,
         target: &str,
@@ -145,6 +155,14 @@ impl<G: QueryGraph> QueryGraph for Arc<G> {
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, super::QueryExecutionError> {
         (**self).reference_candidate_pages_indexed(names_norm, self_page, kind)
+    }
+
+    fn reference_readiness(
+        &self,
+        target: &str,
+        kind: ReferenceKind,
+    ) -> Result<(), super::QueryExecutionError> {
+        (**self).reference_readiness(target, kind)
     }
 
     fn backlink_filter_scope(

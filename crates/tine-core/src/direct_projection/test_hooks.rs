@@ -1,11 +1,14 @@
 //! Test hooks on [`DirectProjection`]: the waits, counters and injected
 //! failures fixtures use to observe and steer the worker. Test-only, kept
 //! out of `direct_projection.rs` so the production file stays readable.
+use super::owner::index_need;
 use super::*;
 
 impl DirectProjection {
     /// Wait until the worker has drained its queue and finished its turn, and
-    /// report whether that turn succeeded (`false`: it failed).
+    /// report whether that turn succeeded (`false`: it failed). An index that
+    /// has given up for the session (GH #594, L1) has nothing more coming, so
+    /// it counts as drained, and failed.
     #[cfg(test)]
     #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     pub(crate) fn wait_drained_test(&self) -> bool {
@@ -13,7 +16,11 @@ impl DirectProjection {
         loop {
             {
                 let pending = self.shared.pending.lock().unwrap();
-                if !pending.has_work() && !self.shared.worker_busy.load(Ordering::Acquire) {
+                let idle = !self.shared.worker_busy.load(Ordering::Acquire);
+                if idle && pending.failed.is_some() {
+                    return false;
+                }
+                if !pending.has_work() && idle {
                     return !self.shared.last_turn_failed.load(Ordering::Acquire);
                 }
             }

@@ -416,6 +416,10 @@ impl Graph {
     ///   narrow (`reference_narrowing_supported`) — nothing is coming for any of
     ///   these, and refusing would remove the only route to an answer rather
     ///   than delay it.
+    ///
+    /// `Failed` refuses with `IndexFailed`: the index stopped trying this
+    /// session, and the panel shows that with a Retry instead of a whole-graph
+    /// walk (Martin, 2026-09-24, index liveness L4; GH #594).
     pub(crate) fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
@@ -446,11 +450,56 @@ impl Graph {
             });
         }
         if crate::direct_projection::reference_narrowing_supported(names_norm, kind) {
-            if let Some(ProjectionProgress::Working(reason)) = self.direct_projection_progress() {
-                return Err(crate::query::QueryExecutionError::NotReady(reason));
+            match self.direct_projection_progress() {
+                Some(ProjectionProgress::Working(reason)) => {
+                    return Err(crate::query::QueryExecutionError::NotReady(reason));
+                }
+                Some(ProjectionProgress::Failed(class)) => {
+                    return Err(crate::query::QueryExecutionError::Unavailable(
+                        crate::query::QueryUnavailableReason::IndexFailed(class),
+                    ));
+                }
+                _ => {}
             }
         }
         Ok(self.reference_candidate_pages(names_norm, self_page, kind))
+    }
+
+    /// A reference panel's first question, before its alias and page-name
+    /// lookups: can the index answer it now? Those lookups wait for index
+    /// work that is coming, so a panel asked while the index built waited up
+    /// to their patience, only to be told "not ready" by the bounded step
+    /// after them (GH #594: the first backlinks read never completed). The
+    /// panel is told at once what the index is doing, within the same bounded
+    /// wait the candidate read makes, and the reader retries or shows the
+    /// failure (index liveness L3/L4). A target the index cannot narrow
+    /// passes: its answer is the page walk whatever the index does.
+    pub(crate) fn reference_readiness(
+        &self,
+        target: &str,
+        kind: ReferenceKind,
+    ) -> Result<(), crate::query::QueryExecutionError> {
+        use crate::direct_projection::ProjectionProgress;
+        let Some(projection) = self.direct_projection.get() else {
+            return Ok(());
+        };
+        if !crate::direct_projection::reference_narrowing_supported(&[target.to_owned()], kind) {
+            return Ok(());
+        }
+        if projection.wait_for_reference_generation(self.cache_generation()) {
+            return Ok(());
+        }
+        match projection.progress_at(self.cache_generation()) {
+            ProjectionProgress::Working(reason) => {
+                Err(crate::query::QueryExecutionError::NotReady(reason))
+            }
+            ProjectionProgress::Failed(class) => {
+                Err(crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::IndexFailed(class),
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {

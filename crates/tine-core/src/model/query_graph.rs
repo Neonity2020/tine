@@ -46,6 +46,14 @@ impl QueryGraph for Graph {
         Graph::reference_candidate_pages_indexed(self, names_norm, self_page, kind)
     }
 
+    fn reference_readiness(
+        &self,
+        target: &str,
+        kind: ReferenceKind,
+    ) -> Result<(), crate::query::QueryExecutionError> {
+        Graph::reference_readiness(self, target, kind)
+    }
+
     fn backlink_filter_scope(
         &self,
         target: &str,

@@ -363,7 +363,8 @@ fn gh543_the_bar_shows_while_readers_wait_for_a_full_repair() {
 
 /// R10-03: while the owner backs off after failed turns, a page consumer's
 /// whole-graph parse starts no index build; only the owner offers a full
-/// snapshot.
+/// snapshot. Since GH #594 (L1) the backoff can end in `Failed`; a consumer
+/// parse must start no build there either.
 #[test]
 fn gh543_a_consumer_parse_starts_no_index_build_during_the_backoff() {
     let (root, graph, owner) = r10_ready_graph("consumer-backoff");
@@ -396,7 +397,7 @@ fn gh543_a_consumer_parse_starts_no_index_build_during_the_backoff() {
     // whole graph and installs it.
     graph.rename_page("p3", "p3x").unwrap();
     graph.with_pages(|_| ());
-    assert!(projection.wait_drained_test() || projection.backing_off());
+    let _ = projection.wait_drained_test();
     assert_eq!(
         projection.fresh_builds_test(),
         before,

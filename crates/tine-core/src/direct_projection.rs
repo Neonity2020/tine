@@ -28,8 +28,13 @@ use uuid::Uuid;
 mod lease;
 #[path = "direct_projection_owner.rs"]
 mod owner;
+#[cfg(test)]
+pub(crate) use owner::index_failures_reported_for_test;
 use owner::ReportDamage;
-use owner::{backing_off, image_is_current, index_need, note_unsettled};
+#[cfg(test)]
+pub(crate) use owner::INDEX_ATTEMPTS;
+use owner::{backing_off, image_is_current, note_unsettled};
+pub use owner::{set_index_failure_observer, IndexFailureEvent};
 pub(crate) use owner::{IndexFailure, IndexNeed, IndexOwnerRegistration, OwnerStep};
 
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
@@ -278,6 +283,12 @@ struct PendingProjection {
     /// The worker is waiting for another writer to release the database's
     /// writer lease; see [`lease::take_writer_lease`].
     lease_wait: bool,
+    /// The index stopped trying for this session after [`owner::INDEX_ATTEMPTS`]
+    /// consecutive failures, and why (GH #594, liveness L1). Cleared only by
+    /// the user's retry.
+    failed: Option<crate::query::IndexFailureClass>,
+    /// Why the last unsettled pass or turn did not make the index ready.
+    last_failure: Option<crate::query::IndexFailureClass>,
 }
 
 impl PendingProjection {
@@ -332,10 +343,13 @@ impl PendingProjection {
     /// an image it keeps (none while a rebuild is owed, and none inside the
     /// backoff after a failed turn returned them).
     fn worker_can_take(&self) -> bool {
-        self.full.is_some()
-            || ((!self.marks.is_empty() || self.registry_owed.is_some())
-                && !self.rebuild
-                && !backing_off(self))
+        // A failed index takes nothing until the user retries (GH #594 L1):
+        // what is queued meanwhile waits for that.
+        self.failed.is_none()
+            && (self.full.is_some()
+                || ((!self.marks.is_empty() || self.registry_owed.is_some())
+                    && !self.rebuild
+                    && !backing_off(self)))
     }
 }
 
@@ -795,7 +809,7 @@ pub(crate) enum QueryJobOpen {
 /// and translates them into the three answers the public boundary can act on.
 /// It adds no state of its own, because a second opinion about whether the
 /// worker is making progress is exactly the twin D-14 forbids.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionProgress {
     /// Ready at this generation by the time the question was asked: the two
     /// reads straddled a save. Retryable.
@@ -810,6 +824,9 @@ pub(crate) enum ProjectionProgress {
     /// returned. No repair this graph can schedule will be picked up, so a
     /// retry loop here would never end.
     Stopped,
+    /// The index could not be built or updated and has stopped trying this
+    /// session (GH #594, liveness L1). Terminal until the user retries.
+    Failed(crate::query::IndexFailureClass),
 }
 
 /// Whether the projection can narrow THIS reference target at all.
@@ -2237,7 +2254,6 @@ impl DirectProjection {
     ///   failed on a damaged image, `rebuild` is owed, and only a fresh build
     ///   clears it. That is a repair, not a wait.
     pub(crate) fn progress_at(&self, generation: u64) -> ProjectionProgress {
-        use crate::query::QueryReadinessReason as Reason;
         // Readiness is published under this lock, by the turn that empties
         // the queue. Read before the lock, "not ready" and "nothing queued"
         // came from either side of that publication, and a projection that
@@ -2246,51 +2262,13 @@ impl DirectProjection {
         if self.ready_at(generation) {
             return ProjectionProgress::Ready;
         }
-        // A writer waiting for the lease takes nothing meanwhile: the
-        // caller takes today's route, as for a stopped one (GH #543).
-        if pending.stop
-            || pending.lease_wait
-            || !self.shared.worker_available.load(Ordering::Acquire)
-        {
-            return ProjectionProgress::Stopped;
+        // One state function answers this and "is work coming" (GH #594 L2).
+        match owner::index_state(&self.shared, &pending) {
+            owner::IndexState::Stopped => ProjectionProgress::Stopped,
+            owner::IndexState::Failed(class) => ProjectionProgress::Failed(class),
+            owner::IndexState::Working(reason) => ProjectionProgress::Working(reason),
+            owner::IndexState::Idle => ProjectionProgress::Stale,
         }
-        // With an owner registered, whole-graph work the index needs is the
-        // owner's to run; a query reports it and never starts it (GH #543).
-        let owned = pending.owners > 0;
-        let need = index_need(&self.shared, &pending);
-        if pending.full.is_some() || (pending.rebuild && owned) {
-            return ProjectionProgress::Working(Reason::Recovering);
-        }
-        if self.shared.repairs_in_flight.load(Ordering::Acquire) > 0 {
-            return ProjectionProgress::Working(Reason::Recovering);
-        }
-        let owner_pass_coming = owned
-            && matches!(
-                need,
-                IndexNeed::SettingUp | IndexNeed::Validate | IndexNeed::Fresh
-            );
-        if owner_pass_coming && !backing_off(&pending) {
-            return ProjectionProgress::Working(Reason::Indexing);
-        }
-        if !pending.marks.is_empty()
-            || !pending.in_flight.is_empty()
-            || self.shared.deltas_coming.load(Ordering::Acquire) > 0
-        {
-            return ProjectionProgress::Working(Reason::PendingEdits);
-        }
-        if owner_pass_coming {
-            // Backing off: the owner retries when the backoff ends. A pass on
-            // the query thread would bypass it.
-            return ProjectionProgress::Working(Reason::Recovering);
-        }
-        if self.shared.worker_failed.load(Ordering::Acquire) {
-            // The queue is empty and the last turn failed: nothing is coming.
-            return ProjectionProgress::Stale;
-        }
-        if self.shared.worker_busy.load(Ordering::Acquire) {
-            return ProjectionProgress::Working(Reason::Busy);
-        }
-        ProjectionProgress::Stale
     }
 
     /// R3: refuse new jobs, interrupt the active ones and wait for their slots
@@ -2487,6 +2465,18 @@ impl Drop for RepairInFlight {
     }
 }
 
+/// The worker could not set up its image and exits: the index is `Failed`
+/// with the error's class, as after its last attempt, so readers are told and
+/// the user can retry, instead of a silent "unavailable" (GH #594 L1).
+fn worker_cannot_start(shared: &ProjectionShared, error: &str) {
+    owner::note_failed(
+        &mut shared.pending.lock().unwrap(),
+        crate::query::IndexFailureClass::of_message(error),
+    );
+    shared.worker_available.store(false, Ordering::Release);
+    shared.changed.notify_all();
+}
+
 fn projection_worker(shared: Arc<ProjectionShared>) {
     // FIRST local, so it is the LAST thing dropped: the writer connection and
     // the exclusive lease below are both released before the exit is published.
@@ -2498,8 +2488,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     };
     if let Err(error) = std::fs::create_dir_all(parent) {
         eprintln!("[tine] Direct Files SQLite projection disabled: create directory: {error}");
-        shared.worker_available.store(false, Ordering::Release);
-        shared.changed.notify_all();
+        worker_cannot_start(&shared, &error.to_string());
         return;
     }
     // Waits, retrying, while another writer holds the lease; `None` only
@@ -2517,8 +2506,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         });
     if let Err(error) = publication_directory {
         report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
-        shared.worker_available.store(false, Ordering::Release);
-        shared.changed.notify_all();
+        worker_cannot_start(&shared, &error);
         return;
     }
     let mut writer_slot = open_existing_projection_database(&shared);
@@ -2767,15 +2755,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 let owes_new_image = failure.is_some_and(|failure| {
                     fresh_build || owner::failure_owes_new_image(&shared, failure)
                 });
-                // A fresh build that violates a constraint lowered every page
-                // into an empty image: a Tine defect no rebuild fixes. It
-                // spends the one rebuild a contradiction owes, then the index
-                // stays down for the session and readers take their ordinary
-                // route, instead of relowering the graph on every backoff
-                // (audit R15-08).
-                let gives_up = fresh_build
-                    && failure == Some(owner::IndexFailure::ContradictoryRows)
-                    && shared.contradiction_rebuilt.swap(true, Ordering::AcqRel);
+                // A fresh build that violates a constraint (a Tine defect no
+                // rebuild fixes) is not relowered on every backoff: like any
+                // failure it has `INDEX_ATTEMPTS`, then the index is `Failed`
+                // (audit R15-08; GH #594 L1).
                 if matches!(error, ProjectionRefusal::Failed(_)) {
                     // Taken before `pending`: never hold both.
                     shared.committed_registry.lock().unwrap().take();
@@ -2802,21 +2785,19 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 if pending.registry_owed.is_none() && pending.full.is_none() {
                     pending.registry_owed = registry_owed;
                 }
-                if owes_new_image || gives_up {
+                if owes_new_image {
                     shared.worker_failed.store(true, Ordering::Release);
-                }
-                if gives_up {
-                    shared.worker_busy.store(false, Ordering::Release);
-                    shared.worker_available.store(false, Ordering::Release);
-                    drop(pending);
-                    shared.changed.notify_all();
-                    report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
-                    return;
                 }
                 if owes_new_image {
                     pending.rebuild = true;
                 }
-                note_unsettled(&mut pending);
+                let class = match &error {
+                    ProjectionRefusal::Failed(message) => {
+                        crate::query::IndexFailureClass::of_message(message)
+                    }
+                    ProjectionRefusal::Stopped => crate::query::IndexFailureClass::Other,
+                };
+                note_unsettled(&mut pending, class);
                 shared.worker_busy.store(false, Ordering::Release);
                 drop(pending);
                 shared.changed.notify_all();

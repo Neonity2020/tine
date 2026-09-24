@@ -21,6 +21,7 @@ pub mod direct_move_recovery;
 #[path = "direct_move_recovery_corpus_tests.rs"]
 mod direct_move_recovery_corpus_tests;
 mod direct_projection;
+pub use direct_projection::{set_index_failure_observer, IndexFailureEvent};
 pub mod directory_identity;
 pub mod doc;
 pub mod edn;

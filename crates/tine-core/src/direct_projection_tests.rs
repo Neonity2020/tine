@@ -3014,11 +3014,15 @@ fn unavailable_projection_refuses_the_public_query_and_keeps_other_semantics() {
 
     let walks_before = crate::query::full_graph_query_evaluations();
     let refused = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+    // GH #594 L1: a worker that cannot set up its image leaves the index
+    // `Failed` with the error's class, which the user can see and retry.
     assert!(
         matches!(
             refused,
             Err(crate::query::QueryExecutionError::Unavailable(
-                crate::query::QueryUnavailableReason::ProjectionUnavailable
+                crate::query::QueryUnavailableReason::IndexFailed(
+                    crate::query::IndexFailureClass::Io
+                )
             ))
         ),
         "a projection that could not be created refuses, it does not walk: {refused:?}"

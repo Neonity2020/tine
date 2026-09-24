@@ -272,7 +272,8 @@ impl Graph {
                 error @ (crate::query::QueryExecutionError::NotReady(_)
                 | crate::query::QueryExecutionError::Unavailable(
                     crate::query::QueryUnavailableReason::ProjectionUnavailable
-                    | crate::query::QueryUnavailableReason::ReadFailed,
+                    | crate::query::QueryUnavailableReason::ReadFailed
+                    | crate::query::QueryUnavailableReason::IndexFailed(_),
                 )),
             ) => self
                 .with_captured_pages(|pages| {

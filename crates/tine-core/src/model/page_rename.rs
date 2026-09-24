@@ -58,6 +58,7 @@ impl Graph {
         unsaved_paths: &[String],
     ) -> io::Result<RenameOutcome> {
         let write = self.admit_graph_text_writer()?;
+        self.list_pages_before_identity_lock();
         let _identity = self.lock_graph_text_identity_mutation()?;
         let old = old.trim();
         let new = new.trim();
@@ -805,6 +806,7 @@ impl Graph {
         expected_path: Option<&str>,
     ) -> io::Result<()> {
         let write = self.admit_graph_text_writer()?;
+        self.list_pages_before_identity_lock();
         let _identity = self.lock_graph_text_identity_mutation()?;
         self.block_external_scope_mutation(&write, name, kind, expected_path, "delete")?;
         let entries = self.configured_text_entries(&write, false)?;
@@ -883,6 +885,15 @@ impl Graph {
             ));
         }
         Ok(())
+    }
+
+    /// Wait for the page list before taking the identity lock, so that the
+    /// scope check under it ([`Self::block_external_scope_mutation`]) reads
+    /// the list memo instead of waiting for the index while every save and
+    /// page creation waits on the lock (GH #406, GH #594 L3). The check
+    /// itself still runs under the lock, on the list current there.
+    fn list_pages_before_identity_lock(&self) {
+        let _ = self.try_list_pages();
     }
 
     /// Validate the snapshot captured by a page menu/title before any mutation.
