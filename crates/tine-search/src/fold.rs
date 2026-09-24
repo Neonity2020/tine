@@ -633,7 +633,11 @@ mod tests {
             ("a\u{034f}b", "ab"),
         ];
         for (raw, plain) in same {
-            assert_eq!(fold_text(raw), fold_text(plain), "{raw:?} should find {plain:?}");
+            assert_eq!(
+                fold_text(raw),
+                fold_text(plain),
+                "{raw:?} should find {plain:?}"
+            );
         }
 
         let different = [
@@ -661,7 +665,11 @@ mod tests {
             ("ѐ", "е"),
         ];
         for (raw, plain) in different {
-            assert_ne!(fold_text(raw), fold_text(plain), "{raw:?} must not find {plain:?}");
+            assert_ne!(
+                fold_text(raw),
+                fold_text(plain),
+                "{raw:?} must not find {plain:?}"
+            );
             assert_eq!(fold(raw).text, fold_text(raw), "raw={raw:?}");
         }
     }

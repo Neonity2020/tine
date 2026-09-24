@@ -212,9 +212,12 @@ enum CheckOutcome {
 
 fn run_check(shared: &ProjectionShared) -> CheckOutcome {
     #[cfg(test)]
-    if let Some(pause) = shared.integrity_check_pause.lock().unwrap().take() {
-        pause.0.wait();
-        pause.1.wait();
+    {
+        let pause = shared.integrity_check_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.0.wait();
+            pause.1.wait();
+        }
     }
     let Ok(mut snapshot) = PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
     else {

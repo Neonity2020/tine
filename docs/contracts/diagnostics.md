@@ -124,7 +124,7 @@ type.
 
 `crates/tine-core/tests/content_out_of_logs.rs` walks production Rust library
 sources, excluding standalone CLI output and cfg(test) regions. Its exact
-allowlist currently contains 18 Rust production print sites, each with a class,
+allowlist currently contains 19 Rust production print sites, each with a class,
 reason, and gate. A deletion changes the census just as an addition does.
 
 `src/contentOutOfLogs.ratchet.test.ts` walks production TypeScript and TSX and
