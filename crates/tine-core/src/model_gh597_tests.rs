@@ -27,6 +27,10 @@ fn gh597_a_case_only_rename_outside_tine_leaves_one_page() {
         let _ = fs::remove_dir_all(&root);
         return;
     }
+    // Enough pages that the launch check repairs the rename in place: a
+    // change to a large share of the graph rebuilds the index whole, which
+    // would drop the old spelling's row on its own.
+    super::gh543_r10::r10_pages(&root, 40);
     fs::write(root.join("pages/Contents.md"), "- body\n").unwrap();
     fs::write(root.join("pages/other.md"), "- see [[contents]]\n").unwrap();
     let database = root.join("private/projection.sqlite");
