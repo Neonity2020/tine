@@ -270,14 +270,14 @@ impl Graph {
         // Which path answered, on the opt-in diagnostics channel: an answer
         // the pages served while the index could not is otherwise
         // indistinguishable from an indexed one (GH #543 Ctrl-K latency).
-        let served = |path: &'static str,
+        let served = |served_by: &'static str,
                       detail: &str,
                       answer: &Result<_, crate::query::QueryExecutionError>| {
             #[cfg(test)]
-            LAST_FRIENDLY_SERVED_BY.with(|last| last.set(Some(path)));
+            LAST_FRIENDLY_SERVED_BY.with(|last| last.set(Some(served_by)));
             crate::direct_projection::projection_diag(|| {
                 format!(
-                    "friendly search served_by={path}{detail} ok={} elapsed={}ms",
+                    "friendly search served_by={served_by}{detail} ok={} elapsed={}ms",
                     answer.is_ok(),
                     started.elapsed().as_millis()
                 )
