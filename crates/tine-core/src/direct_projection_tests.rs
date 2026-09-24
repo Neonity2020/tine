@@ -10574,3 +10574,62 @@ fn a_constraint_violation_reads_as_contradictory_rows() {
         IndexFailure::TurnFailed
     );
 }
+
+/// GH #597. On a case-insensitive filesystem (Windows, default macOS) `pages/Contents.md` resolves to the file `contents.md`.
+/// `load_named("Contents")` must hand out the file under its on-disk spelling:
+/// a path the editor boundary (`resolve_rel`) rejects cannot be activated, and
+/// publishing it creates a second page for the same file. Skips on a
+/// case-sensitive filesystem, where the alias spelling does not exist.
+#[test]
+fn gh597_a_case_variant_name_opens_the_file_under_its_disk_spelling() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh597-case-variant");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::write(
+        root.join("pages/contents.md"),
+        "alias:: Home, Content\nid:: 684ad818-ff8c-411c-befc-e3bac114c097\n\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pages/other.md"), "- see [[Contents]]\n").unwrap();
+    if std::fs::symlink_metadata(root.join("pages/Contents.md")).is_err() {
+        eprintln!("GH #597: case-sensitive filesystem, nothing to check");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    let database = scratch("gh597-case-variant-db").join("projection.sqlite");
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+
+    let page = graph
+        .load_named("Contents", PageKind::Page)
+        .unwrap()
+        .expect("the page exists");
+    assert_eq!(
+        page.path, "pages/contents.md",
+        "opened under an alias spelling"
+    );
+    assert!(
+        graph.resolve_rel(&page.path).is_some(),
+        "load_named handed out a path the editor boundary rejects"
+    );
+    graph
+        .activate_editor(
+            &page.path,
+            crate::ActivationIntent::Replace,
+            page.rev.as_deref(),
+        )
+        .expect("the page named with a case variant can be activated");
+    wait_ready(&graph);
+    let copies = graph
+        .list_pages()
+        .into_iter()
+        .filter(|entry| crate::refs::page_key(&entry.name) == "contents")
+        .count();
+    assert_eq!(
+        copies, 1,
+        "opening by a case variant published a second page"
+    );
+}
