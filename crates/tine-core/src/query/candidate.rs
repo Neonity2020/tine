@@ -4,6 +4,13 @@ use crate::query_plan::{QueryExpr, TextField, TextMatchMode};
 use crate::search_query::{AndGroup, Matcher};
 
 pub(crate) const INTERACTIVE_VERIFIED_WINDOW: usize = 300;
+/// Rows an interactive read visits when no trigram index can drive it (a
+/// needle under three characters). Such a scan walks blocks newest first until
+/// the verified window fills; a rare or absent pair never fills it, and at
+/// 616k blocks the walk took ~1.5 s per keystroke (GH #543 Ctrl-K). At the
+/// budget the read stops and reports more matches may exist. ~50 ms at that
+/// scale.
+pub(crate) const INTERACTIVE_SCAN_BUDGET: usize = 20_000;
 #[cfg(test)]
 pub(crate) const MEASUREMENT_WINDOW_ALTERNATIVES: [usize; 3] = [100, 300, 1_000];
 

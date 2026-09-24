@@ -442,3 +442,44 @@ fn gh594_a_block_is_found_by_its_id_in_the_session_and_after_a_reopen() {
     );
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
+
+/// GH #543 Ctrl-K: when the index cannot answer, the switcher is answered by
+/// a scan of the pages, which returns `Ok` like an indexed answer. The path
+/// that answered is recorded (and logged on the `--debug` channel), so a slow
+/// Ctrl-K can be told apart as index work or page-scan work.
+#[test]
+fn gh543_ctrl_k_records_which_path_answered() {
+    let search = |graph: &Graph| {
+        crate::model::search::LAST_FRIENDLY_SERVED_BY.with(|last| last.set(None));
+        let answer = graph
+            .run_graph_search_latest_displayed_for(
+                "quick-switch",
+                "TODO",
+                10,
+                10,
+                None,
+                false,
+                crate::query_plan::FriendlyDisplayOptions::default(),
+                crate::query_plan::FriendlyConsumer::CtrlK,
+            )
+            .expect("Ctrl-K answers");
+        assert!(!answer.hits.is_empty(), "the search finds the tasks");
+        crate::model::search::LAST_FRIENDLY_SERVED_BY.with(|last| last.get())
+    };
+    let root = r10_scratch("ctrlk-served-by");
+    r10_pages(&root, 4);
+    // The page scan reads the parsed-page cache only when one is installed.
+    let unindexed = Graph::open(&root);
+    unindexed.warm_cache();
+    assert_eq!(search(&unindexed), Some("pages"));
+    drop(unindexed);
+
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let owner = R10Owner::start(&graph);
+    r10_settle(&graph);
+    assert_eq!(search(&graph), Some("index"));
+    r10_finish(root, graph, owner);
+}

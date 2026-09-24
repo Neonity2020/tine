@@ -516,6 +516,17 @@ mod tests {
             .expect("plugins guide is bundled");
         assert!(plugins.markdown.contains("installed disabled"));
         assert!(plugins.markdown.contains("not Logseq or Obsidian plugins"));
+
+        // GH #543 Ctrl-K: results persist while typing, Enter waits for the
+        // fresh answer, and a short search says when older blocks may match.
+        let search = pages
+            .iter()
+            .find(|p| p.title == "Reference/Pages, links, references, and search")
+            .expect("search reference is bundled");
+        assert!(search.markdown.contains("**Enter** waits for them"));
+        assert!(search
+            .markdown
+            .contains("a third character searches them all"));
     }
 
     #[test]

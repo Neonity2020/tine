@@ -3,6 +3,13 @@
 
 use super::*;
 
+/// The path that answered this thread's last Friendly search (test only).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAST_FRIENDLY_SERVED_BY: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl Graph {
     /// Full-text search across all blocks.
     pub fn search(
@@ -236,6 +243,7 @@ impl Graph {
         if let Some(answer) = friendly_without_read(plan, explain, &lane) {
             return Ok(answer);
         }
+        let started = std::time::Instant::now();
         let answer = self.dispatch_direct_query(|request| {
             self.direct_projection_read_job(
                 request,
@@ -259,8 +267,28 @@ impl Graph {
         if lane.as_ref().is_some_and(|cancelled| cancelled()) {
             return Ok(friendly_without_read(plan, explain, &lane).unwrap());
         }
+        // Which path answered, on the opt-in diagnostics channel: an answer
+        // the pages served while the index could not is otherwise
+        // indistinguishable from an indexed one (GH #543 Ctrl-K latency).
+        let served = |path: &'static str,
+                      detail: &str,
+                      answer: &Result<_, crate::query::QueryExecutionError>| {
+            #[cfg(test)]
+            LAST_FRIENDLY_SERVED_BY.with(|last| last.set(Some(path)));
+            crate::direct_projection::projection_diag(|| {
+                format!(
+                    "friendly search served_by={path}{detail} ok={} elapsed={}ms",
+                    answer.is_ok(),
+                    started.elapsed().as_millis()
+                )
+            });
+        };
         match answer {
-            Ok(answer) => Ok(answer),
+            Ok(answer) => {
+                let answer = Ok(answer);
+                served("index", "", &answer);
+                answer
+            }
             Err(crate::query::QueryExecutionError::Cancelled) => {
                 Err(crate::query::QueryExecutionError::Cancelled)
             }
@@ -272,13 +300,21 @@ impl Graph {
                     | crate::query::QueryUnavailableReason::ReadFailed
                     | crate::query::QueryUnavailableReason::IndexFailed(_),
                 )),
-            ) => self
-                .with_captured_pages(|pages| {
-                    crate::query_plan::pre_ready_interactive_snapshot(plan, pages, explain, &|| {
-                        lane.as_ref().is_some_and(|cancelled| cancelled())
+            ) => {
+                let reason = format!(" because={error:?}");
+                let answer = self
+                    .with_captured_pages(|pages| {
+                        crate::query_plan::pre_ready_interactive_snapshot(
+                            plan,
+                            pages,
+                            explain,
+                            &|| lane.as_ref().is_some_and(|cancelled| cancelled()),
+                        )
                     })
-                })
-                .ok_or(error),
+                    .ok_or(error);
+                served("pages", &reason, &answer);
+                answer
+            }
             Err(error) => Err(error),
         }
     }

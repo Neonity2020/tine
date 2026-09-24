@@ -31,6 +31,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   "indexing…" instead of hiding, and reads that can fall back to the pages
   themselves, such as the page list, wait at most a minute for the index
   (GH #594).
+- **Ctrl+K** answers a one- or two-character search in a large graph in a
+  fraction of the time: such a search now reads only the most recent blocks
+  and says **More matches exist** when older ones may match too, where it
+  could take over a second on a 10,000-page graph. While you type, the
+  previous results stay on screen until the new ones arrive instead of
+  blanking on every key, and **Enter** waits for the new results. With
+  `--debug`, the log says whether each search was answered by the index or
+  by scanning pages, and how long it took (GH #543).
 - On a Mac, Tine now declares macOS 12.3 (Monterey) as its minimum, and the
   startup message for a too-old web engine no longer says to update Safari: on
   older macOS, updating the Safari app does not update the engine other apps

@@ -726,3 +726,57 @@ describe("QuickSwitcher search syntax help", () => {
     dispose();
   });
 });
+
+describe("QuickSwitcher while a newer search is running (GH #543)", () => {
+  const pageHit = (name: string) => ({
+    entity: "page" as const,
+    page: { name, kind: "page" as const, date_key: null, path: `pages/${name}.md` },
+    display_text: name,
+    evidence: [],
+    score: 100,
+    match_class: "prefix" as const,
+  });
+  const answer = (...names: string[]) => ({
+    hits: names.map(pageHit),
+    diagnostics: [],
+    explanation: { branches: [] },
+    cancelled: false,
+    has_more: { pages: false, blocks: false },
+  });
+
+  it("keeps the previous results on screen, and Enter chooses from the fresh answer", async () => {
+    let releaseSecond: (() => void) | undefined;
+    vi.spyOn(backend(), "runGraphSearch").mockImplementation(async (q: string) => {
+      if (q === "Alp") return answer("Alpine") as never;
+      await new Promise<void>((resolve) => { releaseSecond = resolve; });
+      return answer("Alpha") as never;
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    openSwitcher();
+    const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+    const type = (value: string) => {
+      input.value = value;
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    };
+    const rows = () => [...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')]
+      .map((row) => row.textContent ?? "");
+    try {
+      type("Alp");
+      await vi.waitFor(() => expect(rows().some((row) => row.includes("Alpine"))).toBe(true));
+
+      type("Alph");
+      await vi.waitFor(() => expect(releaseSecond).toBeDefined());
+      expect(rows().some((row) => row.includes("Alpine")), "the previous answer stays visible").toBe(true);
+
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      expect(route().kind, "Enter on a stale list waits").not.toBe("page");
+
+      releaseSecond!();
+      await vi.waitFor(() => expect(route()).toMatchObject({ kind: "page", name: "Alpha" }));
+    } finally {
+      dispose();
+    }
+  });
+});
