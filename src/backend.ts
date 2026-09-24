@@ -6,6 +6,7 @@ import { createSignal } from "solid-js";
 import type { DiscardReason } from "./safeClose";
 import { notifyGraphRebound } from "./modeHooks";
 import { listenHere } from "./windowEvents";
+import { describeSavePlatformStep, readSavePlatformStep, type SavePlatformStep } from "./savePlatformStep";
 import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
 import type { GraphSearchConsumer, GraphSearchDisplayOptions } from "./editor/queryIr";
 import type {
@@ -332,11 +333,21 @@ export class PublishedExportReadOnlyError extends BackendError {
 }
 
 export class DirectSaveFailureError extends BackendError {
-  constructor(readonly reasonCode: string, readonly ioErrorKind: string) {
-    super("direct-save-failure", `Direct Files could not save (reason code: ${reasonCode}).`);
+  constructor(
+    readonly reasonCode: string,
+    readonly ioErrorKind: string,
+    /** The failed platform call and its OS error number, when the backend
+     *  knows them (GH #538: `unknown` alone could not be acted on). */
+    readonly platformStep: SavePlatformStep | null = null,
+  ) {
+    super(
+      "direct-save-failure",
+      `Direct Files could not save (reason code: ${reasonCode}${describeSavePlatformStep(platformStep)}).`,
+    );
     this.name = "DirectSaveFailureError";
   }
 }
+
 
 /** A Direct Files revision conflict, classified once at the Tauri wire boundary.
  * Callers branch on this tag and never inspect arbitrary backend prose. */
@@ -422,7 +433,11 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
       const ioErrorKind = readIoErrorKind(payload.detail);
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         && ioErrorKind !== null
-        ? new DirectSaveFailureError(payload.reason_code, ioErrorKind)
+        ? new DirectSaveFailureError(
+          payload.reason_code,
+          ioErrorKind,
+          readSavePlatformStep(payload.detail),
+        )
         : null;
     }
     case "save-conflict": {

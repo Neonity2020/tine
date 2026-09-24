@@ -175,11 +175,22 @@ pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
     if super::is_projection_semantic_refusal(error) {
         return DirectSaveFailureCode::RefusedDataPreservation.as_str();
     }
-    error
+    let Some(typed) = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<DirectSaveError>())
-        .map(|typed| typed.code().as_str())
-        .unwrap_or(DirectSaveFailureCode::Unknown.as_str())
+    else {
+        return DirectSaveFailureCode::Unknown.as_str();
+    };
+    // The command boundary tags every error before classifying it
+    // (`DirectSaveError::ensure_io`), so a refusal arrives wrapped as
+    // `Unknown`. Classified as `unknown` it was retried and shown as
+    // `unknown`: the v0.6.985 GH #535/#546 fix never reached the app.
+    if typed.code() == DirectSaveFailureCode::Unknown
+        && super::is_projection_semantic_refusal(&typed.source)
+    {
+        return DirectSaveFailureCode::RefusedDataPreservation.as_str();
+    }
+    typed.code().as_str()
 }
 
 pub(super) fn graph_text_capture_limit_error(resource: &'static str) -> io::Error {

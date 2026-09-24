@@ -232,14 +232,65 @@ pub(crate) fn is_projection_semantic_refusal(error: &io::Error) -> bool {
 /// preserved, because callers above classify on it (`NotFound`/`AlreadyExists`
 /// are guarded-conflict signals) and the platform durability policy matches on
 /// it too. A semantic refusal is returned untouched so its marker type survives.
-fn projection_platform_error(operation: &str, location: &str, error: io::Error) -> io::Error {
+fn projection_platform_error(
+    operation: &'static str,
+    location: &str,
+    error: io::Error,
+) -> io::Error {
     if is_projection_semantic_refusal(&error) {
         return error;
     }
+    let os_error = error.raw_os_error();
     io::Error::new(
         error.kind(),
-        format!("{operation} failed at {location}: {error}"),
+        PlatformStepError {
+            operation,
+            os_error,
+            message: format!("{operation} failed at {location}: {error}"),
+        },
     )
+}
+
+/// A platform call on the save path that failed: which call, and the OS
+/// error number. The app shows both with a save failure (GH #538: a device
+/// whose storage refused `RENAME_NOREPLACE` reported only `unknown`). The
+/// location is kept out of them because it names a page.
+#[derive(Debug)]
+pub struct PlatformStepError {
+    pub operation: &'static str,
+    pub os_error: Option<i32>,
+    message: String,
+}
+
+impl std::fmt::Display for PlatformStepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PlatformStepError {}
+
+/// The OS error number behind a save error, looking through the
+/// [`DirectSaveError`] tag and a [`PlatformStepError`].
+pub fn save_os_error(error: &io::Error) -> Option<i32> {
+    if let Some(code) = error.raw_os_error() {
+        return Some(code);
+    }
+    let inner = error.get_ref()?;
+    if let Some(step) = inner.downcast_ref::<PlatformStepError>() {
+        return step.os_error;
+    }
+    save_os_error(&inner.downcast_ref::<DirectSaveError>()?.source)
+}
+
+/// The failed platform call behind a save error, looking through the
+/// [`DirectSaveError`] tag.
+pub fn platform_step(error: &io::Error) -> Option<&PlatformStepError> {
+    let inner = error.get_ref()?;
+    if let Some(step) = inner.downcast_ref::<PlatformStepError>() {
+        return Some(step);
+    }
+    platform_step(&inner.downcast_ref::<DirectSaveError>()?.source)
 }
 
 /// One lexical/scope validation result shared by exact points and feed events.

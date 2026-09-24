@@ -1,3 +1,5 @@
+import { describeSavePlatformStep, readSavePlatformStep } from "./savePlatformStep";
+
 /**
  * Reduce a native failure to one bounded, shareable line.
  *
@@ -41,6 +43,7 @@ function taggedBackendErrorDetail(firstLine: string): string | null {
     if (typeof scenario === "string" && TAGGED_SCENARIO.test(scenario)) {
       rendered = `${rendered} (${scenario})`;
     }
+    rendered += describeSavePlatformStep(readSavePlatformStep(detail));
   }
   return rendered;
 }

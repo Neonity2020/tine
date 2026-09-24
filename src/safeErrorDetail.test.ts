@@ -8,6 +8,16 @@ describe("safe error detail", () => {
     ).toBe("clean-open failure: clean_open.io");
   });
 
+  it("keeps the failed platform call and OS error of a save failure (GH #538)", () => {
+    expect(
+      safeErrorDetail(JSON.stringify({
+        kind: "direct-save-failure",
+        reason_code: "unknown",
+        detail: { os_error: 22, operation: "renameat2(RENAME_NOREPLACE) publishing the projection" },
+      })),
+    ).toBe("direct-save-failure failure: unknown; renameat2(RENAME_NOREPLACE) publishing the projection, os error 22");
+  });
+
   it("keeps the refusal scenario when the envelope carries one", () => {
     expect(
       safeErrorDetail(

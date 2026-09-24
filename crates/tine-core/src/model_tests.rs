@@ -216,6 +216,29 @@ fn a_caller_holding_the_current_reference_set_is_not_sent_it_again() {
     );
 }
 
+/// The digest reaches the frontend as a JSON number and comes back as the
+/// `known` digest. A JavaScript number is a double: the test above handed the
+/// exact `u64` back and so never saw that a full-width digest returns rounded,
+/// never matches, and every save was sent the whole set (GH #543).
+#[test]
+fn the_reference_digest_survives_a_javascript_round_trip() {
+    for size in [1usize, 2, 10, 500, 10_000] {
+        let names = (0..size)
+            .map(|index| format!("Page {index}"))
+            .collect::<Vec<_>>();
+        let digest = referenced_names_digest(&names);
+        let wire = serde_json::to_value(ReferencedPageNames::answer(digest, &names, None)).unwrap();
+        // `JSON.parse` yields a double; `JSON.stringify` writes it back.
+        let in_javascript = wire["digest"].as_f64().unwrap();
+        let known = serde_json::from_str::<u64>(&format!("{in_javascript:.0}")).unwrap();
+        assert_eq!(
+            ReferencedPageNames::answer(digest, &names, Some(known)).names,
+            None,
+            "a frontend holding the {size}-name set must be told it is unchanged"
+        );
+    }
+}
+
 #[test]
 fn page_name_encoding_round_trips_both_formats() {
     // Legacy: `/` ↔ `%2F`; a literal `___` is NOT a separator (stays put).
@@ -15642,3 +15665,31 @@ mod launch_serve;
 
 #[path = "model_gh594_liveness_tests.rs"]
 mod gh594_liveness;
+
+/// GH #538: the failed call and the OS error number survive the save path's
+/// tagging, so the app can show them instead of a bare `unknown`.
+#[test]
+fn a_platform_failure_keeps_its_call_and_os_error_through_the_save_tag() {
+    let error = super::projection_platform_error(
+        "renameat2(RENAME_NOREPLACE) publishing the projection",
+        "\"Private Page.md\" -> \".Private Page.md.1.editor-recovery\"",
+        std::io::Error::from_raw_os_error(22),
+    );
+    let tagged = DirectSaveError::ensure_io(error);
+    let step = super::platform_step(&tagged).expect("the platform step survives tagging");
+    assert_eq!(step.os_error, Some(22));
+    assert_eq!(
+        step.operation,
+        "renameat2(RENAME_NOREPLACE) publishing the projection"
+    );
+    assert!(!step.operation.contains("Private Page"));
+    assert_eq!(super::save_os_error(&tagged), Some(22));
+    assert_eq!(
+        super::save_os_error(&DirectSaveError::ensure_io(
+            std::io::Error::from_raw_os_error(5)
+        )),
+        Some(5),
+        "a bare OS error keeps its number through the tag too"
+    );
+    assert_eq!(direct_save_failure_code(&tagged), "unknown");
+}

@@ -51,6 +51,32 @@ describe("native call error funnel", () => {
     expect(classifyNativeCallError("conflict:7 suffix")).toBe("conflict:7 suffix");
   });
 
+  it("names the failed platform call and OS error in the save-failure message (GH #538)", () => {
+    const failure = classifyNativeCallError(JSON.stringify({
+      kind: "direct-save-failure",
+      reason_code: "unknown",
+      detail: {
+        io_error_kind: "InvalidInput",
+        os_error: 22,
+        operation: "renameat2(RENAME_NOREPLACE) publishing the projection",
+      },
+    }));
+    expect(failure).toBeInstanceOf(DirectSaveFailureError);
+    expect((failure as DirectSaveFailureError).message).toBe(
+      "Direct Files could not save (reason code: unknown; "
+        + "renameat2(RENAME_NOREPLACE) publishing the projection, os error 22).",
+    );
+    // An operation outside the backend's fixed vocabulary is dropped, never shown.
+    const smuggled = classifyNativeCallError(JSON.stringify({
+      kind: "direct-save-failure",
+      reason_code: "unknown",
+      detail: { io_error_kind: "InvalidInput", os_error: 5, operation: "open /home/me/pages/Secret.md" },
+    }));
+    expect((smuggled as DirectSaveFailureError).message).toBe(
+      "Direct Files could not save (reason code: unknown; os error 5).",
+    );
+  });
+
   it("routes a page-title collision by the producer code rather than conflict prose", () => {
     const failure = classifyNativeCallError(JSON.stringify({
       kind: "direct-save-failure",
