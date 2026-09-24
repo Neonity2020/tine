@@ -155,6 +155,18 @@ impl Graph {
             }
         }
         drop(permit);
+        // GH #597: on a case- (or normalization-) insensitive filesystem the
+        // probe above also answers for a file spelled differently on disk
+        // (`Contents.md` finds `contents.md`). Only the on-disk spelling is the
+        // page's file; handing out another one publishes a second page for the
+        // same file and gives the editor a path `resolve_rel` refuses. Fall back
+        // to the page list, which resolves the name case-insensitively.
+        if found
+            .as_deref()
+            .is_some_and(|path| path_uses_graph_text_alias(&self.root, path))
+        {
+            return Ok(None);
+        }
         let Some(entry) = found.and_then(|path| self.entry_for_path(&path)) else {
             return Ok(None);
         };
@@ -198,6 +210,13 @@ impl Graph {
             }
         }
         drop(permit);
+        // GH #597: the same alias rule as `load_page_by_file_name`.
+        if found
+            .as_deref()
+            .is_some_and(|path| path_uses_graph_text_alias(&self.root, path))
+        {
+            return Ok(None);
+        }
         let Some(entry) = found.and_then(|path| self.entry_for_path(&path)) else {
             return Ok(None);
         };

@@ -47,7 +47,10 @@ impl Graph {
                 }
             }
         }
-        if self.entry_for_path(path).is_none() {
+        // GH #597: a spelling that reaches the file only because the
+        // filesystem ignores case is not that file's page; the file's own
+        // spelling is.
+        if self.entry_for_path(path).is_none() || path_uses_graph_text_alias(&self.root, path) {
             return Ok(None);
         }
         // This checked watcher entrypoint is itself an exact external

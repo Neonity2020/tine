@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows and macOS, a page whose name differs from its file name only in
+  case (for example **Contents** stored as `contents.md`) opens and can be
+  edited again. It failed with "could not be activated for editing" when
+  opened as the home page, from search or from the sidebar, and it could
+  appear twice in search. A file renamed by case only outside Tine, for
+  example by another device, is now listed once under its new name
+  (GH #597).
+
 ## [0.6.985] - 2026-09-24
 
 ### Changed
