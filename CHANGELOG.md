@@ -50,8 +50,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   edited again. It failed with "could not be activated for editing" when
   opened as the home page, from search or from the sidebar, and it could
   appear twice in search. A file renamed by case only outside Tine, for
-  example by another device, is now listed once under its new name
-  (GH #597).
+  example by another device, is now listed once under its new name, and a
+  tab or Recent entry saved under the old spelling opens again (GH #597).
 
 ## [0.6.985] - 2026-09-24
 
