@@ -623,9 +623,13 @@ impl Graph {
     /// is unreachable by name -- gets opened and edited (#21). The cache is
     /// keyed by path, so the stray's own slot is what it reads and publishes.
     /// Returns `Ok(None)` if the path is invalid (see [`resolve_rel`]) or the
-    /// file is gone.
+    /// file is gone. A path spelled in another case than its file on disk
+    /// opens that file (GH #597); the returned `path` is the disk spelling.
     pub fn load_by_path(&self, rel: &str) -> io::Result<Option<PageDto>> {
-        let Some(abs) = self.resolve_rel(rel) else {
+        let Some(abs) = self
+            .resolve_rel(rel)
+            .or_else(|| self.resolve_rel_disk_spelling(rel))
+        else {
             return Ok(None);
         };
         if self.entry_for_path(&abs).is_none() {
