@@ -5839,6 +5839,7 @@ fn empty_projection_shared() -> ProjectionShared {
         lease_contended: AtomicBool::new(false),
         fallback_reads: AtomicU64::new(0),
         referenced_name_reads: AtomicU64::new(0),
+        checkpoint_passes: AtomicU64::new(0),
     }
 }
 
@@ -11078,6 +11079,80 @@ fn gh543_a_rename_turn_commits_its_batches_together() {
         .unwrap();
     assert!(after > 0, "the committed turn publishes the renamed name");
     drop(reader);
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A reader on the WAL when the background checkpoint finishes keeps it from
+/// being emptied. Nothing else checkpoints until the next turn, so a session
+/// that ended there left the copied frames for the next open to copy again:
+/// 13-23 s on every reopen on a hosted Windows disk, with new read
+/// connections stalled behind it (GH #543). The checkpoint retries once the
+/// reader is gone, with no further edit.
+#[test]
+fn gh543_a_copied_wal_is_emptied_after_its_reader_finishes() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-wal-emptied");
+    let database = root.join("private/projection.sqlite");
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+    let wal =
+        || std::fs::metadata(format!("{}-wal", database.display())).map_or(0, |wal| wal.len());
+    struct Threshold;
+    impl Drop for Threshold {
+        fn drop(&mut self) {
+            super::checkpoint::CHECKPOINT_WAL_BYTES_TEST.store(0, Ordering::Release);
+        }
+    }
+    let _threshold = Threshold;
+    super::checkpoint::CHECKPOINT_WAL_BYTES_TEST.store(1, Ordering::Release);
+
+    let reader = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM pages", [], |row| row.get(0))
+        .unwrap();
+    let passes = projection.shared.checkpoint_passes.load(Ordering::Acquire);
+    let entry = graph
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.name == "one")
+        .unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    wait_ready(&graph);
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "TODO one edited [[target]]".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    wait_ready(&graph);
+    let started = Instant::now();
+    while projection.shared.checkpoint_passes.load(Ordering::Acquire) == passes {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the edit's turn ran no background checkpoint"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(wal() > 0, "the open reader must keep the copied WAL");
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+
+    let started = Instant::now();
+    while wal() > 0 && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        wal(),
+        0,
+        "with no further edit, the copied WAL must be emptied once the reader \
+         is gone, or the next open copies it again"
+    );
     assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
     std::fs::remove_dir_all(root).unwrap();
 }

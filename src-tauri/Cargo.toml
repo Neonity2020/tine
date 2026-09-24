@@ -49,7 +49,7 @@ libc = "0.2"
 dirs = "6"
 fs2 = "0.4"
 tine-core = { path = "../crates/tine-core" }
-tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.28.1" }
+tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.28.2" }
 
 [dev-dependencies]
 clap_mangen = "0.2"

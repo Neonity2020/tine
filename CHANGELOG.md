@@ -23,7 +23,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   onto a background thread. On a 10,000-page graph a rename now writes about
   a third as much (603 to 200 MB) and finishes in half the time; on Windows,
   where each of those copies flushed the disk, a rename took about a minute
-  (GH #543). Internal: tine-storage v0.28.1.
+  (GH #543). Once copied, the log is emptied, so the next launch does not
+  copy it again. Internal: tine-storage v0.28.2.
 - Typing in a block no longer resends the list of every linked page name to
   the editor after each save when no link changed: a precision loss in the
   check made it resend all of it, 307 KB on a 10,000-page graph (GH #543).

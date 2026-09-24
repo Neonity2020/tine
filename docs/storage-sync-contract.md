@@ -387,9 +387,16 @@ bytes itself. The unpublished connection alone uses journal and synchronous
 mode OFF; the serving writer is reopened WAL/NORMAL with the resting page-cache
 budget, temporary files in memory, and SQLite's inline autocheckpoint off (the
 WAL is capped at 64 MB when it resets). After a turn commits, if the WAL has
-reached 4 MB, a background thread runs one `PRAGMA wal_checkpoint(PASSIVE)` on a
-connection of its own; a drain waits for that thread before a replacement image
-is published. No checkpoint or fsync of the image runs inside a turn (GH #543).
+reached 4 MB, a background thread runs `PRAGMA wal_checkpoint(PASSIVE)` on a
+connection of its own; when every frame is copied, the same connection empties
+the WAL with a non-waiting `wal_checkpoint(TRUNCATE)`. A reader or writer on the
+WAL makes that a no-op, and the thread retries every 250 ms, up to 20 times,
+without counting as running between attempts. A copied WAL left behind at exit
+would otherwise be copied again by the next open, since only the shared-memory
+index records what was copied (13-23 s per reopen on a hosted Windows disk). A
+drain waits for a running checkpoint before a replacement image is published,
+and a retry never resumes once a fresh build is running. No checkpoint or fsync
+of the image runs inside a turn (GH #543).
 
 The bounded batches stream through one storage-owned fresh-build transaction.
 Its ordinary secondary indexes are absent for every base chunk; the fresh-only

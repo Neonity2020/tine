@@ -1463,7 +1463,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.28.1\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.28.2\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1663,6 +1663,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // files in memory and disables inline autocheckpoints, and a background
     // thread runs `checkpoint_passive_at` on its own connection. Same writes
     // and schema; fewer transactions and no fsync inside a turn.
+    // 2026-09-25: GH #543 reopen regression pins tine-storage v0.28.2:
+    // `checkpoint_passive_at` also empties a fully copied WAL when nothing
+    // holds it, and the background checkpoint retries that briefly. No import
+    // or call-surface change.
     let digest = inventory_digest(&dependency_surface);
     assert_eq!(
         digest,

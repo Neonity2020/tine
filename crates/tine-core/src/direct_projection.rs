@@ -547,6 +547,9 @@ struct ProjectionShared {
     fallback_reads: AtomicU64,
     #[cfg(test)]
     referenced_name_reads: AtomicU64,
+    /// Background checkpoint passes run, retries included.
+    #[cfg(test)]
+    pub(super) checkpoint_passes: AtomicU64,
 }
 
 impl ProjectionShared {
@@ -1155,6 +1158,8 @@ impl DirectProjection {
             fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
             referenced_name_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            checkpoint_passes: AtomicU64::new(0),
         });
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
