@@ -17,6 +17,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   fold as before (`cafe` finds `café`, `γεια` finds `γειά`), `елка` finds
   `ёлка`, and `lodz` now finds `Łódź` (likewise ø, đ, ħ, ŧ). The first launch
   after this update re-indexes the graph once.
+- Reopening a graph no longer makes Ctrl+K, Linked and Unlinked References,
+  query blocks, the page list and block reference counts wait while Tine
+  compares the graph on disk with its search index. Until that comparison
+  finishes they answer from the index as you left it, and they update by
+  themselves when it finishes, so a page edited in another app while Tine was
+  closed shows up then. Edits you make meanwhile show up at once. Actions
+  that depend on the answer, such as creating, renaming or deleting a page,
+  inserting a template or exporting, still wait for the comparison (GH #550).
 - Reopening a graph no longer waits for a full check of the search index
   before Ctrl+K, references and queries answer: that check took over a second
   on a 10,000-page graph at every launch. The index is now checked in the

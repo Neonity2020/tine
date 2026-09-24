@@ -111,6 +111,48 @@ background, on its own read-only connection, and only when it is owed
 - **Damage found:** reported as `index.failure` with class `corrupt` and
   attempt 0, and the index is rebuilt, as for damage a read meets.
 
+## L8 · Launch: stored answers
+
+A reopen does not make display surfaces wait for the launch check (the survey
+that compares the graph on disk with the stored index; up to seconds on a 10k
+page graph, longer on Android). While it runs, the index answers display reads
+from the image the last session left (design note
+`2026-09-24-launch-serve-stored-design`, approved by Martin 2026-09-24).
+
+- **Currency.** Every index read names a `Currency`: `Current` (ready at the
+  exact generation, as before) or `LaunchStored` (`Current`, or the stored
+  image while `serving_stored`). A read inside `Graph::display_read` is
+  `LaunchStored`; every other read is `Current` (`Graph::read_currency`).
+  Query snapshots (Gate Q), the reference-panel readiness check and every
+  reader wait take the reader's currency.
+- **Served when** (`direct_projection_owner.rs::serving_stored`, under the
+  `pending` lock): the image was opened under this facts version and parse
+  configuration, it is not yet validated, no fresh build is owed or running,
+  the worker is up and not failed, and no edit of this session is waiting to be
+  applied. The last clause is read-your-writes: an edit made during the check
+  is applied to the image before it serves again. A configuration or facts
+  version changed while closed serves nothing until the fresh build.
+- **Acting reads stay current.** A display read that acts on its answer runs
+  its index read through `Graph::exact_read` and waits for the check:
+
+  | Read | Why it must be current |
+  | --- | --- |
+  | `try_list_pages` | decides a rename/delete refusal |
+  | `templates` | inserts the template's text into a page |
+  | `indexed_creation_evidence` | decides whether a page name already exists |
+
+  Queries outside a display read (export, plugins) are `Current` too.
+- **Never memoized.** An answer served from the stored image marks its thread
+  (`Graph::note_stored_served`); `answer_is_complete` is then false and no memo
+  keeps it, so nothing outlives the check.
+- **Asked at open, corrected when the check lands.** No frontend read waits
+  for `warm-cache-done` before asking; the backend decides whether to serve or
+  wait. On `warm-cache-done`, `correctLaunchAnswers` (`src/ui.ts`, wired in
+  `src/App.tsx`) re-asks Ctrl-K, the reference panels, query blocks, the page
+  list, the navigation index (aliases, page identities), referenced names and
+  block-ref counts, so an edit made while Tine was closed appears as soon as
+  the check applies it.
+
 ## L6 · Liveness is tested
 
 `model_gh594_liveness_tests.rs` pins: a build that always fails ends Failed
@@ -119,3 +161,7 @@ builds it; a derived read answers within its patience while announced work
 never arrives; a reference panel asked while indexing is told at once; a
 candidate page that is unparseable or deleted outside Tine parses no other
 page (`gh594_an_unhydratable_candidate_does_not_parse_the_graph`).
+`model_launch_serve_tests.rs` pins L8: a clean reopen answers display reads
+during the check with no parse, acting reads wait, an edit made while closed
+is corrected when the check lands, an edit during the check is read back, and
+a changed configuration serves nothing stored.

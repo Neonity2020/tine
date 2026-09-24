@@ -662,15 +662,28 @@ mod tests {
             .iter()
             .find(|template| template.markdown.contains("Search ignores accent marks"))
             .expect("the search Guide page is registered");
-        for (query, text) in [("cafe", "café"), ("lodz", "Łódź"), ("Tine", "Ｔｉｎｅ"), ("елка", "ёлка")] {
+        for (query, text) in [
+            ("cafe", "café"),
+            ("lodz", "Łódź"),
+            ("Tine", "Ｔｉｎｅ"),
+            ("елка", "ёлка"),
+        ] {
             assert!(page.markdown.contains(&format!("`{query}` finds `{text}`")));
-            assert_eq!(canonical_fold(query), canonical_fold(text), "{query} finds {text}");
+            assert_eq!(
+                canonical_fold(query),
+                canonical_fold(text),
+                "{query} finds {text}"
+            );
         }
         for (query, text) in [("か", "が"), ("и", "й"), ("क", "कु")] {
             assert!(page
                 .markdown
                 .contains(&format!("`{query}` does not find `{text}`")));
-            assert_ne!(canonical_fold(query), canonical_fold(text), "{query} must not find {text}");
+            assert_ne!(
+                canonical_fold(query),
+                canonical_fold(text),
+                "{query} must not find {text}"
+            );
         }
     }
 
@@ -1957,6 +1970,8 @@ mod tests {
             "one complete snapshot",
             "document order",
             "never show a partly built index",
+            "index it kept from last time",
+            "update by themselves when the comparison finishes",
             "block picker",
             "structured queries keep waiting",
             "says it is searching",

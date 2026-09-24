@@ -299,7 +299,7 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        let mut job = match projection.open_current_query_job(registry_sensitivity) {
+        let mut job = match self.open_query_job_at(projection, registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -675,6 +675,24 @@ impl Graph {
         })
     }
 
+    /// Open a query job at this thread's currency ([`Graph::read_currency`]),
+    /// recording a job taken before the launch check validated the image.
+    fn open_query_job_at(
+        &self,
+        projection: &Arc<crate::direct_projection::DirectProjection>,
+        registry_sensitivity: crate::direct_projection::RegistrySensitivity,
+    ) -> crate::direct_projection::QueryJobOpen {
+        let currency = Self::read_currency();
+        // Asked before the capture: validation during it leaves the mark on.
+        let stored =
+            currency == crate::direct_projection::Currency::LaunchStored && !projection.validated();
+        let job = projection.open_current_query_job(registry_sensitivity, currency);
+        if stored && matches!(job, crate::direct_projection::QueryJobOpen::Job(_)) {
+            Self::note_stored_served();
+        }
+        job
+    }
+
     /// Own admission and one current read job; callers supply only their reads.
     pub(super) fn direct_projection_read_job<T>(
         &self,
@@ -689,7 +707,7 @@ impl Graph {
                 crate::query::QueryUnavailableReason::ProjectionUnavailable,
             );
         };
-        let mut job = match projection.open_current_query_job(registry_sensitivity) {
+        let mut job = match self.open_query_job_at(projection, registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -962,7 +980,7 @@ impl Graph {
     /// answered from a parsed cache that lacks an unreadable page's stored
     /// references (audit R15-07).
     pub(super) fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
-        self.indexed_read(|projection, generation| projection.referenced_page_names(generation))
+        self.indexed_read(|projection, at| projection.referenced_page_names(at))
     }
 
     /// Load exactly the named pages from the parsed cache, in the order asked
@@ -1237,12 +1255,12 @@ impl Graph {
     pub(super) fn direct_projection_page_aliases_with_owners(
         &self,
     ) -> Option<Vec<(String, String, String)>> {
-        self.indexed_read(|projection, generation| projection.page_aliases_with_owners(generation))
+        self.indexed_read(|projection, at| projection.page_aliases_with_owners(at))
     }
 
     pub(super) fn direct_projection_real_page_names(&self) -> Option<crate::query::RealPageNames> {
-        self.indexed_read(|projection, generation| {
-            let mut names = projection.real_page_names(generation)?;
+        self.indexed_read(|projection, at| {
+            let mut names = projection.real_page_names(at)?;
             for (path, _) in names.values_mut() {
                 *path = self.root.join(&*path);
             }
@@ -1263,48 +1281,51 @@ impl Graph {
         Option<std::collections::HashSet<PathBuf>>,
     )> {
         let read = |projection: &Arc<crate::direct_projection::DirectProjection>,
-                    generation: u64| {
+                    at: crate::direct_projection::ReadAt| {
             let candidates = projection.reference_candidates(
-                generation,
+                at,
                 names_norm,
                 self_page,
                 kind,
                 mode,
                 &self.config(),
             )?;
-            let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
+            let pages = self.direct_projection_pages_for_paths(at.generation, candidates.paths)?;
             Some((pages, candidates.blocks, candidates.page_owners))
         };
         match wait {
             IndexWait::WhileComing => self.indexed_read(read),
             IndexWait::Bounded => {
-                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                let at = crate::direct_projection::ReadAt {
+                    generation: self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                    currency: Self::read_currency(),
+                };
                 let projection = self.direct_projection.get()?;
-                if !projection.wait_for_reference_generation(generation) {
+                if !projection.wait_for_reference_generation(at) {
                     return None;
                 }
-                read(&projection, generation)
+                read(&projection, at)
             }
         }
     }
 
     pub(super) fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
-        self.indexed_read(|projection, generation| projection.block_page_hint(generation, uuid))
+        self.indexed_read(|projection, at| projection.block_page_hint(at, uuid))
     }
 
     pub(super) fn direct_projection_block_ref_counts(
         &self,
     ) -> Option<std::collections::HashMap<String, usize>> {
-        self.indexed_read(|projection, generation| projection.block_ref_counts(generation))
+        self.indexed_read(|projection, at| projection.block_ref_counts(at))
     }
 
     pub(crate) fn direct_projection_block_referrer_candidate_pages(
         &self,
         uuid: &str,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        self.indexed_read(|projection, generation| {
-            let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
-            self.direct_projection_pages_for_paths(generation, paths)
+        self.indexed_read(|projection, at| {
+            let paths = projection.block_referrer_candidate_paths(at, uuid)?;
+            self.direct_projection_pages_for_paths(at.generation, paths)
         })
     }
 

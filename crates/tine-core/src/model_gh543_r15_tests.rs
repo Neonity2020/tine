@@ -639,8 +639,10 @@ fn index_answers_are_asked_at_a_waited_generation() {
             .unwrap_or(lines.len());
         lines[start..end].join(" ")
     }
-    let takes_generation =
-        |sig: &str| sig.contains("generation: u64") && sig.contains("-> Option<");
+    // Launch design D3: the answers take the generation inside a `ReadAt`.
+    let takes_generation = |sig: &str| {
+        (sig.contains("generation: u64") || sig.contains("ReadAt")) && sig.contains("-> Option<")
+    };
 
     let mut files = Vec::new();
     sources(
@@ -662,7 +664,8 @@ fn index_answers_are_asked_at_a_waited_generation() {
             let sig = signature(lines, at);
             if takes_generation(&sig)
                 && (sig.contains("(&self, generation: u64")
-                    || sig.contains("(&self, cache_generation: u64"))
+                    || sig.contains("(&self, cache_generation: u64")
+                    || sig.contains("(&self, at: ReadAt"))
             {
                 answers.insert(name);
             }

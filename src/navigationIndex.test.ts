@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { __setBackendForTest } from "./backend";
 import { mockBackend } from "./mock";
-import { loadNavigationIndexAfterWarm, refreshAliases } from "./graph";
+import { loadNavigationIndex, refreshAliases } from "./graph";
 import { aliasMap, bumpGraphEpoch, resolveAlias } from "./ui";
 
 function deferred<T>() {
@@ -32,7 +32,7 @@ describe("navigation index", () => {
     // the index at this epoch...
     await refreshAliases();
     // ...so the warm's own load must not list every page a second time.
-    await loadNavigationIndexAfterWarm();
+    await loadNavigationIndex();
     expect(list).toHaveBeenCalledTimes(1);
     expect(resolveAlias("alpha")).toBe("Alpha");
   });
@@ -45,7 +45,7 @@ describe("navigation index", () => {
       .mockResolvedValue(PAGES as never);
     __setBackendForTest(api);
     bumpGraphEpoch();
-    await loadNavigationIndexAfterWarm();
+    await loadNavigationIndex();
     // The next ordinary save refresh completes the missing half.
     await refreshAliases();
     expect(list).toHaveBeenCalledTimes(2);
@@ -64,7 +64,7 @@ describe("navigation index", () => {
       .mockResolvedValue(PAGES as never);
     __setBackendForTest(api);
     bumpGraphEpoch();
-    const load = loadNavigationIndexAfterWarm();
+    const load = loadNavigationIndex();
     bumpGraphEpoch(); // a typography change repaints mid-pass
     aliases.resolve([["Alpha", "Beta"]]);
     pages.resolve(PAGES);

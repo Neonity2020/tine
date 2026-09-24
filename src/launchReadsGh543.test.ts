@@ -10,10 +10,9 @@ import { mockBackend } from "./mock";
 import { bumpDataRev, bumpGraphEpoch } from "./ui";
 import type { WarmCacheWaitDeps } from "./warmCache";
 
-// One shared warm gate: every waitForWarmCache resolves when the (single)
-// warm-cache-done arrives — exactly what the real event does to every waiter.
-let releaseWarm: () => void = () => {};
-let warm = new Promise<boolean>((r) => { releaseWarm = () => r(true); });
+// One shared warm gate for every waitForWarmCache: pending until a test says
+// the launch check has landed, as the single warm-cache-done does.
+let warm: Promise<boolean> = new Promise<boolean>(() => {});
 vi.mock("./warmCache", async (orig) => {
   const actual = await orig<typeof import("./warmCache")>();
   return {
@@ -28,21 +27,29 @@ const settle = async (n = 20) => { for (let i = 0; i < n; i++) await new Promise
 afterEach(() => vi.restoreAllMocks());
 
 describe("GH #543 launch-pass reads", () => {
-  // R10-09: every dataRev bump during the launch pass leaves one pending
-  // blockRefCounts fetch waiting on warm-cache-done. The resource checks only
-  // the EPOCH after the wait (blockRefCounts.ts:17-18), so when the warm
-  // finishes every stale waiter issues its own whole-graph block_ref_counts.
-  it("issues one block_ref_counts after the warm, not one per save made during the pass", async () => {
-    warm = new Promise<boolean>((r) => { releaseWarm = () => r(true); });
-    const counts = vi.spyOn(backend(), "getBlockRefCounts").mockResolvedValue({});
+  // R10-09 / R11-09: saves made while a counts read is still out (the index
+  // is being built and the backend waits) must not leave one more read each.
+  // The read is asked at open, with no wait for the launch check: during the
+  // check the backend answers from the stored index (GH #550, launch design
+  // D4). A burst of saves costs the read in flight plus one for the newest
+  // revision.
+  it("keeps one block_ref_counts in flight and one more for a burst of saves", async () => {
+    let answer: () => void = () => {};
+    const counts = vi.spyOn(backend(), "getBlockRefCounts").mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({}); }),
+    );
     bumpGraphEpoch(); // graph open
     await import("./blockRefCounts");
     await settle();
-    for (let i = 0; i < 8; i++) { bumpDataRev(); await settle(2); } // saves during the pass
-    expect(counts).toHaveBeenCalledTimes(0);
-    releaseWarm();
-    await settle();
+    expect(counts).toHaveBeenCalledTimes(1); // asked at open, not after the check
+    for (let i = 0; i < 8; i++) { bumpDataRev(); await settle(2); } // saves while it is out
     expect(counts).toHaveBeenCalledTimes(1);
+    answer();
+    await settle();
+    expect(counts).toHaveBeenCalledTimes(2);
+    answer();
+    await settle();
+    expect(counts).toHaveBeenCalledTimes(2);
   });
 
   // R10-09: page_aliases is requested on EVERY dataRev (App.tsx:1387) with no
@@ -83,10 +90,10 @@ describe("GH #543 launch-pass reads", () => {
     const aliases = vi.spyOn(api, "pageAliases").mockResolvedValue([["Gamma", "Beta"]] as never);
     const list = vi.spyOn(api, "listPages").mockResolvedValue(PAGES as never);
     __setBackendForTest(api);
-    const { applyGraphReopened, loadNavigationIndexAfterWarm } = await import("./graph");
+    const { applyGraphReopened, loadNavigationIndex } = await import("./graph");
     const { resolveAlias } = await import("./ui");
     bumpGraphEpoch();
-    await loadNavigationIndexAfterWarm();
+    await loadNavigationIndex();
     expect(resolveAlias("gamma")).toBe("Beta");
     // `:hidden ["hidden"]` lands; the reopened Graph no longer has Beta.
     aliases.mockResolvedValue([] as never);
@@ -110,5 +117,20 @@ describe("GH #543 launch-pass reads", () => {
     });
     const callers = walk("src").filter((path) => /\.listPages\(\)/.test(readFileSync(path, "utf8")));
     expect(callers, "list pages through listGraphPages (src/pageList.ts), GH #543 R10-10").toEqual([join("src", "pageList.ts")]);
+  });
+
+  // Launch design D4 (GH #550): answers shown during the launch check may come
+  // from the index as the last session left it, so the check's completion
+  // event must reach `correctLaunchAnswers`, which re-asks every surface. The
+  // surfaces' own re-ask is tested in LinkedReferences.test.tsx and
+  // QuickSwitcher.test.tsx; this pins that the app wires the event to it.
+  it("corrects launch answers when the launch check lands", async () => {
+    const app = readFileSync(join("src", "App.tsx"), "utf8");
+    expect(app, "App.tsx must call correctLaunchAnswers on warm-cache-done (launch design D4)")
+      .toContain('listenHere("warm-cache-done", () => correctLaunchAnswers())');
+    const ui = await import("./ui");
+    const before = [ui.indexCorrectionRev(), ui.pageInventoryRev(), ui.dataRev()];
+    ui.correctLaunchAnswers();
+    expect([ui.indexCorrectionRev(), ui.pageInventoryRev(), ui.dataRev()]).toEqual(before.map((n) => n + 1));
   });
 });

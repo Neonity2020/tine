@@ -212,7 +212,7 @@ pub(crate) fn repair_is_proportionate(changed: usize, total: usize) -> bool {
 }
 
 enum QueryCaptureRequirement {
-    CurrentSnapshot,
+    CurrentSnapshot(Currency),
     #[cfg(test)]
     StrictGeneration(u64),
 }
@@ -285,6 +285,10 @@ struct PendingProjection {
     /// The worker has opened (or found no) stored image. Until then nobody,
     /// the worker included, knows what the image needs.
     set_up: bool,
+    /// The stored image was written under the current facts version and parse
+    /// configuration, so it may be served before the launch check validates it
+    /// ([`owner::serving_stored`]). Decided once, when the worker sets up.
+    stored_servable: bool,
     /// The background integrity check ([`integrity`]) holds a read connection
     /// on the image. A drain waits for it to let go.
     integrity_running: bool,
@@ -652,17 +656,55 @@ fn capture_result_identity(
     })
 }
 
+/// How current an index answer must be (launch design D3). Chosen at the
+/// command boundary: a read inside `Graph::display_read` is only displayed and
+/// may be `LaunchStored`; every other read acts on its answer and is `Current`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Currency {
+    /// Ready at the reader's exact generation.
+    Current,
+    /// `Current`, or the stored image the last session left while the launch
+    /// check has not yet validated it ([`owner::serving_stored`]). Wrong at
+    /// worst until the check corrects it, which the display then re-asks.
+    LaunchStored,
+}
+
+/// The generation a Gate R read is asked at, and how current its answer
+/// must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    pub(crate) generation: u64,
+    pub(crate) currency: Currency,
+}
+
+impl ReadAt {
+    #[cfg(test)]
+    pub(crate) fn current(generation: u64) -> Self {
+        Self {
+            generation,
+            currency: Currency::Current,
+        }
+    }
+}
+
 /// Admission gate shared by admission and producer snapshot capture.
 ///
 /// Live queries may read an older complete committed image while ordinary
-/// page edits are queued. They may not read during validation of an unknown
-/// image or while a replacement image is being built/published.
-fn query_capture_admissible(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
+/// page edits are queued. They may not read while a replacement image is being
+/// built/published. Before the launch check validates the image, they read it
+/// only while it is served as stored ([`owner::serving_stored`]): every query
+/// is displayed, and the display re-asks when the check lands (design D2).
+fn query_capture_admissible(
+    shared: &ProjectionShared,
+    pending: &PendingProjection,
+    currency: Currency,
+) -> bool {
     !pending.stop
         && !pending.rebuild
         && !shared.worker_failed.load(Ordering::Acquire)
         && !pending.building
-        && shared.validated.load(Ordering::Acquire)
+        && (shared.validated.load(Ordering::Acquire)
+            || (currency == Currency::LaunchStored && owner::serving_stored(shared, pending)))
 }
 
 fn query_capture_available(
@@ -670,9 +712,9 @@ fn query_capture_available(
     requirement: &QueryCaptureRequirement,
 ) -> bool {
     match requirement {
-        QueryCaptureRequirement::CurrentSnapshot => {
+        QueryCaptureRequirement::CurrentSnapshot(currency) => {
             let pending = shared.pending.lock().unwrap();
-            query_capture_admissible(shared, &pending)
+            query_capture_admissible(shared, &pending, *currency)
         }
         #[cfg(test)]
         QueryCaptureRequirement::StrictGeneration(generation) => shared.ready_at(*generation),
@@ -1017,7 +1059,15 @@ impl DirectProjection {
         self.shared.commit_notification.load(Ordering::Acquire)
     }
 
-    pub(crate) fn start(path: PathBuf) -> std::io::Result<Self> {
+    /// Start the projection of the graph whose index lives at `path`.
+    /// `launch_config` is the parse configuration the graph opens with: a
+    /// stored image written under it (and under this facts version) is served
+    /// to display reads while the launch check runs (design D2). `None`
+    /// serves nothing before the check.
+    pub(crate) fn start(
+        path: PathBuf,
+        launch_config: Option<Arc<ParseConfig>>,
+    ) -> std::io::Result<Self> {
         let shared = Arc::new(ProjectionShared {
             path,
             pending: Mutex::new(PendingProjection::default()),
@@ -1097,7 +1147,7 @@ impl DirectProjection {
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("tine-direct-projection".into())
-            .spawn(move || projection_worker(worker))?;
+            .spawn(move || projection_worker(worker, launch_config))?;
         Ok(Self { shared })
     }
 
@@ -1212,11 +1262,8 @@ impl DirectProjection {
     /// R6: the projected page inventory as `(name, path, kind)` rows,
     /// read through `drain_after` from the ready projection. `list_pages`
     /// rebuilds `PageEntry`s from it instead of parsing every file.
-    pub(crate) fn page_inventory(
-        &self,
-        cache_generation: u64,
-    ) -> Option<Vec<(String, String, PageKind)>> {
-        let reader = self.shared_reader_at(cache_generation)?;
+    pub(crate) fn page_inventory(&self, at: ReadAt) -> Option<Vec<(String, String, PageKind)>> {
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut rows = Vec::new();
         drain_after(
@@ -1242,16 +1289,16 @@ impl DirectProjection {
             },
         )
         .reported(self)?;
-        self.ready_at(cache_generation).then_some(rows)
+        self.answers(at).then_some(rows)
     }
 
-    /// Bounded wait for readiness at `generation` (R6): the whole-graph derived
+    /// Bounded wait until the index answers `at` (R6): the whole-graph derived
     /// reads that would otherwise fall to a full parse in the milliseconds
     /// after a save or a warm turn wait for that bounded worker turn first.
     /// Same ceiling and same non-authority as `wait_for_reference_generation`.
     #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
-    pub(crate) fn wait_ready_at(&self, generation: u64) -> bool {
-        self.wait_for_reference_generation(generation)
+    pub(crate) fn wait_ready_at(&self, at: ReadAt) -> bool {
+        self.wait_for_reference_generation(at)
     }
 
     /// Unbounded wait for readiness at `generation`, for an index owner only
@@ -1490,14 +1537,22 @@ impl DirectProjection {
     /// failure, worker loss, a newer generation, or expiry all return `false`
     /// and the caller uses the exact parser fallback.
     #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
-    pub(crate) fn wait_for_reference_generation(&self, generation: u64) -> bool {
-        if self.ready_at(generation) {
+    ///
+    /// A [`Currency::LaunchStored`] read also stops waiting when the stored
+    /// image serves again: an edit made during the launch check is applied
+    /// in one turn, and the read then sees it (design D2, read-your-writes).
+    pub(crate) fn wait_for_reference_generation(&self, at: ReadAt) -> bool {
+        let generation = at.generation;
+        if self.answers(at) {
             return true;
         }
         let deadline = std::time::Instant::now() + REFERENCE_DELTA_WAIT;
         let mut pending = self.shared.pending.lock().unwrap();
         loop {
-            if self.ready_at(generation) {
+            if self.ready_at(generation)
+                || (at.currency == Currency::LaunchStored
+                    && owner::serving_stored(&self.shared, &pending))
+            {
                 return true;
             }
             if !self.shared.worker_available.load(Ordering::Acquire)
@@ -1528,13 +1583,13 @@ impl DirectProjection {
 
     pub(crate) fn property_facets(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
         autocomplete: bool,
         hidden_properties: &[String],
         max_items: usize,
         max_bytes: usize,
     ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
-        let reader = self.shared_reader_at(cache_generation)?;
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut accumulator = if autocomplete {
             PropertyFacetAccumulator::autocomplete(hidden_properties, max_items, max_bytes)
@@ -1563,7 +1618,7 @@ impl DirectProjection {
             },
         )
         .reported(self)?;
-        if !self.ready_at(cache_generation) {
+        if !self.answers(at) {
             return None;
         }
         #[cfg(test)]
@@ -1590,7 +1645,7 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn property_owner_rows(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
     ) -> Option<(
         Vec<crate::query::registry::OwnerRow>,
         HashMap<String, crate::query::registry::PageMeta>,
@@ -1599,7 +1654,7 @@ impl DirectProjection {
         #[cfg(test)]
         REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
 
-        let reader = self.shared_reader_at(cache_generation)?;
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
 
         // The page map and the rows are read from the SAME `read`, i.e. the same
@@ -1688,7 +1743,7 @@ impl DirectProjection {
 
         // The generation must still hold AFTER both scans, or the two halves
         // could straddle a rebuild — the same re-check `property_facets` makes.
-        if !self.ready_at(cache_generation) {
+        if !self.answers(at) {
             return None;
         }
         #[cfg(test)]
@@ -1730,19 +1785,20 @@ impl DirectProjection {
 
     /// Acquire the current complete projection without waiting for a saved edit.
     /// Ordinary queued deltas do not invalidate the committed image.
+    /// A [`Currency::LaunchStored`] job may read the stored image during the
+    /// launch check (design D2).
     pub(crate) fn open_current_query_job(
         &self,
         registry_sensitivity: RegistrySensitivity,
+        currency: Currency,
     ) -> QueryJobOpen {
+        let requirement = QueryCaptureRequirement::CurrentSnapshot(currency);
         if !self.shared.worker_available.load(Ordering::Acquire)
-            || !query_capture_available(&self.shared, &QueryCaptureRequirement::CurrentSnapshot)
+            || !query_capture_available(&self.shared, &requirement)
         {
             return QueryJobOpen::NotReady;
         }
-        self.enqueue_query_capture(
-            QueryCaptureRequirement::CurrentSnapshot,
-            registry_sensitivity,
-        )
+        self.enqueue_query_capture(requirement, registry_sensitivity)
     }
 
     fn enqueue_query_capture(
@@ -1780,8 +1836,8 @@ impl DirectProjection {
                 return QueryJobOpen::Failed;
             }
             let available = match &requirement {
-                QueryCaptureRequirement::CurrentSnapshot => {
-                    query_capture_admissible(&self.shared, &pending)
+                QueryCaptureRequirement::CurrentSnapshot(currency) => {
+                    query_capture_admissible(&self.shared, &pending, *currency)
                 }
                 #[cfg(test)]
                 QueryCaptureRequirement::StrictGeneration(generation) => self.ready_at(*generation),
@@ -1830,9 +1886,9 @@ impl DirectProjection {
     /// every SQLite handle visible to the publication drain.
     fn shared_reader_at(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
     ) -> Option<std::sync::MutexGuard<'_, Option<PhysicalGraphProjectionDatabase>>> {
-        if !self.ready_at(cache_generation) {
+        if !self.answers(at) {
             return None;
         }
         #[cfg(test)]
@@ -1848,7 +1904,7 @@ impl DirectProjection {
             }
         }
         let mut reader = self.shared.reader.lock().unwrap();
-        if !self.ready_at(cache_generation) {
+        if !self.answers(at) {
             return None;
         }
         if reader.is_none() {
@@ -1870,8 +1926,8 @@ impl DirectProjection {
         Some(reader)
     }
 
-    pub(crate) fn referenced_page_names(&self, cache_generation: u64) -> Option<Vec<String>> {
-        let reader = self.shared_reader_at(cache_generation)?;
+    pub(crate) fn referenced_page_names(&self, at: ReadAt) -> Option<Vec<String>> {
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut names = std::collections::HashMap::<String, String>::new();
         drain_after(
@@ -1893,7 +1949,7 @@ impl DirectProjection {
             |_, _| None,
         )
         .reported(self)?;
-        if !self.ready_at(cache_generation) {
+        if !self.answers(at) {
             return None;
         }
         let mut names = names.into_values().collect::<Vec<_>>();
@@ -1907,9 +1963,9 @@ impl DirectProjection {
 
     pub(crate) fn page_aliases_with_owners(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
     ) -> Option<Vec<(String, String, String)>> {
-        let _reader = self.shared_reader_at(cache_generation)?;
+        let _reader = self.shared_reader_at(at)?;
         let mut aliases = Vec::new();
         let mut snapshot =
             PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
@@ -1944,14 +2000,11 @@ impl DirectProjection {
             },
         )
         .reported(self)?;
-        self.ready_at(cache_generation).then_some(aliases)
+        self.answers(at).then_some(aliases)
     }
 
-    pub(crate) fn real_page_names(
-        &self,
-        cache_generation: u64,
-    ) -> Option<crate::query::RealPageNames> {
-        let reader = self.shared_reader_at(cache_generation)?;
+    pub(crate) fn real_page_names(&self, at: ReadAt) -> Option<crate::query::RealPageNames> {
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut names = crate::query::RealPageNames::new();
         drain_after(
@@ -1981,7 +2034,7 @@ impl DirectProjection {
             |_, _| None,
         )
         .reported(self)?;
-        self.ready_at(cache_generation).then_some(names)
+        self.answers(at).then_some(names)
     }
 
     /// The candidate set for one reference target: the pages that may contain a
@@ -2002,7 +2055,7 @@ impl DirectProjection {
     /// candidate page is classified as it was.
     pub(crate) fn reference_candidates(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
         names_norm: &[String],
         self_page: &str,
         kind: ReferenceKind,
@@ -2012,7 +2065,7 @@ impl DirectProjection {
         if !reference_narrowing_supported(names_norm, kind) {
             return None;
         }
-        let reader = self.shared_reader_at(cache_generation)?;
+        let reader = self.shared_reader_at(at)?;
         let mut paths = std::collections::BTreeSet::new();
         let mut blocks = std::collections::HashSet::new();
         let mut page_owners = matches!(
@@ -2274,23 +2327,18 @@ impl DirectProjection {
                 }
             }
         }
-        self.ready_at(cache_generation)
-            .then_some(ReferenceCandidateIndex {
-                paths,
-                blocks: Some(blocks),
-                page_owners,
-            })
+        self.answers(at).then_some(ReferenceCandidateIndex {
+            paths,
+            blocks: Some(blocks),
+            page_owners,
+        })
     }
 
     /// Outer `None` means projection unavailable/stale and requires parser
     /// fallback. Inner `None` is an exact current-generation miss.
-    pub(crate) fn block_page_hint(
-        &self,
-        cache_generation: u64,
-        uuid: &str,
-    ) -> Option<Option<String>> {
+    pub(crate) fn block_page_hint(&self, at: ReadAt, uuid: &str) -> Option<Option<String>> {
         let parsed_uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
-        let reader = self.shared_reader_at(cache_generation)?;
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         // A live id this session gave a block is stored as the block's
         // structural id (R3). A hint needs only the page, and the page of the
@@ -2323,14 +2371,14 @@ impl DirectProjection {
                 .map(|page| page.name),
             None => None,
         };
-        self.ready_at(cache_generation).then_some(page)
+        self.answers(at).then_some(page)
     }
 
     pub(crate) fn block_ref_counts(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
     ) -> Option<std::collections::HashMap<String, usize>> {
-        let reader = self.shared_reader_at(cache_generation)?;
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut counts = std::collections::HashMap::new();
         drain_after(
@@ -2348,16 +2396,16 @@ impl DirectProjection {
             |_, _| None,
         )
         .reported(self)?;
-        self.ready_at(cache_generation).then_some(counts)
+        self.answers(at).then_some(counts)
     }
 
     pub(crate) fn block_referrer_candidate_paths(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
         uuid: &str,
     ) -> Option<std::collections::BTreeSet<PathBuf>> {
         let uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
-        let reader = self.shared_reader_at(cache_generation)?;
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut paths = std::collections::BTreeSet::new();
         drain_after(
@@ -2370,11 +2418,26 @@ impl DirectProjection {
             |_, _| None,
         )
         .reported(self)?;
-        self.ready_at(cache_generation).then_some(paths)
+        self.answers(at).then_some(paths)
     }
 
     pub(crate) fn ready_at(&self, generation: u64) -> bool {
         self.shared.ready_at(generation)
+    }
+
+    /// Whether the index may answer a read at `at`: ready at its generation,
+    /// or, for a [`Currency::LaunchStored`] read, serving the stored image
+    /// during the launch check ([`owner::serving_stored`]).
+    pub(crate) fn answers(&self, at: ReadAt) -> bool {
+        self.ready_at(at.generation)
+            || (at.currency == Currency::LaunchStored && self.serving_stored())
+    }
+
+    /// Whether the index answers `LaunchStored` reads from the image the last
+    /// session left, before the launch check has validated it (design D2).
+    pub(crate) fn serving_stored(&self) -> bool {
+        let pending = self.shared.pending.lock().unwrap();
+        owner::serving_stored(&self.shared, &pending)
     }
 
     /// RET2's readiness lifecycle: why this generation is not ready, and what
@@ -2618,7 +2681,7 @@ fn worker_cannot_start(shared: &ProjectionShared, error: &str) {
     shared.changed.notify_all();
 }
 
-fn projection_worker(shared: Arc<ProjectionShared>) {
+fn projection_worker(shared: Arc<ProjectionShared>, launch_config: Option<Arc<ParseConfig>>) {
     // FIRST local, so it is the LAST thing dropped: the writer connection and
     // the exclusive lease below are both released before the exit is published.
     let _exit = ProjectionWorkerExit(Arc::clone(&shared));
@@ -2651,11 +2714,28 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         return;
     }
     let mut writer_slot = open_existing_projection_database(&shared);
+    // Every stored row was written under this facts version and this parse
+    // configuration: the image may answer display reads before the launch
+    // check validates it. After a configuration or facts change it answers
+    // nothing until the fresh build the check then owes (design D2).
+    let stored_config = launch_config.filter(|config| {
+        writer_slot.is_some()
+            && derived_reads::stored_facts_are(
+                &shared.path,
+                &projection_source_revision("", config.digest()),
+            )
+    });
     {
         let mut pending = shared.pending.lock().unwrap();
         // No image: only a fresh build can give it one.
         pending.rebuild |= writer_slot.is_none();
         pending.set_up = true;
+        pending.stored_servable = stored_config.is_some();
+        // Queries capture beside the committed property registry: read it
+        // now, so a stored image answers them before the check (design D2).
+        if pending.registry_owed.is_none() {
+            pending.registry_owed = stored_config;
+        }
     }
     shared.changed.notify_all();
     if writer_slot.is_some() {
@@ -2769,8 +2849,12 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             .values()
             .map(|(_, delta)| delta.entry().rel_path.clone())
             .collect::<std::collections::BTreeSet<_>>();
+        // The launch's registry-only turn (design D2) applies nothing: a test
+        // holding "the next apply" means the survey's work after it.
         #[cfg(test)]
-        run_before_apply_deltas_hook(&shared.path);
+        if fresh_build || !marks.is_empty() || shared.validated.load(Ordering::Acquire) {
+            run_before_apply_deltas_hook(&shared.path);
+        }
         let applied: Result<AppliedTurn, ProjectionRefusal> = (|| {
             #[cfg(test)]
             if shared

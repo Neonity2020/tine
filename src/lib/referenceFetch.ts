@@ -1,7 +1,7 @@
 import { OperationCancelledError, type QueryNotReadyError } from "../backend";
 import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import { classifyReferenceLoadError, type ReferenceLoadError } from "./referenceLoadError";
-import { graphEpoch } from "../ui";
+import { graphEpoch, indexCorrectionRev } from "../ui";
 import { graphBinding } from "../persistence";
 
 /**
@@ -39,14 +39,27 @@ export interface ReferenceRead {
   readonly name: string;
   readonly graphEpoch: number;
   readonly graphBinding: number;
+  /** `indexCorrectionRev`: an answer given from the index as the last session
+   *  left it is asked again once the launch check lands (GH #550). */
+  readonly correction: number;
 }
 
 export function referenceRead(name: string): ReferenceRead {
-  return { name, graphEpoch: graphEpoch(), graphBinding: graphBinding() };
+  return {
+    name,
+    graphEpoch: graphEpoch(),
+    graphBinding: graphBinding(),
+    correction: indexCorrectionRev(),
+  };
 }
 
 function sameReferenceRead(a: ReferenceRead, b: ReferenceRead): boolean {
-  return a.name === b.name && a.graphEpoch === b.graphEpoch && a.graphBinding === b.graphBinding;
+  return (
+    a.name === b.name &&
+    a.graphEpoch === b.graphEpoch &&
+    a.graphBinding === b.graphBinding &&
+    a.correction === b.correction
+  );
 }
 
 export function createReferenceFetcher(options: {

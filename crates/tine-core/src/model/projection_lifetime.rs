@@ -21,7 +21,10 @@ impl Graph {
             "attach the Direct projection before the first parse; nothing \
              offers it a cache installed earlier (GH #543, R8-14)"
         );
-        let projection = Arc::new(crate::direct_projection::DirectProjection::start(path)?);
+        let projection = Arc::new(crate::direct_projection::DirectProjection::start(
+            path,
+            Some(Arc::new(self.config().parse_config())),
+        )?);
         self.direct_projection.attach(projection);
         Ok(())
     }
@@ -344,11 +347,14 @@ impl Graph {
     /// would; if it gives up, the read falls back as before. With a parsed cache present the fallback is cheap, so no
     /// extra wait (this also keeps the warm thread from waiting on itself).
     /// Returns the generation the projection is ready at, which is newer than
-    /// `generation` when a page was published during the wait.
+    /// `generation` when a page was published during the wait. A
+    /// `LaunchStored` read does not wait while the stored image is served
+    /// (launch design D2): the display re-asks when the check lands.
     pub(super) fn wait_for_derived_read(
         &self,
         projection: &crate::direct_projection::DirectProjection,
         mut generation: u64,
+        currency: crate::direct_projection::Currency,
     ) -> Option<u64> {
         use crate::direct_projection::ProjectionProgress;
         use crate::query::QueryReadinessReason as Reason;
@@ -371,7 +377,11 @@ impl Graph {
             }
         }
         loop {
-            if projection.wait_ready_at(generation) {
+            let at = crate::direct_projection::ReadAt {
+                generation,
+                currency,
+            };
+            if projection.wait_ready_at(at) {
                 return Some(generation);
             }
             // A replaced graph's reads are no longer anyone's to wait for,
@@ -461,18 +471,16 @@ impl Graph {
     /// without a year, and every page list parsed the graph (GH #543, audit
     /// R13-06).
     pub(super) fn direct_projection_page_inventory(&self) -> Option<(u64, Vec<PageEntry>)> {
-        self.indexed_read(|projection, generation| {
-            self.direct_projection_page_inventory_at(projection, generation)
-        })
+        self.indexed_read(|projection, at| self.direct_projection_page_inventory_at(projection, at))
     }
 
     fn direct_projection_page_inventory_at(
         &self,
         projection: &Arc<crate::direct_projection::DirectProjection>,
-        generation: u64,
+        at: crate::direct_projection::ReadAt,
     ) -> Option<(u64, Vec<PageEntry>)> {
-        let rows = projection.page_inventory(generation)?;
-        let days = projection.journal_days(generation)?;
+        let rows = projection.page_inventory(at)?;
+        let days = projection.journal_days(at)?;
         let mut entries = Vec::with_capacity(rows.len());
         for (name, rel_path, kind) in rows {
             let date_key = match kind {
@@ -488,7 +496,7 @@ impl Graph {
             });
         }
         entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        Some((generation, entries))
+        Some((at.generation, entries))
     }
 
     /// R6: parse exactly the named pages for reference/fuzzy hydration when no
@@ -596,9 +604,9 @@ impl Graph {
         max_items: usize,
         max_bytes: usize,
     ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
-        self.indexed_read(|projection, generation| {
+        self.indexed_read(|projection, at| {
             projection.property_facets(
-                generation,
+                at,
                 autocomplete,
                 &self.config().block_hidden_properties,
                 max_items,
@@ -621,7 +629,7 @@ impl Graph {
         Vec<crate::query::registry::OwnerRow>,
         std::collections::HashMap<String, crate::query::registry::PageMeta>,
     )> {
-        self.indexed_read(|projection, generation| projection.property_owner_rows(generation))
+        self.indexed_read(|projection, at| projection.property_owner_rows(at))
     }
 }
 

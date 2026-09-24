@@ -1,7 +1,6 @@
 import { createResource, createRoot } from "solid-js";
 import { backend } from "./backend";
 import { dataRev, graphEpoch } from "./ui";
-import { waitForWarmCache } from "./warmCache";
 import { blockExternalId } from "./store";
 import { readOr } from "./resourceRead";
 import { readLane } from "./readLane";
@@ -12,13 +11,14 @@ import { readLane } from "./readLane";
 // update together when the graph changes (a new ref is saved → graphEpoch bumps →
 // refetch). Created in its own root: it lives for the app's lifetime by design.
 const countsMap = createRoot(() => {
-  // The warm wait covers the launch pass only; the lane covers a later one
-  // (a repair), where every save used to leave one more read waiting (R11-09).
+  // Asked at open: the backend answers from the stored index during the launch
+  // check, or waits for the index being built, and the check's completion bumps
+  // `dataRev`, which asks again (GH #550). The lane keeps one read in flight, so
+  // a save no longer leaves one more read waiting (R11-09).
   const lane = readLane();
   const [countsResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev() }),
     async ({ epoch, revision }) => {
-      if (!(await waitForWarmCache(epoch))) return {};
       // A save during the pass has already asked again: each stale waiter
       // issuing its own whole-graph read at hand-over cost N+1 of them
       // (GH #543, audit R10-09). Solid drops a superseded fetch's value.

@@ -15637,5 +15637,8 @@ mod gh543_r14;
 #[path = "model_gh543_r15_tests.rs"]
 mod gh543_r15;
 
+#[path = "model_launch_serve_tests.rs"]
+mod launch_serve;
+
 #[path = "model_gh594_liveness_tests.rs"]
 mod gh594_liveness;

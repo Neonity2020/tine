@@ -540,7 +540,7 @@ impl Graph {
     /// caller then falls back to the parsed evidence. The recorded failures
     /// travel with it, as with the parsed evidence.
     fn indexed_creation_evidence(&self) -> Option<DirectCreationEvidence> {
-        let (generation, entries) = self.direct_projection_page_inventory()?;
+        let (generation, entries) = self.exact_read(|| self.direct_projection_page_inventory())?;
         let failures = self.page_index_failures.read().unwrap().to_vec();
         let mut owners = std::collections::HashMap::with_capacity(entries.len());
         let mut physical_paths = std::collections::HashSet::with_capacity(entries.len());

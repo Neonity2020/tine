@@ -1,6 +1,8 @@
 //! The readiness boundary for launch-time SQL answers.
 use super::*;
-use crate::direct_projection::{derived_reads::DerivedSelection, DirectProjection};
+use crate::direct_projection::{
+    derived_reads::DerivedSelection, Currency, DirectProjection, ReadAt,
+};
 use crate::query::graph::PageFallback;
 use std::collections::HashMap;
 
@@ -20,6 +22,12 @@ thread_local! {
     /// Set when this thread's last derived read declined because a parsed
     /// cache answers instead; see [`Graph::indexed_or_fallback`].
     static CACHE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set inside [`Graph::exact_read`]: this display read also acts on its
+    /// answer, which must be current.
+    static EXACT_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set when this thread's display read was answered from the stored image
+    /// before the launch check validated it; see [`Graph::answer_is_complete`].
+    static STORED_SERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// When this thread's derived read stops waiting; see [`ReadDeadline`].
     static READ_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
@@ -124,7 +132,14 @@ impl Graph {
             return None;
         }
         let previous = DISPLAY_READ.with(|state| state.replace(DisplayRead::On));
+        let stored_before = STORED_SERVED.with(|served| served.replace(false));
         let answer = read();
+        // Only an enclosing display read inherits the mark; a top-level one
+        // leaves the thread (a reused command thread) as it found it.
+        let stored = STORED_SERVED.with(|served| served.replace(stored_before));
+        if stored && previous != DisplayRead::Off {
+            STORED_SERVED.with(|served| served.set(true));
+        }
         let skipped = DISPLAY_READ.with(|state| state.replace(previous)) == DisplayRead::Skipped;
         if skipped && previous != DisplayRead::Off {
             DISPLAY_READ.with(|state| state.set(DisplayRead::Skipped));
@@ -132,11 +147,46 @@ impl Graph {
         (!skipped).then_some(answer)
     }
 
-    /// False once this thread's display read skipped a parse: its answer is
-    /// incomplete and must not be memoized, or a later read of this graph that
-    /// acts on its answer (export, creation) would be served the gap.
+    /// False once this thread's display read skipped a parse, or was answered
+    /// from the stored image before the launch check validated it: its answer
+    /// is incomplete or unverified and must not be memoized, or a later read of
+    /// this graph that acts on its answer (export, creation) would be served it.
     pub(super) fn answer_is_complete(&self) -> bool {
         DISPLAY_READ.with(|state| state.get() != DisplayRead::Skipped)
+            && !STORED_SERVED.with(std::cell::Cell::get)
+    }
+
+    /// How current this thread's index reads must be (launch design D3): a
+    /// display read may be answered from the stored image during the launch
+    /// check; any other read, and a display read that acts on its answer
+    /// ([`Graph::exact_read`]), waits for the check.
+    pub(super) fn read_currency() -> Currency {
+        let display = DISPLAY_READ.with(|state| state.get() != DisplayRead::Off);
+        if display && !EXACT_READ.with(std::cell::Cell::get) {
+            Currency::LaunchStored
+        } else {
+            Currency::Current
+        }
+    }
+
+    /// Record that this thread's answer came from the stored image before the
+    /// launch check validated it ([`Graph::answer_is_complete`]).
+    pub(super) fn note_stored_served() {
+        STORED_SERVED.with(|served| served.set(true));
+    }
+
+    /// Run `read`, whose answer is acted on, with index reads that must be
+    /// current even inside a display read: creation evidence, a listing that
+    /// decides a refusal, template text inserted into a page.
+    pub(crate) fn exact_read<T>(&self, read: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                EXACT_READ.with(|exact| exact.set(self.0));
+            }
+        }
+        let _restore = Restore(EXACT_READ.with(|exact| exact.replace(true)));
+        read()
     }
 
     /// True when a display read on a retired graph must not parse the graph;
@@ -218,10 +268,18 @@ impl Graph {
         Err(PageFallback::Parse)
     }
 
-    fn derived_reader(&self) -> Option<(Arc<DirectProjection>, u64)> {
+    fn derived_reader(&self) -> Option<(Arc<DirectProjection>, ReadAt)> {
         let projection = self.direct_projection.get()?;
-        let generation = self.wait_for_derived_read(&projection, self.cache_generation())?;
-        Some((projection, generation))
+        let currency = Self::read_currency();
+        let generation =
+            self.wait_for_derived_read(&projection, self.cache_generation(), currency)?;
+        Some((
+            projection,
+            ReadAt {
+                generation,
+                currency,
+            },
+        ))
     }
 
     /// Run `read` against the index at a ready generation. A generation move
@@ -232,12 +290,19 @@ impl Graph {
     /// launch (GH #543).
     pub(super) fn indexed_read<T>(
         &self,
-        mut read: impl FnMut(&Arc<DirectProjection>, u64) -> Option<T>,
+        mut read: impl FnMut(&Arc<DirectProjection>, ReadAt) -> Option<T>,
     ) -> Option<T> {
         let _deadline = ReadDeadline::enter(self);
         loop {
-            let (projection, generation) = self.derived_reader()?;
-            let answer = read(&projection, generation);
+            let (projection, at) = self.derived_reader()?;
+            let generation = at.generation;
+            // Asked before the read: a check that lands during it must not
+            // let a stored answer pass for a current one.
+            let stored = at.currency == Currency::LaunchStored && !projection.ready_at(generation);
+            let answer = read(&projection, at);
+            if answer.is_some() && stored {
+                Self::note_stored_served();
+            }
             #[cfg(test)]
             let answer = {
                 use std::sync::atomic::Ordering;
@@ -286,18 +351,18 @@ impl Graph {
         &self,
         selection: DerivedSelection<'_>,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        self.indexed_read(|projection, generation| {
-            self.indexed_derived_pages_at(projection, generation, &selection)
+        self.indexed_read(|projection, at| {
+            self.indexed_derived_pages_at(projection, at, &selection)
         })
     }
 
     fn indexed_derived_pages_at(
         &self,
         projection: &Arc<DirectProjection>,
-        generation: u64,
+        at: ReadAt,
         selection: &DerivedSelection<'_>,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        let rows = projection.derived_pages(generation, selection)?;
+        let rows = projection.derived_pages(at, selection)?;
         let mut pages = rows
             .into_iter()
             .map(|row| {
@@ -371,7 +436,7 @@ impl Graph {
                     // failure into a whole-graph parse after the index answered.
                     for source in sources {
                         if let Some(hydrated) =
-                            self.parse_pages_on_demand_with_revisions(generation, vec![source])
+                            self.parse_pages_on_demand_with_revisions(at.generation, vec![source])
                         {
                             pages.extend(hydrated);
                         }
@@ -383,18 +448,16 @@ impl Graph {
     }
 
     pub(super) fn indexed_page_icons(&self, names: &[String]) -> Option<HashMap<String, String>> {
-        self.indexed_read(|projection, generation| {
-            self.indexed_page_icons_at(projection, generation, names)
-        })
+        self.indexed_read(|projection, at| self.indexed_page_icons_at(projection, at, names))
     }
 
     fn indexed_page_icons_at(
         &self,
         projection: &Arc<DirectProjection>,
-        generation: u64,
+        at: ReadAt,
         names: &[String],
     ) -> Option<HashMap<String, String>> {
-        let aliases = projection.page_aliases_with_owners(generation)?;
+        let aliases = projection.page_aliases_with_owners(at)?;
         let mut keys = names
             .iter()
             .map(|name| crate::refs::page_key(name))
@@ -404,7 +467,7 @@ impl Graph {
                 keys.insert(crate::refs::page_key(canonical));
             }
         }
-        let rows = projection.page_icon_rows(generation, &keys.into_iter().collect::<Vec<_>>())?;
+        let rows = projection.page_icon_rows(at, &keys.into_iter().collect::<Vec<_>>())?;
         let mut real = HashSet::new();
         let mut icons = HashMap::new();
         for (key, preamble) in rows {
@@ -435,6 +498,6 @@ impl Graph {
     }
 
     pub(super) fn indexed_journal_content_days(&self) -> Option<Vec<i64>> {
-        self.indexed_read(|projection, generation| projection.journal_content_days(generation))
+        self.indexed_read(|projection, at| projection.journal_content_days(at))
     }
 }

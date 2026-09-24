@@ -1,6 +1,6 @@
 // GH #543 (audit R10-06, R10-10), render config: it drives the real
-// loadGraphPath. A graph open lists its pages once, and a reopen during the
-// launch warm still loads the navigation index.
+// loadGraphPath. A graph open lists its pages once, and loads the navigation
+// index at once and again on a reopen during the launch check.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { __setBackendForTest } from "./backend";
 import { mockBackend } from "./mock";
@@ -30,31 +30,28 @@ describe("GH #543 graph-open reads", () => {
     expect(calls).toBe(1);
     __setBackendForTest(null);
   });
-  // R10-06: a watcher reopen during the launch pass (config.edn delivered by
-  // Syncthing, a `:hidden` edit, or — since 0c4c4f52 — any journal-title
-  // format change, which now reaches the frontend only as graph-rebound)
-  // moves the binding while loadAliases waits for the warm. loadAliases then
-  // returns (graph.ts:455-457) and nothing else loads the navigation index
-  // until the next save or create/delete: every alias link resolves to a
-  // non-existent page meanwhile.
-  it("loads the navigation index when the graph is reopened during the launch warm", async () => {
+  // R10-06 and launch design D4 (GH #550): the navigation index loads at
+  // graph open, while the launch index check is still running (the backend
+  // answers from the index the last session left), so alias links resolve
+  // from the first paint. A watcher reopen during the check (config.edn
+  // delivered by Syncthing, a `:hidden` edit, a journal-title format change)
+  // loads it again for the reopened graph. It used to wait for the check
+  // first, and a reopen during that wait left it unloaded until the next save.
+  it("loads the navigation index at open and again on a reopen during the launch check", async () => {
     const api = mockBackend();
-    let warmDone!: (v: boolean) => void;
-    vi.spyOn(api, "warmDone").mockImplementation(() => new Promise<boolean>((r) => { warmDone = r; }));
+    vi.spyOn(api, "warmDone").mockImplementation(() => new Promise<boolean>(() => {})); // the check never lands here
     const aliases = vi.spyOn(api, "pageAliases").mockResolvedValue([["Gamma", "Beta"]] as never);
     __setBackendForTest(api);
     const { applyGraphReopened } = await import("./graph");
     const { resolveAlias } = await import("./ui");
     await loadGraphPath("/g/A", { transitionHeld: true });
     await settle();
-    const before = aliases.mock.calls.length;
-    applyGraphReopened(); // graph-rebound from the watcher mid-pass
-    await settle();
-    warmDone(true); // the reopened graph's warm completes
-    await settle();
-    await settle();
     expect(resolveAlias("gamma")).toBe("Beta");
+    aliases.mockResolvedValue([["Delta", "Beta"]] as never);
+    applyGraphReopened(); // graph-rebound from the watcher mid-check
+    await settle();
+    await settle();
+    expect(resolveAlias("delta")).toBe("Beta");
     __setBackendForTest(null);
   });
 });
-

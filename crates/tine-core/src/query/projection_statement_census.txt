@@ -11,6 +11,7 @@ SELECT b.block_id, bt.content, p.path FROM (SELECT rowid AS block_id FROM search
 SELECT b.block_id, bt.content, p.path FROM blocks b LEFT JOIN block_text bt ON bt.block_id = b.block_id LEFT JOIN pages p ON p.page_id = b.page_id LEFT JOIN names p_name ON p_name.name_id = p.name_id ORDER BY b.block_id DESC
 SELECT block_id FROM blocks WHERE result_id = ? OR logseq_uuid = ? OR block_id IN (SELECT o.owner_id FROM properties o JOIN names n ON n.name_id = o.name_id WHERE o.owner_type = 1 AND n.key = 'id' AND o.value = ?)
 SELECT block_id, page_id, preorder FROM blocks WHERE block_id IN (?)
+SELECT count(*), coalesce(sum(substr(revision, 1, ?) <> ?), 0) FROM direct_source_revisions
 SELECT n.key, COALESCE(t.preamble, '') FROM pages p JOIN names n ON n.name_id = p.name_id LEFT JOIN page_text t ON t.page_id = p.page_id WHERE p.text_kind = 0 AND n.key = ? ORDER BY p.path
 SELECT o.owner_id FROM properties o JOIN names n ON n.name_id = o.name_id WHERE o.owner_type = 1 AND n.key = 'template' AND o.value <> ''
 SELECT o.owner_type, o.owner_id, o.page_id, n.raw, n.key, o.value, o.ordinal, b.page_id FROM properties o JOIN names n ON n.name_id = o.name_id LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id ORDER BY o.owner_type, o.owner_id, o.name_id, o.ordinal

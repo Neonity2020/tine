@@ -505,7 +505,12 @@ impl Graph {
         if !crate::direct_projection::reference_narrowing_supported(&[target.to_owned()], kind) {
             return Ok(());
         }
-        if projection.wait_for_reference_generation(self.cache_generation()) {
+        let at = crate::direct_projection::ReadAt {
+            generation: self.cache_generation(),
+            currency: Self::read_currency(),
+        };
+        // A display read may take the stored image during the launch check.
+        if projection.wait_for_reference_generation(at) {
             return Ok(());
         }
         match projection.progress_at(self.cache_generation()) {

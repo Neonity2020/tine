@@ -256,4 +256,12 @@ impl DirectProjection {
     pub(crate) fn run_integrity_check_test(&self) -> bool {
         super::integrity::run_check_now(&self.shared)
     }
+
+    /// The reopen's question: was every stored fact written under `config`?
+    pub(crate) fn stored_facts_are_test(&self, config: &ParseConfig) -> bool {
+        super::derived_reads::stored_facts_are(
+            &self.shared.path,
+            &projection_source_revision("", config.digest()),
+        )
+    }
 }

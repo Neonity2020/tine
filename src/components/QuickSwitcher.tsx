@@ -1,7 +1,7 @@
 import { For, Show, batch, createSignal, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { runQueryWhenReady, searchIndexPendingMessage } from "../queryReadiness";
 import { backend } from "../backend";
-import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu } from "../ui";
+import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu, indexCorrectionRev } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { closePane, focusPane, focusedRouter, layoutPaneIds, openRouteInOtherPane, paneRouter } from "../panes";
@@ -111,6 +111,9 @@ export function QuickSwitcher(): JSX.Element {
   let searchRequest = 0;
   createEffect(() => {
     searchRetry();
+    // Ask again once the launch index check lands: an answer before it may
+    // come from the index as the last session left it (GH #550).
+    indexCorrectionRev();
     const open = switcherOpen();
     const raw = query();
     const commands = commandsOnly();

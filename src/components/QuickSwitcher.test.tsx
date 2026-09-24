@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
-import { closeSwitcher, openSwitcher, pageInventoryRev, rightSidebar, setGraphMeta, setGraphTransitioning, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
+import { closeSwitcher, correctLaunchAnswers, openSwitcher, pageInventoryRev, rightSidebar, setGraphMeta, setGraphTransitioning, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
 import { activeId, closeTab, route, tabRoute, tabs } from "../router";
 import { backend, QueryNotReadyError } from "../backend";
 import { closePane, focusPane, layoutPaneIds, paneRouter, resetPaneLayoutToSingle, setFocusedPaneId, splitPane } from "../panes";
@@ -30,6 +30,45 @@ afterEach(() => {
 });
 
 describe("QuickSwitcher search syntax help", () => {
+
+  // Launch design D4 (GH #550): a search answered from the index as the last
+  // session left it is asked again when the launch check lands, so a page
+  // edited while Tine was closed appears without another keystroke.
+  it("asks again when the launch index check lands", async () => {
+    const hit = (name: string) => ({
+      hits: [{
+        entity: "page" as const,
+        page: { name, kind: "page", date_key: null, path: `pages/${name}.md` },
+        display_text: name,
+        evidence: [{ clause_id: 1, field: "page_name", mode: "fuzzy", spans: [{ start: 0, end: 6 }] }],
+        score: 100,
+        match_class: "prefix",
+      }],
+      diagnostics: [],
+      explanation: { branches: [] },
+      cancelled: false,
+    });
+    let answer = hit("Needle stored");
+    const search = vi.spyOn(backend(), "runGraphSearch").mockImplementation(async () => answer as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    try {
+      openSwitcher();
+      const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+      input.value = "Needle";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await vi.waitFor(() => expect(root.textContent).toContain("Needle stored"));
+      const asked = search.mock.calls.length;
+      answer = hit("Needle fresh");
+      correctLaunchAnswers();
+      await vi.waitFor(() => expect(root.textContent).toContain("Needle fresh"));
+      expect(search.mock.calls.length).toBeGreaterThan(asked);
+      expect(search.mock.lastCall?.[0]).toBe("Needle");
+    } finally {
+      dispose();
+    }
+  });
 
   it("says a rebuild is a rebuild while search is not ready", async () => {
     // The index is REBUILDING, not merely catching up on edits. Keeping that

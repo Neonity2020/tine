@@ -339,6 +339,30 @@ pub(crate) fn index_failures_reported_for_test() -> Vec<IndexFailureEvent> {
     TEST_INDEX_FAILURE_LOG.lock().unwrap().clone()
 }
 
+/// Whether the index serves the stored image to `LaunchStored` reads: the image
+/// the last session left, opened under this facts version and configuration
+/// (`stored_servable`), before the launch check has validated it, with no
+/// replacement owed or under way and no edit of this session waiting to be
+/// applied (read-your-writes). The ONE answer to that question (launch design
+/// D2); it is not readiness, which [`image_is_current`] alone claims.
+pub(super) fn serving_stored(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
+    pending.stored_servable
+        && pending.set_up
+        && !shared.validated.load(Ordering::Acquire)
+        && !pending.stop
+        && !pending.lease_wait
+        && pending.failed.is_none()
+        && !pending.rebuild
+        && pending.full.is_none()
+        && !pending.building
+        && pending.marks.is_empty()
+        && pending.in_flight.is_empty()
+        && shared.worker_available.load(Ordering::Acquire)
+        && !shared.worker_failed.load(Ordering::Acquire)
+        && shared.deltas_coming.load(Ordering::Acquire) == 0
+        && shared.repairs_in_flight.load(Ordering::Acquire) == 0
+}
+
 /// The index's state apart from readiness at a particular generation: the ONE
 /// answer both the progress a reader is told ([`DirectProjection::progress_at`])
 /// and "is work coming" ([`index_work_coming`]) are read from (GH #594, index

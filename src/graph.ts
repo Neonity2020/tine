@@ -13,7 +13,6 @@ import { resetTabsToJournals, openPage, restoreSession, flushSession, route, sam
 import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
 import { journalTitle, localDayKey, setJournalTitleFormat } from "./journal";
 import { applyTemplateVars, prepareTemplateVars } from "./editor/templateVars";
-import { waitForWarmCache } from "./warmCache";
 import { listGraphPages } from "./pageList";
 import { CUSTOM_CSS_STYLE_ID, ensureLsShimStyle } from "./lsShim";
 import { ensureThemeStyle } from "./themeGallery";
@@ -477,16 +476,16 @@ export async function refreshPageIdentities(): Promise<void> {
   await completeNavigationIndex(epoch);
 }
 
-/** Graph open's navigation index, once the warm pass has parsed every alias.
- *  Warm-cache-done belongs to the binding, not the render epoch: a repaint
- *  during the wait used to cancel the load, and nothing asked again (audit
- *  R9-10). Aliases are always re-read here; the page identities only if this
- *  epoch has not already fetched them (audit R9-08). */
+/** Graph open's navigation index, asked at once: during the launch index
+ *  check the backend answers from the index as the last session left it, or
+ *  waits while the index is being built, and the check's completion re-asks
+ *  both halves through `dataRev` and `pageInventoryRev` (GH #550, launch design
+ *  D4). It used to wait for `warm-cache-done` first, which kept every alias
+ *  link unresolved for the whole launch check. Aliases are always re-read
+ *  here; the page identities only if this epoch has not already fetched them
+ *  (audit R9-08). */
 async function loadAliases(): Promise<void> {
-  const binding = graphBinding();
-  await waitForWarmCache(graphEpoch());
-  if (binding !== graphBinding()) return;
-  await loadNavigationIndexAfterWarm();
+  await loadNavigationIndex();
 }
 
 // Every rebind (a backend reopen, a restored backup) re-asks the navigation
@@ -496,7 +495,7 @@ async function loadAliases(): Promise<void> {
 // so the binding and the render epoch have both moved when it asks.
 onGraphRebound(() => queueMicrotask(() => void loadAliases()));
 
-export async function loadNavigationIndexAfterWarm(): Promise<void> {
+export async function loadNavigationIndex(): Promise<void> {
   await Promise.all([refreshAliases(), ensurePageIdentities(graphEpoch())]);
 }
 
@@ -970,7 +969,7 @@ export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | n
  *  the graph (for example `:hidden`). Everything read from the old `Graph` is
  *  stale: in-flight results are dropped, and the page set and what is on
  *  screen are read again (GH #543, audit R9-13). The navigation index is
- *  re-read by its own rebind listener (above `loadNavigationIndexAfterWarm`). */
+ *  re-read by its own rebind listener (above `loadNavigationIndex`). */
 export function applyGraphReopened(): void {
   notifyGraphRebound();
   bumpGraphEpoch();

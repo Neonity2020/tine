@@ -369,7 +369,8 @@ impl Graph {
     /// All `template:: <name>` templates across the graph, with the blocks to
     /// insert (ids and template properties stripped).
     pub fn templates(&self) -> Vec<TemplateDto> {
-        crate::query::templates(self)
+        // Its blocks are inserted into a page: never the unchecked image.
+        self.exact_read(|| crate::query::templates(self))
     }
 
     /// Resolve a `((uuid))` block reference to its shallow identity row.

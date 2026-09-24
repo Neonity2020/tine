@@ -420,8 +420,14 @@ impl Graph {
         };
         let config = self.config().parse_config().digest();
         let generation = self.cache_gen.load(Ordering::Acquire);
+        // Revision-exact: a stored row at these bytes is these bytes' rows
+        // whether or not the launch check has run, so a page opened while the
+        // stored image is served publishes nothing (launch design D2).
         if !projection.image_holds_source_revision(
-            generation,
+            crate::direct_projection::ReadAt {
+                generation,
+                currency: crate::direct_projection::Currency::LaunchStored,
+            },
             &self.rel_path(path),
             &crate::direct_projection::projection_source_revision(revision, config),
         ) {

@@ -267,7 +267,50 @@ fn index_readiness_contract_matches_the_code() {
         IndexFailureClass::ALL.len(),
         "the class table lists exactly the classes"
     );
+    // L8: the acting reads the contract lists are the functions that run an
+    // index read through `exact_read`, and no others.
+    let mut sites = Vec::new();
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut dirs = vec![src];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".rs") || name.contains("tests") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut function = "";
+            for line in text.lines() {
+                if let Some(at) = line.find("fn ") {
+                    let rest = &line[at + 3..];
+                    function = rest.split(['(', '<']).next().unwrap_or("");
+                }
+                if line.contains(".exact_read(") {
+                    sites.push(function.to_owned());
+                }
+            }
+        }
+    }
+    sites.sort();
+    let mut listed = LAUNCH_EXACT_READS.to_vec();
+    listed.sort();
+    assert_eq!(sites, listed, "L8's acting reads are the exact_read sites");
+    for read in LAUNCH_EXACT_READS {
+        assert!(
+            contract.contains(&format!("  | `{read}` |")),
+            "L8 does not list {read}"
+        );
+    }
 }
+
+/// The reads that act on their answer and therefore wait for the launch check
+/// even inside a display read (`docs/contracts/index-readiness.md` L8).
+const LAUNCH_EXACT_READS: &[&str] = &["try_list_pages", "templates", "indexed_creation_evidence"];
 
 /// A page edited in one session keeps its Linked and Unlinked References in
 /// the next. The index stores the block ids the editor's document carried; a

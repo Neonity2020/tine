@@ -5,7 +5,7 @@ import { backend, QueryNotReadyError, QueryUnavailableError } from "../backend";
 import type { BacklinkFilterContext, BacklinkFilterEntry, BlockDto, RefGroup } from "../types";
 import { LinkedReferences } from "./LinkedReferences";
 import { resetReferenceSectionState } from "../referenceSectionState";
-import { bumpGraphEpoch, setGraphMeta } from "../ui";
+import { bumpGraphEpoch, correctLaunchAnswers, setGraphMeta } from "../ui";
 import { bumpGraphBinding } from "../persistence";
 import { parseSearchQuery } from "../editor/searchQuery";
 import { mockSearchMatches } from "../mockSearchQuery";
@@ -1011,6 +1011,30 @@ describe("LinkedReferences across a rebind of the same page", () => {
       first.resolve([group("preRebind")]);
       await vi.waitFor(() => expect(root.textContent).toContain("new"));
       expect(root.textContent).not.toContain("preRebind");
+    } finally {
+      dispose();
+    }
+  });
+});
+
+// Launch design D4 (GH #550): during the launch index check the panel may be
+// answered from the index as the last session left it. When the check lands
+// (`warm-cache-done` → `correctLaunchAnswers`) the panel asks again and shows
+// the corrected answer, without the user touching anything.
+describe("Linked References after the launch index check", () => {
+  it("asks again and shows the corrected answer", async () => {
+    let answer: RefGroup[] = [{ page: "Source", kind: "page", blocks: [block("stored", "[[Target]] stored")] }];
+    const backlinks = vi.spyOn(backend(), "getBacklinks").mockImplementation(async () => answer);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    try {
+      await vi.waitFor(() => expect(root.querySelector(".test-ref-group")?.textContent).toBe("stored"));
+      const asked = backlinks.mock.calls.length;
+      answer = [{ page: "Source", kind: "page", blocks: [block("fresh", "[[Target]] fresh")] }];
+      correctLaunchAnswers();
+      await vi.waitFor(() => expect(root.querySelector(".test-ref-group")?.textContent).toBe("fresh"));
+      expect(backlinks.mock.calls.length).toBeGreaterThan(asked);
     } finally {
       dispose();
     }

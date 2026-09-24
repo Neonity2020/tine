@@ -3,10 +3,6 @@ import { backend } from "./backend";
 import { bumpDataRev } from "./ui";
 import { setDoc } from "./store";
 
-vi.mock("./warmCache", () => ({
-  waitForWarmCache: vi.fn(async () => true),
-}));
-
 async function waitUntil(predicate: () => boolean): Promise<void> {
   for (let i = 0; i < 50; i++) {
     if (predicate()) return;
@@ -35,7 +31,8 @@ describe("block reference count refresh (GH #154)", () => {
     bumpDataRev();
 
     await waitUntil(() => getCounts.mock.calls.length >= 2);
-    expect(blockRefCount("target-block")).toBe(1);
+    // The answer lands a tick after the call: wait for the count itself.
+    await waitUntil(() => blockRefCount("target-block") === 1);
   });
 
   it("reads two referrers under a freshly assigned durable id while the live key stays transient", async () => {
@@ -73,7 +70,6 @@ describe("block reference count refresh (GH #154)", () => {
 
     bumpDataRev();
     await waitUntil(() => getCounts.mock.calls.length >= 1);
-
-    expect(blockRefCount(transient)).toBe(2);
+    await waitUntil(() => blockRefCount(transient) === 2);
   });
 });

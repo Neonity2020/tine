@@ -82,13 +82,40 @@ struct BlockRow {
     page: usize,
 }
 
+/// Whether every row of the stored image at `path` was lowered under the
+/// facts version and parse configuration `prefix` names (the part of a
+/// [`projection_source_revision`] before the content revision). An empty or
+/// unreadable image is not: nothing is served from it.
+pub(super) fn stored_facts_are(path: &Path, prefix: &str) -> bool {
+    let Ok(mut snapshot) = PhysicalProjectionQuerySnapshot::open_direct(path, || Ok(())) else {
+        return false;
+    };
+    let mut rows = 0_i64;
+    let mut foreign = 0_i64;
+    let read = crate::query::projection_sql::visit(
+        &mut snapshot,
+        "SELECT count(*), coalesce(sum(substr(revision, 1, ?) <> ?), 0) \
+         FROM direct_source_revisions",
+        &[
+            PhysicalQueryValue::Integer(prefix.chars().count() as i64),
+            PhysicalQueryValue::Text(prefix.to_owned()),
+        ],
+        |row| {
+            rows = integer(row, 0)?;
+            foreign = integer(row, 1)?;
+            Ok(std::ops::ControlFlow::Break(()))
+        },
+    );
+    read.is_ok() && rows > 0 && foreign == 0
+}
+
 impl DirectProjection {
     pub(crate) fn derived_pages(
         &self,
-        generation: u64,
+        at: ReadAt,
         selection: &DerivedSelection<'_>,
     ) -> Option<Vec<DerivedPage>> {
-        let _reader = self.shared_reader_at(generation)?;
+        let _reader = self.shared_reader_at(at)?;
         let mut snapshot =
             PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
                 .reported(self)?;
@@ -268,7 +295,7 @@ impl DirectProjection {
                 page.session_ids = revision.map(|revision| (revision, preorder));
             }
         }
-        self.ready_at(generation).then_some(pages)
+        self.answers(at).then_some(pages)
     }
 
     /// Whether the index holds, or is being given, content `revision` of the
@@ -388,22 +415,22 @@ impl DirectProjection {
     /// of those bytes gives.
     pub(crate) fn image_holds_source_revision(
         &self,
-        generation: u64,
+        at: ReadAt,
         rel: &str,
         revision: &str,
     ) -> bool {
-        let Some(_reader) = self.shared_reader_at(generation) else {
+        let Some(_reader) = self.shared_reader_at(at) else {
             return false;
         };
-        self.stored_revision_is(rel, revision) && self.ready_at(generation)
+        self.stored_revision_is(rel, revision) && self.answers(at)
     }
 
     pub(crate) fn page_icon_rows(
         &self,
-        generation: u64,
+        at: ReadAt,
         keys: &[String],
     ) -> Option<Vec<(String, String)>> {
-        let _reader = self.shared_reader_at(generation)?;
+        let _reader = self.shared_reader_at(at)?;
         let mut snapshot =
             PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
                 .reported(self)?;
@@ -416,13 +443,13 @@ impl DirectProjection {
                     Ok(std::ops::ControlFlow::Continue(()))
                 }).reported(self)?;
         }
-        self.ready_at(generation).then_some(rows)
+        self.answers(at).then_some(rows)
     }
 
     /// The days of the journals that have content, from their stored
     /// `journal_day` (see [`DerivedPage::journal_day`]).
-    pub(crate) fn journal_content_days(&self, generation: u64) -> Option<Vec<i64>> {
-        let _reader = self.shared_reader_at(generation)?;
+    pub(crate) fn journal_content_days(&self, at: ReadAt) -> Option<Vec<i64>> {
+        let _reader = self.shared_reader_at(at)?;
         let mut snapshot =
             PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
                 .reported(self)?;
@@ -435,13 +462,13 @@ impl DirectProjection {
                 }
                 Ok(std::ops::ControlFlow::Continue(()))
             }).reported(self)?;
-        self.ready_at(generation)
+        self.answers(at)
             .then(|| content_pages.into_values().flatten().collect())
     }
 
     /// Every journal's stored day by path (see [`DerivedPage::journal_day`]).
-    pub(crate) fn journal_days(&self, generation: u64) -> Option<HashMap<String, i64>> {
-        let _reader = self.shared_reader_at(generation)?;
+    pub(crate) fn journal_days(&self, at: ReadAt) -> Option<HashMap<String, i64>> {
+        let _reader = self.shared_reader_at(at)?;
         let mut snapshot =
             PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
                 .reported(self)?;
@@ -456,6 +483,6 @@ impl DirectProjection {
             },
         )
         .reported(self)?;
-        self.ready_at(generation).then_some(days)
+        self.answers(at).then_some(days)
     }
 }

@@ -375,7 +375,7 @@ fn current_snapshot_capture_runs_before_later_queued_save() {
     // registering this test's observer; wait_ready alone sees readiness
     // before the final notification instructions execute.
     let QueryJobOpen::Job(initial) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("initial complete image");
     };
@@ -406,7 +406,7 @@ fn current_snapshot_capture_runs_before_later_queued_save() {
     observed.recv_timeout(Duration::from_secs(3)).unwrap();
     let query_projection = Arc::clone(&projection);
     let query = std::thread::spawn(move || {
-        query_projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        query_projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     });
     let deadline = Instant::now() + Duration::from_secs(3);
     while projection
@@ -442,7 +442,7 @@ fn current_snapshot_capture_runs_before_later_queued_save() {
         panic!("queued C must not reject the earlier coherent query");
     };
     let QueryJobOpen::Job(mut current) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("final C snapshot");
     };
@@ -515,7 +515,7 @@ fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
     projection.unready_test();
     assert!(!projection.ready_at(graph.cache_generation()));
     let QueryJobOpen::Job(mut job) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("a complete current image needs no saved target");
     };
@@ -540,7 +540,7 @@ fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
     assert!(!job.is_cancelled());
     assert_eq!(job.snapshot.query_revision().unwrap(), acquired_revision);
     let QueryJobOpen::Job(current) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("new image job");
     };
@@ -562,14 +562,14 @@ fn current_snapshot_requires_initialization_but_not_source_freshness() {
         .unwrap();
     let projection = graph.direct_projection_test().unwrap();
     assert!(matches!(
-        projection.open_current_query_job(RegistrySensitivity::Insensitive),
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current),
         QueryJobOpen::NotReady
     ));
     graph.warm_cache();
     wait_ready(&graph);
     projection.unready_test();
     let QueryJobOpen::Job(job) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("a complete image remains available while source freshness is unknown");
     };
@@ -710,7 +710,7 @@ fn current_snapshot_write_failure_recovers_from_authoritative_source() {
         "a genuine serving-writer failure reaches the always-on failure family"
     );
     assert!(matches!(
-        projection.open_current_query_job(RegistrySensitivity::Insensitive),
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current),
         QueryJobOpen::NotReady
     ));
     crate::direct_projection::recover_until_ready(&graph);
@@ -2750,9 +2750,9 @@ fn interactive_plain_reference_excludes_self_before_window_admission() {
 fn reference_wait_is_zero_cost_when_no_projection_work_exists() {
     let _serial = serialize_projection_tests();
     let root = scratch("reference-no-work-wait");
-    let projection = DirectProjection::start(root.join("projection.sqlite")).unwrap();
+    let projection = DirectProjection::start(root.join("projection.sqlite"), None).unwrap();
     let started = Instant::now();
-    assert!(!projection.wait_for_reference_generation(1));
+    assert!(!projection.wait_for_reference_generation(ReadAt::current(1)));
     assert!(
         started.elapsed() < Duration::from_millis(50),
         "an unavailable projection must fall back immediately"
@@ -3928,12 +3928,12 @@ fn public_friendly_unavailable_is_typed_not_empty() {
     let graph = friendly_committed_fixture("friendly-busy");
     let projection = graph.direct_projection_test().unwrap();
     let QueryJobOpen::Job(first) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("first job")
     };
     let QueryJobOpen::Job(second) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("second job")
     };
@@ -4150,7 +4150,7 @@ fn bl1_loaded_runtime_id_can_miss_sql_without_a_parsed_cache() {
     // R3: the index stores structural ids, so the id a fresh parse gives the
     // block names its row even though another session wrote the page.
     assert_eq!(
-        projection.block_page_hint(graph.cache_generation(), id),
+        projection.block_page_hint(ReadAt::current(graph.cache_generation()), id),
         Some(Some("one".to_owned())),
         "the index finds a block by the id today's parse gives it"
     );
@@ -4300,7 +4300,7 @@ fn warm_reopen_parses_nothing_and_answers_from_sql() {
     );
 
     let QueryJobOpen::Job(job) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("the clean SQL image admits a pinned reader");
     };
@@ -4778,7 +4778,7 @@ fn query_registry_snapshot_rejects_orphaned_property_owners() {
     // registry adapter can publish a partial row stream.
     assert!(
         projection
-            .property_owner_rows(graph.cache_generation())
+            .property_owner_rows(ReadAt::current(graph.cache_generation()))
             .is_none(),
         "an orphaned integer owner must fail the physical registry read"
     );
@@ -5037,7 +5037,7 @@ fn publication_sources_are_compared_inside_the_owned_main_snapshot() {
     let config = graph.config().parse_config();
     let projection = graph.direct_projection_test().unwrap();
     let QueryJobOpen::Job(mut old) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("old publication image");
     };
@@ -5073,7 +5073,7 @@ fn publication_sources_are_compared_inside_the_owned_main_snapshot() {
     );
     assert!(!old.publication_sources_match(&fresh, &config).unwrap());
     let QueryJobOpen::Job(mut current) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("current publication image");
     };
@@ -5095,7 +5095,7 @@ fn publication_sources_are_compared_inside_the_owned_main_snapshot() {
         .unwrap();
     drop(writer);
     let QueryJobOpen::Job(mut damaged) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("damaged source-metadata image");
     };
@@ -5863,7 +5863,7 @@ fn query_job_capture_waits_for_post_commit_identity_publication() {
     // registering this test's observer; wait_ready alone sees readiness
     // before the final notification instructions execute.
     let QueryJobOpen::Job(initial) =
-        projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        projection.open_current_query_job(RegistrySensitivity::Insensitive, Currency::Current)
     else {
         panic!("initial complete image");
     };
@@ -6853,7 +6853,7 @@ fn a_torn_projection_is_replaced_only_by_a_complete_fresh_build() {
     let torn = vec![0x55; 4096];
     std::fs::write(&path, &torn).unwrap();
 
-    let projection = DirectProjection::start(path.clone()).unwrap();
+    let projection = DirectProjection::start(path.clone(), None).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), torn);
     assert!(projection.worker_available());
     assert!(projection.close_and_wait_for_worker(Duration::from_secs(5)));
@@ -7454,7 +7454,7 @@ fn owned_stage_cleanup_is_exact_and_runs_on_open() {
         std::fs::write(private.join(name), b"keep").unwrap();
     }
 
-    let projection = DirectProjection::start(private.join("projection.sqlite")).unwrap();
+    let projection = DirectProjection::start(private.join("projection.sqlite"), None).unwrap();
     let started = Instant::now();
     while private.join(owned).exists() && started.elapsed() < Duration::from_secs(3) {
         std::thread::sleep(Duration::from_millis(1));
@@ -7811,8 +7811,9 @@ fn held_alias_reader_is_drained_before_fresh_publication() {
         }
     }));
     let alias_projection = Arc::clone(&projection);
-    let alias_read =
-        std::thread::spawn(move || alias_projection.page_aliases_with_owners(generation));
+    let alias_read = std::thread::spawn(move || {
+        alias_projection.page_aliases_with_owners(ReadAt::current(generation))
+    });
     reached.wait();
 
     let (before_tx, before_rx) = mpsc::channel();
@@ -7872,7 +7873,9 @@ fn delayed_shared_reader_rechecks_readiness_before_opening_a_connection() {
         }
     }));
     let delayed_projection = Arc::clone(&projection);
-    let delayed = std::thread::spawn(move || delayed_projection.referenced_page_names(generation));
+    let delayed = std::thread::spawn(move || {
+        delayed_projection.referenced_page_names(ReadAt::current(generation))
+    });
     reached.wait();
 
     let publication_reached = Arc::new(std::sync::Barrier::new(2));
@@ -9942,52 +9945,77 @@ fn gh543_a_display_read_cut_short_leaves_no_memo_behind() {
 
 /// Resolving block references is a display read like any listing: a refresh
 /// that retires its graph mid-read leaves it parsing nothing (GH #543, R2-01).
+/// Since the launch design (D2) a clean reopen answers it from the stored
+/// image during the launch check, so the waiting read is a reopen whose
+/// stored image cannot serve: the parse configuration changed while closed.
 #[test]
 fn gh543_a_block_resolve_on_a_retired_graph_parses_nothing() {
-    let _serial = serialize_projection_tests();
-    let root = r6_graph("gh543-retired-resolve");
-    let database = root.join("private/projection.sqlite");
-    {
-        let graph = Graph::open(&root);
-        graph.attach_direct_projection(database.clone()).unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-        release_projection(&graph);
-    }
-    let graph = Arc::new(Graph::open(&root));
-    graph.attach_direct_projection(database).unwrap();
-    let pause = graph.pause_next_warm_after_read_test();
-    let warmer = {
-        let graph = Arc::clone(&graph);
-        std::thread::spawn(move || graph.warm_cache())
-    };
-    pause.reached.wait();
-    let reader = {
-        let graph = Arc::clone(&graph);
-        std::thread::spawn(move || {
-            graph.display_read(|| {
-                crate::query::resolve_blocks_bounded(
-                    &graph,
-                    &["11111111-1111-4111-8111-111111111111".into()],
-                    100,
-                    1_000_000,
-                )
+    let run = |config_changed: bool| {
+        let _serial = serialize_projection_tests();
+        let root = r6_graph(if config_changed {
+            "gh543-retired-resolve-config"
+        } else {
+            "gh543-retired-resolve-stored"
+        });
+        let database = root.join("private/projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+            release_projection(&graph);
+        }
+        if config_changed {
+            std::fs::create_dir_all(root.join("logseq")).unwrap();
+            std::fs::write(
+                root.join("logseq/config.edn"),
+                "{:property/separated-by-commas #{:foo}}\n",
+            )
+            .unwrap();
+        }
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database).unwrap();
+        let pause = graph.pause_next_warm_after_read_test();
+        let warmer = {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || graph.warm_cache())
+        };
+        pause.reached.wait();
+        let reader = {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || {
+                graph.display_read(|| {
+                    crate::query::resolve_blocks_bounded(
+                        &graph,
+                        &["11111111-1111-4111-8111-111111111111".into()],
+                        100,
+                        1_000_000,
+                    )
+                })
             })
-        })
+        };
+        std::thread::sleep(Duration::from_millis(350));
+        graph.retire();
+        let answer = reader.join().unwrap();
+        let parses = graph.page_build_parses_test();
+        pause.release.wait();
+        warmer.join().unwrap();
+        release_projection(&graph);
+        let _ = std::fs::remove_dir_all(root);
+        (answer.is_some(), parses)
     };
-    std::thread::sleep(Duration::from_millis(350));
-    graph.retire();
-    let answer = reader.join().unwrap();
-    let parses = graph.page_build_parses_test();
-    pause.release.wait();
-    warmer.join().unwrap();
-    release_projection(&graph);
-    let _ = std::fs::remove_dir_all(root);
+    let (answered, parses) = run(true);
     assert!(
-        answer.is_none(),
+        !answered,
         "a read cut short by retirement reported an answer"
     );
     assert_eq!(parses, 0, "a block resolve parsed its retired graph");
+    let (answered, parses) = run(false);
+    assert!(
+        answered,
+        "a clean reopen answers from the stored image during the launch check"
+    );
+    assert_eq!(parses, 0, "a stored answer parsed the graph");
 }
 
 /// A warm that finds the snapshot already captured (here by an orphan-asset

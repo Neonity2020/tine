@@ -331,6 +331,9 @@ fn every_projection_statement_shape_is_blessed() {
     assert_eq!(projection.holds_pages_under("pages/"), Some(true));
     // The background integrity check, owed after a reboot (design D1).
     assert!(projection.run_integrity_check_test());
+    // A reopen serves the stored image during the launch check only when
+    // every stored fact was written under the current configuration (D2).
+    assert!(projection.stored_facts_are_test(&graph.config().parse_config()));
 
     let recorded: BTreeSet<String> = census::recorded().into_keys().collect();
     let assert_shape = |label: &str, required: &[&str], forbidden: &[&str]| {

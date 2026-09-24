@@ -14,7 +14,7 @@ impl Graph {
     /// [`Graph::list_pages`] for a caller that acts on the listing: a graph
     /// whose text cannot be read is an error, never an empty graph.
     pub fn try_list_pages(&self) -> io::Result<Vec<PageEntry>> {
-        self.page_listing(true)
+        self.exact_read(|| self.page_listing(true))
     }
 
     /// Forget the memoized page list, as a reopen that never parsed has none:
@@ -218,7 +218,9 @@ impl Graph {
             // recorded under a stale key would outlive the edit that
             // invalidated it — an autocomplete offering pages that no longer
             // exist, or missing one just linked.
-            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
+            if self.answer_is_complete()
+                && self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation
+            {
                 *self.referenced_names_cache.write().unwrap() = Some((generation, digest, names));
             }
             return answer;

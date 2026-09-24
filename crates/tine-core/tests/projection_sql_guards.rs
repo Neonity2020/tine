@@ -73,9 +73,11 @@ fn projection_statement_sites_are_pinned() {
         // already holds the opened bytes. (Audit R13-06) a journal's day is
         // read from its row. (Reconciler) the survey reads the stored
         // revisions; the watcher asks which pages sit under a directory.
+        // Design D2 (2026-09-24): a reopen asks whether every stored fact
+        // was written under the current facts version and configuration.
         (
             "crates/tine-core/src/direct_projection/derived_reads.rs",
-            10,
+            11,
         ),
         // Design D1 (2026-09-24): the background integrity check's
         // `PRAGMA quick_check`.

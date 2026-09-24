@@ -1,5 +1,5 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
-import { createMemo, createSignal, useContext } from "solid-js";
+import { batch, createMemo, createSignal, useContext } from "solid-js";
 import { isPublishedExport } from "./publishedBackend";
 import { graphBinding } from "./persistence";
 import type {
@@ -1098,6 +1098,26 @@ export function bumpPageInventoryRev() {
 // name-resolves-to-a-page answer keys on BOTH revisions. Bumped only when the
 // alias map actually changes, so an ordinary keystroke save costs nothing.
 export const [aliasRev, setAliasRev] = createSignal(0);
+// The launch index check finished (`warm-cache-done`). Until then an answer may
+// come from the index as the last session left it; surfaces that show one and
+// do not otherwise refresh on `dataRev` (the reference panels, Ctrl+K) ask
+// again once when this moves (GH #550, launch design D4).
+export const [indexCorrectionRev, setIndexCorrectionRev] = createSignal(0);
+export function bumpIndexCorrectionRev() {
+  setIndexCorrectionRev((n) => n + 1);
+}
+/** The launch index check landed (`warm-cache-done`): every surface that may
+ *  have shown an answer from the index as the last session left it asks
+ *  again. Reference panels and Ctrl+K key on `indexCorrectionRev`, the page
+ *  list and page identities on `pageInventoryRev`, and query blocks, aliases,
+ *  referenced names and block-ref counts on `dataRev` (launch design D4). */
+export function correctLaunchAnswers() {
+  batch(() => {
+    bumpIndexCorrectionRev();
+    bumpPageInventoryRev();
+    bumpDataRev();
+  });
+}
 export function bumpAliasRev() {
   setAliasRev((n) => n + 1);
 }

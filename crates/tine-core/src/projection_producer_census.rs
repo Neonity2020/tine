@@ -1640,10 +1640,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // background through one read-only `open_direct` snapshot in
     // `integrity.rs`, reading one `Text` verdict (design D1). Read only; no
     // write, schema or pin change.
+    // 2026-09-24: a reopen serves the stored image during the launch check
+    // only when its stored facts were written under the current facts
+    // version and parse configuration (design D2): `derived_reads.rs` gains
+    // one read-only `open_direct` and binds one `Integer` and one `Text`.
+    // Read only; no write, schema or pin change.
     let digest = inventory_digest(&dependency_surface);
     assert_eq!(
         digest,
-        "ecc590f9bf54601f1301f7cda7ba77b81b73d0351b156a617ed176a3fda0e61f",
+        "0e561394bc9932c9b2b468195578d1d04e11c161669edd6c832403cd15b62dab",
         "the complete tine-storage import/direct-call surface changed (digest now {digest}): {dependency_surface:#?}"
     );
 }

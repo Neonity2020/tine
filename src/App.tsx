@@ -1,4 +1,5 @@
 import { Match, Show, Suspense, Switch, createEffect, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
+import { listenHere } from "./windowEvents";
 import { Sidebar } from "./components/Sidebar";
 import { isPublishedExport, loadPublishedSnapshot } from "./publishedBackend";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
@@ -79,6 +80,7 @@ import {
   bumpDataRev,
   pageInventoryRev,
   bumpPageInventoryRev,
+  correctLaunchAnswers,
   installPaneTracker,
   isConflicted,
   pushToast,
@@ -1158,6 +1160,19 @@ export function App(): JSX.Element {
     void backend().onQueryProjectionChanged(bumpDataRev).then((u) => {
       if (disposed) u();
       else unsub = u;
+    });
+    onCleanup(() => { disposed = true; unsub(); });
+  });
+  // Answers shown during the launch check may come from the index as the last
+  // session left it; once the check lands, every surface asks again (GH #550).
+  onMount(() => {
+    let disposed = false;
+    let unsub = () => {};
+    void listenHere("warm-cache-done", () => correctLaunchAnswers()).then((u) => {
+      if (disposed) u();
+      else unsub = u;
+    }).catch(() => {
+      // A published export has no native events; nothing is ever corrected there.
     });
     onCleanup(() => { disposed = true; unsub(); });
   });

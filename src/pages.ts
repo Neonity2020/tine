@@ -1,7 +1,6 @@
 import { createMemo, createResource, createRoot } from "solid-js";
 import { backend } from "./backend";
 import { dataRev, graphEpoch, pageInventoryRev } from "./ui";
-import { waitForWarmCache } from "./warmCache";
 import type { PageEntry } from "./types";
 import { readOr } from "./resourceRead";
 import { listGraphPages } from "./pageList";
@@ -48,13 +47,12 @@ const pageInventory = createRoot(() => {
   const [referencedNamesResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev(), inventory: pageInventoryRev() }),
     async ({ epoch, revision, inventory }) => {
-      // `referenced_page_names` deliberately returns empty before the Rust warm
-      // cache exists. Wait for its completion event instead, so that early empty
-      // result cannot get memoized for this frontend revision.
-      if (!(await waitForWarmCache(epoch))) return [];
+      // Asked at open: the backend answers from the stored index during the
+      // launch check, or waits for the index while it is being built, and the
+      // check's completion bumps `dataRev`, which asks again (GH #550).
       if (epoch !== graphEpoch() || revision !== dataRev() || inventory !== pageInventoryRev()) return [];
       const carried = known?.epoch === epoch ? known : null;
-      // The warm wait covers the launch pass only; the lane a later one (R11-09).
+      // The lane keeps one read in flight across revisions (R11-09).
       const answer = await referencedNamesLane(
         () => epoch === graphEpoch() && revision === dataRev() && inventory === pageInventoryRev(),
         () => backend().referencedPageNames(carried?.digest ?? null).catch(() => null),
