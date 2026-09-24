@@ -374,8 +374,13 @@ pub(super) fn index_state(shared: &ProjectionShared, pending: &PendingProjection
     if owner_pass_coming && !backing_off(pending) {
         return IndexState::Working(Reason::Indexing);
     }
+    // An owed registry capture is queued work too, taken when no rebuild is
+    // owed (`worker_can_take`). One waiting out a failed turn's backoff was
+    // reported as "nothing coming", so readers parsed the whole graph beside
+    // an index that was about to answer (GH #594 L2).
     if !pending.marks.is_empty()
         || !pending.in_flight.is_empty()
+        || (pending.registry_owed.is_some() && !pending.rebuild)
         || shared.deltas_coming.load(Ordering::Acquire) > 0
     {
         return IndexState::Working(Reason::PendingEdits);

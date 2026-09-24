@@ -1616,9 +1616,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // names go. The survey reads stored revisions through one more read-only
     // `open_direct`. Removals and reads only; no new write kind, schema or
     // dependency pin.
+    // 2026-09-24: GH #594 the Linked References candidate read joins stored
+    // block order in one read-only SQL statement, so each stored id resolves
+    // through `ResultIdentity::public_id`: the `page_referrer_candidates_after`
+    // call and its entity-coordinate matches go, and an unresolvable id is
+    // reported as `MaterializationError::Corrupt`. Reads and error types only;
+    // no write, schema or pin change.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "f547233646248bcf36332d45ee4981f0abe6ffa673b9abcb743153ceceb63ead",
+        "c04cd60fe2970afc1c2e8e855eb42d171b3837e9eb4ddfb72b77752d2e1bc1f8",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

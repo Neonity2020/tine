@@ -15,6 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   id. This includes `(((uuid)))`, which Logseq and Tine both read as a
   reference to the id `(uuid`; write `( ((uuid)))` or `[label](((uuid)))` to
   show a reference in parentheses (GH #589).
+- Linked and Unlinked References no longer lose blocks from pages you edited
+  before restarting Tine. A block you added or moved on a page in one session
+  went missing from other pages' reference panels after a relaunch, and stayed
+  missing until that page was edited again (GH #594).
 - When the search index cannot be built, Linked and Unlinked References and
   query blocks now say so instead of staying empty or "indexing" for the rest
   of the session. Tine tries a failing build at most three times; after that

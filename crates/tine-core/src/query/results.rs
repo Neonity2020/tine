@@ -91,6 +91,34 @@ pub(crate) struct ResultIdentity {
 }
 
 impl ResultIdentity {
+    /// The public id of one stored block row: the id the page's document
+    /// carries at the snapshot's generation. A page this session lowered keeps
+    /// its stored live id; any other page's document is a fresh parse, whose
+    /// runtime ids are structural. Every reader that matches a stored block
+    /// against a document asks this, or its answer names blocks no document
+    /// has: the Linked References filter compared stored ids directly, and a
+    /// page edited in an earlier session lost its backlinks after a reopen
+    /// (GH #594).
+    pub(crate) fn public_id(
+        &self,
+        path: &str,
+        order_key: &str,
+        stored_id: &str,
+    ) -> Result<String, String> {
+        if self.keeps_stored_id(path) {
+            return Ok(stored_id.to_owned());
+        }
+        doc_runtime_id_for_order(path, order_key)
+            .map(|id| id.to_string())
+            .map_err(|error| format!("stored structural order does not resolve an id: {error}"))
+    }
+
+    /// Whether `path`'s rows answer with their stored id: this session
+    /// lowered them, so the document carries the same live ids.
+    fn keeps_stored_id(&self, path: &str) -> bool {
+        self.all_session || self.session_pages.contains(path)
+    }
+
     /// Every page's identity belongs to this session, so every row keeps its
     /// stored id.
     #[cfg(test)]
@@ -1148,13 +1176,10 @@ pub(crate) fn resolve_identity(
     stored_id: &str,
     stored_estimate: usize,
 ) -> Result<(String, usize), String> {
-    let structural = !identity.all_session && !identity.session_pages.contains(path);
-    if !structural {
+    if identity.keeps_stored_id(path) {
         return Ok((stored_id.to_owned(), stored_estimate));
     }
-    let resolved = doc_runtime_id_for_order(path, order_key)
-        .map_err(|error| format!("stored structural order does not resolve an id: {error}"))?
-        .to_string();
+    let resolved = identity.public_id(path, order_key, stored_id)?;
     let estimate = stored_estimate
         .checked_sub(stored_id.len())
         .and_then(|rest| rest.checked_add(resolved.len()))

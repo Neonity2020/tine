@@ -1,6 +1,7 @@
 //! GH #594, index liveness (L1-L3): within a bound the index is ready or
 //! visibly failed, and no reader waits on it without end.
 
+use super::gh543_interleaving::save_existing;
 use super::gh543_r10::{r10_finish, r10_pages, r10_scratch, r10_settle, R10Owner};
 use super::*;
 use crate::direct_projection::ProjectionProgress;
@@ -261,5 +262,86 @@ fn index_readiness_contract_matches_the_code() {
         contract.matches("\n| `").count(),
         IndexFailureClass::ALL.len(),
         "the class table lists exactly the classes"
+    );
+}
+
+/// A page edited in one session keeps its Linked and Unlinked References in
+/// the next. The index stores the block ids the editor's document carried; a
+/// fresh parse after the reopen assigns structural ids instead, and the
+/// reference panels' candidate filter compared the stored ids directly, so
+/// every block of a page edited in an earlier session vanished from both
+/// panels until the page was edited again (found by the L6 reference oracle).
+#[test]
+fn gh594_a_page_edited_before_a_reopen_keeps_its_references() {
+    let root = r10_scratch("edited-reopen");
+    r10_pages(&root, 4);
+    let database = root.join("private/projection.sqlite");
+    let open = || {
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database.clone()).unwrap();
+        let owner = R10Owner::start(&graph);
+        r10_settle(&graph);
+        (graph, owner)
+    };
+    let rows = |groups: &[crate::model::RefGroup]| {
+        let mut rows = groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .blocks
+                    .iter()
+                    .map(move |block| format!("{}|{}", group.page, block.raw))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    let panels = |graph: &Graph| {
+        (
+            crate::query::backlinks_bounded_indexed(graph, "p2", usize::MAX, usize::MAX)
+                .map(|answer| rows(&answer.groups)),
+            crate::query::unlinked_refs_bounded_indexed(graph, "p3", usize::MAX, usize::MAX)
+                .map(|answer| rows(&answer.groups)),
+        )
+    };
+    let (graph, owner) = open();
+    // An edit that adds a block above, so every block's position moves too.
+    save_existing(
+        &graph,
+        "p1",
+        "- a new block that mentions p3\n- TODO edited [[p2]]\n",
+    );
+    r10_settle(&graph);
+    let during = panels(&graph);
+    owner.stop();
+    crate::direct_projection::release_projection(&*graph);
+    drop(graph);
+
+    let (graph, owner) = open();
+    let after = panels(&graph);
+    let disk = Graph::open(&root);
+    let expected = (
+        rows(&crate::query::backlinks_bounded(&disk, "p2", usize::MAX, usize::MAX).groups),
+        rows(&crate::query::unlinked_refs_bounded(&disk, "p3", usize::MAX, usize::MAX).groups),
+    );
+    r10_finish(root, graph, owner);
+
+    assert_eq!(
+        expected,
+        (
+            vec!["p1|TODO edited [[p2]]".to_owned()],
+            vec!["p1|a new block that mentions p3".to_owned()],
+        ),
+        "the fixture's own answer"
+    );
+    assert_eq!(
+        (during.0.ok(), during.1.ok()),
+        (Some(expected.0.clone()), Some(expected.1.clone())),
+        "the session that made the edit lists it"
+    );
+    assert_eq!(
+        (after.0.ok(), after.1.ok()),
+        (Some(expected.0), Some(expected.1)),
+        "after the reopen, Linked and Unlinked References still list the edited page"
     );
 }

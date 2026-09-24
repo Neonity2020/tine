@@ -15,6 +15,13 @@
 //!    the index held for it, by design);
 //! 4. no consumer ran a whole-graph parse while the projection was alive.
 //!
+//! Index faults are injected too: bursts of failed worker turns, some longer
+//! than the index's attempts. Within the settle bound after the last fault the
+//! index is ready or visibly `Failed`, and every derived read -- queries,
+//! Linked and Unlinked References, the page list -- answers or reports the
+//! failure; none waits without end. A failed index converges after the
+//! reopen the user's Retry performs (GH #594, index liveness L6).
+//!
 //! Stage 0 of the one-indexing-owner design
 //! (`tine-agents/specs/notes/2026-09-22-single-indexing-owner-design.md`).
 
@@ -123,21 +130,43 @@ impl Session {
                 let mut turn = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     let started = Instant::now();
-                    match turn % 3 {
-                        0 => match graph.run_query_bounded(
-                            QUERIES[turn % QUERIES.len()],
-                            100,
-                            1 << 20,
-                        ) {
-                            Ok(_) | Err(crate::query::QueryExecutionError::NotReady(_)) => {}
-                            Err(other) => errors.lock().unwrap().push(format!("query: {other}")),
-                        },
+                    let target = format!("p{}", turn % 7);
+                    let answered = match turn % 5 {
+                        0 => graph
+                            .run_query_bounded(QUERIES[turn % QUERIES.len()], 100, 1 << 20)
+                            .map(|_| ()),
                         1 => {
                             let _ = graph.list_pages();
+                            Ok(())
                         }
+                        2 => {
+                            crate::query::backlinks_bounded_indexed(&*graph, &target, 100, 1 << 20)
+                                .map(|_| ())
+                        }
+                        3 => crate::query::unlinked_refs_bounded_indexed(
+                            &*graph,
+                            &target,
+                            100,
+                            1 << 20,
+                        )
+                        .map(|_| ()),
                         _ => {
                             let _ = graph.referenced_page_names();
+                            Ok(())
                         }
+                    };
+                    // Answered, not ready yet, or visibly failed: anything
+                    // else is a reader told something it cannot act on.
+                    match answered {
+                        Ok(())
+                        | Err(crate::query::QueryExecutionError::NotReady(_))
+                        | Err(crate::query::QueryExecutionError::Unavailable(
+                            crate::query::QueryUnavailableReason::IndexFailed(_),
+                        )) => {}
+                        Err(other) => errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("read {} of {target}: {other}", turn % 5)),
                     }
                     slowest.fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     turn += 1;
@@ -242,7 +271,9 @@ fn check_session_work(
     findings: &mut Vec<String>,
 ) {
     let parses = graph.consumer_page_parses_test() - acting_parses;
-    if parses > 0 {
+    // A failed index is read around by design: the page list and the other
+    // reads that can fall back parse the pages (GH #594 L3).
+    if parses > 0 && index_failure(graph).is_none() {
         findings.push(format!(
             "{parses} consumer parse(s) while the projection was alive"
         ));
@@ -261,22 +292,111 @@ const CONFIGS: &[&str] = &[
     "{:block-hidden-properties #{:status}}",
 ];
 
-fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<String>) {
+/// The class the index failed with, if it has stopped trying this session.
+fn index_failure(graph: &Graph) -> Option<crate::query::IndexFailureClass> {
+    match graph
+        .direct_projection_test()?
+        .progress_at(graph.cache_generation())
+    {
+        crate::direct_projection::ProjectionProgress::Failed(class) => Some(class),
+        _ => None,
+    }
+}
+
+/// Wait for the index to be ready at the current generation or visibly
+/// failed; `None` (and a finding) when it is neither within the bound.
+fn wait_ready_or_failed(
+    graph: &Graph,
+    findings: &mut Vec<String>,
+) -> Option<Option<crate::query::IndexFailureClass>> {
     let started = Instant::now();
-    while !graph.direct_projection_ready_test() {
+    loop {
+        if graph.direct_projection_ready_test() {
+            return Some(None);
+        }
+        if let Some(class) = index_failure(graph) {
+            return Some(Some(class));
+        }
         if started.elapsed() > SETTLE_BOUND {
             findings.push(format!(
-                "readiness never reached cache_generation={} ({})",
+                "the index was neither ready at cache_generation={} nor failed ({})",
                 graph.cache_generation(),
                 graph
                     .direct_projection_test()
                     .map(|projection| projection.debug_state_test())
                     .unwrap_or_else(|| "no projection".to_owned())
             ));
-            return;
+            return None;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Run `read` on its own thread; `None` when it has not returned in `limit`.
+fn within<T: Send + 'static>(
+    limit: Duration,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(read());
+    });
+    receiver.recv_timeout(limit).ok()
+}
+
+/// A failed index is reported, at once, by every read that needs it, and
+/// the reads that can fall back answer (GH #594 L3/L4).
+fn check_failed_reads(
+    graph: &Arc<Graph>,
+    class: crate::query::IndexFailureClass,
+    findings: &mut Vec<String>,
+) {
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    const PROMPTLY: Duration = Duration::from_secs(5);
+    let reads: [(&str, fn(&Graph) -> Result<(), QueryExecutionError>); 3] = [
+        ("query", |graph| {
+            graph
+                .run_query_bounded(QUERIES[0], 100, 1 << 20)
+                .map(|_| ())
+        }),
+        ("linked references", |graph| {
+            crate::query::backlinks_bounded_indexed(graph, "p1", 100, 1 << 20).map(|_| ())
+        }),
+        ("unlinked references", |graph| {
+            crate::query::unlinked_refs_bounded_indexed(graph, "p1", 100, 1 << 20).map(|_| ())
+        }),
+    ];
+    for (what, read) in reads {
+        let graph = Arc::clone(graph);
+        match within(PROMPTLY, move || read(&graph)) {
+            Some(Err(QueryExecutionError::Unavailable(QueryUnavailableReason::IndexFailed(
+                reported,
+            )))) if reported == class => {}
+            None => findings.push(format!("{what} over a failed index did not return")),
+            Some(other) => findings.push(format!(
+                "{what} over an index failed with {class:?} said {other:?}"
+            )),
+        }
+    }
+    let listed = {
+        let graph = Arc::clone(graph);
+        within(PROMPTLY, move || graph.list_pages().len())
+    };
+    if listed.is_none() {
+        findings.push("the page list over a failed index did not return".to_owned());
+    }
+}
+
+fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<String>) {
+    match wait_ready_or_failed(graph, findings) {
+        Some(None) => check_answers(root, graph, bad, findings),
+        Some(Some(class)) => findings.push(format!("the index failed with {class:?}")),
+        None => {}
+    }
+}
+
+/// The ready index answers what a fresh parse of the disk answers.
+fn check_answers(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<String>) {
     let oracle = Graph::open(root);
     for query in QUERIES {
         let expected = crate::query::run_query_bounded(&oracle, query, 1_000, 1 << 24);
@@ -305,6 +425,52 @@ fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<
                 }
             }
             Err(error) => findings.push(format!("{query}: ready index refused: {error}")),
+        }
+    }
+    // Linked and Unlinked References, per page, as the panels ask them.
+    let rows = |groups: &[crate::model::RefGroup]| {
+        let mut rows = groups
+            .iter()
+            .filter(|group| !bad.contains(&group.page.to_lowercase()))
+            .flat_map(|group| {
+                group
+                    .blocks
+                    .iter()
+                    .map(move |block| format!("{}|{}", group.page, block.raw))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    for entry in oracle.list_pages() {
+        let target = entry.name.to_lowercase();
+        if bad.contains(&target) {
+            continue;
+        }
+        let expected = crate::query::backlinks_bounded(&oracle, &target, usize::MAX, usize::MAX);
+        match crate::query::backlinks_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
+            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
+            Ok(indexed) => findings.push(format!(
+                "linked references of {target}: index {:?} != disk {:?}",
+                rows(&indexed.groups),
+                rows(&expected.groups)
+            )),
+            Err(error) => findings.push(format!(
+                "linked references of {target}: ready index refused: {error}"
+            )),
+        }
+        let expected =
+            crate::query::unlinked_refs_bounded(&oracle, &target, usize::MAX, usize::MAX);
+        match crate::query::unlinked_refs_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
+            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
+            Ok(indexed) => findings.push(format!(
+                "unlinked references of {target}: index {:?} != disk {:?}",
+                rows(&indexed.groups),
+                rows(&expected.groups)
+            )),
+            Err(error) => findings.push(format!(
+                "unlinked references of {target}: ready index refused: {error}"
+            )),
         }
     }
     let names = |graph: &Graph| {
@@ -413,6 +579,8 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
     // Parses made by whole-graph acting reads, which parse by design.
     let mut acting_parses = 0usize;
     let mut session_steps = 0usize;
+    // Whether this session was given an index fault.
+    let mut faulted = false;
 
     for step in 0..steps {
         std::thread::sleep(Duration::from_millis(rng.below(6)));
@@ -442,7 +610,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
         }
         let pick =
             |rng: &mut Rng, names: &[String]| names[rng.below(names.len() as u64) as usize].clone();
-        let op = rng.below(120);
+        let op = rng.below(126);
         if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
             eprintln!("seed {seed} step {step}: op {op} names {names:?}");
         }
@@ -581,6 +749,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
                 // launch check is what must find it.
                 missed.clear();
                 session = Session::open(&root, &database);
+                faulted = false;
                 Ok(())
             }
             // A page's parse starts panicking: an external edit, reported
@@ -644,6 +813,16 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
                 graph.direct_projection_owe_validation_test();
                 Ok(())
             }
+            // A fault that fails the index's next turns: a short burst it
+            // retries past, or one that outlasts its attempts and leaves it
+            // `Failed` for the session (GH #594 L6).
+            120..=125 => {
+                if let Some(projection) = graph.direct_projection_test() {
+                    projection.inject_turn_failures_test(1 + rng.below(4) as u32);
+                    faulted = true;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         };
         // An operation may be refused (a stale base, a name clash); what
@@ -667,13 +846,45 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
             eprintln!("  settle reconcile {missed_now:?} -> {settled:?}");
         }
     }
-    if session.quiesce(&mut findings) {
-        check_settled(&root, &graph, &bad, &mut findings);
-        check_session_work(&graph, acting_parses, session_steps, &mut findings);
-        drop(graph);
-        session.close(&mut findings);
-        let _ = fs::remove_dir_all(&root);
+    if !session.quiesce(&mut findings) {
+        return findings;
     }
+    if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
+        for dir in ["logseq", "pages", "journals"] {
+            for entry in fs::read_dir(root.join(dir)).into_iter().flatten().flatten() {
+                let text = fs::read_to_string(entry.path()).unwrap_or_default();
+                eprintln!("  {dir}/{}: {text:?}", entry.file_name().to_string_lossy());
+            }
+        }
+    }
+    let settled = wait_ready_or_failed(&graph, &mut findings);
+    check_session_work(&graph, acting_parses, session_steps, &mut findings);
+    match settled {
+        None => return findings,
+        Some(None) => {
+            check_answers(&root, &graph, &bad, &mut findings);
+            drop(graph);
+        }
+        Some(Some(class)) => {
+            if !faulted {
+                findings.push(format!("the index failed with {class:?} and no fault"));
+            }
+            check_failed_reads(&graph, class, &mut findings);
+            // The user's Retry: reopen the graph. The index converges.
+            drop(graph);
+            session.close(&mut findings);
+            session = Session::open(&root, &database);
+            let graph = Arc::clone(&session.graph);
+            if !session.quiesce(&mut findings) {
+                return findings;
+            }
+            check_settled(&root, &graph, &bad, &mut findings);
+            check_session_work(&graph, 0, 0, &mut findings);
+            drop(graph);
+        }
+    }
+    session.close(&mut findings);
+    let _ = fs::remove_dir_all(&root);
     findings
 }
 
@@ -723,7 +934,7 @@ fn gh543_long_interleaving_run() {
     run_seeds(first..first + env("TINE_INTERLEAVING_SEEDS", 200), 60);
 }
 
-fn save_existing(graph: &Graph, name: &str, text: &str) {
+pub(super) fn save_existing(graph: &Graph, name: &str, text: &str) {
     let mut page = graph
         .load_named(name, PageKind::Page)
         .unwrap()

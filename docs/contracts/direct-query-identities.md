@@ -20,9 +20,17 @@ reopen's survey kept are Structural. This provenance controls whether result
 construction uses stored IDs or deterministic structural IDs. Authority
 serialization is unchanged.
 
+Every reader that names a stored block to a Document asks one function,
+`ResultIdentity::public_id`: result construction, and the Linked and Unlinked
+References candidate filter, which admits only the blocks the index named. A
+reader that compares stored IDs directly names blocks no Document carries after
+a reopen: the filter did, and a page edited in an earlier session lost its
+references (GH #594).
+
 Gates: `edited_page_reload_and_sql_keep_the_same_session_ids`,
-`session_identity_survives_parsed_page_eviction`, and
-`session_pages_name_exactly_the_pages_this_process_lowered`.
+`session_identity_survives_parsed_page_eviction`,
+`session_pages_name_exactly_the_pages_this_process_lowered`, and
+`gh594_a_page_edited_before_a_reopen_keeps_its_references`.
 
 This contract repairs identity consistency. It does not establish that the
 reported multiline TODO viewport jump has been reproduced or fixed.

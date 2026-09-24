@@ -96,12 +96,20 @@ impl DirectProjection {
     pub(crate) fn inject_next_turn_failure_test(&self) {
         self.shared
             .inject_turn_failure
-            .store(true, Ordering::Release);
+            .fetch_max(1, Ordering::AcqRel);
+    }
+
+    /// Fail the worker's next `turns` turns as well as any already owed: a
+    /// fault that outlasts the retries (GH #594 L6).
+    pub(crate) fn inject_turn_failures_test(&self, turns: u32) {
+        self.shared
+            .inject_turn_failure
+            .fetch_add(turns, Ordering::AcqRel);
     }
 
     /// Whether an injected turn failure is still waiting for a turn.
     pub(crate) fn turn_failure_injection_pending_test(&self) -> bool {
-        self.shared.inject_turn_failure.load(Ordering::Acquire)
+        self.shared.inject_turn_failure.load(Ordering::Acquire) > 0
     }
 
     /// Refuse the next statement on an intact image, as SQLite refuses a

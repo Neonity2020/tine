@@ -5683,6 +5683,32 @@ fn session_identity_survives_parsed_page_eviction() {
     let _ = std::fs::remove_dir_all(database.parent().unwrap());
 }
 
+/// GH #594 L2: an owed registry capture waiting out a failed turn's backoff
+/// is work coming. Reported as nothing coming, it sent every reader that can
+/// fall back to a whole-graph parse beside an index about to answer (found
+/// by the L6 fault injection).
+#[test]
+fn an_owed_registry_waiting_out_a_backoff_is_work_coming() {
+    let shared = empty_projection_shared();
+    shared.validated.store(true, Ordering::Release);
+    let mut pending = shared.pending.lock().unwrap();
+    pending.set_up = true;
+    pending.registry_owed = Some(Arc::new(ParseConfig::default()));
+    pending.unsettled_passes = 2;
+    pending.retry_after = Some(Instant::now() + Duration::from_secs(60));
+    assert_eq!(
+        owner::index_state(&shared, &pending),
+        owner::IndexState::Working(crate::query::QueryReadinessReason::PendingEdits),
+        "the worker takes the owed registry when the backoff ends"
+    );
+    // Owed behind a rebuild nobody runs, it is not coming.
+    pending.rebuild = true;
+    assert_eq!(
+        owner::index_state(&shared, &pending),
+        owner::IndexState::Idle
+    );
+}
+
 fn empty_projection_shared() -> ProjectionShared {
     ProjectionShared {
         path: PathBuf::from("unused"),
@@ -5727,7 +5753,7 @@ fn empty_projection_shared() -> ProjectionShared {
         registry_capture_attempts: AtomicU64::new(0),
         inject_read_failure: AtomicBool::new(false),
         inject_image_damage: AtomicBool::new(false),
-        inject_turn_failure: AtomicBool::new(false),
+        inject_turn_failure: std::sync::atomic::AtomicU32::new(0),
         last_turn_failed: AtomicBool::new(false),
         lease_contended: AtomicBool::new(false),
         fallback_reads: AtomicU64::new(0),

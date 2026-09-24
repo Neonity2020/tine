@@ -487,9 +487,10 @@ struct ProjectionShared {
     /// to exercise; a statement refused on an intact image is a real query.
     #[cfg(test)]
     inject_image_damage: AtomicBool,
-    /// Fail the worker's next turn, as a disk error or a SQLite fault would.
+    /// Fail the worker's next this-many turns, as a disk error or a SQLite
+    /// fault would.
     #[cfg(test)]
-    inject_turn_failure: AtomicBool,
+    inject_turn_failure: std::sync::atomic::AtomicU32,
     /// The worker's last turn failed. A failure on an intact image leaves
     /// nothing else behind to observe it by.
     #[cfg(test)]
@@ -972,7 +973,7 @@ impl DirectProjection {
             #[cfg(test)]
             inject_image_damage: AtomicBool::new(false),
             #[cfg(test)]
-            inject_turn_failure: AtomicBool::new(false),
+            inject_turn_failure: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             last_turn_failed: AtomicBool::new(false),
             #[cfg(test)]
@@ -1911,50 +1912,76 @@ impl DirectProjection {
             )
         )
         .then(std::collections::HashSet::new);
-        let read = reader.as_ref()?.read();
+        reader.as_ref()?;
+        // The block set names blocks as the candidate pages' documents do, by
+        // the identity policy captured beside the image (R3,
+        // `ResultIdentity::public_id`). The stored id of a page edited in an
+        // earlier session is that session's live id, which no document
+        // carries after a reopen; compared directly, the filter dropped every
+        // such block and Linked References lost them (GH #594).
+        let identity = crate::query::results::ResultIdentity {
+            session_pages: Arc::clone(&self.shared.session_pages.lock().unwrap()),
+            all_session: false,
+        };
+        let mut insert_block = |path: &str,
+                                result_id: Option<&PhysicalQueryValue>,
+                                order_key: Option<&PhysicalQueryValue>|
+         -> Result<(), tine_storage::sqlite::MaterializationError> {
+            match (result_id, order_key) {
+                (
+                    Some(PhysicalQueryValue::Text(result_id)),
+                    Some(PhysicalQueryValue::Text(order_key)),
+                ) => {
+                    blocks.insert(
+                        identity
+                            .public_id(path, order_key, result_id)
+                            .map_err(tine_storage::sqlite::MaterializationError::Corrupt)?,
+                    );
+                    Ok(())
+                }
+                // A page-level posting names no block. The page-property
+                // pseudo-block it stands for is built from the page preamble
+                // and never classified through the block walk, so the block
+                // set stays complete for the walk.
+                (Some(PhysicalQueryValue::Null), Some(PhysicalQueryValue::Null)) => Ok(()),
+                _ => Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                    "reference candidate has an invalid identity".into(),
+                )),
+            }
+        };
         // All title/alias needles observe one committed image. Reopening per
         // spelling could otherwise union candidates from opposite sides of an
         // edit even though each individual query was coherent.
-        let mut plain_snapshot = if kind == ReferenceKind::Plain {
-            Some(
-                PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
-                    .reported(self)?,
-            )
-        } else {
-            None
-        };
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
-                    drain_after(
-                        |after, batch| read.page_referrer_candidates_after(name, after, batch),
+                    // Property-key pseudo pages are not backlinks; duplicate
+                    // occurrences collapse to one source entity.
+                    crate::query::projection_sql::visit(
+                        &mut snapshot,
+                        "SELECT DISTINCT p.path, b.result_id, b.order_key \
+                         FROM reference_postings r \
+                         JOIN names n ON n.name_id = r.target_name_id \
+                         JOIN pages p ON p.page_id = r.source_page_id \
+                         LEFT JOIN blocks b \
+                           ON r.source_entity_type = 1 AND b.block_id = r.source_entity_id \
+                         WHERE r.target_type = 0 AND r.reference_kind <= 4 AND n.key = ?1",
+                        &[PhysicalQueryValue::Text(name.clone())],
                         |row| {
-                            let entity = match row.source {
-                                PhysicalEntityId::Page(_) => {
-                                    PhysicalEntityCoordinate::Page(row.entity_cursor)
-                                }
-                                PhysicalEntityId::Block(_) => {
-                                    PhysicalEntityCoordinate::Block(row.entity_cursor)
-                                }
+                            let Some(PhysicalQueryValue::Text(path)) = row.first() else {
+                                return Err(
+                                    tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                        "reference candidate has no page path".into(),
+                                    ),
+                                );
                             };
-                            (row.page_cursor, entity)
+                            insert_block(path, row.get(1), row.get(2))?;
+                            paths.insert(PathBuf::from(path));
+                            Ok(std::ops::ControlFlow::Continue(()))
                         },
-                        |row| {
-                            paths.insert(PathBuf::from(row.source_page_path));
-                            match row.source {
-                                PhysicalEntityId::Block(block_id) => {
-                                    blocks.insert(block_id);
-                                }
-                                // A page-level posting names no block. The
-                                // page-property pseudo-block it stands for is
-                                // built from the page preamble and never
-                                // classified through the block walk, so the
-                                // block set stays complete for the walk.
-                                PhysicalEntityId::Page(_) => {}
-                            }
-                            Ok(())
-                        },
-                        |_, _| None,
                     )
                     .reported(self)?;
                 }
@@ -1965,7 +1992,7 @@ impl DirectProjection {
                         .as_ref()
                         .map(|expression| vec![PhysicalQueryValue::Text(expression.clone())])
                         .unwrap_or_default();
-                    let snapshot = plain_snapshot.as_mut()?;
+                    let snapshot = &mut snapshot;
                     let exclusions = crate::refs::ReferenceSourceExclusions::new(
                         self_page,
                         config.favorites_page.as_deref(),
@@ -2024,7 +2051,7 @@ impl DirectProjection {
                         let candidate_source =
                             "(SELECT c.rowid AS entity_id, \
                                      CASE WHEN ep.page_id IS NOT NULL THEN 0 ELSE 1 END AS entity_type, \
-                                     owner.path, b.result_id, \
+                                     owner.path, b.result_id, b.order_key, \
                                      CASE WHEN ep.page_id IS NOT NULL \
                                           THEN COALESCE(pt.preamble, '') ELSE bt.content END AS raw, \
                                      owner_name.key AS owner_key \
@@ -2054,7 +2081,7 @@ impl DirectProjection {
                             .then(|| format!(" WHERE {conditions}"))
                             .unwrap_or_default();
                         format!(
-                            "SELECT path, result_id, entity_id, entity_type \
+                            "SELECT path, result_id, entity_id, entity_type, order_key \
                              FROM {candidate_source}{where_sql} \
                              ORDER BY entity_id DESC{limit_sql}"
                         )
@@ -2089,11 +2116,12 @@ impl DirectProjection {
                             .unwrap_or_default();
                         format!(
                             "SELECT p.path AS path, NULL AS result_id, \
-                                    p.page_id AS entity_id, 0 AS entity_type \
+                                    p.page_id AS entity_id, 0 AS entity_type, \
+                                    NULL AS order_key \
                              FROM pages p JOIN names n ON n.name_id = p.name_id \
                              LEFT JOIN page_text pt ON pt.page_id = p.page_id{page_where} \
                              UNION ALL \
-                             SELECT p.path, b.result_id, b.block_id, 1 \
+                             SELECT p.path, b.result_id, b.block_id, 1, b.order_key \
                              FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id \
                              JOIN pages p ON p.page_id = b.page_id \
                              JOIN names n ON n.name_id = p.name_id{block_where} \
@@ -2113,21 +2141,9 @@ impl DirectProjection {
                                 "plain-reference candidate has no page path".into(),
                             ));
                         };
+                        insert_block(path, row.get(1), row.get(4))?;
                         let path = PathBuf::from(path);
                         paths.insert(path.clone());
-                        match row.get(1) {
-                            Some(PhysicalQueryValue::Text(result_id)) => {
-                                blocks.insert(result_id.clone());
-                            }
-                            Some(PhysicalQueryValue::Null) => {}
-                            _ => {
-                                return Err(
-                                    tine_storage::sqlite::MaterializationError::InvalidQuery(
-                                        "plain-reference candidate has an invalid identity".into(),
-                                    ),
-                                );
-                            }
-                        }
                         match row.get(3) {
                             Some(PhysicalQueryValue::Integer(0)) => {
                                 if let Some(page_owners) = page_owners.as_mut() {
@@ -2629,7 +2645,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         run_before_apply_deltas_hook();
         let applied: Result<AppliedTurn, ProjectionRefusal> = (|| {
             #[cfg(test)]
-            if shared.inject_turn_failure.swap(false, Ordering::AcqRel) {
+            if shared
+                .inject_turn_failure
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
                 return Err(ProjectionRefusal::Failed(
                     "injected turn failure".to_owned(),
                 ));
