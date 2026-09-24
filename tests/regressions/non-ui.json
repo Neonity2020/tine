@@ -7846,6 +7846,30 @@
  "notes": "Blocking core operation (latency). ADR 0069 (accepted by Martin 2026-09-24): a one- or two-character needle written entirely in Han, kana or Hangul was exempt from the scan budget and scanned every block (1.5 s per keystroke for a rare word at 616k blocks). tine-storage 0.28.0 adds short_word_fts (schema 31), fed from candidate::short_word_tokens, the unigrams and bigrams of each CJK run of the same folded text, by the router's own script predicate; the planner bounds such needles by it for Ctrl-K, content-match queries and unlinked references. Completeness: every 1-2 scalar CJK substring of indexed text is one of its tokens (property test); candidates are still verified exactly. Mixed short needles and OR arms bounded by different tables keep the unbudgeted scan. Unit cost measured through Tine's writer: +12.4 KB WAL per 1-block CJK edit, +25-33 KB per 60-block CJK edit, 0 without CJK. Shares the FACTS_VERSION 5 / schema 31 rebuild with the search-fold change. Not measured on the 10k CJK graph in Tine."
 },
 {
+ "id": "REG-SEARCH-FOLD-KEEPS-LETTER-MARKS-001",
+ "title": "Search folds accents but keeps a mark that makes a different letter or syllable",
+ "family": "search",
+ "sources": {
+  "issues": [],
+  "commits": ["a3e7bfda9120388f5766db7d61a2d8c1638701f3"],
+  "internal": "Martin decision BZ3, 2026-09-24"
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-search/src/fold.rs::accents_fold_and_letter_making_marks_do_not",
+   "crates/tine-search/src/fold.rs::the_ignorable_marks_are_every_default_ignorable_mark",
+   "crates/tine-core/src/onboarding.rs::search_guide_mark_examples_are_what_search_does",
+   "src/render/searchWasm.integration.test.ts::keeps marks that make another letter and folds only accents"
+  ],
+  "scenario": null,
+  "failBefore": "Decided behaviour change: accents_fold_and_letter_making_marks_do_not asserts か does not find が, и does not find й and क does not find कु, which the previous fold (every nonspacing mark removed) made match."
+ },
+ "notes": "Flexible heuristic with an exact decided rule. A nonspacing mark folds away only if its combining class is nonzero and not one of 8, 9, 84, 91, 103, 118, 129, 130, 132 (kana voicing, virama, Telugu length, Thai/Lao u, Tibetan vowels), Firefox's find-in-page rule; Cyrillic keeps its marks except ё -> е; stroked letters (ł ø đ ħ ŧ) fold to their base. Stored search tokens change: DIRECT_PROJECTION_FACTS_VERSION 4 -> 5, one re-index shared with the CJK short-word index."
+},
+{
  "id": "REG-CASE-VARIANT-PAGE-NAME-597",
  "title": "A page opened by a name that differs from its file name only in case opens and can be edited, and is listed once",
  "family": "filesystem-safety",

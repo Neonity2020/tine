@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.986] - 2026-09-25
+
 ### Fixed
 
 - On Android 11 to 14 shared storage, creating, saving and renaming pages

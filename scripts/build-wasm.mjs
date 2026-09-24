@@ -71,10 +71,14 @@ if (existsSync(join(root, "crates", "lsdoc-wasm", "Cargo.lock"))) {
 
 const tmp = mkdtempSync(join(tmpdir(), "lsdoc-wasm-"));
 console.log(`wasm-pack build → ${tmp}`);
+// Panic locations embed source paths. Without the remap the checkout's
+// absolute path (a private worktree name) ships in the public bytes, and the
+// measured size ceiling moves with the length of that name.
+const rustflags = [process.env.RUSTFLAGS, `--remap-path-prefix=${root}=/tine`].filter(Boolean).join(" ");
 execFileSync(
   "wasm-pack",
   ["build", "crates/lsdoc-wasm", "--target", "web", "--release", "--out-dir", tmp, "--out-name", "lsdoc_wasm"],
-  { cwd: root, stdio: "inherit", env: { ...process.env, LSDOC_TAG: coreTag } },
+  { cwd: root, stdio: "inherit", env: { ...process.env, LSDOC_TAG: coreTag, RUSTFLAGS: rustflags } },
 );
 
 requireSearchLockAlignment();
