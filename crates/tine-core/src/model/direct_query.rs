@@ -367,13 +367,10 @@ impl Graph {
         // and the identity capture; `read_results` owns the descriptor read,
         // the budget and the payload batches, and installs the statement's
         // compiled-regex program on the job's own connection.
-        // The identity policy, captured with the snapshot: a page THIS process
-        // lowered answers with its stored live id; a row reused from an earlier
-        // session answers with the structural id the fresh parse assigns it.
-        let identity = crate::query::results::ResultIdentity {
-            session_pages: Arc::clone(&job.session_pages),
-            all_session: false,
-        };
+        // The identity decoder, captured with the snapshot: a row answers with
+        // its stored structural id, unless this session's document names that
+        // block by a live id recorded at the row's revision (R3).
+        let identity = job.identity.clone();
         // The recency axis is the WALK'S producer, by the two inputs the
         // projection stores; it runs only for a page the answer admitted.
         let recency = |page: crate::query::results::RecencyPage<'_>| {
@@ -447,10 +444,7 @@ impl Graph {
         self.dispatch_direct_query(|request| {
             self.direct_projection_read_job(request, sensitivity, |job| {
                 let registry = self.direct_lowering_registry(prepared.requires_registry(), job)?;
-                let identity = crate::query::results::ResultIdentity {
-                    session_pages: Arc::clone(&job.session_pages),
-                    all_session: false,
-                };
+                let identity = job.identity.clone();
                 let recency = |page: crate::query::results::RecencyPage<'_>| {
                     crate::query::page_recency_secs_for(
                         page.journal_day,
@@ -518,10 +512,7 @@ impl Graph {
                         )));
                     }
                     let registry = self.direct_lowering_registry(true, job)?;
-                    let identity = ResultIdentity {
-                        session_pages: Arc::new(HashSet::new()),
-                        all_session: false,
-                    };
+                    let identity = ResultIdentity::structural();
                     let recency = |page: RecencyPage<'_>| {
                         crate::query::page_recency_secs_for(
                             page.journal_day,
@@ -844,10 +835,7 @@ impl Graph {
                     )
                 })
                 .collect::<Vec<_>>();
-            let identity = crate::query::results::ResultIdentity {
-                session_pages: Arc::clone(&job.session_pages),
-                all_session: false,
-            };
+            let identity = job.identity.clone();
             let recency = |page: crate::query::results::RecencyPage<'_>| {
                 crate::query::page_recency_secs_for(page.journal_day, &self.root.join(page.path))
             };

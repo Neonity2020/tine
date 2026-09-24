@@ -2,9 +2,7 @@
 //! packet intentionally does not execute them; the manager runs them after
 //! wiring the public adapters on the combined exact head.
 
-use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 
 use tine_storage::sqlite::PhysicalProjectionQuerySnapshot;
 
@@ -78,10 +76,7 @@ fn friendly_main_reader_matches_the_independent_walk_for_rank_and_identity_shape
         QueryPlan::friendly("alpha OR Café", 8, 8),
         QueryPlan::friendly("-draft", 8, 8),
     ];
-    let structural = ResultIdentity {
-        session_pages: Arc::new(HashSet::new()),
-        all_session: false,
-    };
+    let structural = ResultIdentity::structural();
     for plan in &plans {
         let expected = plan.execute_with_explain(&corpus.graph, || false, true);
         let stored = read(&corpus, plan, &ResultIdentity::session_owned())
@@ -506,10 +501,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let root = scratch("q3-friendly-scope");
     write_membership_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let structural = ResultIdentity {
-        session_pages: Arc::new(HashSet::new()),
-        all_session: false,
-    };
+    let structural = ResultIdentity::structural();
 
     // ---- Names: exactly the name and alias owners, and NOTHING body-only ----
     let names = read_with(

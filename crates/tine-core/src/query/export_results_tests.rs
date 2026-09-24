@@ -513,10 +513,7 @@ fn export_core_answers_exactly_what_the_walk_export_answers() {
         // A FRESH Direct session: no page's identity is this session's, so
         // every row — root and descendant alike — resolves its public id
         // structurally from the stored path and order key.
-        ResultIdentity {
-            session_pages: std::sync::Arc::new(std::collections::HashSet::new()),
-            all_session: false,
-        },
+        ResultIdentity::structural(),
     ] {
         for specs in &runs {
             for caps in sweep_caps() {

@@ -345,3 +345,100 @@ fn gh594_a_page_edited_before_a_reopen_keeps_its_references() {
         "after the reopen, Linked and Unlinked References still list the edited page"
     );
 }
+
+/// R3 (GH #594 follow-up): the index stores every block's structural id and
+/// the session maps the live ids its documents carry. Before R3 the index
+/// stored the live ids of the session that saved a page, so after a reopen
+/// the id a fresh parse gives a block named no row: looking the block up by
+/// that id found nothing. Checked both ways and on every surface that names
+/// a block by id: lookup, page hint, and the Linked References answer, in
+/// the session that moved the block and after a reopen.
+#[test]
+fn gh594_a_block_is_found_by_its_id_in_the_session_and_after_a_reopen() {
+    let root = r10_scratch("id-reopen");
+    r10_pages(&root, 4);
+    let database = root.join("private/projection.sqlite");
+    let open = || {
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database.clone()).unwrap();
+        let owner = R10Owner::start(&graph);
+        r10_settle(&graph);
+        (graph, owner)
+    };
+    let blocks = |graph: &Graph| -> Vec<(String, String)> {
+        graph
+            .load_named("p1", PageKind::Page)
+            .unwrap()
+            .expect("p1 exists")
+            .blocks
+            .iter()
+            .map(|block| (block.id.clone(), block.raw.clone()))
+            .collect()
+    };
+    let problems = |graph: &Graph, when: &str| -> Vec<String> {
+        let mut problems = Vec::new();
+        let page = blocks(graph);
+        for (id, raw) in &page {
+            match graph.resolve_block(id) {
+                Some(group) if group.blocks.first().is_some_and(|block| block.raw == *raw) => {}
+                other => problems.push(format!(
+                    "{when}: looking up {raw:?} by its id {id} found {:?}",
+                    other.map(|group| group.blocks.into_iter().map(|b| b.raw).collect::<Vec<_>>())
+                )),
+            }
+            if graph.block_page_hint(id).as_deref() != Some("p1") {
+                problems.push(format!(
+                    "{when}: the page hint of {raw:?} is {:?}",
+                    graph.block_page_hint(id)
+                ));
+            }
+        }
+        let linked = crate::query::backlinks_bounded_indexed(graph, "p2", usize::MAX, usize::MAX)
+            .map(|answer| {
+                answer
+                    .groups
+                    .into_iter()
+                    .flat_map(|group| group.blocks)
+                    .find(|block| block.raw == "TODO edited [[p2]]")
+                    .map(|block| block.id)
+            });
+        let expected = page
+            .iter()
+            .find(|(_, raw)| raw == "TODO edited [[p2]]")
+            .map(|(id, _)| id.clone());
+        if linked.as_ref().ok() != Some(&expected) {
+            problems.push(format!(
+                "{when}: Linked References names the edited block {linked:?}, its page {expected:?}"
+            ));
+        }
+        problems
+    };
+
+    let (graph, owner) = open();
+    let before = blocks(&graph);
+    let mut page = graph.load_named("p1", PageKind::Page).unwrap().unwrap();
+    let base = page.rev.clone();
+    let mut inserted = page.blocks[0].clone();
+    inserted.id = uuid::Uuid::new_v4().to_string();
+    inserted.raw = "a new block".into();
+    inserted.children.clear();
+    page.blocks[0].raw = "TODO edited [[p2]]".into();
+    page.blocks.insert(0, inserted);
+    graph.save_page(&page, base.as_deref()).unwrap();
+    r10_settle(&graph);
+    let during = blocks(&graph);
+    let mut found = problems(&graph, "in the session");
+    owner.stop();
+    crate::direct_projection::release_projection(&*graph);
+    drop(graph);
+
+    let (graph, owner) = open();
+    found.extend(problems(&graph, "after the reopen"));
+    r10_finish(root, graph, owner);
+
+    assert_eq!(
+        during[1].0, before[0].0,
+        "the fixture: the block below the insertion keeps its id in the session"
+    );
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}

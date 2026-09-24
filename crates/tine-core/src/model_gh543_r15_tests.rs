@@ -239,10 +239,13 @@ fn gh543_r15_cache_fallback_answers_like_the_index_for_an_unreadable_page() {
     // Hold the worker's next turn so the index is mid-turn.
     let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    crate::direct_projection::before_next_apply_test(Box::new(move || {
-        let _ = reached_tx.send(());
-        let _ = release_rx.recv_timeout(Duration::from_secs(20));
-    }));
+    crate::direct_projection::before_next_apply_test(
+        &root,
+        Box::new(move || {
+            let _ = reached_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+        }),
+    );
     fs::write(root.join("pages/p1.md"), "- edited r15c [[p2]]\n").unwrap();
     graph.sync_file_checked(&root.join("pages/p1.md")).unwrap();
     let held = reached_rx.recv_timeout(Duration::from_secs(5)).is_ok();

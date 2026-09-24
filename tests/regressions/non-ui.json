@@ -7655,12 +7655,14 @@
  "coverage": {
   "tests": [
    "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_page_edited_before_a_reopen_keeps_its_references",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_block_is_found_by_its_id_in_the_session_and_after_a_reopen",
+   "crates/tine-core/src/direct_projection_tests.rs::live_ids_decode_only_with_the_stored_revisions_exceptions",
    "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
   ],
   "scenario": null,
-  "failBefore": "tine-agents/evidence/batch-gh594/necessity-liveness.txt (reopen test: backlinks and unlinked references both empty before the fix; found by the L6 reference oracle on seed 9)"
+  "failBefore": "tine-agents/evidence/batch-gh594/necessity-liveness.txt (reopen test: backlinks and unlinked references both empty before the fix; found by the L6 reference oracle on seed 9. Reverse lookup: the page hint of a block kept across an insertion is None after a reopen before R3)"
  },
- "notes": "Blocking core operation. An editor save stores the session's live block ids in the index; after a relaunch a fresh parse names the same blocks by structural ids (docs/contracts/direct-query-identities.md, R3). The reference panels' candidate filter compared stored ids to parsed ids directly, bypassing ResultIdentity, so every block of a page edited in an earlier session dropped out of other pages' Linked and Unlinked References until that page was edited again. The filter now resolves stored ids through ResultIdentity::public_id, the same function result construction uses. Candidate cause of the reporter's missing backlinks in GH #594 (inference: the report does not say whether the pages were edited before relaunching). Follow-up (not fixed here): the reverse direction, resolving a structural id back to a stored row on a page stored with live ids, still fails after a relaunch; the UI stamps a persistent id:: before navigating to a block, so it is latent."
+ "notes": "Blocking core operation. An editor save stores the session's live block ids in the index; after a relaunch a fresh parse names the same blocks by structural ids (docs/contracts/direct-query-identities.md, R3). The reference panels' candidate filter compared stored ids to parsed ids directly, bypassing ResultIdentity, so every block of a page edited in an earlier session dropped out of other pages' Linked and Unlinked References until that page was edited again. The filter now resolves stored ids through ResultIdentity::public_id, the same function result construction uses. Candidate cause of the reporter's missing backlinks in GH #594 (inference: the report does not say whether the pages were edited before relaunching). The reverse direction (a block's id back to its stored row) failed after a relaunch too; R3 fixes the class at its source: the index stores structural ids only, and the session maps live ids through exceptions keyed by stored source revision (ResultIdentity::stored_id for lookups). FACTS_VERSION 4 re-lowers every page once."
 },
 {
  "id": "REG-INDEX-LIVENESS-594",

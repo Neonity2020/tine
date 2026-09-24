@@ -241,10 +241,7 @@ impl Graph {
                 request,
                 crate::direct_projection::RegistrySensitivity::Insensitive,
                 |job| {
-                    let identity = crate::query::results::ResultIdentity {
-                        session_pages: Arc::clone(&job.session_pages),
-                        all_session: false,
-                    };
+                    let identity = job.identity.clone();
                     read_friendly_results(
                         &mut job.snapshot,
                         &FriendlyReadInputs {

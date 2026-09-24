@@ -95,10 +95,16 @@ pub(super) fn lower_in_batches(
         let mut reference_postings = Vec::new();
         let mut aliases = Vec::new();
         let mut revisions = Vec::with_capacity(chunk.len());
+        let mut live_ids = Vec::with_capacity(chunk.len());
         for page in chunk {
-            let (physical, mut postings, mut page_aliases) =
+            let (physical, mut postings, mut page_aliases, page_live_ids) =
                 physical_page(&page.entry, &page.document, &page.parse_config)
                     .map_err(LoweringError::Failed)?;
+            live_ids.push((
+                page.entry.rel_path.clone(),
+                page.revision.clone(),
+                page_live_ids,
+            ));
             revisions.push(PhysicalGraphProjectionSourceRevision {
                 path: page.entry.rel_path.clone(),
                 revision: page.revision.clone(),
@@ -112,6 +118,9 @@ pub(super) fn lower_in_batches(
         if replacements.is_empty() && deletions.is_empty() {
             continue;
         }
+        // Before the rows commit, so any snapshot that reads them finds the
+        // live ids they decode to (R3).
+        shared.record_live_ids(live_ids);
         write(
             PhysicalGraphProjectionChange {
                 replacements,
@@ -182,7 +191,7 @@ pub(crate) fn physical_page_for_test(
     document: &Document,
     parse_config: &ParseConfig,
 ) -> Result<PhysicalPage, String> {
-    physical_page(entry, document, parse_config).map(|(page, _, _)| page)
+    physical_page(entry, document, parse_config).map(|(page, ..)| page)
 }
 
 /// Every page the image at `image` stores, rebuilt from its rows as a fresh
@@ -203,11 +212,14 @@ pub(crate) fn carried_physical_pages_test(
     .into_iter()
     .map(|page| {
         physical_page(&page.entry, &page.document, &page.parse_config)
-            .map(|(physical, _, _)| (page.entry.rel_path, physical))
+            .map(|(physical, ..)| (page.entry.rel_path, physical))
     })
     .collect()
 }
 
+/// One page's rows, its reference postings and aliases, and the live-id
+/// exceptions of its document: `structural -> live` for every block whose
+/// runtime id is not the structural id its rows store (R3).
 pub(super) fn physical_page(
     entry: &PageEntry,
     document: &Document,
@@ -217,6 +229,7 @@ pub(super) fn physical_page(
         PhysicalPage,
         Vec<PhysicalReferencePosting>,
         Vec<PhysicalAliasDeclaration>,
+        HashMap<String, String>,
     ),
     String,
 > {
@@ -276,12 +289,16 @@ pub(super) fn physical_page(
         )?;
     }
     let mut block_refs_norm: Vec<Vec<String>> = Vec::new();
+    let mut live_ids = HashMap::new();
+    let namespace = crate::vocab::doc_runtime_namespace(path)
+        .map_err(|error| format!("page {path} has no structural id namespace: {error}"))?;
     lower_blocks(
         &document.roots,
         path,
-        None,
+        (namespace, None),
         &mut Vec::new(),
         &mut blocks,
+        &mut live_ids,
         &mut reference_postings,
         &mut block_refs_norm,
         parse_config,
@@ -348,16 +365,22 @@ pub(super) fn physical_page(
         },
         reference_postings,
         aliases,
+        live_ids,
     ))
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Rows name every block by its STRUCTURAL id, derived from `parent`'s
+/// (`parent.0`, the page namespace at the roots) and its sibling position:
+/// the id a fresh parse assigns. SQLite is never the identity authority; a
+/// document block named otherwise is recorded in `live_ids` (R3).
 pub(super) fn lower_blocks(
     source: &[DocBlock],
     page_path: &str,
-    parent: Option<&str>,
+    parent: (uuid::Uuid, Option<&str>),
     structural_path: &mut Vec<u32>,
     out: &mut Vec<PhysicalBlock>,
+    live_ids: &mut HashMap<String, String>,
     reference_postings: &mut Vec<PhysicalReferencePosting>,
     refs_norm: &mut Vec<Vec<String>>,
     parse_config: &ParseConfig,
@@ -367,6 +390,11 @@ pub(super) fn lower_blocks(
         let position = u32::try_from(position)
             .map_err(|_| "page has more than u32::MAX sibling blocks".to_string())?;
         structural_path.push(position);
+        let structural = crate::vocab::doc_runtime_child(parent.0, position);
+        let id = structural.to_string();
+        if block.uuid != id {
+            live_ids.insert(id.clone(), block.uuid.clone());
+        }
         let projection = block.projection();
         let order = structural_path
             .iter()
@@ -376,7 +404,7 @@ pub(super) fn lower_blocks(
         append_reference_postings(
             reference_postings,
             page_path,
-            PhysicalEntityId::Block(block.uuid.clone()),
+            PhysicalEntityId::Block(id.clone()),
             order.as_bytes(),
             projection.refs_page.iter().cloned(),
             crate::doc::property_reference_page_names(&block.raw).into_iter(),
@@ -387,7 +415,7 @@ pub(super) fn lower_blocks(
             };
             reference_postings.push(PhysicalReferencePosting {
                 source_page_path: page_path.to_owned(),
-                source_entity: PhysicalEntityId::Block(block.uuid.clone()),
+                source_entity: PhysicalEntityId::Block(id.clone()),
                 source_locator: order.as_bytes().to_vec(),
                 ordinal: u32::try_from(reference_postings.len())
                     .map_err(|_| "one page exceeds u32::MAX reference postings".to_string())?,
@@ -417,7 +445,7 @@ pub(super) fn lower_blocks(
             .and_then(|value| Uuid::parse_str(value.trim()).ok())
             .map(Uuid::into_bytes);
         out.push(PhysicalBlock {
-            result_id: block.uuid.clone(),
+            result_id: id.clone(),
             own_refs: projection
                 .refs_norm
                 .iter()
@@ -426,7 +454,7 @@ pub(super) fn lower_blocks(
                     key: key.clone(),
                 })
                 .collect(),
-            parent: parent.map(str::to_owned),
+            parent: parent.1.map(str::to_owned),
             order,
             content: block.raw.clone(),
             search_tokens: projection.visible_lower.clone(),
@@ -456,9 +484,10 @@ pub(super) fn lower_blocks(
         lower_blocks(
             &block.children,
             page_path,
-            Some(block.uuid.as_str()),
+            (structural, Some(id.as_str())),
             structural_path,
             out,
+            live_ids,
             reference_postings,
             refs_norm,
             parse_config,

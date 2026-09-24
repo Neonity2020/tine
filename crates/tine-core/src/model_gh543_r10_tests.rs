@@ -212,13 +212,16 @@ pub(super) fn r10_prebuild(root: &Path, database: &Path) {
 
 /// Hold the worker's next turn just before it applies: `.0` is reached,
 /// `.1` releases it.
-fn r10_hold_next_turn() -> Arc<(std::sync::Barrier, std::sync::Barrier)> {
+fn r10_hold_next_turn(root: &Path) -> Arc<(std::sync::Barrier, std::sync::Barrier)> {
     let pair = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
     let held = Arc::clone(&pair);
-    crate::direct_projection::before_next_apply_test(Box::new(move || {
-        held.0.wait();
-        held.1.wait();
-    }));
+    crate::direct_projection::before_next_apply_test(
+        root,
+        Box::new(move || {
+            held.0.wait();
+            held.1.wait();
+        }),
+    );
     pair
 }
 
@@ -336,7 +339,7 @@ fn gh543_the_bar_shows_while_readers_wait_for_a_full_repair() {
     }
     let graph = Arc::new(Graph::open(&root));
     graph.attach_direct_projection(database).unwrap();
-    let hold = r10_hold_next_turn();
+    let hold = r10_hold_next_turn(&root);
     let owner = R10Owner::start(&graph);
     hold.0.wait();
     let projection = graph.direct_projection_test().unwrap();

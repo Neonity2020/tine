@@ -18,7 +18,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - Linked and Unlinked References no longer lose blocks from pages you edited
   before restarting Tine. A block you added or moved on a page in one session
   went missing from other pages' reference panels after a relaunch, and stayed
-  missing until that page was edited again (GH #594).
+  missing until that page was edited again. Looking such a block up by its
+  id after a relaunch works again too. The first launch after this update
+  re-indexes the graph once (GH #594).
 - When the search index cannot be built, Linked and Unlinked References and
   query blocks now say so instead of staying empty or "indexing" for the rest
   of the session. Tine tries a failing build at most three times; after that

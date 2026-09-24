@@ -112,11 +112,23 @@ fn structural_runtime_child(parent: Uuid, sibling: u64) -> Uuid {
     deterministic_runtime_uuid(parent, &sibling.to_be_bytes())
 }
 
+/// The namespace a page's structural runtime ids descend from: the root of
+/// [`doc_runtime_id_for_order`] and of a fresh parse's assignment.
+pub(crate) fn doc_runtime_namespace(owner_rel_path: &str) -> io::Result<Uuid> {
+    runtime_owner_namespace("file-block-runtime-v1", owner_rel_path)
+}
+
+/// The structural runtime id of the `sibling`-th child under `parent`, one
+/// step of [`doc_runtime_id_for_order`].
+pub(crate) fn doc_runtime_child(parent: Uuid, sibling: u32) -> Uuid {
+    structural_runtime_child(parent, u64::from(sibling))
+}
+
 /// Reproduce a fresh Direct parse's runtime ID from its stored structural path.
 /// Public/external `id::` is a separate identity. This is the R3 result
 /// constructor seam: resolve admitted output without a startup-wide ID rewrite.
 pub(crate) fn doc_runtime_id_for_order(owner_rel_path: &str, order_key: &str) -> io::Result<Uuid> {
-    let mut structural = runtime_owner_namespace("file-block-runtime-v1", owner_rel_path)?;
+    let mut structural = doc_runtime_namespace(owner_rel_path)?;
     let mut depth = 0;
     for component in order_key.split('/') {
         depth += 1;

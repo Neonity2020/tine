@@ -78,10 +78,13 @@ fn contradiction_during_update_turn(updates: usize, counted: bool) {
     // Hold turn 1 (one update) so the rest queue into turn 2.
     let (release_first, first_released) = std::sync::mpsc::channel::<()>();
     let (first_reached_tx, first_reached) = std::sync::mpsc::channel::<()>();
-    crate::direct_projection::before_next_apply_test(Box::new(move || {
-        let _ = first_reached_tx.send(());
-        let _ = first_released.recv_timeout(Duration::from_secs(30));
-    }));
+    crate::direct_projection::before_next_apply_test(
+        &root,
+        Box::new(move || {
+            let _ = first_reached_tx.send(());
+            let _ = first_released.recv_timeout(Duration::from_secs(30));
+        }),
+    );
     fs::write(root.join("pages/p0.md"), "- TODO bulk0 [[p1]]\n").unwrap();
     graph.sync_file_checked(&root.join("pages/p0.md")).unwrap();
     first_reached.recv_timeout(Duration::from_secs(10)).unwrap();

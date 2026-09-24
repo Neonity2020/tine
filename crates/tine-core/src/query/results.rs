@@ -70,53 +70,81 @@ pub(crate) const PAYLOAD_BATCH: usize = 128;
 /// the page's own facets share these two tables under owner type 0.
 const OWNER_BLOCK: i64 = 1;
 
-/// Where an admitted row's PUBLIC id comes from (WARM-IDENTITY-ORDER-CONTRACT).
+/// The live runtime ids one lowering of a page carried where they differ from
+/// the structural id the index stores (R3; GH #594), keyed by that structural
+/// id. `revision` is the page's stored source revision: the exceptions decode
+/// exactly the rows written at it and no other.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PageLiveIds {
+    pub(crate) revision: String,
+    pub(crate) ids: std::collections::HashMap<String, String>,
+}
+
+/// Where an admitted row's PUBLIC id comes from (WARM-IDENTITY-ORDER-CONTRACT;
+/// R3 of `docs/contracts/direct-query-identities.md`).
 ///
-/// Physical selection ids and public result ids are separate. This policy is
-/// captured ONCE per job, beside the snapshot, and is never re-read from live
-/// state while an answer is being built.
+/// The index stores every block's STRUCTURAL id,
+/// `doc_runtime_id_for_order(path, order_key)`: what a fresh parse assigns, so
+/// a page nobody edited in this session resolves with no document and no
+/// traversal. A block this session's document names otherwise (a block that
+/// kept its id across an insertion above it, a new block) is an exception
+/// recorded by the lowering, and `live` holds the exceptions whose revision is
+/// the one this snapshot stores. SQLite is never the identity authority.
 ///
-/// A page nobody edited in this session will be re-parsed on demand into
-/// reproducible STRUCTURAL runtime ids, so its rows resolve through
-/// `doc_runtime_id_for_order(path, order_key)` — no document, no traversal. A
-/// page this session DID edit kept its live ids at an exact revision, so its
-/// rows use the stored `blocks.result_id`.
-///
-/// The set is captured by the caller together with the snapshot; nothing here
-/// reads live state. `all_session` is the whole-graph shortcut for a session
-/// that owns every page's identity.
+/// Captured ONCE per job, beside the snapshot, and never re-read from live
+/// state while an answer is being built. `all_session` answers the stored id
+/// as it is, for fixtures that store the ids they expect.
+#[derive(Clone, Default)]
 pub(crate) struct ResultIdentity {
-    pub(crate) session_pages: Arc<HashSet<String>>,
+    pub(crate) live: Arc<std::collections::HashMap<String, Arc<PageLiveIds>>>,
     pub(crate) all_session: bool,
 }
 
 impl ResultIdentity {
+    /// No page carries a live exception: every stored id is structural.
+    pub(crate) fn structural() -> Self {
+        Self::default()
+    }
+
     /// The public id of one stored block row: the id the page's document
-    /// carries at the snapshot's generation. A page this session lowered keeps
-    /// its stored live id; any other page's document is a fresh parse, whose
-    /// runtime ids are structural. Every reader that matches a stored block
-    /// against a document asks this, or its answer names blocks no document
-    /// has: the Linked References filter compared stored ids directly, and a
-    /// page edited in an earlier session lost its backlinks after a reopen
-    /// (GH #594).
+    /// carries at the snapshot's generation. Every reader that matches a
+    /// stored block against a document asks this, or its answer names blocks
+    /// no document has: the Linked References filter compared stored ids
+    /// directly, and a page edited in an earlier session lost its backlinks
+    /// after a reopen (GH #594).
     pub(crate) fn public_id(
         &self,
         path: &str,
         order_key: &str,
         stored_id: &str,
     ) -> Result<String, String> {
-        if self.keeps_stored_id(path) {
+        if self.all_session {
             return Ok(stored_id.to_owned());
         }
-        doc_runtime_id_for_order(path, order_key)
-            .map(|id| id.to_string())
-            .map_err(|error| format!("stored structural order does not resolve an id: {error}"))
+        let structural = doc_runtime_id_for_order(path, order_key)
+            .map_err(|error| format!("stored structural order does not resolve an id: {error}"))?
+            .to_string();
+        Ok(self
+            .live
+            .get(path)
+            .and_then(|page| page.ids.get(&structural))
+            .cloned()
+            .unwrap_or(structural))
     }
 
-    /// Whether `path`'s rows answer with their stored id: this session
-    /// lowered them, so the document carries the same live ids.
-    fn keeps_stored_id(&self, path: &str) -> bool {
-        self.all_session || self.session_pages.contains(path)
+    /// The id the index stores for `public`: its structural id when it is one
+    /// of this snapshot's live exceptions, else `public` itself. The reverse of
+    /// [`Self::public_id`], for a reader that looks a block up by the id a
+    /// document gave it.
+    pub(crate) fn stored_id<'a>(&'a self, public: &'a str) -> &'a str {
+        self.live
+            .values()
+            .find_map(|page| {
+                page.ids
+                    .iter()
+                    .find_map(|(stored, live)| (live == public).then_some(stored.as_str()))
+            })
+            .unwrap_or(public)
     }
 
     /// Every page's identity belongs to this session, so every row keeps its
@@ -124,7 +152,7 @@ impl ResultIdentity {
     #[cfg(test)]
     pub(crate) fn session_owned() -> Self {
         Self {
-            session_pages: Arc::default(),
+            live: Arc::default(),
             all_session: true,
         }
     }
@@ -1176,10 +1204,10 @@ pub(crate) fn resolve_identity(
     stored_id: &str,
     stored_estimate: usize,
 ) -> Result<(String, usize), String> {
-    if identity.keeps_stored_id(path) {
-        return Ok((stored_id.to_owned(), stored_estimate));
-    }
     let resolved = identity.public_id(path, order_key, stored_id)?;
+    if resolved == stored_id {
+        return Ok((resolved, stored_estimate));
+    }
     let estimate = stored_estimate
         .checked_sub(stored_id.len())
         .and_then(|rest| rest.checked_add(resolved.len()))

@@ -294,7 +294,7 @@ fn query_job_closes_snapshot_before_releasing_capacity() {
     let job = DirectQueryJob {
         snapshot,
         _slot: slot,
-        session_pages: Arc::new(HashSet::new()),
+        identity: crate::query::results::ResultIdentity::structural(),
         config: Arc::new(ParseConfig::default()),
         query_revision: 0,
         registry: None,
@@ -395,10 +395,13 @@ fn current_snapshot_capture_runs_before_later_queued_save() {
     let baseline = page.rev.clone();
     page.blocks[0].raw = "TODO save B".into();
     wait_ready(&graph);
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        paused.send(()).unwrap();
-        resumed.recv().unwrap();
-    }));
+    before_next_apply_test(
+        &root,
+        Box::new(move || {
+            paused.send(()).unwrap();
+            resumed.recv().unwrap();
+        }),
+    );
     graph.save_page(&page, baseline.as_deref()).unwrap();
     observed.recv_timeout(Duration::from_secs(3)).unwrap();
     let query_projection = Arc::clone(&projection);
@@ -1076,8 +1079,8 @@ fn a_rebuild_drains_a_live_query_job_before_touching_the_file() {
     assert_eq!(projection.active_query_jobs_test(), 1);
     assert!(!job.is_cancelled());
     assert!(
-        job.session_pages.contains("pages/source.md"),
-        "the captured fresh-build snapshot publishes its live ids"
+        job.identity.live.is_empty(),
+        "a fresh build of unedited pages stores structural ids and records no live one"
     );
     let mut rows = 0usize;
     job.snapshot
@@ -1162,86 +1165,6 @@ fn lowering_measurement_excludes_other_graphs() {
     assert_eq!(lowerings(), 1, "only the measured graph contributes");
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(other);
-}
-
-#[test]
-fn session_pages_name_exactly_the_pages_this_process_lowered() {
-    let _serial = serialize_projection_tests();
-    let root = scratch("session-pages");
-    std::fs::create_dir_all(root.join("pages")).unwrap();
-    std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
-    std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
-    let database = scratch("session-pages-db").join("projection.sqlite");
-    let ids = |graph: &Graph, names: &[&str]| -> HashSet<String> {
-        graph
-            .list_pages()
-            .into_iter()
-            .filter(|entry| names.contains(&entry.name.as_str()))
-            .map(|entry| entry.rel_path)
-            .collect()
-    };
-
-    {
-        let graph = Graph::open(&root);
-        graph.attach_direct_projection(database.clone()).unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-        let projection = graph.direct_projection_test().unwrap();
-        let before_delete = projection.session_pages_test();
-        assert_eq!(*before_delete, ids(&graph, &["one", "two"]));
-
-        let two = ids(&graph, &["two"]);
-        graph.delete_page("two", PageKind::Page).unwrap();
-        wait_ready(&graph);
-        let after_delete = projection.session_pages_test();
-        assert_eq!(*after_delete, ids(&graph, &["one"]));
-        assert!(after_delete.is_disjoint(&two));
-        assert!(!Arc::ptr_eq(&before_delete, &after_delete));
-        assert!(
-            !before_delete.is_disjoint(&two),
-            "copy-on-write must preserve the captured pre-delete membership"
-        );
-
-        let entry = graph
-            .list_pages()
-            .into_iter()
-            .find(|entry| entry.name == "one")
-            .unwrap();
-        let mut page = graph.load_page(&entry).unwrap();
-        let baseline = page.rev.clone();
-        page.blocks[0].raw = "DONE one".into();
-        graph.save_page(&page, baseline.as_deref()).unwrap();
-        wait_ready(&graph);
-        let after_existing_page_edit = projection.session_pages_test();
-        assert_eq!(*after_existing_page_edit, ids(&graph, &["one"]));
-        assert!(
-            Arc::ptr_eq(&after_delete, &after_existing_page_edit),
-            "lowering a page already in this session must reuse the membership Arc"
-        );
-        release_projection(&graph);
-    }
-    std::thread::sleep(Duration::from_millis(20));
-
-    std::fs::write(root.join("pages/two.md"), "- DONE two again\n").unwrap();
-    reset_lowerings(&root);
-    {
-        let graph = Graph::open(&root);
-        graph.attach_direct_projection(database.clone()).unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-        assert_eq!(
-            lowerings(),
-            2,
-            "a stale warm builds one complete fresh image"
-        );
-        let projection = graph.direct_projection_test().unwrap();
-        assert_eq!(
-            *projection.session_pages_test(),
-            ids(&graph, &["one", "two"])
-        );
-    }
-    let _ = std::fs::remove_dir_all(root);
-    let _ = std::fs::remove_dir_all(database.parent().unwrap());
 }
 
 /// **RET2's cancellation shape.** A cancelled snapshot means the caller's
@@ -2228,10 +2151,13 @@ fn a_timed_out_close_retains_resources_until_the_writer_really_exits() {
     projection.retain_worker_resource(resource);
     let (paused_tx, paused_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        paused_tx.send(()).unwrap();
-        resume_rx.recv().unwrap();
-    }));
+    before_next_apply_test(
+        &root,
+        Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }),
+    );
     let entry = graph
         .list_pages()
         .into_iter()
@@ -2283,10 +2209,13 @@ fn reference_lookup_waits_for_an_inflight_one_page_projection_delta() {
 
     let (worker_paused_tx, worker_paused_rx) = mpsc::channel();
     let (release_worker_tx, release_worker_rx) = mpsc::channel();
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        worker_paused_tx.send(()).unwrap();
-        release_worker_rx.recv().unwrap();
-    }));
+    before_next_apply_test(
+        &root,
+        Box::new(move || {
+            worker_paused_tx.send(()).unwrap();
+            release_worker_rx.recv().unwrap();
+        }),
+    );
 
     let entry = graph
         .list_pages()
@@ -2363,10 +2292,13 @@ fn a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_eve
 
     let (worker_paused_tx, worker_paused_rx) = mpsc::channel();
     let (release_worker_tx, release_worker_rx) = mpsc::channel();
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        worker_paused_tx.send(()).unwrap();
-        release_worker_rx.recv().unwrap();
-    }));
+    before_next_apply_test(
+        &root,
+        Box::new(move || {
+            worker_paused_tx.send(()).unwrap();
+            release_worker_rx.recv().unwrap();
+        }),
+    );
 
     let entry = graph
         .list_pages()
@@ -3392,7 +3324,7 @@ fn extractor_version_participates_in_disposable_source_revision() {
         .collect::<String>();
     assert_eq!(
         projected,
-        format!("direct-facts-v3:{hex}:sha256:unchanged-source")
+        format!("direct-facts-v4:{hex}:sha256:unchanged-source")
     );
     assert_ne!(projected, source);
 }
@@ -4211,11 +4143,16 @@ fn bl1_loaded_runtime_id_can_miss_sql_without_a_parsed_cache() {
     assert!(!graph.has_parsed_cache_test());
     assert_eq!(graph.page_build_parses_test(), 0);
     let projection = graph.direct_projection_test().unwrap();
-    assert!(!projection.session_pages_test().contains("pages/one.md"));
+    assert!(
+        projection.session_ids_test().is_empty(),
+        "a reopen records no live id"
+    );
+    // R3: the index stores structural ids, so the id a fresh parse gives the
+    // block names its row even though another session wrote the page.
     assert_eq!(
         projection.block_page_hint(graph.cache_generation(), id),
-        Some(None),
-        "the frontend holds a runtime id absent from the current SQL image"
+        Some(Some("one".to_owned())),
+        "the index finds a block by the id today's parse gives it"
     );
     let resolved = graph.resolve_block(id).expect("today's parser resolves it");
     assert_eq!(resolved.blocks[0].raw, page.blocks[1].raw);
@@ -4265,10 +4202,13 @@ fn gh543_a_derived_read_behind_a_queued_edit_waits_instead_of_parsing() {
     let (two, two_rev) = edit("two", "DONE two edited");
     let (paused_tx, paused_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel::<()>();
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        paused_tx.send(()).unwrap();
-        resume_rx.recv().unwrap();
-    }));
+    before_next_apply_test(
+        &database,
+        Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }),
+    );
     graph.save_page(&one, one_rev.as_deref()).unwrap();
     paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     graph.save_page(&two, two_rev.as_deref()).unwrap();
@@ -4663,21 +4603,30 @@ fn bl1_sql_preview_runtime_ids_remain_locatable() {
     let preview = graph.preview_block(BL1_ID, 8).unwrap();
     assert_eq!(graph.on_demand_parses_test(), 0);
     let child = &preview.group.blocks[0].children[0];
-    assert!(!graph
+    assert!(graph
         .direct_projection_test()
         .unwrap()
-        .session_pages_test()
-        .contains("pages/one.md"));
+        .session_ids_test()
+        .is_empty());
+    // R3: the index stores the structural id the preview named the child by,
+    // so the index answers it without parsing the page.
     let resolved = graph.resolve_block(&child.id).unwrap();
     assert_eq!(resolved.blocks[0].raw, child.raw);
     assert_eq!(graph.page_build_parses_test(), 0);
-    assert_eq!(graph.on_demand_parses_test(), 1);
-    // Exact revision failure cannot resurrect the old runtime id or trigger a
-    // graph walk, even before a watcher has reported the changed file.
+    assert_eq!(graph.on_demand_parses_test(), 0);
+    // A file changed behind the index, before a watcher has reported it: the
+    // index answers from its own stored image (the block the id named when it
+    // was lowered, never another block) and walks nothing.
     std::fs::write(root.join("pages/one.md"), "- externally replaced\n").unwrap();
-    assert!(graph.resolve_block(&child.id).is_none());
+    let stale = graph
+        .resolve_block(&child.id)
+        .map(|g| g.blocks[0].raw.clone());
+    assert!(
+        stale.is_none() || stale.as_deref() == Some(child.raw.as_str()),
+        "{stale:?}"
+    );
     assert_eq!(graph.page_build_parses_test(), 0);
-    assert_eq!(graph.on_demand_parses_test(), 1);
+    assert_eq!(graph.on_demand_parses_test(), 0);
     release_projection(&graph);
 }
 
@@ -5594,6 +5543,77 @@ fn failed_projection_writer_can_recover_from_source_inventory() {
     assert!(!projection.shared.worker_failed.load(Ordering::Acquire));
 }
 
+/// R3: a reader decodes a page's live ids only with the exceptions recorded
+/// for the revision its snapshot stores. Exceptions of another revision (an
+/// image being written, or one already replaced) never apply, and only the
+/// newest `LIVE_ID_REVISIONS` revisions per page are kept.
+#[test]
+fn live_ids_decode_only_with_the_stored_revisions_exceptions() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("live-ids-by-revision");
+    let database = scratch("live-ids-by-revision-db").join("projection.sqlite");
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+    let entry = graph
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.name == "one")
+        .unwrap();
+    let one = entry.rel_path.clone();
+    let mut page = graph.load_page(&entry).unwrap();
+    let baseline = page.rev.clone();
+    let kept = page.blocks[0].clone();
+    let mut inserted = kept.clone();
+    inserted.id = Uuid::new_v4().to_string();
+    inserted.raw = "TODO inserted first".into();
+    page.blocks.insert(0, inserted);
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    wait_ready(&graph);
+    let capture = || {
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&projection.shared.path, || Ok(()))
+                .unwrap();
+        capture_result_identity(&projection.shared, &mut snapshot).unwrap()
+    };
+    // Whether the captured exceptions for `one` name the kept block's live id.
+    let live_of = |identity: &crate::query::results::ResultIdentity| {
+        identity
+            .live
+            .get(&one)
+            .map(|entry| entry.ids.values().any(|live| *live == kept.id))
+    };
+    assert_eq!(
+        live_of(&capture()),
+        Some(true),
+        "the stored revision's exceptions name the kept block by its live id"
+    );
+    let foreign = || HashMap::from([(Uuid::new_v4().to_string(), Uuid::new_v4().to_string())]);
+    projection
+        .shared
+        .record_live_ids(vec![(one.clone(), "not-stored-1".into(), foreign())]);
+    assert_eq!(
+        live_of(&capture()),
+        Some(true),
+        "a newer revision's exceptions do not decode the stored image"
+    );
+    projection
+        .shared
+        .record_live_ids(vec![(one.clone(), "not-stored-2".into(), foreign())]);
+    assert_eq!(
+        projection.session_ids_test()[&one].len(),
+        LIVE_ID_REVISIONS,
+        "only the newest revisions keep their exceptions"
+    );
+    assert_eq!(
+        live_of(&capture()),
+        None,
+        "no recorded revision matches: the page decodes structurally"
+    );
+}
+
 /// Cache eviction does not change an unchanged page's session identities.
 /// The compact session owner survives without retaining parsed documents.
 #[test]
@@ -5622,7 +5642,10 @@ fn session_identity_survives_parsed_page_eviction() {
     page.blocks.insert(0, inserted);
     graph.save_page(&page, baseline.as_deref()).unwrap();
     wait_ready(&graph);
-    assert!(projection.session_pages_test().contains(&one));
+    assert!(
+        projection.session_ids_test().contains_key(&one),
+        "the kept block moved: its live id is recorded beside its new structural row"
+    );
     let live = graph
         .run_query_bounded("(task TODO)", 100, 1_000_000)
         .expect("the ready projection answers the public bounded route");
@@ -5655,7 +5678,7 @@ fn session_identity_survives_parsed_page_eviction() {
     let repairs = graph.warm_repair_parses_test();
     graph.invalidate_cache_test();
     assert!(
-        projection.session_pages_test().contains(&one),
+        projection.session_ids_test().contains_key(&one),
         "dropping the parsed cache must retain compatible live IDs"
     );
     graph.warm_cache();
@@ -5723,7 +5746,7 @@ fn empty_projection_shared() -> ProjectionShared {
         contradiction_rebuilt: AtomicBool::new(false),
         fresh_build_running: AtomicBool::new(false),
         query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
-        session_pages: Mutex::new(Arc::new(HashSet::new())),
+        session_ids: Mutex::new(Arc::default()),
         committed_registry: Arc::new(Mutex::new(None)),
         worker_available: AtomicBool::new(true),
         worker_failed: AtomicBool::new(false),
@@ -5844,7 +5867,6 @@ fn query_job_capture_waits_for_post_commit_identity_publication() {
     let (commit_wake, commits) = std::sync::mpsc::channel();
     projection.observe_commits(commit_wake);
     let id = "pages/identity-new.md".to_owned();
-    assert!(!projection.session_pages_test().contains(&id));
     let (paused, observed) = std::sync::mpsc::channel();
     let (resume, resumed) = std::sync::mpsc::channel();
     *projection.shared.after_sql_commit.lock().unwrap() = Some(Box::new(move || {
@@ -5864,7 +5886,6 @@ fn query_job_capture_waits_for_post_commit_identity_publication() {
             |row| row.get(0),
         )
         .unwrap();
-    let identity_pending = !projection.session_pages_test().contains(&id);
     let notification_pending = matches!(
         commits.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
@@ -5894,7 +5915,6 @@ fn query_job_capture_waits_for_post_commit_identity_publication() {
     resume.send(()).unwrap();
     let captured = result.recv_timeout(Duration::from_secs(3)).unwrap();
     assert_eq!(committed, 1);
-    assert!(identity_pending);
     assert!(
         notification_pending,
         "raw SQL commit must not publish incoherent identity"
@@ -5904,7 +5924,10 @@ fn query_job_capture_waits_for_post_commit_identity_publication() {
     let QueryJobOpen::Job(mut job) = captured else {
         panic!("published capture");
     };
-    assert!(job.session_pages.contains(&id));
+    assert!(
+        !job.identity.live.contains_key(&id),
+        "a page lowered from its parsed text records no live id"
+    );
     let mut matching = 0;
     job.snapshot
         .visit_projection_query(
@@ -9563,10 +9586,13 @@ fn gh543_a_warm_is_queued_beside_pending_page_updates() {
     // second page's update is still queued when the warm is handed over.
     let (paused, observed) = std::sync::mpsc::channel();
     let (resume, resumed) = std::sync::mpsc::channel::<()>();
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        paused.send(()).unwrap();
-        resumed.recv().unwrap();
-    }));
+    before_next_apply_test(
+        &database,
+        Box::new(move || {
+            paused.send(()).unwrap();
+            resumed.recv().unwrap();
+        }),
+    );
     let open = |path: &str| {
         let entry = graph.entry_for_path(&root.join(path)).expect("entry");
         graph.load_page(&entry).expect("the page opens");
@@ -9846,10 +9872,13 @@ fn gh543_a_display_read_on_a_retired_graph_parses_nothing() {
     let (two, two_rev) = edit("two", "DONE two edited");
     let (paused_tx, paused_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel::<()>();
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        let _ = paused_tx.send(());
-        let _ = resume_rx.recv();
-    }));
+    before_next_apply_test(
+        &database,
+        Box::new(move || {
+            let _ = paused_tx.send(());
+            let _ = resume_rx.recv();
+        }),
+    );
     graph.save_page(&one, one_rev.as_deref()).unwrap();
     paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     graph.save_page(&two, two_rev.as_deref()).unwrap();
@@ -10465,10 +10494,13 @@ fn gh543_a_full_turn_with_a_delete_and_a_later_update_applies() {
     // are taken together, as they are when a rename lands during a rebuild.
     let (paused_tx, paused_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel::<()>();
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-        paused_tx.send(()).unwrap();
-        resume_rx.recv().unwrap();
-    }));
+    before_next_apply_test(
+        &root,
+        Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }),
+    );
     let (first, first_doc) = pages[0].clone();
     projection.enqueue_replace(
         generation + 1,

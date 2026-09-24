@@ -2,6 +2,7 @@ use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::query::registry_cache::{CommittedRegistryCache, RegistryCapture};
 use crate::query::registry_sql::{self, PageRegistryMetadata};
+use crate::query::results::PageLiveIds;
 use crate::query::PropertyFacetAccumulator;
 use crate::query_cursor::drain_after;
 use crate::query_jobs::{
@@ -53,14 +54,19 @@ type SharedCommittedRegistry = Arc<Mutex<Option<CommittedRegistryOwner>>>;
 // when tine-storage's disposable SQLite schema itself remains compatible.
 // v3: `pages.journal_day` is the page's own `date_key`, so a journal named by
 // `title::` has its day (GH #543, audit R13-06).
-const DIRECT_PROJECTION_FACTS_VERSION: u32 = 3;
+// v4: `blocks.result_id` is the block's structural id, never a session's live
+// id, so a page stored by an earlier session resolves after a reopen (R3; GH
+// #594).
+const DIRECT_PROJECTION_FACTS_VERSION: u32 = 4;
 const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(test)]
 // Test receipts count only their own graph, including its worker threads.
 static PHYSICAL_PAGE_LOWERINGS: Mutex<(Option<PathBuf>, u64)> = Mutex::new((None, 0));
 
 #[cfg(test)]
-static BEFORE_APPLY_PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+type BeforeApplyHook = (PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static BEFORE_APPLY_PENDING: Mutex<Option<BeforeApplyHook>> = Mutex::new(None);
 
 /// Count page lowerings under `root` from now on (model-level tests).
 #[cfg(test)]
@@ -73,16 +79,30 @@ pub(crate) fn page_lowerings_test() -> u64 {
     PHYSICAL_PAGE_LOWERINGS.lock().unwrap().1
 }
 
-/// Run `hook` on the worker once, just before its next turn applies.
+/// Run `hook` once, just before the next turn applies, on the worker whose
+/// projection database path starts with `scope` (the database itself, or the
+/// graph root when the database lives under it). Scoped to one graph: tests
+/// run in parallel, and a hook another graph's worker took would hold that
+/// test's turn instead.
 #[cfg(test)]
-pub(crate) fn before_next_apply_test(hook: Box<dyn FnOnce() + Send>) {
-    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(hook);
+pub(crate) fn before_next_apply_test(scope: &Path, hook: Box<dyn FnOnce() + Send>) {
+    *BEFORE_APPLY_PENDING.lock().unwrap() = Some((scope.to_path_buf(), hook));
 }
 
 #[cfg(test)]
-fn run_before_apply_deltas_hook() {
-    let hook = BEFORE_APPLY_PENDING.lock().unwrap().take();
-    if let Some(hook) = hook {
+fn run_before_apply_deltas_hook(database: &Path) {
+    let hook = {
+        let mut pending = BEFORE_APPLY_PENDING.lock().unwrap();
+        if pending
+            .as_ref()
+            .is_some_and(|(scope, _)| database.starts_with(scope))
+        {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
         hook();
     }
 }
@@ -381,17 +401,15 @@ struct ProjectionShared {
     /// drains every job before it replaces or resets the file, and `Drop`
     /// drains before the worker is stopped.
     query_jobs: Arc<QueryJobOwner>,
-    /// R3 identity policy (WARM-IDENTITY-ORDER-CONTRACT.md §"Chosen strategy"
-    /// 2–3): the pages whose rows THIS process lowered. Their stored
-    /// `blocks.result_id` is the live runtime id the parsed
-    /// document carried when the row was written. Every other page's rows
-    /// survived from an earlier session, and a fresh parse of an unchanged
-    /// page assigns STRUCTURAL runtime ids, so their public id is derived from
-    /// `(path, order_key)` through `model::doc_runtime_id_for_order` instead.
-    /// Copy-on-write: the worker swaps a new `Arc` after each successful
-    /// apply, and a job clones the `Arc` at snapshot acquisition — never a
-    /// live lookup during output.
-    session_pages: Mutex<Arc<HashSet<String>>>,
+    /// R3 identity (`docs/contracts/direct-query-identities.md`): the index
+    /// stores every block's STRUCTURAL id; these are the live ids this
+    /// session's documents carried where they differ, per page and stored
+    /// source revision, newest first and at most [`LIVE_ID_REVISIONS`] of
+    /// them. Recorded before the rows commit, so a snapshot of either the new
+    /// image or the one before it finds the revision its rows were written
+    /// at. Copy-on-write: a job clones the `Arc` beside its snapshot
+    /// ([`capture_result_identity`]) and never reads it live during output.
+    session_ids: Mutex<Arc<SessionLiveIds>>,
     committed_registry: SharedCommittedRegistry,
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
@@ -528,26 +546,92 @@ impl ProjectionShared {
         fence
     }
 
-    /// R3 identity policy bookkeeping, run by the worker after every
-    /// successful apply: the pages just lowered carry this process's live ids;
-    /// the pages just deleted carry nothing.
-    fn record_session_pages(&self, applied: &AppliedPages) {
-        if applied.lowered.is_empty() && applied.deleted.is_empty() {
+    /// R3: record the live-id exceptions of pages about to be written, BEFORE
+    /// their rows commit. A page that never had an exception and has none now
+    /// needs no entry: its public ids are its stored structural ids.
+    pub(super) fn record_live_ids(&self, pages: Vec<(String, String, HashMap<String, String>)>) {
+        let mut current = self.session_ids.lock().unwrap();
+        let mut next: Option<SessionLiveIds> = None;
+        for (path, revision, ids) in pages {
+            let known = next.as_ref().unwrap_or(&current).contains_key(&path);
+            if ids.is_empty() && !known {
+                continue;
+            }
+            let entries = next
+                .get_or_insert_with(|| (**current).clone())
+                .entry(path)
+                .or_default();
+            entries.retain(|entry| entry.revision != revision);
+            entries.insert(0, Arc::new(PageLiveIds { revision, ids }));
+            entries.truncate(LIVE_ID_REVISIONS);
+        }
+        if let Some(next) = next {
+            *current = Arc::new(next);
+        }
+    }
+
+    /// R3 bookkeeping after an apply commits: a deleted page's rows are gone,
+    /// and so are its exceptions.
+    fn record_deleted_pages(&self, applied: &AppliedPages) {
+        let mut current = self.session_ids.lock().unwrap();
+        if !applied
+            .deleted
+            .iter()
+            .any(|page| current.contains_key(page))
+        {
             return;
         }
-        let mut current = self.session_pages.lock().unwrap();
-        let membership_changed = applied.lowered.iter().any(|page| !current.contains(page))
-            || applied.deleted.iter().any(|page| current.contains(page));
-        if !membership_changed {
-            return;
-        }
-        let mut next: HashSet<String> = (**current).clone();
-        next.extend(applied.lowered.iter().cloned());
+        let mut next = (**current).clone();
         for page in &applied.deleted {
             next.remove(page);
         }
         *current = Arc::new(next);
     }
+}
+
+/// How many stored revisions of one page keep their live-id exceptions: the
+/// image being written and the one before it, which a snapshot opened just
+/// before the commit still reads.
+const LIVE_ID_REVISIONS: usize = 2;
+
+/// Per page path, the live-id exceptions of its latest lowerings, newest
+/// first (R3; see `ProjectionShared::session_ids`).
+pub(crate) type SessionLiveIds = HashMap<String, Vec<Arc<PageLiveIds>>>;
+
+/// The public-identity decoder of one snapshot (R3): the recorded exceptions
+/// whose revision is the one this snapshot stores for their page. A snapshot
+/// of an image recorded exceptions do not describe decodes structurally, and
+/// never names one block by another's live id.
+fn capture_result_identity(
+    shared: &ProjectionShared,
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+) -> Result<crate::query::results::ResultIdentity, tine_storage::sqlite::MaterializationError> {
+    let recorded = Arc::clone(&shared.session_ids.lock().unwrap());
+    let mut live = HashMap::new();
+    for (path, entries) in recorded.iter() {
+        let mut stored = None;
+        crate::query::projection_sql::visit(
+            snapshot,
+            "SELECT revision FROM direct_source_revisions WHERE path = ?",
+            &[PhysicalQueryValue::Text(path.clone())],
+            |row| {
+                if let Some(PhysicalQueryValue::Text(revision)) = row.first() {
+                    stored = Some(revision.clone());
+                }
+                Ok(std::ops::ControlFlow::Break(()))
+            },
+        )?;
+        if let Some(entry) = stored
+            .and_then(|stored| entries.iter().find(|entry| entry.revision == stored))
+            .filter(|entry| !entry.ids.is_empty())
+        {
+            live.insert(path.clone(), Arc::clone(entry));
+        }
+    }
+    Ok(crate::query::results::ResultIdentity {
+        live: Arc::new(live),
+        all_session: false,
+    })
 }
 
 /// Admission gate shared by admission and producer snapshot capture.
@@ -613,7 +697,9 @@ fn capture_query_job(
     if !slot.register(snapshot.cancellation()) {
         return QueryJobOpen::Cancelled;
     }
-    let session_pages = Arc::clone(&shared.session_pages.lock().unwrap());
+    let Ok(identity) = capture_result_identity(shared, &mut snapshot) else {
+        return QueryJobOpen::Failed;
+    };
     let query_revision = match snapshot.query_revision() {
         Ok(revision) => revision,
         Err(_) => return QueryJobOpen::Failed,
@@ -651,7 +737,7 @@ fn capture_query_job(
     QueryJobOpen::Job(DirectQueryJob {
         _slot: slot,
         snapshot,
-        session_pages,
+        identity,
         config,
         #[cfg(test)]
         query_revision,
@@ -670,9 +756,9 @@ pub(crate) struct DirectQueryJob {
     pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
     /// Held for its `Drop`: releasing the slot is the job's only exit.
     _slot: crate::query_jobs::OwnedJobSlot,
-    /// The pages whose rows this process lowered (see
-    /// `ProjectionShared::session_pages`), as of the snapshot.
-    pub(crate) session_pages: Arc<HashSet<String>>,
+    /// The public-identity decoder of this snapshot's rows (R3,
+    /// [`capture_result_identity`]).
+    pub(crate) identity: crate::query::results::ResultIdentity,
     pub(crate) config: Arc<ParseConfig>,
     /// Actual acquired SQL image, distinct from the admission target.
     #[cfg(test)]
@@ -927,7 +1013,7 @@ impl DirectProjection {
             contradiction_rebuilt: AtomicBool::new(false),
             fresh_build_running: AtomicBool::new(false),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
-            session_pages: Mutex::new(Arc::new(HashSet::new())),
+            session_ids: Mutex::new(Arc::default()),
             committed_registry: Arc::new(Mutex::new(None)),
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
@@ -1696,8 +1782,8 @@ impl DirectProjection {
     }
 
     #[cfg(test)]
-    pub(crate) fn session_pages_test(&self) -> Arc<HashSet<String>> {
-        Arc::clone(&self.shared.session_pages.lock().unwrap())
+    pub(crate) fn session_ids_test(&self) -> Arc<SessionLiveIds> {
+        Arc::clone(&self.shared.session_ids.lock().unwrap())
     }
 
     #[cfg(test)]
@@ -1919,10 +2005,13 @@ impl DirectProjection {
         // earlier session is that session's live id, which no document
         // carries after a reopen; compared directly, the filter dropped every
         // such block and Linked References lost them (GH #594).
-        let identity = crate::query::results::ResultIdentity {
-            session_pages: Arc::clone(&self.shared.session_pages.lock().unwrap()),
-            all_session: false,
-        };
+        // All title/alias needles observe one committed image. Reopening per
+        // spelling could otherwise union candidates from opposite sides of an
+        // edit even though each individual query was coherent.
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
+        let identity = capture_result_identity(&self.shared, &mut snapshot).reported(self)?;
         let mut insert_block = |path: &str,
                                 result_id: Option<&PhysicalQueryValue>,
                                 order_key: Option<&PhysicalQueryValue>|
@@ -1949,12 +2038,6 @@ impl DirectProjection {
                 )),
             }
         };
-        // All title/alias needles observe one committed image. Reopening per
-        // spelling could otherwise union candidates from opposite sides of an
-        // edit even though each individual query was coherent.
-        let mut snapshot =
-            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
-                .reported(self)?;
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
@@ -2184,7 +2267,24 @@ impl DirectProjection {
         let parsed_uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
         let reader = self.shared_reader_at(cache_generation)?;
         let read = reader.as_ref()?.read();
-        let block = match read.block(uuid).reported(self)? {
+        // A live id this session gave a block is stored as the block's
+        // structural id (R3). A hint needs only the page, and the page of the
+        // row found is checked against the page that recorded the id.
+        let recorded = Arc::clone(&self.shared.session_ids.lock().unwrap());
+        let live = recorded.iter().find_map(|(path, entries)| {
+            entries.iter().find_map(|entry| {
+                entry
+                    .ids
+                    .iter()
+                    .find_map(|(stored, live)| (live == uuid).then_some((path, stored)))
+            })
+        });
+        let stored = live.map_or(uuid, |(_, stored)| stored.as_str());
+        let block = match read
+            .block(stored)
+            .reported(self)?
+            .filter(|block| live.is_none_or(|(path, _)| block.page_path == *path))
+        {
             Some(block) => crate::query::logseq_uuid_owner([block], false),
             None => crate::query::logseq_uuid_owner(
                 read.blocks_by_logseq_uuid(parsed_uuid, 2).reported(self)?,
@@ -2642,7 +2742,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             .map(|(_, delta)| delta.entry().rel_path.clone())
             .collect::<std::collections::BTreeSet<_>>();
         #[cfg(test)]
-        run_before_apply_deltas_hook();
+        run_before_apply_deltas_hook(&shared.path);
         let applied: Result<AppliedTurn, ProjectionRefusal> = (|| {
             #[cfg(test)]
             if shared
@@ -2725,7 +2825,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     hook();
                 }
             }
-            shared.record_session_pages(&applied.pages);
+            shared.record_deleted_pages(&applied.pages);
             let changes = registry_sql::registry_changes(&registry_before, &applied.registry_pages);
             let mut registry = shared.committed_registry.lock().unwrap();
             let config = registry_config

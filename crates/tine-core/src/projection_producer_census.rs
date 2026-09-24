@@ -1622,9 +1622,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // call and its entity-coordinate matches go, and an unresolvable id is
     // reported as `MaterializationError::Corrupt`. Reads and error types only;
     // no write, schema or pin change.
+    // 2026-09-24: GH #594 R3 — lowering names every block by its structural
+    // id and the session maps live ids. A reader captures the live-id
+    // exceptions beside its snapshot by reading stored source revisions, and
+    // a live id translates to its stored id before a lookup: two
+    // `PhysicalQueryValue::Text(` binds in direct_projection.rs and one in
+    // derived_reads.rs. Read-side binds only; no write, schema or pin change.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "c04cd60fe2970afc1c2e8e855eb42d171b3837e9eb4ddfb72b77752d2e1bc1f8",
+        "925cb64d3b3ddea2fbc1a884613af3d11033c3826a836075f130bfaba979ff25",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
