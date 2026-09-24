@@ -142,6 +142,54 @@ fn gh594_a_derived_read_waits_at_most_its_patience() {
     );
 }
 
+/// GH #406's lock half: a rename or delete while index work is announced
+/// and never arrives finishes within the read patience. Both read the page
+/// list, and they used to wait for the index while holding the graph-text
+/// identity lock, so every other edit queued behind the wait.
+#[test]
+fn gh594_a_rename_or_delete_while_indexing_waits_at_most_its_patience() {
+    let root = r10_scratch("gh594-rename-patience");
+    r10_pages(&root, 12);
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let registration = graph.register_index_owner();
+    graph.set_derived_read_patience_test(Duration::from_millis(500));
+    let renamed = {
+        let graph = Arc::clone(&graph);
+        within(Duration::from_secs(10), move || {
+            graph
+                .rename_page("p3", "p3 renamed")
+                .map_err(|e| e.to_string())
+        })
+    };
+    let deleted = {
+        let graph = Arc::clone(&graph);
+        within(Duration::from_secs(10), move || {
+            graph
+                .delete_page("p4", crate::vocab::PageKind::Page)
+                .map_err(|e| e.to_string())
+        })
+    };
+    let listed = graph.list_pages();
+    drop(registration);
+    crate::direct_projection::release_projection(&*graph);
+    drop(graph);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        matches!(renamed, Some(Ok(_))),
+        "a rename must not wait for index work that never arrives: {renamed:?}"
+    );
+    assert!(
+        matches!(deleted, Some(Ok(_))),
+        "a delete must not wait for index work that never arrives: {deleted:?}"
+    );
+    let names: Vec<_> = listed.iter().map(|page| page.name.to_lowercase()).collect();
+    assert!(names.contains(&"p3 renamed".to_owned()), "{names:?}");
+    assert!(!names.contains(&"p4".to_owned()), "{names:?}");
+}
+
 /// A reference panel asked while the index builds is told so at once. Its
 /// alias and page-name lookups used to wait for the build first, and the
 /// field's first backlinks read never completed.
