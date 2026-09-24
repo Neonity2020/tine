@@ -44,14 +44,12 @@ mod tests {
             .unwrap()
             .0;
         assert!(!folded_needle_boundary.contains("canonical_fold"));
-        let trigram_builder = candidates
-            .split_once("fn scalar_trigram_expression")
-            .unwrap()
-            .1
-            .split_once("fn and_group_expression")
-            .unwrap()
-            .0;
-        assert!(!trigram_builder.contains("canonical_fold"));
+        // Both index builders (trigram and short-word, ADR 0069) take needles
+        // and text already folded; the planner never folds again.
+        let candidate_builders = candidates.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(candidate_builders.contains("fn scalar_trigram_expression"));
+        assert!(candidate_builders.contains("fn short_word_tokens"));
+        assert!(!candidate_builders.contains("canonical_fold"));
         assert!(sql.contains("candidate::matcher_plan(&matcher)"));
         assert!(!sql.contains("CandidateMode::Interactive"));
 
@@ -74,8 +72,9 @@ mod tests {
         assert!(quick_switcher.contains("pageIdentityKey(page.matchedAlias) === queryIdentity"));
         assert!(!quick_switcher.contains("p.adaptiveClass === \"exact\""));
 
-        assert!(projection
-            .contains("search_tokens: crate::search_query::canonical_fold(&visible_search_text)"));
+        assert!(projection.contains(
+            "let search_tokens = crate::search_query::canonical_fold(&visible_search_text);"
+        ));
         assert!(projection.contains("search_tokens: projection.visible_lower.clone()"));
         assert!(quick_switcher.contains("\"ctrl_k\""));
         assert!(

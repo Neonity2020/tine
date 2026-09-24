@@ -427,6 +427,25 @@ fn a_two_scalar_term_is_unbounded_rather_than_unanswered() {
     assert_eq!(short.content_plans, vec![ContentPlan::ShortUnindexable]);
 }
 
+/// ADR 0069: a one- or two-character CJK term is bounded by the short-word
+/// index; a short term mixing CJK and Latin still is not.
+#[test]
+fn a_short_cjk_term_is_bounded_by_the_short_word_index() {
+    for needle in ["東京", "会"] {
+        let statement = match_sql(needle);
+        assert!(
+            statement.sql.contains("short_word_fts MATCH"),
+            "{}",
+            statement.sql
+        );
+        assert!(statement.positively_bounded, "{needle}");
+        assert_eq!(statement.content_plans, vec![ContentPlan::Fts]);
+    }
+    let mixed = match_sql("a会");
+    assert!(!mixed.sql.contains("short_word_fts") && !mixed.positively_bounded);
+    assert_eq!(mixed.content_plans, vec![ContentPlan::ShortUnindexable]);
+}
+
 /// One unbounded OR arm makes the LEAF unbounded, and that is not a defect
 /// to work around: the anchor is reached once per arm.
 #[test]

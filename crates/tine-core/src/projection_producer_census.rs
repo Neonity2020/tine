@@ -1455,7 +1455,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.27.1\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.28.0\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1645,6 +1645,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // version and parse configuration (design D2): `derived_reads.rs` gains
     // one read-only `open_direct` and binds one `Integer` and one `Text`.
     // Read only; no write, schema or pin change.
+    // 2026-09-24: ADR 0069 pins tine-storage v0.28.0 (schema 31: the
+    // `short_word_fts` table, written from the new `short_word_tokens` field
+    // inside storage's existing page transaction). Lowering fills one more
+    // field; the production import and direct-call inventory is unchanged.
     let digest = inventory_digest(&dependency_surface);
     assert_eq!(
         digest,

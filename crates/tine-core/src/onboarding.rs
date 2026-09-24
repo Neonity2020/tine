@@ -527,6 +527,10 @@ mod tests {
         assert!(search
             .markdown
             .contains("a third character searches them all"));
+        // ADR 0069: short CJK searches are complete, not recent-only.
+        assert!(search
+            .markdown
+            .contains("such a search always covers every block"));
     }
 
     #[test]

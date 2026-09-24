@@ -7725,7 +7725,32 @@
   "scenario": null,
   "failBefore": "tine-agents/evidence/batch-gh594/necessity-ctrlk.txt (without the budget the scan visited 20052 rows for a pair only the oldest block holds)"
  },
- "notes": "Blocking core operation (latency), Martin's Ctrl-K follow-up to GH #543. A needle under three characters has no trigram index, so the interactive read scanned blocks newest first until 300 verified matches; a rare pair visited every block (~1.5 s at 616k blocks, subagent note 2026-09-24-gh543-ctrlk-latency.md). The scan now stops at INTERACTIVE_SCAN_BUDGET (20,000 rows, ~50 ms at that scale) and sets has_more, which the switcher shows as More matches exist. Each Friendly search also logs on the --debug channel whether the index or a page scan answered it, with its elapsed time, and the interactive cursor logs its visits. A needle with Han, kana or Hangul is exempt from the budget (interactive_scan_budget): one or two characters are an ordinary word there, and the budgeted scan returned 0 of 26 matches for one measured word at 10k pages (subagent note 2026-09-24-ctrlk-0.6.982-parity.md; necessity tine-agents/evidence/batch-ctrlk-cjk/necessity-cjk-budget.txt). Such a needle scans every block, as in v0.6.985; an index for short CJK words is a separate decision. The pre-ready page fallback ranks on the cached fold (visible_lower, asserted equal to canonical_fold by a source test) and builds its page inventory once per cache generation (necessity-inventory-memo.txt: 3 builds for 3 keystrokes before); the frontend readiness retry is capped at 250 ms instead of 800 (necessity-retry-cap.txt)."
+ "notes": "Blocking core operation (latency), Martin's Ctrl-K follow-up to GH #543. A needle under three characters has no trigram index, so the interactive read scanned blocks newest first until 300 verified matches; a rare pair visited every block (~1.5 s at 616k blocks, subagent note 2026-09-24-gh543-ctrlk-latency.md). The scan now stops at INTERACTIVE_SCAN_BUDGET (20,000 rows, ~50 ms at that scale) and sets has_more, which the switcher shows as More matches exist. Each Friendly search also logs on the --debug channel whether the index or a page scan answered it, with its elapsed time, and the interactive cursor logs its visits. A needle with Han, kana or Hangul is exempt from the budget (interactive_scan_budget): one or two characters are an ordinary word there, and the budgeted scan returned 0 of 26 matches for one measured word at 10k pages (subagent note 2026-09-24-ctrlk-0.6.982-parity.md; necessity tine-agents/evidence/batch-ctrlk-cjk/necessity-cjk-budget.txt). Such a needle scanned every block, as in v0.6.985, until the short-word index (REG-CJK-SHORT-WORD-INDEX-543, ADR 0069) replaced that scan. The pre-ready page fallback ranks on the cached fold (visible_lower, asserted equal to canonical_fold by a source test) and builds its page inventory once per cache generation (necessity-inventory-memo.txt: 3 builds for 3 keystrokes before); the frontend readiness retry is capped at 250 ms instead of 800 (necessity-retry-cap.txt)."
+},
+{
+ "id": "REG-CJK-SHORT-WORD-INDEX-543",
+ "title": "A one- or two-character Chinese, Japanese or Korean search reads only the matching blocks",
+ "family": "search",
+ "sources": {
+  "issues": [543],
+  "commits": [],
+  "internal": "ADR 0069"
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/friendly_tests.rs::a_short_cjk_search_finds_matches_past_the_scan_budget",
+   "crates/tine-core/src/direct_projection_tests.rs::a_short_cjk_page_name_reads_its_unlinked_candidates_from_the_short_word_index",
+   "crates/tine-core/src/query/sql_tests.rs::a_short_cjk_term_is_bounded_by_the_short_word_index",
+   "crates/tine-core/src/query/candidate.rs::every_short_cjk_substring_is_a_token_of_its_text",
+   "crates/tine-core/src/query/candidate.rs::a_short_cjk_needle_is_index_driven_and_mixed_ones_are_not"
+  ],
+  "scenario": null,
+  "failBefore": "tine-agents/evidence/batch-cjk-short-word/necessity.txt (without the short-word bound Ctrl-K visited 20053 blocks for a word only the oldest block holds; the query and unlinked-reference tests fail)"
+ },
+ "notes": "Blocking core operation (latency). ADR 0069 (accepted by Martin 2026-09-24): a one- or two-character needle written entirely in Han, kana or Hangul was exempt from the scan budget and scanned every block (1.5 s per keystroke for a rare word at 616k blocks). tine-storage 0.28.0 adds short_word_fts (schema 31), fed from candidate::short_word_tokens, the unigrams and bigrams of each CJK run of the same folded text, by the router's own script predicate; the planner bounds such needles by it for Ctrl-K, content-match queries and unlinked references. Completeness: every 1-2 scalar CJK substring of indexed text is one of its tokens (property test); candidates are still verified exactly. Mixed short needles and OR arms bounded by different tables keep the unbudgeted scan. Unit cost measured through Tine's writer: +12.4 KB WAL per 1-block CJK edit, +25-33 KB per 60-block CJK edit, 0 without CJK. Shares the FACTS_VERSION 5 / schema 31 rebuild with the search-fold change. Not measured on the 10k CJK graph in Tine."
 },
 {
  "id": "REG-CASE-VARIANT-PAGE-NAME-597",

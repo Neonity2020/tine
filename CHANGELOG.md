@@ -17,6 +17,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   fold as before (`cafe` finds `café`, `γεια` finds `γειά`), `елка` finds
   `ёлка`, and `lodz` now finds `Łódź` (likewise ø, đ, ħ, ŧ). The first launch
   after this update re-indexes the graph once.
+- A Ctrl+K search of one or two Chinese, Japanese or Korean characters, such
+  as `会议` or `東京`, now reads an index of those short words and visits only
+  the matching blocks. Before, it scanned every block, which for a rare word
+  took about 1.5 s per keystroke on a 10,000-page graph. Unlinked References
+  of a one- or two-character page name and `content match` queries use the
+  same index. It is built during the same one-time re-index as the change
+  above (GH #543). Internal: tine-storage v0.28.0, projection schema 31.
 - Reopening a graph no longer makes Ctrl+K, Linked and Unlinked References,
   query blocks, the page list and block reference counts wait while Tine
   compares the graph on disk with its search index. Until that comparison

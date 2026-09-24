@@ -1655,10 +1655,14 @@ impl Compiler<'_> {
                 );
                 match crate::query::candidate::matcher_plan(&matcher) {
                     crate::query::candidate::CandidatePlan::Scan => exact,
-                    crate::query::candidate::CandidatePlan::Index { match_expression } => {
+                    crate::query::candidate::CandidatePlan::Index {
+                        table,
+                        match_expression,
+                    } => {
                         let expression = self.bind(PhysicalQueryValue::Text(match_expression));
+                        let table = table.name();
                         fold_and(vec![
-                            format!("{b}.block_id IN (SELECT rowid FROM search_fts WHERE search_fts MATCH {expression})"),
+                            format!("{b}.block_id IN (SELECT rowid FROM {table} WHERE {table} MATCH {expression})"),
                             exact,
                         ])
                     }

@@ -168,12 +168,16 @@ pub(super) fn projected_text_bytes(pages: &[tine_storage::sqlite::PhysicalPage])
     pages
         .iter()
         .map(|page| {
-            let own = page.search_tokens.len() as u64
+            let own = (page.search_tokens.len() + page.short_word_tokens.len()) as u64
                 + page.preamble.as_ref().map_or(0, |text| text.len() as u64);
             own + page
                 .blocks
                 .iter()
-                .map(|block| (block.content.len() + block.search_tokens.len()) as u64)
+                .map(|block| {
+                    (block.content.len()
+                        + block.search_tokens.len()
+                        + block.short_word_tokens.len()) as u64
+                })
                 .sum::<u64>()
         })
         .sum()
@@ -338,6 +342,7 @@ pub(super) fn physical_page(
             })
             .collect();
     }
+    let search_tokens = crate::search_query::canonical_fold(&visible_search_text);
     let page_property_atoms = crate::query::derived::property_atom_rows(
         &properties
             .iter()
@@ -357,7 +362,8 @@ pub(super) fn physical_page(
             // set where the file stem names no date (GH #543, audit R13-06).
             journal_day: entry.date_key.filter(|_| entry.kind == PageKind::Journal),
             preamble: document.pre_block.clone(),
-            search_tokens: crate::search_query::canonical_fold(&visible_search_text),
+            short_word_tokens: crate::query::candidate::short_word_tokens(&search_tokens),
+            search_tokens,
             properties,
             tags: crate::query::derived::tag_rows(&tags),
             property_atoms: page_property_atoms,
@@ -458,6 +464,9 @@ pub(super) fn lower_blocks(
             order,
             content: block.raw.clone(),
             search_tokens: projection.visible_lower.clone(),
+            short_word_tokens: crate::query::candidate::short_word_tokens(
+                &projection.visible_lower,
+            ),
             heading_level: projection.heading_level,
             collapsed: block.collapsed(),
             logseq_uuid,

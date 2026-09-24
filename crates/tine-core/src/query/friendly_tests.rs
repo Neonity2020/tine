@@ -1593,7 +1593,9 @@ fn page_rank_composite_key_preserves_candidates_and_ranks_each_once() {
 /// match still answers.
 /// One- and two-character words are ordinary in Chinese, Japanese and
 /// Korean. The scan budget for short needles cut such searches off at the
-/// newest blocks; they must find every match, however old.
+/// newest blocks; they must find every match, however old. Since ADR 0069 the
+/// short-word index drives them: a rare word reads its own blocks, not the
+/// ~20k-row walk that took 1.5 s per keystroke at 616k blocks.
 #[test]
 fn a_short_cjk_search_finds_matches_past_the_scan_budget() {
     let _serial = serialize();
@@ -1614,13 +1616,19 @@ fn a_short_cjk_search_finds_matches_past_the_scan_budget() {
             crate::query_plan::FriendlyDisplayOptions::default(),
             crate::query_plan::FriendlyConsumer::CtrlK,
         );
+        reset_friendly_read_census();
         let found = read(&corpus, &plan, &ResultIdentity::session_owned()).expect("search");
+        let visits = friendly_read_census().block_candidate_visits;
         assert!(
             found.hits.iter().any(|hit| matches!(
                 hit,
                 QueryHit::Block { display_text, .. } if display_text.contains(needle)
             )),
             "{needle} finds its oldest block"
+        );
+        assert!(
+            visits <= 2,
+            "{needle}: the short-word index drives the read, but it visited {visits} blocks"
         );
         assert!(
             !found.has_more.blocks,

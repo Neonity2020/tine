@@ -1,6 +1,6 @@
 # 0069. A CJK unigram and bigram index answers one- and two-character searches
 
-- **Status:** Proposed
+- **Status:** Accepted (Martin, 2026-09-24)
 - **Date:** 2026-09-24
 
 ## Context
@@ -45,8 +45,16 @@ like the trigram table and holds, for each block, the unigrams and bigrams of
 every maximal run of characters in the block's folded search text that
 satisfy `is_short_word_script`: Han, kana and Hangul, the same predicate that
 routes the query, so the index and the router cannot disagree on a script. The tokens
-are space-joined and indexed with the stock `unicode61` tokenizer,
-`detail=none`, `contentless_delete=1`.
+are space-joined and indexed with the stock `ascii` tokenizer, `detail=none`,
+`contentless_delete=1`.
+
+*Implementation note (2026-09-24, before any release):* `ascii` replaced the
+proposed `unicode61`. `unicode61` treats combining marks as separators, so a
+decomposed kana voicing mark (U+3099, inside the router's kana range) would
+have split its bigram; `ascii` splits only on ASCII separators and keeps every
+non-ASCII scalar inside its token, byte for byte. The unit cost is unchanged.
+The tables live in tine-storage 0.28.0 (`short_word_fts`, schema 31); the
+tokens are `query::candidate::short_word_tokens`.
 
 - A block with no CJK text writes no row, so a graph without CJK pays nothing.
 - A one- or two-character needle that is all CJK asks this table
@@ -60,15 +68,18 @@ are space-joined and indexed with the stock `unicode61` tokenizer,
   (a3e7bfda, BZ3) already moved the facts version to 5 and has not been
   released, so this costs no second rebuild (BZ5).
 
-Unit cost: +24.5 KB of WAL per edit of a 1-block page and +93 KB per edit of a
-60-block page, on CJK content only; ≈ 0 bytes on a page without CJK. 0 new
-files per edit (the same SQLite file). 0 transport bytes (the projection is
-local and never synced). Graph-wide: +37 MB on a 616k-block all-CJK graph, and
-a 4.7 s build alongside the trigram build's 5.2 s. Measured 2026-09-24 with
-Python's sqlite 3.53.1 over that graph (34.5 MB of text), using a schema that
-mirrors Tine's FTS tables but not the whole projection
-(`subagent-tasks/notes/2026-09-24-ctrlk-0.6.982-parity.md` §5). Re-measure
-through Tine's own writer when this lands (measurement task, 2026-09-24).
+Unit cost: +12.4 KB of WAL per edit of a 1-block CJK page (98.9 KB with the
+index against 86.5 KB without) and +25–33 KB per edit of a 60-block CJK page
+(132–140 KB against 107 KB); 0 bytes on a page without CJK (identical WAL
+growth; deleting absent short-word rowids writes nothing). 0 new files per
+edit (the same SQLite file). 0 transport bytes (the projection is local and
+never synced). Measured 2026-09-24 through Tine's own writer: WAL growth per
+save on a scratch graph, six saves each, one 36-character Chinese line per
+block, with the tokens on and forced empty. Graph-wide, from the earlier
+Python model of the tables (sqlite 3.53.1, a 616k-block all-CJK graph,
+`subagent-tasks/notes/2026-09-24-ctrlk-0.6.982-parity.md` §5): +37 MB, and a
+4.7 s build alongside the trigram build's 5.2 s. That model had estimated the
+per-edit costs at 24.5 KB and 93 KB; the writer measures lower.
 
 ## Consequences
 

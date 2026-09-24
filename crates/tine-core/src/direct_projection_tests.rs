@@ -2672,6 +2672,59 @@ fn interactive_indexed_plain_reference_keeps_exact_callback_work_bounded() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// ADR 0069: unlinked references of a two-character CJK page read the
+/// short-word index for their candidates, like a longer name reads trigrams,
+/// instead of ranking every block in the graph.
+#[test]
+fn a_short_cjk_page_name_reads_its_unlinked_candidates_from_the_short_word_index() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-short-word");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let mut source = String::from("- 我在東京工作\n");
+    for ordinal in 0..200 {
+        source.push_str(&format!("- unrelated {ordinal}\n"));
+    }
+    std::fs::write(root.join("pages/source.md"), source).unwrap();
+    std::fs::write(root.join("pages/東京.md"), "- owner\n").unwrap();
+
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+
+    reset_plain_reference_query_instrumentation();
+    let candidates = graph
+        .reference_candidate_pages_indexed(
+            &[crate::refs::page_key("東京")],
+            "東京",
+            ReferenceKind::Plain,
+        )
+        .expect("indexed interactive candidates");
+    let (callbacks, plans) = plain_reference_query_instrumentation();
+    assert!(
+        candidates
+            .pages
+            .iter()
+            .any(|(entry, _)| entry.rel_path == "pages/source.md"),
+        "the mention is a candidate"
+    );
+    assert_eq!(
+        callbacks, 1,
+        "exact work is the one mention; plans={plans:?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .flatten()
+            .any(|step| step.contains("short_word_fts")),
+        "the unlinked cursor must read the short-word index: {plans:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn interactive_block_owner_does_not_admit_unwindowed_page_preamble() {
     let _serial = serialize_projection_tests();

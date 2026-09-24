@@ -1030,14 +1030,18 @@ fn indexed_block_source(
             sql: "blocks b".to_string(),
             recency: "b.block_id",
         },
-        CandidatePlan::Index { match_expression } => {
+        CandidatePlan::Index {
+            table,
+            match_expression,
+        } => {
             params.push(PhysicalQueryValue::Text(match_expression));
             BlockCandidateSource {
                 sql: format!(
-                    "(SELECT rowid AS block_id FROM search_fts \
-                       WHERE search_fts MATCH ?{} ORDER BY rowid DESC) c \
+                    "(SELECT rowid AS block_id FROM {table} \
+                       WHERE {table} MATCH ?{} ORDER BY rowid DESC) c \
                      JOIN blocks b ON b.block_id = c.block_id",
-                    params.len()
+                    params.len(),
+                    table = table.name(),
                 ),
                 recency: "c.block_id",
             }

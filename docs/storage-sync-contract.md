@@ -98,7 +98,7 @@ writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transa
 transaction commits are not authority or individual durability barriers, because
 the file is a disposable cache (§3 invariant 3).
 
-**Tables of the projection (schema 30).** This list is the schema of record:
+**Tables of the projection (schema 31).** This list is the schema of record:
 `crates/tine-core/tests/contract_docs.rs` asserts it equals `sqlite_master`
 of a freshly initialized projection, so a table cannot appear or disappear
 without this contract saying so. FTS5 shadow tables are listed with their
@@ -119,7 +119,8 @@ virtual table.
 - `reference_alias_declarations` — `alias::` declarations per source page.
 - `query_projection_state` — the image revision a query snapshot validates (`query_revision`).
 - `direct_source_revisions` — the source revision keyed by the public path each page's rows were lowered from.
-- `search_fts`, `search_fts_config`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the one contentless trigram FTS5 table and its shadow tables. Its rowid is the disjoint page/block entity coordinate, so no owner map exists.
+- `search_fts`, `search_fts_config`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the contentless trigram FTS5 table and its shadow tables. Its rowid is the disjoint page/block entity coordinate, so no owner map exists.
+- `short_word_fts`, `short_word_fts_config`, `short_word_fts_data`, `short_word_fts_docsize`, `short_word_fts_idx` — the contentless short-word FTS5 table (ADR 0069) and its shadow tables: the unigrams and bigrams of each CJK run of the same folded text, keyed by the same rowids. An entity with no CJK text has no row.
 
 **Index completeness belongs to projection publication.** An admitted projection
 snapshot contains the search index maintained in the same page transaction as
@@ -152,7 +153,10 @@ a calendar day, so a malformed date keeps its presence and loses only its day.
 superset.** `block_text.content` and `page_text.preamble` are the only retained
 text copies. The producer feeds `canonical_fold(exact visible text)` (with
 whitespace preserved) into the contentless, case-sensitive trigram
-`search_fts`; no folded or visible text body is stored beside the raw input.
+`search_fts`, and the unigrams and bigrams of that fold's CJK runs
+(`candidate::short_word_tokens`, the router's own script predicate) into
+`short_word_fts`, which answers the one- and two-character needles trigrams
+cannot; no folded or visible text body is stored beside the raw input.
 Block predicates frame `(block_text.content, pages.path)` and derive exact
 visible text through `DocBlock::preamble` inside an operation-owned callback.
 Candidate membership can therefore be lossy, while equality, LIKE, regex,
@@ -160,7 +164,7 @@ Friendly ranking, evidence, and sort fallbacks all use one exact projection.
 Page rows remain in the same disjoint entity-rowid space so preamble and title
 candidates are never lost.
 
-**Query metadata stays on its physical owner (schema 30).** `blocks` stores
+**Query metadata stays on its physical owner (schema 31).** `blocks` stores
 public result identity, tree preorder, construction estimate and tag/property
 counts without duplicating raw payload. `pages` stores the corresponding page
 estimate and property count. A posting's `own` bit
@@ -178,8 +182,8 @@ consumption are subsequent packets. Removing global parsing from warm startup
 and result consumption remains separate from cold reconstruction: a cold,
 stale, damaged or config-changed image is built from one captured parsed
 snapshot in an unpublished stage. DB reuse alone does not claim fast
-end-to-end startup. Older projection readers reject the schema-30 disposable
-cache and rebuild it.
+end-to-end startup. A projection of any other schema (schema 30 included)
+fails `validate_schema`'s DDL census and is rebuilt as a disposable cache.
 
 `pages` holds identity and routing;
 `page_text` owns preamble and search text. `blocks` holds structure, metadata

@@ -2148,10 +2148,10 @@ impl DirectProjection {
                 }
                 ReferenceKind::Plain => {
                     let folded = crate::search_query::canonical_fold(name);
-                    let plan = crate::query::candidate::scalar_trigram_expression(&folded);
+                    let plan = crate::query::candidate::fragment_bound(&folded);
                     let mut params = plan
                         .as_ref()
-                        .map(|expression| vec![PhysicalQueryValue::Text(expression.clone())])
+                        .map(|(_, expression)| vec![PhysicalQueryValue::Text(expression.clone())])
                         .unwrap_or_default();
                     let snapshot = &mut snapshot;
                     let exclusions = crate::refs::ReferenceSourceExclusions::new(
@@ -2208,23 +2208,25 @@ impl DirectProjection {
                             limit_sql = format!(" LIMIT ?{}", params.len());
                         }
                     }
-                    let sql = if let Some(_) = plan {
-                        let candidate_source =
+                    let sql = if let Some((table, _)) = plan {
+                        let candidate_source = format!(
                             "(SELECT c.rowid AS entity_id, \
                                      CASE WHEN ep.page_id IS NOT NULL THEN 0 ELSE 1 END AS entity_type, \
                                      owner.path, b.result_id, b.order_key, \
                                      CASE WHEN ep.page_id IS NOT NULL \
                                           THEN COALESCE(pt.preamble, '') ELSE bt.content END AS raw, \
                                      owner_name.key AS owner_key \
-                              FROM (SELECT rowid FROM search_fts \
-                                    WHERE search_fts MATCH ?1 ORDER BY rowid DESC) c \
+                              FROM (SELECT rowid FROM {table} \
+                                    WHERE {table} MATCH ?1 ORDER BY rowid DESC) c \
                               LEFT JOIN pages ep ON ep.page_id = c.rowid \
                               LEFT JOIN blocks b ON b.block_id = c.rowid \
                               JOIN pages owner ON owner.page_id = COALESCE(ep.page_id, b.page_id) \
                               JOIN names owner_name ON owner_name.name_id = owner.name_id \
                               LEFT JOIN page_text pt ON pt.page_id = ep.page_id \
                               LEFT JOIN block_text bt ON bt.block_id = b.block_id \
-                              WHERE ep.page_id IS NOT NULL OR b.block_id IS NOT NULL) candidates";
+                              WHERE ep.page_id IS NOT NULL OR b.block_id IS NOT NULL) candidates",
+                            table = table.name(),
+                        );
                         let mut conditions = indexed_filter;
                         if matches!(
                             mode,
