@@ -298,7 +298,8 @@ pub(super) fn note_failed(pending: &mut PendingProjection, class: IndexFailureCl
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexFailureEvent {
     pub class: IndexFailureClass,
-    /// 1-based, consecutive since the index was last ready.
+    /// 1-based, consecutive since the index was last ready; 0 when the
+    /// background integrity check found the stored image damaged.
     pub attempt: u32,
     /// This attempt left the index `Failed`.
     pub terminal: bool,
@@ -315,7 +316,7 @@ pub fn set_index_failure_observer(observer: impl Fn(IndexFailureEvent) + Send + 
     let _ = INDEX_FAILURE_OBSERVER.set(Box::new(observer));
 }
 
-fn report_index_failure(event: IndexFailureEvent) {
+pub(super) fn report_index_failure(event: IndexFailureEvent) {
     #[cfg(test)]
     record_index_failure_for_test(event);
     if let Some(observer) = INDEX_FAILURE_OBSERVER.get() {
@@ -537,14 +538,7 @@ impl DirectProjection {
     /// same lock as the request, so two failed reads cannot both see "no
     /// build yet" and queue two.
     pub(crate) fn request_rebuild(&self) {
-        let mut pending = self.shared.pending.lock().unwrap();
-        if fresh_build_owns_image(&self.shared, &pending) {
-            return;
-        }
-        pending.rebuild = true;
-        self.shared.ready.store(false, Ordering::Release);
-        drop(pending);
-        self.shared.changed.notify_all();
+        request_rebuild(&self.shared);
     }
 
     /// Whether `failure` owes the index a new image; see
@@ -581,4 +575,18 @@ impl Drop for IndexOwnerRegistration {
         self.0.pending.lock().unwrap().owners -= 1;
         self.0.changed.notify_all();
     }
+}
+
+/// Owe the index a fresh image: the stored one is damaged. Nothing when a
+/// fresh build already owns its replacement (IT-10); checked under the same
+/// lock as the request, so two reports cannot both queue a build.
+pub(super) fn request_rebuild(shared: &ProjectionShared) {
+    let mut pending = shared.pending.lock().unwrap();
+    if fresh_build_owns_image(shared, &pending) {
+        return;
+    }
+    pending.rebuild = true;
+    shared.ready.store(false, Ordering::Release);
+    drop(pending);
+    shared.changed.notify_all();
 }

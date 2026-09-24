@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Reopening a graph no longer waits for a full check of the search index
+  before Ctrl+K, references and queries answer: that check took over a second
+  on a 10,000-page graph at every launch. The index is now checked in the
+  background, and only after the computer or phone restarted or once a week;
+  a phone closing Tine in the background never causes a check or a rebuild.
+  Damage the check finds still rebuilds the index (GH #550).
 - A block reference whose target cannot be found now shows its full
   `((…))` text, as Logseq does, instead of the first eight characters of its
   id. This includes `(((uuid)))`, which Logseq and Tine both read as a

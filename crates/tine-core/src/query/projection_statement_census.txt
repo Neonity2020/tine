@@ -1,3 +1,4 @@
+PRAGMA quick_check(1)
 SELECT DISTINCT p.path, b.result_id, b.order_key FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id JOIN pages p ON p.page_id = r.source_page_id LEFT JOIN blocks b ON r.source_entity_type = 1 AND b.block_id = r.source_entity_id WHERE r.target_type = 0 AND r.reference_kind <= 4 AND n.key = ?
 SELECT alias.raw, owner.raw, p.path FROM reference_alias_declarations d JOIN pages p ON p.page_id = d.source_page_id JOIN names owner ON owner.name_id = p.name_id JOIN names alias ON alias.name_id = d.alias_name_id WHERE d.source_entity_type = 0 AND d.source_entity_id = d.source_page_id ORDER BY d.source_page_id, d.ordinal, alias.raw
 SELECT b.block_id, b.page_id, b.collapsed, b.heading_level, t.content, k.marker, pl.priority, pl.scheduled, pl.deadline FROM blocks b JOIN block_text t ON t.block_id = b.block_id LEFT JOIN tasks k ON k.block_id = b.block_id LEFT JOIN block_planning pl ON pl.block_id = b.block_id WHERE b.block_id IN (?)

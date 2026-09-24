@@ -77,6 +77,9 @@ fn projection_statement_sites_are_pinned() {
             "crates/tine-core/src/direct_projection/derived_reads.rs",
             10,
         ),
+        // Design D1 (2026-09-24): the background integrity check's
+        // `PRAGMA quick_check`.
+        ("crates/tine-core/src/direct_projection/integrity.rs", 1),
         ("crates/tine-core/src/model/direct_query.rs", 3),
         ("crates/tine-core/src/query/export_results.rs", 5),
         ("crates/tine-core/src/query/friendly.rs", 4),

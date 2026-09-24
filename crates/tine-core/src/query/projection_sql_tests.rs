@@ -329,6 +329,8 @@ fn every_projection_statement_shape_is_blessed() {
         .stored_revisions()
         .is_some_and(|stored| !stored.is_empty()));
     assert_eq!(projection.holds_pages_under("pages/"), Some(true));
+    // The background integrity check, owed after a reboot (design D1).
+    assert!(projection.run_integrity_check_test());
 
     let recorded: BTreeSet<String> = census::recorded().into_keys().collect();
     let assert_shape = |label: &str, required: &[&str], forbidden: &[&str]| {

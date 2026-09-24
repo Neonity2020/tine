@@ -982,6 +982,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ),
         // 2026-09-22: GH #543 (design v4 stage 4) moved the writer lease's
         // lock-file open into its own module, unchanged.
+        // 2026-09-24: the background integrity check records its last pass
+        // beside the image in the app data dir (design D1): one disposable
+        // text file, never the graph; a lost or torn record costs one check.
+        (
+            "crates/tine-core/src/direct_projection/integrity.rs",
+            "fs.write",
+            1,
+        ),
         (
             "crates/tine-core/src/direct_projection_lease.rs",
             "open.create",
@@ -1628,10 +1636,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // a live id translates to its stored id before a lookup: two
     // `PhysicalQueryValue::Text(` binds in direct_projection.rs and one in
     // derived_reads.rs. Read-side binds only; no write, schema or pin change.
+    // 2026-09-24: the launch integrity check runs `PRAGMA quick_check` in the
+    // background through one read-only `open_direct` snapshot in
+    // `integrity.rs`, reading one `Text` verdict (design D1). Read only; no
+    // write, schema or pin change.
+    let digest = inventory_digest(&dependency_surface);
     assert_eq!(
-        inventory_digest(&dependency_surface),
-        "925cb64d3b3ddea2fbc1a884613af3d11033c3826a836075f130bfaba979ff25",
-        "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
+        digest,
+        "ecc590f9bf54601f1301f7cda7ba77b81b73d0351b156a617ed176a3fda0e61f",
+        "the complete tine-storage import/direct-call surface changed (digest now {digest}): {dependency_surface:#?}"
     );
 }
 

@@ -5754,6 +5754,7 @@ fn empty_projection_shared() -> ProjectionShared {
         worker_finished: AtomicBool::new(false),
         worker_resources: Mutex::new(Some(Vec::new())),
         validated: AtomicBool::new(false),
+        integrity_check: Mutex::new(None),
         after_sql_commit: Mutex::new(None),
         after_lowering_batch: Mutex::new(None),
         before_fresh_publication: Mutex::new(None),
@@ -5776,6 +5777,9 @@ fn empty_projection_shared() -> ProjectionShared {
         registry_capture_attempts: AtomicU64::new(0),
         inject_read_failure: AtomicBool::new(false),
         inject_image_damage: AtomicBool::new(false),
+        inject_integrity_damage: AtomicBool::new(false),
+        integrity_checks_started: AtomicU64::new(0),
+        integrity_check_pause: Mutex::new(None),
         inject_turn_failure: std::sync::atomic::AtomicU32::new(0),
         last_turn_failed: AtomicBool::new(false),
         lease_contended: AtomicBool::new(false),
@@ -10704,4 +10708,220 @@ fn gh597_a_case_variant_name_opens_the_file_under_its_disk_spelling() {
         copies, 1,
         "opening by a case variant published a second page"
     );
+}
+
+// ---- Launch integrity check off the launch path (design D1, GH #550/#543) ----
+
+fn launch_check_graph(tag: &str) -> (PathBuf, PathBuf) {
+    let root = r6_graph(tag);
+    let database = root.join("private/projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    (root, database)
+}
+
+fn wait_for_integrity_check(projection: &DirectProjection) {
+    let started = Instant::now();
+    while projection.integrity_running_test() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the background integrity check did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// D1: a reopen on the boot the image was last checked in runs no integrity
+/// check at all, however the last session ended -- an Android kill included:
+/// the record is written when a check passes, never at exit. Before, every
+/// launch ran `quick_check` over the whole image before its first answer
+/// (1.2-1.7 s on 10k pages).
+#[test]
+fn d1_a_reopen_on_the_same_boot_runs_no_integrity_check() {
+    let _serial = serialize_projection_tests();
+    let (root, database) = launch_check_graph("d1-same-boot");
+    assert!(
+        super::integrity::read_record(&database).is_some(),
+        "the fresh build records the image it checked"
+    );
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+    assert_eq!(
+        projection.projection_health_checks_test(),
+        0,
+        "opening the stored image ran an integrity check"
+    );
+    assert_eq!(projection.integrity_checks_started_test(), 0);
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// D1: after a reboot the check is owed; it runs beside the launch -- the
+/// index answers while it is still held -- and records the new boot.
+#[test]
+fn d1_a_reopen_after_a_reboot_checks_in_the_background() {
+    let _serial = serialize_projection_tests();
+    let (root, database) = launch_check_graph("d1-reboot");
+    let boot = super::integrity::boot_time_secs().expect("the test host knows its boot time");
+    let mut record = super::integrity::read_record(&database).unwrap();
+    record.boot = Some(boot - 3600);
+    super::integrity::write_record(&database, record);
+
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    // Held before it opens the image: the launch must not wait for it.
+    let pause = projection.pause_next_integrity_check_test();
+    graph.warm_cache();
+    pause.0.wait();
+    wait_ready(&graph);
+    assert!(projection.integrity_running_test());
+    assert!(graph
+        .list_pages()
+        .iter()
+        .any(|entry| entry.name == "Titled Page"));
+    pause.1.wait();
+    wait_for_integrity_check(&projection);
+    assert_eq!(projection.integrity_checks_started_test(), 1);
+    let after = super::integrity::read_record(&database).unwrap();
+    assert!(
+        (after.boot.unwrap() - boot).abs() <= 1,
+        "the passed check records this boot"
+    );
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// D1: damage the background check finds owes a fresh image, and the index
+/// is rebuilt and ready again.
+#[test]
+fn d1_damage_found_by_the_background_check_rebuilds_the_index() {
+    let _serial = serialize_projection_tests();
+    let (root, database) = launch_check_graph("d1-damage");
+    std::fs::remove_file(super::integrity::record_path(&database)).unwrap();
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    projection.inject_integrity_damage_test();
+    let before = projection.fresh_builds_test();
+    graph.warm_cache();
+    wait_for_integrity_check(&projection);
+    let started = Instant::now();
+    while projection.fresh_builds_test() == before {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "damage found by the integrity check did not rebuild the index: {}",
+            projection.debug_state_test()
+        );
+        graph.warm_cache();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_ready(&graph);
+    assert!(graph
+        .list_pages()
+        .iter()
+        .any(|entry| entry.name == "Titled Page"));
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// D1: closing the graph interrupts a running check and waits for it to let
+/// go of the image (on Windows an open reader blocks a replacement); nothing
+/// is recorded for a check that did not finish.
+#[test]
+fn d1_a_close_interrupts_the_background_check() {
+    let _serial = serialize_projection_tests();
+    let (root, database) = launch_check_graph("d1-close");
+    std::fs::remove_file(super::integrity::record_path(&database)).unwrap();
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let pause = projection.pause_next_integrity_check_test();
+    graph.warm_cache();
+    pause.0.wait();
+    let closer = {
+        let projection = Arc::clone(&projection);
+        std::thread::spawn(move || projection.close_and_wait_for_worker(Duration::from_secs(15)))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    pause.1.wait();
+    assert!(closer.join().unwrap(), "the worker did not stop");
+    assert!(!projection.integrity_running_test());
+    assert!(
+        super::integrity::read_record(&database).is_none(),
+        "an interrupted check recorded a pass"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn d1_the_check_is_due_after_a_reboot_or_a_week_and_not_otherwise() {
+    use super::integrity::{check_due, PassRecord, CHECK_INTERVAL};
+    let now = 2_000_000_000;
+    let week = CHECK_INTERVAL.as_secs();
+    let record = |boot, checked_at| Some(PassRecord { boot, checked_at });
+    assert!(check_due(None, now, Some(1)), "never checked");
+    assert!(
+        !check_due(record(Some(1_000), now - 60), now, Some(1_030)),
+        "same boot"
+    );
+    assert!(
+        check_due(record(Some(1_000), now - 60), now, Some(900_000)),
+        "rebooted"
+    );
+    assert!(
+        check_due(record(Some(1_000), now - week), now, Some(1_000)),
+        "a week old"
+    );
+    assert!(
+        check_due(record(Some(1_000), now + week), now, Some(1_000)),
+        "clock went back"
+    );
+    assert!(
+        !check_due(record(None, now - 60), now, Some(1_000)),
+        "boot unknown then"
+    );
+    assert!(
+        !check_due(record(Some(1_000), now - 60), now, None),
+        "boot unknown now"
+    );
+}
+
+/// AGENTS.md: a platform `cfg` list names every shipped target. The boot time
+/// has an arm for each; the fallback is only for non-Tine platforms.
+#[test]
+fn d1_every_tine_platform_knows_its_boot_time() {
+    let source = include_str!("direct_projection/integrity.rs");
+    // The one-line `#[cfg(...)]` attributes of the positive arms.
+    let arms = source
+        .lines()
+        .filter(|line| line.starts_with("#[cfg(") && !line.starts_with("#[cfg(not("))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for target in [
+        "target_os = \"linux\"",
+        "target_os = \"android\"",
+        "windows",
+        "target_os = \"macos\"",
+        "target_os = \"ios\"",
+    ] {
+        assert!(
+            arms.contains(target),
+            "boot_time_secs has no arm for {target}"
+        );
+    }
+    let boot = super::integrity::boot_time_secs().expect("this host knows its boot time");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(boot > 0 && boot <= now);
 }

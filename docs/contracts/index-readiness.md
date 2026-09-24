@@ -90,6 +90,27 @@ class, attempt number and whether it was terminal
 | `no_progress` | an attempt ended with nothing done |
 | `other` | none of the above |
 
+## L7 · The integrity check never delays an answer
+
+Opening the stored index checks only its schema. Its integrity
+(`PRAGMA quick_check`, 1.2–1.7 s on a 10k-page graph) is checked in the
+background, on its own read-only connection, and only when it is owed
+(`direct_projection/integrity.rs`):
+
+- **Threat it defends against:** power loss or an OS crash on storage that
+  does not honour fsync, and disk errors. The index is SQLite in WAL mode at
+  `synchronous=NORMAL`, so a killed process (Android's memory and power
+  management, a crash, a force-stop) cannot damage it and never causes a
+  check or a rebuild.
+- **Owed when:** no record of a passed check exists beside the index (in the
+  app's data directory, never the graph), the OS has rebooted since the last
+  pass, or the last pass is older than `CHECK_INTERVAL` = 7 days. A fresh
+  build checks the image it publishes and records the pass.
+- **While it runs:** nothing waits for it. Closing the graph, a config change
+  or a replacement image interrupts it and waits for it to let go of the file.
+- **Damage found:** reported as `index.failure` with class `corrupt` and
+  attempt 0, and the index is rebuilt, as for damage a read meets.
+
 ## L6 · Liveness is tested
 
 `model_gh594_liveness_tests.rs` pins: a build that always fails ends Failed

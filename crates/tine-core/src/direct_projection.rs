@@ -282,6 +282,9 @@ struct PendingProjection {
     /// The worker has opened (or found no) stored image. Until then nobody,
     /// the worker included, knows what the image needs.
     set_up: bool,
+    /// The background integrity check ([`integrity`]) holds a read connection
+    /// on the image. A drain waits for it to let go.
+    integrity_running: bool,
     /// The worker is running a fresh build. Queries do not capture from an
     /// image being replaced.
     building: bool,
@@ -441,6 +444,8 @@ struct ProjectionShared {
     /// In-scope scenario: an external edit between two sessions, followed by
     /// a save of some other page before the survey runs.
     validated: AtomicBool,
+    /// Interrupts the running background integrity check ([`integrity`]).
+    integrity_check: Mutex<Option<tine_storage::sqlite::PhysicalProjectionQueryCancellation>>,
     #[cfg(test)]
     after_sql_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -505,6 +510,15 @@ struct ProjectionShared {
     /// to exercise; a statement refused on an intact image is a real query.
     #[cfg(test)]
     inject_image_damage: AtomicBool,
+    /// The next background integrity check finds the image damaged.
+    #[cfg(test)]
+    inject_integrity_damage: AtomicBool,
+    /// Background integrity checks started ([`integrity`]).
+    #[cfg(test)]
+    integrity_checks_started: AtomicU64,
+    /// Hold the next background integrity check before it opens the image.
+    #[cfg(test)]
+    integrity_check_pause: Mutex<Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>>,
     /// Fail the worker's next this-many turns, as a disk error or a SQLite
     /// fault would.
     #[cfg(test)]
@@ -543,6 +557,7 @@ impl ProjectionShared {
         };
         reject_query_captures(captures);
         self.changed.notify_all();
+        integrity::cancel_and_wait(self);
         fence
     }
 
@@ -1021,6 +1036,7 @@ impl DirectProjection {
             worker_finished: AtomicBool::new(false),
             worker_resources: Mutex::new(Some(Vec::new())),
             validated: AtomicBool::new(false),
+            integrity_check: Mutex::new(None),
             #[cfg(test)]
             after_sql_commit: Mutex::new(None),
             #[cfg(test)]
@@ -1058,6 +1074,12 @@ impl DirectProjection {
             inject_read_failure: AtomicBool::new(false),
             #[cfg(test)]
             inject_image_damage: AtomicBool::new(false),
+            #[cfg(test)]
+            inject_integrity_damage: AtomicBool::new(false),
+            #[cfg(test)]
+            integrity_checks_started: AtomicU64::new(0),
+            #[cfg(test)]
+            integrity_check_pause: Mutex::new(None),
             #[cfg(test)]
             inject_turn_failure: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -2633,6 +2655,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         pending.set_up = true;
     }
     shared.changed.notify_all();
+    if writer_slot.is_some() {
+        integrity::start_if_due(&shared);
+    }
     loop {
         let turn = {
             let mut pending = shared.pending.lock().unwrap();
@@ -3021,6 +3046,9 @@ fn projection_image_is_healthy(
     database.validate_schema().is_ok() && database.quick_check().is_ok()
 }
 
+/// The stored image, if there is one this build can read. Only its schema is
+/// checked here: its integrity is checked in the background, and only when
+/// the OS may have gone down since the last check ([`integrity`], D1).
 fn open_existing_projection_database(
     shared: &ProjectionShared,
 ) -> Option<PhysicalGraphProjectionDatabase> {
@@ -3028,7 +3056,7 @@ fn open_existing_projection_database(
         return None;
     }
     let database = PhysicalGraphProjectionDatabase::open_writable(&shared.path).ok()?;
-    projection_image_is_healthy(shared, &database).then_some(database)
+    database.validate_schema().is_ok().then_some(database)
 }
 
 const PROJECTION_STAGE_MARKER: &str = ".tine-projection-build-";
@@ -3366,6 +3394,7 @@ fn build_and_publish_fresh_projection(
         database
             .quick_check()
             .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        integrity::record_pass_now(&shared.path);
         database
             .checkpoint_truncate()
             .map_err(|error| LoweringError::Failed(error.to_string()))?;
@@ -3520,6 +3549,9 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
 
 mod carried;
 pub(crate) mod derived_reads;
+mod integrity;
+#[cfg(test)]
+pub(crate) use integrity::CHECK_INTERVAL as INDEX_INTEGRITY_CHECK_INTERVAL;
 mod lowering;
 #[cfg(test)]
 mod test_hooks;

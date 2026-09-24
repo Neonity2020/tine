@@ -251,6 +251,10 @@ fn index_readiness_contract_matches_the_code() {
         "`DERIVED_READ_PATIENCE` = {} s",
         crate::model::derived_reads::DERIVED_READ_PATIENCE.as_secs()
     )));
+    assert!(contract.contains(&format!(
+        "`CHECK_INTERVAL` = {} days",
+        crate::direct_projection::INDEX_INTEGRITY_CHECK_INTERVAL.as_secs() / 86_400
+    )));
     for class in IndexFailureClass::ALL {
         assert!(
             contract.contains(&format!("| `{}` |", class.as_str())),

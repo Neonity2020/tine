@@ -223,3 +223,37 @@ impl DirectProjection {
         pair
     }
 }
+
+impl DirectProjection {
+    /// Background integrity checks started so far.
+    pub(crate) fn integrity_checks_started_test(&self) -> u64 {
+        self.shared.integrity_checks_started.load(Ordering::Relaxed)
+    }
+
+    /// Hold the next background integrity check before it opens the image:
+    /// `.0` is reached, `.1` releases it.
+    pub(crate) fn pause_next_integrity_check_test(
+        &self,
+    ) -> Arc<(std::sync::Barrier, std::sync::Barrier)> {
+        let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *self.shared.integrity_check_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
+    /// The next background integrity check finds the image damaged.
+    pub(crate) fn inject_integrity_damage_test(&self) {
+        self.shared
+            .inject_integrity_damage
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether a background integrity check is running.
+    pub(crate) fn integrity_running_test(&self) -> bool {
+        self.shared.pending.lock().unwrap().integrity_running
+    }
+
+    /// Run the integrity check on this thread; whether the image is intact.
+    pub(crate) fn run_integrity_check_test(&self) -> bool {
+        super::integrity::run_check_now(&self.shared)
+    }
+}
