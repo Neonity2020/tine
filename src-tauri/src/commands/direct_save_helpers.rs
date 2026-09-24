@@ -74,16 +74,16 @@ pub(crate) fn direct_save_error_message(error: std::io::Error) -> CommandError {
     }
     // The failed call and its OS error number are closed vocabulary and a
     // number: no page name or path, so they are safe in the toast and in a
-    // shared diagnostics report. Without them GH #538 read `unknown`.
-    CommandError::tagged(
-        "direct-save-failure",
-        Some(code),
-        Some(serde_json::json!({
-            "io_error_kind": io_error_kind,
-            "os_error": tine_core::model::save_os_error(&error),
-            "operation": tine_core::model::platform_step(&error).map(|step| step.operation),
-        })),
-    )
+    // shared diagnostics report. Without them GH #538 read `unknown`. Each is
+    // sent only when known, so a failure without one keeps the legacy wire.
+    let mut detail = serde_json::json!({ "io_error_kind": io_error_kind });
+    if let Some(os_error) = tine_core::model::save_os_error(&error) {
+        detail["os_error"] = serde_json::json!(os_error);
+    }
+    if let Some(step) = tine_core::model::platform_step(&error) {
+        detail["operation"] = serde_json::json!(step.operation);
+    }
+    CommandError::tagged("direct-save-failure", Some(code), Some(detail))
 }
 
 /// Report what a slow or failed Direct-Markdown save actually did.

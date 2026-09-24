@@ -594,9 +594,13 @@ mod tests {
             .split("/// Report what a slow")
             .next()
             .unwrap();
+        let direct_mapper_tokens: String = direct_mapper
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         assert!(
-            direct_mapper.contains("CommandError::tagged(\n            \"save-conflict\"")
-                && direct_mapper.contains("CommandError::tagged(\n        \"direct-save-failure\"")
+            direct_mapper_tokens.contains("CommandError::tagged(\"save-conflict\"")
+                && direct_mapper_tokens.contains("CommandError::tagged(\"direct-save-failure\"")
                 && !direct_mapper.contains("CommandError::from"),
             "DirectSaveError must retain its closed code and epoch in Tagged, never Io/Prose"
         );
