@@ -17,6 +17,15 @@ describe("actual lsdoc Wasm search exports", () => {
     expect(searchFold(searchFold("𝐀"))).toBe("a");
   });
 
+  it("keeps marks that make another letter and folds only accents", () => {
+    expect(searchFold("が")).not.toBe(searchFold("か"));
+    expect(searchFold("कु")).not.toBe(searchFold("क"));
+    expect(searchFold("й")).not.toBe(searchFold("и"));
+    expect(searchFold("ёлка")).toBe(searchFold("елка"));
+    expect(searchFold("Łódź")).toBe(searchFold("lodz"));
+    expect(searchFold("γειά")).toBe(searchFold("γεια"));
+  });
+
   it("maps folded scalars back to original UTF-16 ranges across emoji", () => {
     const mapped = searchFoldMap("😀 𝐀 café");
     const scalars = Array.from(mapped.text);

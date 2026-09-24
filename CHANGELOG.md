@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Search no longer treats letters that differ by a mark as the same letter
+  where the mark makes a different letter or syllable: `か` no longer finds
+  `が`, `и` no longer finds `й`, and in Hindi, Thai or Tibetan a vowel sign
+  or virama is no longer dropped, so `क` no longer finds `कु`. Accents still
+  fold as before (`cafe` finds `café`, `γεια` finds `γειά`), `елка` finds
+  `ёлка`, and `lodz` now finds `Łódź` (likewise ø, đ, ħ, ŧ). The first launch
+  after this update re-indexes the graph once.
 - Reopening a graph no longer waits for a full check of the search index
   before Ctrl+K, references and queries answer: that check took over a second
   on a 10,000-page graph at every launch. The index is now checked in the

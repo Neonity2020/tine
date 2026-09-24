@@ -46,8 +46,98 @@ fn is_mn(ch: char) -> bool {
     mn_regex().is_match(ch.encode_utf8(&mut bytes))
 }
 
+/// The nonspacing marks that are default-ignorable: the combining grapheme
+/// joiner, the Khmer inherent vowels, and the variation selectors. They only
+/// pick a glyph. `the_ignorable_marks_are_every_default_ignorable_mark` pins
+/// the list against Unicode.
+fn is_ignorable_mark(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{034f}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180d}'
+            | '\u{180f}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{e0100}'..='\u{e01ef}'
+    )
+}
+
+/// Combining classes of marks that make a different letter or syllable rather
+/// than accent one: kana voicing (8), virama (9), the Telugu length marks (84,
+/// 91), the Thai vowel sign u/uu (103), the Lao vowel sign u/uu (118) and the
+/// Tibetan vowel signs (129, 130, 132). Firefox's find-in-page keeps the same
+/// classes, after Japanese users reported は = ば = ぱ (bug 1624244).
+const LETTER_CLASSES: [u8; 9] = [8, 9, 84, 91, 103, 118, 129, 130, 132];
+
+/// Whether `ch` is a Cyrillic letter. Cyrillic marks make letters of their
+/// own (й is not и), so they are kept, except that ё searches as е, as
+/// Russian commonly writes it.
+fn is_cyrillic(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0400}'..='\u{052f}'
+            | '\u{1c80}'..='\u{1c8f}'
+            | '\u{2de0}'..='\u{2dff}'
+            | '\u{a640}'..='\u{a69f}'
+    )
+}
+
+/// Letters with a stroke or slash have no decomposition, so no mark removal
+/// reaches them; they search as their base letter (Firefox bug 1649187).
+fn strip_stroke(ch: char) -> char {
+    match ch {
+        'ł' => 'l',
+        'ø' => 'o',
+        'đ' => 'd',
+        'ħ' => 'h',
+        'ŧ' => 't',
+        other => other,
+    }
+}
+
+/// Whether the fold drops the decomposed scalar `ch`, whose base is the last
+/// scalar before it that is not a mark. An accent drops (é finds e, Hebrew
+/// points and Arabic harakat drop); a mark with combining class 0 or one of
+/// [`LETTER_CLASSES`] stays, because it makes another letter (Devanagari कु is
+/// not क, が is not か). Variation selectors and the combining grapheme joiner
+/// only select a glyph and always drop. Decided by Martin 2026-09-24.
+fn drops(ch: char, base: Option<char>) -> bool {
+    if !is_mn(ch) {
+        return false;
+    }
+    if is_ignorable_mark(ch) {
+        return true;
+    }
+    let class = canonical_combining_class(ch);
+    if class == 0 || LETTER_CLASSES.contains(&class) {
+        return false;
+    }
+    match base {
+        // ё is е + U+0308 once decomposed.
+        Some('\u{0435}') => ch == '\u{0308}',
+        Some(base) if is_cyrillic(base) => false,
+        _ => true,
+    }
+}
+
+/// The removal decision for every decomposed scalar, in order.
+fn removal_marks(chars: &[char]) -> Vec<bool> {
+    let mut base = None;
+    chars
+        .iter()
+        .map(|&ch| {
+            let removed = drops(ch, base);
+            if canonical_combining_class(ch) == 0 && !is_mn(ch) {
+                base = Some(ch);
+            }
+            removed
+        })
+        .collect()
+}
+
 /// The one native search fold: whole-string lowercase, compatibility
-/// decomposition, Mn removal, canonical reorder, and canonical composition.
+/// decomposition with stroked letters unstroked, accent removal ([`drops`]),
+/// canonical reorder, and canonical composition.
 ///
 /// Whole-string lowercase supplies contextual forms such as final sigma. The
 /// raw UTF-16 range attached to each scalar follows it through every later
@@ -108,7 +198,7 @@ fn fold_pipeline(
                         .next()
                         .expect("whole-string lowercase preserves scalar partition length");
                     decompose_compatible(contextual, |ch| {
-                        decomposed.chars.push(ch);
+                        decomposed.chars.push(strip_stroke(ch));
                         sources.push(scalar_start..original_utf16);
                         clusters.push(cluster_index);
                     });
@@ -122,7 +212,7 @@ fn fold_pipeline(
         raw_graphemes
     } else {
         for contextual in lowered.chars() {
-            decompose_compatible(contextual, |ch| decomposed.chars.push(ch));
+            decompose_compatible(contextual, |ch| decomposed.chars.push(strip_stroke(ch)));
         }
         0
     };
@@ -151,8 +241,13 @@ fn source_distance(mark: &Range<usize>, retained: &Range<usize>) -> (usize, bool
 
 fn remove_mn(mut input: FoldBuffer) -> (FoldBuffer, RemovalWork) {
     let input_scalars = input.chars.len();
+    let removed = removal_marks(&input.chars);
     if input.sources.is_none() {
-        input.chars.retain(|ch| !is_mn(*ch));
+        let mut at = 0;
+        input.chars.retain(|_| {
+            at += 1;
+            !removed[at - 1]
+        });
         return (
             input,
             RemovalWork {
@@ -171,16 +266,14 @@ fn remove_mn(mut input: FoldBuffer) -> (FoldBuffer, RemovalWork) {
     // Tags are still in raw source order. The closest retained contributor in
     // the same grapheme is therefore one of the two retained neighbors. Delay
     // range unions so attaching one mark cannot change a later distance/tie.
-    let mut removed = vec![false; input_scalars];
     let mut previous = vec![None; input_scalars];
     let mut previous_retained = None;
-    for (at, ch) in input.chars.iter().enumerate() {
+    for at in 0..input_scalars {
         work_units += 1;
         if previous_retained.is_some_and(|before: usize| clusters[before] != clusters[at]) {
             previous_retained = None;
         }
         previous[at] = previous_retained;
-        removed[at] = is_mn(*ch);
         if !removed[at] {
             previous_retained = Some(at);
         }
@@ -381,10 +474,12 @@ mod tests {
     use unicode_normalization::UnicodeNormalization;
 
     fn oracle(raw: &str) -> String {
-        raw.to_lowercase()
-            .nfkc()
-            .nfd()
-            .filter(|ch| !is_mn(*ch))
+        let decomposed: Vec<char> = raw.to_lowercase().nfkc().nfd().map(strip_stroke).collect();
+        let removed = removal_marks(&decomposed);
+        decomposed
+            .into_iter()
+            .zip(removed)
+            .filter_map(|(ch, removed)| (!removed).then_some(ch))
             .nfc()
             .collect()
     }
@@ -509,6 +604,76 @@ mod tests {
         assert!(mapped_work.raw_graphemes > 0);
         assert_eq!(mapped_work.provenance_scalars, mapped_work.input_scalars);
         assert_eq!(mapped.sources.len(), mapped.text.chars().count());
+    }
+
+    /// The mark policy Martin decided on 2026-09-24: accents fold, marks
+    /// that make another letter or syllable do not.
+    #[test]
+    fn accents_fold_and_letter_making_marks_do_not() {
+        let same = [
+            ("café", "cafe"),
+            ("Příliš žluťoučký kůň", "prilis zlutoucky kun"),
+            ("γειά", "γεια"),
+            // Hebrew points (ccc 10-26) and Arabic harakat (27-35).
+            ("שָׁלוֹם", "שלום"),
+            ("مَرْحَبًا", "مرحبا"),
+            // Thai tone mark (ccc 107), Lao tone mark (122), Devanagari nukta (7).
+            ("ก่า", "กา"),
+            ("ກ່າ", "ກາ"),
+            ("क़", "क"),
+            ("ёлка", "елка"),
+            ("ЁЛКА", "елка"),
+            ("Łódź", "lodz"),
+            ("Øresund", "oresund"),
+            ("Đà Nẵng", "da nang"),
+            ("Ħal", "hal"),
+            ("Ŧ", "t"),
+            // Variation selectors and the combining grapheme joiner only pick a glyph.
+            ("\u{2764}\u{fe0f}", "\u{2764}"),
+            ("a\u{034f}b", "ab"),
+        ];
+        for (raw, plain) in same {
+            assert_eq!(fold_text(raw), fold_text(plain), "{raw:?} should find {plain:?}");
+        }
+
+        let different = [
+            // Kana voicing (ccc 8).
+            ("が", "か"),
+            ("ぱ", "は"),
+            ("ｶﾞ", "カ"),
+            // Virama (ccc 9) and Devanagari vowel signs (ccc 0).
+            ("क्", "क"),
+            ("कु", "क"),
+            ("कि", "क"),
+            // Thai sara u (ccc 103), thanthakhat and nikhahit (ccc 0).
+            ("กุ", "ก"),
+            ("ก์", "ก"),
+            ("กํ", "ก"),
+            // Lao vowel sign u (ccc 118).
+            ("ກຸ", "ກ"),
+            // Tibetan vowel signs (ccc 130, 132).
+            ("ཀི", "ཀ"),
+            ("ཀུ", "ཀ"),
+            // Cyrillic letters made with a mark.
+            ("й", "и"),
+            ("ї", "і"),
+            ("ў", "у"),
+            ("ѐ", "е"),
+        ];
+        for (raw, plain) in different {
+            assert_ne!(fold_text(raw), fold_text(plain), "{raw:?} must not find {plain:?}");
+            assert_eq!(fold(raw).text, fold_text(raw), "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_ignorable_marks_are_every_default_ignorable_mark() {
+        let ignorable = Regex::new(r"\A\p{Default_Ignorable_Code_Point}\z").unwrap();
+        for ch in (0..=0x10ffff_u32).filter_map(char::from_u32) {
+            let mut bytes = [0_u8; 4];
+            let expected = is_mn(ch) && ignorable.is_match(ch.encode_utf8(&mut bytes));
+            assert_eq!(is_ignorable_mark(ch), expected, "U+{:04X}", ch as u32);
+        }
     }
 
     #[test]

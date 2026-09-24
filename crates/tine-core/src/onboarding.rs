@@ -653,6 +653,27 @@ mod tests {
         );
     }
 
+    /// The search Guide's examples of what folds and what does not are what the
+    /// search fold does (decided by Martin 2026-09-24).
+    #[test]
+    fn search_guide_mark_examples_are_what_search_does() {
+        use crate::search_query::canonical_fold;
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.markdown.contains("Search ignores accent marks"))
+            .expect("the search Guide page is registered");
+        for (query, text) in [("cafe", "café"), ("lodz", "Łódź"), ("Tine", "Ｔｉｎｅ"), ("елка", "ёлка")] {
+            assert!(page.markdown.contains(&format!("`{query}` finds `{text}`")));
+            assert_eq!(canonical_fold(query), canonical_fold(text), "{query} finds {text}");
+        }
+        for (query, text) in [("か", "が"), ("и", "й"), ("क", "कु")] {
+            assert!(page
+                .markdown
+                .contains(&format!("`{query}` does not find `{text}`")));
+            assert_ne!(canonical_fold(query), canonical_fold(text), "{query} must not find {text}");
+        }
+    }
+
     /// GH #543: the Guide tells a user opening a large graph that the toolbar
     /// shows indexing progress and that Tine is usable meanwhile.
     #[test]

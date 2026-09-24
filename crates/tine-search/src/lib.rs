@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn a6_search_fold_applies_compatibility_and_removes_only_mn() {
+    fn a6_search_fold_applies_compatibility_and_removes_only_accents() {
         assert!(hit("café", "a cafe\u{301} here"));
         assert!(hit("cafe\u{301}", "a café here"));
         assert!(hit("\u{ac00}", "Hangul \u{1100}\u{1161}"));
@@ -441,6 +441,10 @@ mod tests {
         assert!(hit("prilis zlutoucky kun", "Příliš žluťoučký kůň"));
         assert!(!hit("का", "क"), "Mc must remain significant");
         assert!(!hit("a⃝", "a"), "Me must remain significant");
+        assert!(!hit("か", "が"), "kana voicing makes another syllable");
+        assert!(!hit("и", "й"), "й is its own Cyrillic letter");
+        assert!(hit("елка", "ёлка"));
+        assert!(hit("lodz", "Łódź"));
         assert!(!hit("STRASSE", "Straße"), "this is not full casefold");
         // Regular expressions retain their original-text semantics.
         assert!(!hit("/café/", "cafe\u{301}"));

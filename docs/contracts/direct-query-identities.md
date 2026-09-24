@@ -26,8 +26,9 @@ lowering commits, the projection records that page's exceptions
 `ProjectionShared::session_ids`. The newest `LIVE_ID_REVISIONS` (2) revisions
 per page are kept, so a snapshot of the image just replaced still decodes. A
 page lowered with no exceptions records an empty entry for its new revision,
-and deletion drops the page's entries. `DIRECT_PROJECTION_FACTS_VERSION` 4
-re-lowers every page stored by an earlier version once.
+and deletion drops the page's entries. Version 4 of
+`DIRECT_PROJECTION_FACTS_VERSION` (now 5) re-lowered every page stored by an
+earlier version once; each later bump does the same.
 
 A reader captures `ResultIdentity` beside its snapshot
 (`capture_result_identity`): the recorded exceptions whose revision equals the

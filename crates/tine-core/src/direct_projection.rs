@@ -57,7 +57,10 @@ type SharedCommittedRegistry = Arc<Mutex<Option<CommittedRegistryOwner>>>;
 // v4: `blocks.result_id` is the block's structural id, never a session's live
 // id, so a page stored by an earlier session resolves after a reopen (R3; GH
 // #594).
-const DIRECT_PROJECTION_FACTS_VERSION: u32 = 4;
+// v5: the search fold keeps marks that make another letter (kana voicing,
+// virama, Indic vowel signs, Cyrillic й) and unstrokes ł ø đ ħ ŧ, so stored
+// search tokens and folded names change (decided by Martin 2026-09-24).
+const DIRECT_PROJECTION_FACTS_VERSION: u32 = 5;
 const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(test)]
 // Test receipts count only their own graph, including its worker threads.
