@@ -56,3 +56,26 @@ fn gh597_a_case_only_rename_outside_tine_leaves_one_page() {
     assert_eq!(pages, vec!["pages/contents.md".to_owned()]);
     r10_finish(root, graph, owner);
 }
+
+/// A tab, Recent entry or sidebar item saved with the alias spelling
+/// `pages/Contents.md` while Tine handed it out opens the file under its disk
+/// spelling instead of failing as "no longer available at that path".
+#[test]
+fn gh597_a_path_saved_under_another_case_spelling_opens_the_file() {
+    let root = r10_scratch("gh597-saved-alias-path");
+    if !resolves_case_variants(&root) {
+        eprintln!("GH #597: case-sensitive filesystem, nothing to check");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    fs::write(root.join("pages/contents.md"), "- body\n").unwrap();
+    let graph = Graph::open(&root);
+    let dto = graph
+        .load_by_path("pages/Contents.md")
+        .unwrap()
+        .expect("the saved spelling opens the file");
+    assert_eq!(dto.path, "pages/contents.md");
+    assert!(graph.load_by_path("pages/Contents-2.md").unwrap().is_none());
+    drop(graph);
+    let _ = fs::remove_dir_all(&root);
+}

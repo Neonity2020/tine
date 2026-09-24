@@ -31,7 +31,7 @@ import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { refreshAfterRename } from "../graph";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { bumpGraphEpoch, clearConflict, clearRecent, conflicts, closeContextMenu, contextMenu, graphEpoch, markConflict, registerLiveSaveConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, conflicts, closeContextMenu, contextMenu, graphEpoch, markConflict, registerLiveSaveConflict, recentPages, rightSidebar, setDataRev, setRecentPages, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 
 beforeAll(async () => {
@@ -975,6 +975,32 @@ describe("tag-page table", () => {
     await tick();
     expect(runQuery).not.toHaveBeenCalled();
     dispose();
+  });
+});
+
+describe("a route pinned to another case spelling of its file (GH #597)", () => {
+  it("opens the file under its disk spelling and re-keys the tab and Recent entry", async () => {
+    const dto: PageDto = {
+      name: "contents", title: "contents", kind: "page", path: "pages/contents.md",
+      pre_block: null, rev: "disk-rev",
+      blocks: [{ id: "contents-root", raw: "Table of contents", children: [], collapsed: false }],
+    };
+    const read = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    setRecentPages([{ name: "Contents", kind: "page", path: "pages/Contents.md" }]);
+    mainPaneRouter.replaceActiveRoute({ kind: "page", name: "Contents", pageKind: "page", path: "pages/Contents.md" });
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(read).toHaveBeenCalledWith("pages/Contents.md");
+      expect(root.textContent).not.toContain("no longer available at that path");
+      expect(root.textContent).toContain("Table of contents");
+      expect(mainPaneRouter.route()).toMatchObject({ kind: "page", name: "contents", path: "pages/contents.md" });
+      expect(recentPages().filter((r) => r.path === "pages/Contents.md")).toEqual([]);
+    } finally {
+      dispose();
+      setRecentPages([]);
+    }
   });
 });
 
