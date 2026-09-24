@@ -812,16 +812,32 @@ about the running device; the receipt wins.** The same `EINVAL` is reachable off
 Android on any filesystem without `rename2` flags (FAT/exFAT removable media,
 some FUSE and network mounts).
 
-Every graph-tree name transition therefore takes the platform primitive and
-nothing else, on every platform, through `model::rename_projection_noreplace`.
-Graph text is sole-authority data: a two-step publication (reserve the
-destination with an exclusive create, then rename onto the reservation) could
-leave a reserved-but-empty file at a live graph name after a crash, with no
-second copy to rebuild it from. On a filesystem without the flag, a Direct
-Files create or save fails rather than publishing non-atomically, and the error
-names the refused call. Managed Storage's reconstructible projection used that
-reservation fallback, with a per-device memo of the answer; both were removed
-with it (ADR 0066).
+Every graph-tree name transition takes the platform primitive first, on every
+platform, through `model::rename_projection_noreplace` (same directory) or
+`model::rename_graph_text_noreplace` (across directories). Graph text is
+sole-authority data: a two-step publication (reserve the destination with an
+exclusive create, then rename onto the reservation) could leave a
+reserved-but-empty file at a live graph name after a crash, with no second copy
+to rebuild it from, so there is no reservation fallback.
+
+When the platform refuses the **flag itself** — the rename's own `EINVAL`,
+`ENOSYS` or `EOPNOTSUPP`/`ENOTSUP` on Linux, Android, macOS or iOS; never
+`EEXIST`, never another I/O error, never Windows — the transition checks that
+the destination name is absent and then renames plainly (Martin, 2026-09-24,
+decision B1, GH #538). An occupied destination is still `AlreadyExists` with
+nothing moved, and a plain rename keeps the same crash atomicity as the flagged
+one. What this gives up, on such storage only, is atomicity of the absence
+check: an external writer that creates the destination name in the
+microseconds between the check and the rename is replaced (scenario:
+external-editor race or sync delivery on flag-refusing storage). Every caller's
+destination is either a unique Tine-private name no one else creates (the
+retire step) or a live name the caller has just vacated or proved absent.
+Before this decision such storage failed every Direct Files create, save and
+rename (Android 11-14 without the 2024 MediaProvider update; NFS). Pinned by
+`gh538_flag_refusing_storage_creates_saves_and_renames_pages` and
+`gh538_flag_refusing_storage_never_replaces_an_occupied_name`. Managed
+Storage's reconstructible projection used the reservation fallback, with a
+per-device memo of the answer; both were removed with it (ADR 0066).
 
 ### 2.10d When the graph filesystem folds two page names into one file
 

@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- On Android 11 to 14 shared storage, creating, saving and renaming pages
+  failed with "Invalid argument (os error 22)", because the storage refuses
+  the rename that is guaranteed never to overwrite a file. Tine now checks
+  that the name is free and renames without the guarantee on storage that
+  refuses it. The same applies to network drives (NFS) that refuse it
+  (GH #538).
 - Renaming a page that many pages link to, or a sync tool changing many
   files at once, no longer holds up searches and references while Tine updates
   its index. The update is written as one transaction instead of one per 32

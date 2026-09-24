@@ -1101,6 +1101,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "cap.remove_file",
             2,
         ),
+        // GH #538 (Martin 2026-09-24, B1): the checked plain rename used only
+        // where the platform refuses the no-replace flag itself, after an
+        // absence check (`plain_rename_where_the_flag_is_refused`, §2.10b).
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "cap.rename",
+            1,
+        ),
         (
             "crates/tine-core/src/model/projection_rename.rs",
             "libc.renameat2",

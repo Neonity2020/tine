@@ -15693,3 +15693,98 @@ fn a_platform_failure_keeps_its_call_and_os_error_through_the_save_tag() {
     );
     assert_eq!(direct_save_failure_code(&tagged), "unknown");
 }
+
+/// Hidden names left in a directory: staged, retired or recovery artifacts a
+/// completed operation must not strand.
+#[cfg(unix)]
+fn gh538_hidden_names(dir: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with('.'))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// GH #538: on storage that refuses the no-replace flag (Android 11-14 shared
+/// storage, NFS), page creation, an ordinary save and a page rename all
+/// complete through the checked plain rename, and leave no hidden artifact.
+#[cfg(unix)]
+#[test]
+fn gh538_flag_refusing_storage_creates_saves_and_renames_pages() {
+    let dir = scratch("gh538-flag-refusing-storage");
+    fs::write(dir.join("pages/hub.md"), "- hub\n").unwrap();
+    fs::write(dir.join("pages/referrer.md"), "- links [[hub]]\n").unwrap();
+    let graph = Graph::open(&dir);
+    graph.warm_cache();
+    let _refused = refuse_noreplace_flag_on_this_thread_test();
+
+    let created = markdown_page_dto("fresh", "fresh", "- created\n").unwrap();
+    graph.save_page(&created, None).unwrap();
+    assert_eq!(
+        fs::read(dir.join("pages/fresh.md")).unwrap(),
+        b"- created\n"
+    );
+
+    let hub = graph
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.name == "hub")
+        .unwrap();
+    let mut page = graph.load_page(&hub).unwrap();
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "hub edited".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    assert_eq!(
+        fs::read(dir.join("pages/hub.md")).unwrap(),
+        b"- hub edited\n"
+    );
+
+    graph.rename_page("hub", "moved hub").unwrap();
+    assert!(!dir.join("pages/hub.md").exists());
+    assert_eq!(
+        fs::read(dir.join("pages/moved hub.md")).unwrap(),
+        b"- hub edited\n"
+    );
+    assert_eq!(
+        fs::read(dir.join("pages/referrer.md")).unwrap(),
+        b"- links [[moved hub]]\n"
+    );
+    assert_eq!(gh538_hidden_names(&dir.join("pages")), Vec::<String>::new());
+    drop(graph);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// GH #538: the fallback keeps the no-clobber answer for an occupied name. It
+/// moves nothing and reports `AlreadyExists`, same as the flagged rename.
+#[cfg(unix)]
+#[test]
+fn gh538_flag_refusing_storage_never_replaces_an_occupied_name() {
+    let root = scratch("gh538-flag-refusing-occupied");
+    let dir = Dir::open_ambient_dir(root.join("pages"), ambient_authority()).unwrap();
+    let _refused = refuse_noreplace_flag_on_this_thread_test();
+
+    dir.write("staged", b"- staged\n").unwrap();
+    dir.write("Page.md", b"- theirs\n").unwrap();
+    let occupied = rename_projection_noreplace(&dir, "staged", "Page.md").unwrap_err();
+    assert_eq!(occupied.kind(), io::ErrorKind::AlreadyExists, "{occupied}");
+    assert_eq!(fs::read(root.join("pages/Page.md")).unwrap(), b"- theirs\n");
+    assert_eq!(fs::read(root.join("pages/staged")).unwrap(), b"- staged\n");
+
+    let other = Dir::open_ambient_dir(root.join("journals"), ambient_authority()).unwrap();
+    other.write("Page.md", b"- other\n").unwrap();
+    let across = rename_graph_text_noreplace(&dir, "staged", &other, "Page.md").unwrap_err();
+    assert_eq!(across.kind(), io::ErrorKind::AlreadyExists, "{across}");
+    assert_eq!(
+        fs::read(root.join("journals/Page.md")).unwrap(),
+        b"- other\n"
+    );
+
+    rename_projection_noreplace(&dir, "staged", "Fresh.md").unwrap();
+    assert_eq!(
+        fs::read(root.join("pages/Fresh.md")).unwrap(),
+        b"- staged\n"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

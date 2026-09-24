@@ -189,6 +189,11 @@ fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
 
+    #[cfg(test)]
+    if refuse_noreplace_flag_for_test() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+
     let from = CString::new(from)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid temporary name"))?;
     let to = CString::new(to)
@@ -215,6 +220,11 @@ fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::
 fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
+
+    #[cfg(test)]
+    if refuse_noreplace_flag_for_test() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
 
     let from = CString::new(from)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid source name"))?;
@@ -361,16 +371,92 @@ fn rename_projection_noreplace_platform(_dir: &Dir, _from: &str, _to: &str) -> i
 /// an artifact the graph itself is the only authority for, so the atomic
 /// primitive is the contract: there is no second copy to rebuild from, and a
 /// two-step publication would leave a reserved-but-empty live name behind a
-/// crash. A filesystem that cannot provide the primitive fails the write, on
-/// every platform (`docs/storage-sync-contract.md` §2.10b).
+/// crash.
+///
+/// A filesystem that refuses the flag itself gets a checked plain rename
+/// instead ([`plain_rename_where_the_flag_is_refused`];
+/// `docs/storage-sync-contract.md` §2.10b). Any other failure fails the write
+/// and names the refused call.
 pub(super) fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
-    rename_projection_noreplace_platform(dir, from, to).map_err(|error| {
-        projection_platform_error(
-            PROJECTION_NOREPLACE_RENAME_OPERATION,
-            &format!("{from:?} -> {to:?}"),
-            error,
-        )
+    rename_projection_noreplace_platform(dir, from, to)
+        .or_else(|error| plain_rename_where_the_flag_is_refused(error, dir, from, dir, to))
+        .map_err(|error| {
+            projection_platform_error(
+                PROJECTION_NOREPLACE_RENAME_OPERATION,
+                &format!("{from:?} -> {to:?}"),
+                error,
+            )
+        })
+}
+
+/// GH #538: Android 11-14 shared storage (MediaProvider's FUSE daemon before
+/// its 2024 update) answers `renameat2(RENAME_NOREPLACE)` with `EINVAL` while a
+/// plain rename works, and so do filesystems without `rename2` flags (NFS,
+/// some FUSE and removable media). Failing there made every Direct Files save
+/// and page creation fail. Martin decided on 2026-09-24 (B1) to rename plainly
+/// there after checking that `to` is absent.
+///
+/// Only a refusal of the flag qualifies: the platform's own `EINVAL`, `ENOSYS`
+/// or `EOPNOTSUPP`/`ENOTSUP`, never `EEXIST` or an I/O error, and never
+/// Windows, whose primitive has no such refusal on record. An occupied `to`
+/// is still `AlreadyExists` with nothing moved. What this gives up, on such
+/// storage only, is atomicity of that check: a file an external writer creates
+/// at `to` between the check and the rename is replaced. Every caller's `to`
+/// is either a unique Tine-private name no one else creates, or a live name
+/// the caller has just vacated or proved absent, so the window is the
+/// microseconds between two syscalls.
+fn plain_rename_where_the_flag_is_refused(
+    error: io::Error,
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+) -> io::Result<()> {
+    if !noreplace_flag_refused(&error) {
+        return Err(error);
+    }
+    match destination_dir.symlink_metadata(to) {
+        Err(absent) if absent.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        Err(_) => return Err(error),
+    }
+    source_dir.rename(from, destination_dir, to)
+}
+
+#[cfg(unix)]
+fn noreplace_flag_refused(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|errno| {
+        [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP, libc::ENOTSUP].contains(&errno)
     })
+}
+
+#[cfg(not(unix))]
+fn noreplace_flag_refused(_error: &io::Error) -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static REFUSE_NOREPLACE_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make this thread's no-replace renames fail as flag-refusing storage does
+/// (`EINVAL`, GH #538) until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn refuse_noreplace_flag_on_this_thread_test() -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_NOREPLACE_FLAG.with(|flag| flag.set(false));
+        }
+    }
+    REFUSE_NOREPLACE_FLAG.with(|flag| flag.set(true));
+    Restore
+}
+
+#[cfg(test)]
+fn refuse_noreplace_flag_for_test() -> bool {
+    REFUSE_NOREPLACE_FLAG.with(std::cell::Cell::get)
 }
 
 /// The Direct Files graph-text name transition: the exact-byte move protocol of
@@ -421,8 +507,36 @@ fn graph_text_transition_byte_collision(position: &str) -> io::Error {
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// The cross-directory graph-text move: the platform's no-replace rename, with
+/// the same checked plain-rename fallback as [`rename_projection_noreplace`]
+/// where the storage refuses the flag (GH #538).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub(super) fn rename_graph_text_noreplace(
+    source_dir: &Dir,
+    source: &str,
+    destination_dir: &Dir,
+    destination: &str,
+) -> io::Result<()> {
+    rename_graph_text_noreplace_platform(source_dir, source, destination_dir, destination).or_else(
+        |error| {
+            plain_rename_where_the_flag_is_refused(
+                error,
+                source_dir,
+                source,
+                destination_dir,
+                destination,
+            )
+        },
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_graph_text_noreplace_platform(
     source_dir: &Dir,
     source: &str,
     destination_dir: &Dir,
@@ -430,6 +544,11 @@ pub(super) fn rename_graph_text_noreplace(
 ) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
+
+    #[cfg(test)]
+    if refuse_noreplace_flag_for_test() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
 
     let source = CString::new(source)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid source name"))?;
@@ -451,7 +570,7 @@ pub(super) fn rename_graph_text_noreplace(
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(super) fn rename_graph_text_noreplace(
+fn rename_graph_text_noreplace_platform(
     source_dir: &Dir,
     source: &str,
     destination_dir: &Dir,
@@ -459,6 +578,11 @@ pub(super) fn rename_graph_text_noreplace(
 ) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
+
+    #[cfg(test)]
+    if refuse_noreplace_flag_for_test() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
 
     let source = CString::new(source)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid source name"))?;

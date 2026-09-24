@@ -3214,6 +3214,34 @@
    "notes": "GH #572, jaemskyle: macOS Big Sur 11.7.8, 0.6.984 DMG. The system WKWebView was Safari-14-era: the lsdoc wasm failed to compile ('can't get 0th argument Type' -- the vendored module declares an externref parameter, the reference-types feature, Safari 15) and the frontend then threw on Array.prototype.at (Safari 15.4), so every page showed 'This page could not be displayed' and the block-renderer banner. Tine's declared floors were false: macOS had Tauri's default 10.13 and iOS was set to 14.0. Martin chose (2026-09-21) to require the Safari 15.4 engine with a clear message rather than support Safari 14: index.html runs an ES5 classic check (at, Object.hasOwn, structuredClone, and WebAssembly.validate of a one-type externref module) before the app module, renders the explanation and remedy (update Safari; iOS 15.4), and main.tsx stops and reveals the window on its flag. iOS minimumSystemVersion is 15.4. A source scan keeps post-15.4 built-ins out of src/. Verified in Chromium against the production build with Array.prototype.at deleted and with the reference-types probe failing: flag set, message shown, app not mounted; unmodified, the app mounts. Not verified on a real Safari 14 engine. Known limit, documented in the Guide: pdf.js needs Safari 17.4 (Promise.withResolvers, AbortSignal.any, class static blocks in the PdfViewer chunk only). Negative follow-up after v0.6.985 (jaemskyle, 2026-09-21): the Safari APP was 16.5.2 while Tine's web view still lacked Array.prototype.at -- on older macOS a Safari update installs a staged WebKit only Safari uses, so the remedy 'update Safari' was wrong. Martin approved (2026-09-24) a macOS floor instead: bundle.macOS.minimumSystemVersion 12.3 (the release that shipped the Safari 15.4 engine) in tauri.macos.conf.json, and the startup message and Guide now name macOS 12.3 and say updating the Safari app does not help. engineCheck.test.ts ties the message to the bundle floor; failed 5/9 on the old text/config, passes 9/9."
   },
   {
+   "id": "REG-DIRECT-SAVE-FLAG-REFUSING-STORAGE-538",
+   "title": "Creating, saving and renaming pages works on storage that refuses atomic no-replace renames",
+   "family": "storage-durability",
+   "sources": {
+    "issues": [
+     538
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android",
+    "linux",
+    "macos",
+    "ios"
+   ],
+   "layer": "rust-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model_tests.rs::gh538_flag_refusing_storage_creates_saves_and_renames_pages",
+     "crates/tine-core/src/model_tests.rs::gh538_flag_refusing_storage_never_replaces_an_occupied_name"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #538 (sulisu, Android 12): every Direct Files save failed with renameat2(RENAME_NOREPLACE) 'Invalid argument (os error 22)'. Android 11-14 MediaProvider's FUSE daemon rejects any rename flag (AOSP FuseDaemon do_rename; NOREPLACE supported only from bff215d832, 2024), while a plain rename works; NFS behaves the same. Martin's decision B1 (2026-09-24): when the platform refuses the flag itself (EINVAL/ENOSYS/EOPNOTSUPP/ENOTSUP, unix only), check that the destination is absent and rename plainly; an occupied destination stays AlreadyExists. Applies to both graph-text primitives (rename_projection_noreplace, rename_graph_text_noreplace), so create, the save's retire and publish steps, and page rename/move all complete. Contract §2.10b records the trade: an external create in the microseconds between check and rename is replaced, on such storage only. Fail-before: both tests fail with the fallback disabled (the create path with the reporter's exact error). Real filesystem: on this box's NFS mount, 26 save/rename/create tests fail with os error 22 without the fallback and pass with it (evidence tine-agents/evidence/gh538-noreplace-fallback/). Not verified on an Android 11-14 device."
+  },
+  {
    "id": "REG-CONFIG-STRANDED-ON-FLAG-REFUSING-STORAGE-538",
    "title": "A settings write on storage that refuses atomic no-replace renames leaves config.edn in place, and a graph already hit by it opens again",
    "family": "storage-durability",
