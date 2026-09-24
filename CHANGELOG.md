@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- On a Mac, Tine now declares macOS 12.3 (Monterey) as its minimum, and the
+  startup message for a too-old web engine no longer says to update Safari: on
+  older macOS, updating the Safari app does not update the engine other apps
+  use, so the advice could not work (GH #572).
+
 ## [0.6.985] - 2026-09-24
 
 ### Changed

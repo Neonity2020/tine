@@ -2,13 +2,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-// GH #572: on a web engine older than Safari 15.4 (macOS Big Sur without a Safari
-// update, iOS < 15.4) the lsdoc wasm fails to compile and ES2022 built-ins are
+// GH #572: on a web engine older than Safari 15.4 (macOS before 12.3, even with the
+// Safari app updated; iOS < 15.4) the lsdoc wasm fails to compile and ES2022 built-ins are
 // missing, so Tine loaded half-broken. index.html's classic script must detect
 // that and say so before the application module can run.
 const root = path.resolve(import.meta.dirname, "..");
 const index = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const script = /<script id="tine-engine-check">([\s\S]*?)<\/script>/.exec(index)![1];
+const macosMinimum = (
+  JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.macos.conf.json"), "utf8")) as {
+    bundle?: { macOS?: { minimumSystemVersion?: string } };
+  }
+).bundle?.macOS?.minimumSystemVersion;
 
 function runCheck(engine: { at?: boolean; hasOwn?: boolean; structuredClone?: boolean; referenceTypes?: boolean; ua?: string }) {
   const rootEl = { innerHTML: "Opening Tine…" };
@@ -41,11 +46,21 @@ describe("unsupported web engine check (GH #572)", () => {
     ["Array.prototype.at is missing (Safari < 15.4)", { at: false }],
     ["Object.hasOwn is missing", { hasOwn: false }],
     ["structuredClone is missing", { structuredClone: false }],
-  ])("stops startup and tells a Mac user to update Safari when %s", (_why, engine) => {
+  ])("stops startup and tells a Mac user which macOS Tine needs when %s", (_why, engine) => {
     const result = runCheck(engine);
     expect(result.unsupported).toBe(true);
     expect(result.html).toContain("too old for Tine");
-    expect(result.html).toContain("update Safari");
+    // Updating the Safari app does not update the engine other apps embed on
+    // older macOS (GH #572: Safari 16.5.2 on Big Sur, Tine's web view still
+    // lacked Array.prototype.at), so the remedy names the macOS version.
+    expect(result.html).toContain(`macOS ${macosMinimum}`);
+    expect(result.html).not.toMatch(/update Safari/i);
+  });
+
+  it("names the same macOS floor the app bundle declares", () => {
+    // Safari 15.4's engine shipped with macOS 12.3; the bundle refuses to
+    // launch below it, and the message and the bundle must agree.
+    expect(macosMinimum).toBe("12.3");
   });
 
   it("gives a non-Apple system a generic instruction", () => {

@@ -1742,10 +1742,11 @@ mod tests {
         assert!(page.markdown.contains("Export to PDF is desktop-only"));
         assert!(page.markdown.contains("experimental 32-bit Windows"));
         // GH #572: the macOS web-engine floor and its user remedy are documented.
+        // Updating the Safari app does not update the engine other apps get
+        // on older macOS, so the remedy is the macOS version, not Safari.
         assert!(page.markdown.contains("Safari 15.4 or later"));
-        assert!(page
-            .markdown
-            .contains("updating Safari through Software Update"));
+        assert!(page.markdown.contains("macOS 12.3 (Monterey) or later"));
+        assert!(!page.markdown.contains("updating Safari through Software Update"));
         assert!(page.markdown.contains("testflight.apple.com/join/rpGGpTVW"));
         assert!(page.markdown.contains("Plugins do not run on iOS yet"));
         assert!(page.markdown.contains("f-droid.org/packages/page.tine.app"));
