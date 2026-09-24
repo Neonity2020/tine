@@ -153,11 +153,11 @@ describe("modified-click contract on internal links (GH #283)", () => {
     const group: RefGroup = {
       page: "Anchor Page",
       kind: "page",
-      blocks: [{ id: "ref-1", raw: "referenced content", collapsed: false, children: [] }],
+      blocks: [{ id: "58900000-0000-4000-8000-0000000000a1", raw: "referenced content", collapsed: false, children: [] }],
     };
-    vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map((id) => (id === "ref-1" ? group : null)));
+    vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map((id) => (id === "58900000-0000-4000-8000-0000000000a1" ? group : null)));
     const m = mount(() =>
-      renderInlines([{ k: "link", url: { type: "block_ref", v: "ref-1" }, full: "((ref-1))" }]) as JSX.Element
+      renderInlines([{ k: "link", url: { type: "block_ref", v: "58900000-0000-4000-8000-0000000000a1" }, full: "((58900000-0000-4000-8000-0000000000a1))" }]) as JSX.Element
     );
     try {
       const anchor = await vi.waitFor(() => {
@@ -307,11 +307,11 @@ describe("Alt+click opens the link in the other pane (GH #438)", () => {
     const group: RefGroup = {
       page: "Anchor Page",
       kind: "page",
-      blocks: [{ id: "ref-1", raw: "referenced content", collapsed: false, children: [] }],
+      blocks: [{ id: "58900000-0000-4000-8000-0000000000a1", raw: "referenced content", collapsed: false, children: [] }],
     };
-    vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map((id) => (id === "ref-1" ? group : null)));
+    vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map((id) => (id === "58900000-0000-4000-8000-0000000000a1" ? group : null)));
     const m = mount(() =>
-      renderInlines([{ k: "link", url: { type: "block_ref", v: "ref-1" }, full: "((ref-1))" }]) as JSX.Element
+      renderInlines([{ k: "link", url: { type: "block_ref", v: "58900000-0000-4000-8000-0000000000a1" }, full: "((58900000-0000-4000-8000-0000000000a1))" }]) as JSX.Element
     );
     try {
       const anchor = await vi.waitFor(() => {

@@ -743,7 +743,17 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
                             text
                         ));
                     }
-                    None => out.push_str(&format!("<span class=\"block-ref\">{body}</span>")),
+                    // Unresolved: lsdoc's placeholder is the id's first
+                    // eight characters; show the reference's source text in
+                    // full instead, as OG does (GH #589). A label stays.
+                    None => {
+                        let text = if body == auto {
+                            esc(&format!("(({id}))"))
+                        } else {
+                            body
+                        };
+                        out.push_str(&format!("<span class=\"block-ref\">{text}</span>"));
+                    }
                 }
                 continue;
             }

@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- A block reference whose target cannot be found now shows its full
+  `((…))` text, as Logseq does, instead of the first eight characters of its
+  id. This includes `(((uuid)))`, which Logseq and Tine both read as a
+  reference to the id `(uuid`; write `( ((uuid)))` or `[label](((uuid)))` to
+  show a reference in parentheses (GH #589).
 - When the search index cannot be built, Linked and Unlinked References and
   query blocks now say so instead of staying empty or "indexing" for the rest
   of the session. Tine tries a failing build at most three times; after that
