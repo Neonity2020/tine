@@ -117,8 +117,15 @@ fn pre_ready_ctrl_k_keeps_current_page_scope_and_cancellation_atomic() {
     }));
 
     let plan = QueryPlan::block_search_literal("ready", 10);
-    let cancelled =
-        graph.with_pages(|pages| pre_ready_interactive_snapshot(&plan, pages, false, &|| true));
+    let cancelled = graph.with_pages(|pages| {
+        pre_ready_interactive_snapshot(
+            &plan,
+            pages,
+            || pre_ready_page_inventory(pages, &|| false).map(std::sync::Arc::new),
+            false,
+            &|| true,
+        )
+    });
     assert!(cancelled.cancelled);
     assert!(cancelled.hits.is_empty());
     crate::test_support::remove_dir_all(dir);
@@ -165,8 +172,15 @@ fn pre_ready_ctrl_k_ranks_all_page_names_and_aliases_before_limiting() {
             FriendlyDisplayOptions::default(),
             FriendlyConsumer::CtrlK,
         );
-        let answer = graph
-            .with_pages(|pages| pre_ready_interactive_snapshot(&plan, pages, false, &|| false));
+        let answer = graph.with_pages(|pages| {
+            pre_ready_interactive_snapshot(
+                &plan,
+                pages,
+                || pre_ready_page_inventory(pages, &|| false).map(std::sync::Arc::new),
+                false,
+                &|| false,
+            )
+        });
         assert_eq!(
             answer
                 .hits

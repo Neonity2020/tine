@@ -484,6 +484,52 @@ fn gh543_ctrl_k_records_which_path_answered() {
     r10_finish(root, graph, owner);
 }
 
+/// Ctrl-K while the index is not ready answers from the parsed pages. Its
+/// page side (every page, alias and referenced name) cost ~105 ms at 10k
+/// pages and was rebuilt on every keystroke; it is now built once per cache
+/// generation, and rebuilt when a page changes.
+#[test]
+fn gh543_pre_ready_ctrl_k_builds_its_page_inventory_once_per_generation() {
+    let search = |graph: &Graph, needle: &str| {
+        graph
+            .run_graph_search_latest_displayed_for(
+                "quick-switch",
+                needle,
+                10,
+                10,
+                None,
+                false,
+                crate::query_plan::FriendlyDisplayOptions::default(),
+                crate::query_plan::FriendlyConsumer::CtrlK,
+            )
+            .expect("Ctrl-K answers")
+    };
+    let builds = || crate::query_plan::PRE_READY_INVENTORY_BUILDS.with(|b| b.get());
+    let root = r10_scratch("ctrlk-inventory-memo");
+    r10_pages(&root, 4);
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    let before = builds();
+    search(&graph, "TODO");
+    search(&graph, "TOD");
+    search(&graph, "TO");
+    assert_eq!(builds() - before, 1, "one build serves every keystroke");
+
+    std::fs::write(root.join("pages/Zebra crossing.md"), "- stripes\n").unwrap();
+    graph.sync_file(&root.join("pages/Zebra crossing.md"));
+    let answer = search(&graph, "zebra");
+    assert_eq!(builds() - before, 2, "a changed page rebuilds it");
+    assert!(
+        answer.hits.iter().any(|hit| matches!(
+            hit,
+            crate::query_plan::QueryHit::Page { page, .. } if page.name == "Zebra crossing"
+        )),
+        "the new page is found by name"
+    );
+    drop(graph);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// L6 (seeds 1137/1296): a page Tine cannot hydrate (it does not parse, or it
 /// was deleted without the watcher hearing) keeps its index rows, so the
 /// index still names it as a reference candidate. Hydrating the candidates
@@ -545,5 +591,39 @@ fn gh594_an_unhydratable_candidate_does_not_parse_the_graph() {
             after - parses
         );
         r10_finish(root, graph, owner);
+    }
+}
+
+/// Measurement, not a gate: pre-ready Ctrl-K latency over a real graph
+/// (`TINE_CTRLK_GRAPH`) for needles in `TINE_CTRLK_NEEDLES` (one per line,
+/// `label<TAB>needle`). Run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_pre_ready_ctrl_k() {
+    let root = std::path::PathBuf::from(std::env::var("TINE_CTRLK_GRAPH").unwrap());
+    let needles = std::fs::read_to_string(std::env::var("TINE_CTRLK_NEEDLES").unwrap()).unwrap();
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    for line in needles.lines() {
+        let Some((label, needle)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let _ = graph.run_graph_search_latest_displayed_for(
+                "quick-switch",
+                needle,
+                100,
+                100,
+                None,
+                false,
+                crate::query_plan::FriendlyDisplayOptions::default(),
+                crate::query_plan::FriendlyConsumer::CtrlK,
+            );
+            times.push(started.elapsed().as_millis());
+        }
+        times.sort();
+        eprintln!("{label}\tmedian={}ms\tmax={}ms", times[2], times[4]);
     }
 }

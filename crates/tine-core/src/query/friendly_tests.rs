@@ -8,6 +8,7 @@ use tine_storage::sqlite::PhysicalProjectionQuerySnapshot;
 
 use super::*;
 use crate::model::PageKind;
+use crate::query::candidate::INTERACTIVE_SCAN_BUDGET;
 use crate::query::results::{
     reset_result_read_census, result_read_census, set_before_payload_batch_hook,
 };
@@ -1590,6 +1591,44 @@ fn page_rank_composite_key_preserves_candidates_and_ranks_each_once() {
 /// (~1.5 s per keystroke at 616k blocks). It now stops at
 /// `INTERACTIVE_SCAN_BUDGET` rows and says more matches may exist; a recent
 /// match still answers.
+/// One- and two-character words are ordinary in Chinese, Japanese and
+/// Korean. The scan budget for short needles cut such searches off at the
+/// newest blocks; they must find every match, however old.
+#[test]
+fn a_short_cjk_search_finds_matches_past_the_scan_budget() {
+    let _serial = serialize();
+    let root = scratch("friendly-scan-budget-cjk");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let mut body = String::from("- 東京 oldest\n- 서울 oldest\n- ねこ oldest\n");
+    for at in 0..INTERACTIVE_SCAN_BUDGET + 50 {
+        body.push_str(&format!("- plain {at}\n"));
+    }
+    std::fs::write(root.join("pages/Many.md"), body).expect("many page");
+    let corpus = Corpus::open(root, true);
+    for needle in ["東京", "서울", "ねこ", "京"] {
+        let plan = crate::query_plan::friendly_search_plan_for(
+            needle,
+            0,
+            10,
+            None,
+            crate::query_plan::FriendlyDisplayOptions::default(),
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        );
+        let found = read(&corpus, &plan, &ResultIdentity::session_owned()).expect("search");
+        assert!(
+            found.hits.iter().any(|hit| matches!(
+                hit,
+                QueryHit::Block { display_text, .. } if display_text.contains(needle)
+            )),
+            "{needle} finds its oldest block"
+        );
+        assert!(
+            !found.has_more.blocks,
+            "{needle}: a complete scan has no more"
+        );
+    }
+}
+
 #[test]
 fn an_unindexed_interactive_scan_stops_at_its_budget_and_says_so() {
     let _serial = serialize();

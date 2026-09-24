@@ -2020,6 +2020,50 @@ fn walk_blocks<'a>(
     true
 }
 
+/// The page side of a pre-ready search: every page, alias and referenced
+/// name in one parsed snapshot. It depends on the snapshot only, so the graph
+/// keeps one per cache generation instead of rebuilding it per keystroke
+/// (~105 ms at 10k pages, GH #543 Ctrl-K).
+#[derive(Default)]
+pub(crate) struct PreReadyPageInventory {
+    file_pages: Vec<PageEntry>,
+    aliases: Vec<(String, String, String)>,
+    referenced: Vec<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PRE_READY_INVENTORY_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// `None` when cancelled.
+pub(crate) fn pre_ready_page_inventory(
+    pages: &[(PageEntry, std::sync::Arc<crate::doc::Document>)],
+    cancelled: &impl Fn() -> bool,
+) -> Option<PreReadyPageInventory> {
+    #[cfg(test)]
+    PRE_READY_INVENTORY_BUILDS.with(|builds| builds.set(builds.get() + 1));
+    let mut file_pages = Vec::with_capacity(pages.len());
+    let mut aliases = Vec::new();
+    for (entry, document) in pages {
+        if cancelled() {
+            return None;
+        }
+        file_pages.push(entry.clone());
+        for (alias, _) in crate::query::document_alias_spellings(document) {
+            aliases.push((alias, entry.name.clone(), entry.rel_path.clone()));
+        }
+    }
+    let referenced =
+        crate::query::referenced_page_names_from_snapshot_cancellable(pages, cancelled)?;
+    Some(PreReadyPageInventory {
+        file_pages,
+        aliases,
+        referenced,
+    })
+}
+
 /// The explicitly allowed pre-ready producer for Ctrl-K text and `((`.
 /// Membership and evidence come from the same compiled plan as indexed search;
 /// only ordering differs: one captured parsed snapshot is emitted in document
@@ -2027,6 +2071,7 @@ fn walk_blocks<'a>(
 pub(crate) fn pre_ready_interactive_snapshot(
     plan: &QueryPlan,
     pages: &[(PageEntry, std::sync::Arc<crate::doc::Document>)],
+    inventory: impl FnOnce() -> Option<std::sync::Arc<PreReadyPageInventory>>,
     explain: bool,
     cancelled: &impl Fn() -> bool,
 ) -> QueryExecution {
@@ -2051,33 +2096,13 @@ pub(crate) fn pre_ready_interactive_snapshot(
         .branches
         .iter()
         .any(|branch| branch.target == QueryTarget::Pages && branch.limit > 0);
-    let mut file_pages = Vec::new();
-    let mut aliases = Vec::new();
-    let referenced = if needs_page_inventory {
-        for (entry, document) in pages {
-            if cancelled() {
-                return cancelled_execution(plan, explanation);
-            }
-            file_pages.push(entry.clone());
-            let owner_aliases = crate::query::document_alias_spellings(document)
-                .into_iter()
-                .map(|(alias, _)| alias)
-                .collect::<Vec<_>>();
-            for alias in &owner_aliases {
-                if cancelled() {
-                    return cancelled_execution(plan, explanation);
-                }
-                aliases.push((alias.clone(), entry.name.clone(), entry.rel_path.clone()));
-            }
-        }
-        let Some(referenced) =
-            crate::query::referenced_page_names_from_snapshot_cancellable(pages, cancelled)
-        else {
+    let inventory = if needs_page_inventory {
+        let Some(inventory) = inventory() else {
             return cancelled_execution(plan, explanation);
         };
-        referenced
+        inventory
     } else {
-        Vec::new()
+        std::sync::Arc::default()
     };
     let mut hits = Vec::new();
     let mut has_more = QueryHasMore::default();
@@ -2089,9 +2114,9 @@ pub(crate) fn pre_ready_interactive_snapshot(
             QueryTarget::Pages => {
                 let Some((page_hits, page_has_more)) = execute_page_candidates(
                     plan,
-                    &file_pages,
-                    &aliases,
-                    &referenced,
+                    &inventory.file_pages,
+                    &inventory.aliases,
+                    &inventory.referenced,
                     branch,
                     cancelled,
                 ) else {
@@ -2128,8 +2153,12 @@ pub(crate) fn pre_ready_interactive_snapshot(
                                 return false;
                             }
                             let projection = block.projection();
-                            let Some(rank) = rank_block_text(plan, branch, &projection.visible)
-                            else {
+                            let Some(rank) = rank_block_text_folded(
+                                plan,
+                                branch,
+                                &projection.visible,
+                                &projection.visible_lower,
+                            ) else {
                                 return true;
                             };
                             if admitted == branch.limit {

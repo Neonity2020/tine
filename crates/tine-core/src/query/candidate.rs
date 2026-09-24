@@ -120,6 +120,48 @@ fn expr_bound(expr: &QueryExpr) -> Option<String> {
     }
 }
 
+/// Rows an interactive read of `expr` may visit: [`INTERACTIVE_SCAN_BUDGET`]
+/// when no trigram index drives it, unlimited otherwise. A needle in Chinese,
+/// Japanese or Korean is exempt: one or two characters are an ordinary word
+/// there, and a budgeted scan answered such words from the newest blocks only
+/// (0 of 26 matches for one measured word at 10k pages).
+pub(crate) fn interactive_scan_budget(expr: &QueryExpr) -> Option<usize> {
+    match expression_plan(expr) {
+        CandidatePlan::Scan if !mentions_short_word_script(expr) => Some(INTERACTIVE_SCAN_BUDGET),
+        _ => None,
+    }
+}
+
+fn mentions_short_word_script(expr: &QueryExpr) -> bool {
+    match expr {
+        QueryExpr::Text(predicate) => predicate.value.chars().any(is_short_word_script),
+        QueryExpr::And(children) | QueryExpr::Or(children) => {
+            children.iter().any(mentions_short_word_script)
+        }
+        QueryExpr::Not(child) => mentions_short_word_script(child),
+        QueryExpr::Never => false,
+    }
+}
+
+/// Han, kana and Hangul: scripts written in words of one or two characters.
+fn is_short_word_script(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{1100}'..='\u{11FF}'
+            | '\u{2E80}'..='\u{2FDF}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{3130}'..='\u{318F}'
+            | '\u{31F0}'..='\u{31FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{A960}'..='\u{A97F}'
+            | '\u{AC00}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF66}'..='\u{FFDC}'
+            | '\u{20000}'..='\u{3134F}'
+    )
+}
+
 pub(crate) fn expression_plan(expr: &QueryExpr) -> CandidatePlan {
     match expr_bound(expr) {
         Some(match_expression) => CandidatePlan::Index { match_expression },

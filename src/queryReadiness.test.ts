@@ -100,6 +100,23 @@ describe("owned query readiness", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("asks again within a quarter second once the index may be ready (GH #543)", async () => {
+    vi.useFakeTimers();
+    const current = owner();
+    let ready = false;
+    const load = vi.fn(async () => {
+      if (!ready) throw new QueryNotReadyError("indexing");
+      return "answer";
+    });
+    const result = runQueryWhenReady(load, current);
+    await vi.advanceTimersByTimeAsync(5_000);
+    const attempts = load.mock.calls.length;
+    ready = true;
+    await vi.advanceTimersByTimeAsync(250);
+    expect(load.mock.calls.length).toBe(attempts + 1);
+    expect(await result).toBe("answer");
+  });
+
   it("never retries a permanent error or cancellation", async () => {
     vi.useFakeTimers();
     for (const error of [new QueryUnavailableError("projection.failed", "Failed"), new OperationCancelledError(), new Error("Updating query results…")]) {

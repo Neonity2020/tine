@@ -14,7 +14,7 @@ use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
 use crate::direct_projection::page_kind_from_sql;
 use crate::query::candidate::{
-    expression_plan, CandidateMode, CandidatePlan, INTERACTIVE_SCAN_BUDGET,
+    expression_plan, interactive_scan_budget, CandidateMode, CandidatePlan,
 };
 use crate::query::ir::FriendlyPageMatchScope;
 use crate::query::rank::QueryRankPrograms;
@@ -1120,7 +1120,7 @@ fn interactive_block_cursor_statement(
 /// The verified candidates of one interactive read.
 struct VerifiedIds {
     ids: Vec<i64>,
-    /// An unindexed scan stopped at [`INTERACTIVE_SCAN_BUDGET`] before the
+    /// An unindexed scan stopped at its [`interactive_scan_budget`] before the
     /// window filled: older blocks were not visited, so more may match.
     budget_spent: bool,
 }
@@ -1129,7 +1129,7 @@ struct VerifiedIds {
 /// This is deliberately a Rust cursor: putting the exact callback in a
 /// materialized SQL CTE evaluates the complete candidate set before LIMIT and
 /// turns a verified-match window back into graph-sized work. A scan no index
-/// drives also stops at [`INTERACTIVE_SCAN_BUDGET`] visited rows.
+/// drives also stops at its [`interactive_scan_budget`].
 fn interactive_verified_block_ids(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     plan: &QueryPlan,
@@ -1138,10 +1138,7 @@ fn interactive_verified_block_ids(
     lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<VerifiedIds, ResultReadError> {
     let (sql, params) = interactive_block_cursor_statement(plan, branch);
-    let budget = match expression_plan(&branch.predicate) {
-        CandidatePlan::Scan => Some(INTERACTIVE_SCAN_BUDGET),
-        CandidatePlan::Index { .. } => None,
-    };
+    let budget = interactive_scan_budget(&branch.predicate);
     let mut ids = Vec::with_capacity(window);
     let mut visits = 0usize;
     let mut budget_spent = false;

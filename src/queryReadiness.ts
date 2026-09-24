@@ -158,7 +158,10 @@ export async function runQueryWhenReady<T>(
         owner.onPending(error);
       }
       await delay(waitMs, owner.signal);
-      waitMs = Math.min(waitMs * 2, 800);
+      // Capped low: the wait ends when the index turns ready, and a longer
+      // step kept search and references on "indexing" up to 0.8 s after
+      // that (GH #543 Ctrl-K).
+      waitMs = Math.min(waitMs * 2, 250);
     }
   } finally {
     if (!owner.signal.aborted && owner.isCurrent()) owner.onPending(null);

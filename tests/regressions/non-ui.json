@@ -7717,12 +7717,15 @@
  "coverage": {
   "tests": [
    "crates/tine-core/src/query/friendly_tests.rs::an_unindexed_interactive_scan_stops_at_its_budget_and_says_so",
-   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh543_ctrl_k_records_which_path_answered"
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh543_ctrl_k_records_which_path_answered",
+   "crates/tine-core/src/query/friendly_tests.rs::a_short_cjk_search_finds_matches_past_the_scan_budget",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh543_pre_ready_ctrl_k_builds_its_page_inventory_once_per_generation",
+   "src/queryReadiness.test.ts::asks again within a quarter second once the index may be ready (GH #543)"
   ],
   "scenario": null,
   "failBefore": "tine-agents/evidence/batch-gh594/necessity-ctrlk.txt (without the budget the scan visited 20052 rows for a pair only the oldest block holds)"
  },
- "notes": "Blocking core operation (latency), Martin's Ctrl-K follow-up to GH #543. A needle under three characters has no trigram index, so the interactive read scanned blocks newest first until 300 verified matches; a rare pair visited every block (~1.5 s at 616k blocks, subagent note 2026-09-24-gh543-ctrlk-latency.md). The scan now stops at INTERACTIVE_SCAN_BUDGET (20,000 rows, ~50 ms at that scale) and sets has_more, which the switcher shows as More matches exist. Each Friendly search also logs on the --debug channel whether the index or a page scan answered it, with its elapsed time, and the interactive cursor logs its visits."
+ "notes": "Blocking core operation (latency), Martin's Ctrl-K follow-up to GH #543. A needle under three characters has no trigram index, so the interactive read scanned blocks newest first until 300 verified matches; a rare pair visited every block (~1.5 s at 616k blocks, subagent note 2026-09-24-gh543-ctrlk-latency.md). The scan now stops at INTERACTIVE_SCAN_BUDGET (20,000 rows, ~50 ms at that scale) and sets has_more, which the switcher shows as More matches exist. Each Friendly search also logs on the --debug channel whether the index or a page scan answered it, with its elapsed time, and the interactive cursor logs its visits. A needle with Han, kana or Hangul is exempt from the budget (interactive_scan_budget): one or two characters are an ordinary word there, and the budgeted scan returned 0 of 26 matches for one measured word at 10k pages (subagent note 2026-09-24-ctrlk-0.6.982-parity.md; necessity tine-agents/evidence/batch-ctrlk-cjk/necessity-cjk-budget.txt). Such a needle scans every block, as in v0.6.985; an index for short CJK words is a separate decision. The pre-ready page fallback ranks on the cached fold (visible_lower, asserted equal to canonical_fold by a source test) and builds its page inventory once per cache generation (necessity-inventory-memo.txt: 3 builds for 3 keystrokes before); the frontend readiness retry is capped at 250 ms instead of 800 (necessity-retry-cap.txt)."
 }
 ]
 }

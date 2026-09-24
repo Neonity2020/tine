@@ -302,13 +302,16 @@ impl Graph {
                 )),
             ) => {
                 let reason = format!(" because={error:?}");
+                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                let cancelled = || lane.as_ref().is_some_and(|cancelled| cancelled());
                 let answer = self
                     .with_captured_pages(|pages| {
                         crate::query_plan::pre_ready_interactive_snapshot(
                             plan,
                             pages,
+                            || self.pre_ready_inventory(pages, generation, &cancelled),
                             explain,
-                            &|| lane.as_ref().is_some_and(|cancelled| cancelled()),
+                            &cancelled,
                         )
                     })
                     .ok_or(error);
@@ -317,6 +320,34 @@ impl Graph {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// The page side of a pre-ready search over `pages`, reused while the
+    /// cache generation stands: rebuilding it per keystroke cost ~105 ms at
+    /// 10k pages. `generation` is read before `pages` was captured; a
+    /// generation that moved since then may not match `pages`, so that
+    /// inventory is built fresh and not kept.
+    fn pre_ready_inventory(
+        &self,
+        pages: &[(PageEntry, Arc<crate::doc::Document>)],
+        generation: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<Arc<crate::query_plan::PreReadyPageInventory>> {
+        let current = || self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation;
+        if current() {
+            if let Some((cached, inventory)) = self.pre_ready_inventory.lock().unwrap().as_ref() {
+                if *cached == generation {
+                    return Some(Arc::clone(inventory));
+                }
+            }
+        }
+        let inventory = Arc::new(crate::query_plan::pre_ready_page_inventory(
+            pages, cancelled,
+        )?);
+        if current() {
+            *self.pre_ready_inventory.lock().unwrap() = Some((generation, Arc::clone(&inventory)));
+        }
+        Some(inventory)
     }
 
     /// Fuzzy page-name matches for the quick switcher.

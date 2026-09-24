@@ -436,6 +436,10 @@ pub struct Graph {
     /// Keyed on `cache_gen`, this is exactly as fresh as the projection read it
     /// replaces, which already refuses to answer at any other generation.
     referenced_names_cache: RwLock<Option<(u64, u64, Vec<String>)>>,
+    /// The page side of a pre-ready Ctrl-K search, for the cache generation
+    /// it was built from ([`crate::query_plan::PreReadyPageInventory`]).
+    pre_ready_inventory:
+        std::sync::Mutex<Option<(u64, Arc<crate::query_plan::PreReadyPageInventory>)>>,
     /// Memoized exact `find_entry(name, kind)` resolution, keyed by `cache_gen`.
     /// Unlike `list_pages()`, this index is built from raw `list_md` output so it
     /// preserves `find_entry`'s duplicate selection: date-stem file first, else

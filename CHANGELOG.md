@@ -36,7 +36,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Ctrl+K** answers a one- or two-character search in a large graph in a
   fraction of the time: such a search now reads only the most recent blocks
   and says **More matches exist** when older ones may match too, where it
-  could take over a second on a 10,000-page graph. While you type, the
+  could take over a second on a 10,000-page graph. A search in Chinese,
+  Japanese or Korean, where one or two characters are a whole word, still
+  searches every block. While the index is first being built, Ctrl+K answers
+  from the pages up to several times faster, and it switches to the index
+  sooner once the index is ready. While you type, the
   previous results stay on screen until the new ones arrive instead of
   blanking on every key, and **Enter** waits for the new results. With
   `--debug`, the log says whether each search was answered by the index or

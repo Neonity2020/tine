@@ -465,6 +465,7 @@ impl Graph {
             direct_projection: projection_slot::ProjectionSlot::empty(),
             page_list_cache: RwLock::new(None),
             referenced_names_cache: RwLock::new(None),
+            pre_ready_inventory: std::sync::Mutex::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             recent_graph_text_states: std::sync::Mutex::new(std::collections::HashMap::new()),
