@@ -87,10 +87,14 @@ fn hand_written_cursor_drains_are_pinned() {
     // 9 → 7: P3b deleted the fuzzy-candidate cursor and moved authored alias
     // rows through the shared projection statement door. The seven surviving
     // storage cursor consumers still delegate to `drain_after`.
+    // 7 → 6 (GH #594 R3, 2026-09-24): `reference_candidates` needs each
+    // block's structural identity, which `page_referrer_candidates_after`
+    // does not carry, so it reads through the shared projection statement
+    // door like P3b's alias rows. The six surviving consumers still delegate.
     assert_eq!(
         direct.matches("drain_after(").count(),
-        7,
-        "I-12: the seven owned Direct cursor consumers must each delegate to drain_after"
+        6,
+        "I-12: the six owned Direct cursor consumers must each delegate to drain_after"
     );
 }
 
@@ -121,9 +125,6 @@ fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static s
         }
         (DIRECT, "real_page_names", "navigation_pages_after_with_header_validation") => {
             ("other-question", "Direct real page ownership")
-        }
-        (DIRECT, "reference_candidates", "page_referrer_candidates_after") => {
-            ("other-question", "Direct explicit reference candidates")
         }
         // R6: `list_pages` in a warm session (no parsed cache) is served from
         // the ready projection's page inventory instead of a whole-graph parse.
@@ -202,12 +203,6 @@ fn expected_census() -> BTreeSet<CensusRecord> {
             "page_inventory",
             "Direct page inventory for list_pages",
         ),
-        (
-            "page_referrer_candidates_after",
-            DIRECT,
-            "reference_candidates",
-            "Direct explicit reference candidates",
-        ),
     ] {
         add(family, file, symbol, "other-question", question);
     }
@@ -220,8 +215,9 @@ fn simple_query_read_family_census_is_exact() {
     let expected = expected_census();
     assert_exact_census(&source, &expected);
 
+    // `page_referrer_candidates_after` has no product consumer since GH #594
+    // R3; a call to it anywhere is unclassified and fails the census.
     let representative = [
-        ("page_referrer_candidates_after", "Source::PageRef"),
         ("property_facet_rows_after", "Source::PageProperty"),
         (
             "navigation_pages_after_with_header_validation",

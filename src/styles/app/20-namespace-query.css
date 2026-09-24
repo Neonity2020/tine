@@ -2820,3 +2820,12 @@ html.drag-selection-suppressed * {
   min-height: 20px;
 }
 
+
+/* GH #594: the index failed — say so, with a way out. */
+.index-failed {
+  color: var(--danger, #dc2626);
+}
+
+.index-failed button {
+  margin-left: 0.25em;
+}

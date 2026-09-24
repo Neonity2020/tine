@@ -1039,6 +1039,7 @@ export const PUBLISHED_REFUSED_METHODS = [
   "setLinkFirstMatch",
   "setWatchMode",
   "restoreBackup",
+  "retryIndex",
   "createGraphVerification",
   "cancelGraphVerification",
   "saveGraphVerificationReport",

@@ -3,12 +3,18 @@
 //! it. Everything here is read and changed under `pending`.
 
 use super::*;
+use crate::query::IndexFailureClass;
 
 /// What whole-graph work the index needs next; see [`index_need`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IndexNeed {
     /// The worker has not yet opened its stored image.
     SettingUp,
+    /// The index could not be built or updated in [`INDEX_ATTEMPTS`]
+    /// consecutive attempts and has stopped trying for this session (GH #594,
+    /// index liveness L1). Only the user's retry or the next launch starts
+    /// it again: nothing is coming, and readers answer `IndexFailed`.
+    Failed,
     /// The worker is gone for good. Nothing enqueued is ever taken.
     Terminal,
     /// Another process holds the index database's lease (or a writer in
@@ -43,6 +49,8 @@ pub(super) fn index_need(shared: &ProjectionShared, pending: &PendingProjection)
         IndexNeed::LeaseWait
     } else if !pending.set_up {
         IndexNeed::SettingUp
+    } else if pending.failed.is_some() {
+        IndexNeed::Failed
     } else if pending.full.is_some() || pending.building {
         IndexNeed::InHand
     } else if pending.rebuild {
@@ -232,52 +240,187 @@ pub(super) fn backing_off(pending: &PendingProjection) -> bool {
         .is_some_and(|retry_after| std::time::Instant::now() < retry_after)
 }
 
+/// How many consecutive whole-graph passes or worker turns may end without
+/// making the index ready before it stops trying for the session (GH #594,
+/// index liveness L1). The first failure is retried at once and the second
+/// after a second; a third leaves the index `Failed`.
+pub(crate) const INDEX_ATTEMPTS: u32 = 3;
+
 /// Record a whole-graph pass or worker turn that did not make the index
-/// ready. The first one is retried at once: a launch check that a rename
-/// raced is ordinary, and while a backoff holds, nothing is coming, so every
-/// reader falls back to parsing the graph itself. From the second on, the
-/// next owner pass waits `1 s · 2^(n−2)`, at most 30 minutes, so a
-/// deterministic failure (a page that always panics, a directory that stays
-/// unreadable) costs a bounded number of whole-graph passes instead of one
-/// after another. New facts do not cut the wait short: that would make every
+/// ready, and why. The first one is retried at once: a launch check that a
+/// rename raced is ordinary. The second waits a second, so a failure that
+/// repeats does not run whole-graph passes back to back. The
+/// [`INDEX_ATTEMPTS`]th leaves the index `Failed` with this class, for good
+/// this session: retrying on a backoff forever reported "recovering" to every
+/// reader while nothing ever recovered, and each retry parsed the whole graph
+/// again (GH #594). New facts do not cut the wait short: that would make every
 /// save a rebuild trigger while the failure lasts.
-pub(super) fn note_unsettled(pending: &mut PendingProjection) {
+pub(super) fn note_unsettled(pending: &mut PendingProjection, class: IndexFailureClass) {
     pending.unsettled_passes = pending.unsettled_passes.saturating_add(1);
-    if pending.unsettled_passes == 1 {
-        projection_diag(|| "unsettled pass 1; retrying at once".to_owned());
+    pending.last_failure = Some(class);
+    let passes = pending.unsettled_passes;
+    report_index_failure(IndexFailureEvent {
+        class,
+        attempt: passes,
+        terminal: passes >= INDEX_ATTEMPTS,
+    });
+    if passes >= INDEX_ATTEMPTS {
+        pending.failed = Some(class);
+        pending.retry_after = None;
+        projection_diag(|| format!("unsettled pass {passes} ({}); index failed", class.as_str()));
         return;
     }
-    let exponent = (pending.unsettled_passes - 2).min(11);
-    let wait = std::time::Duration::from_secs(1u64 << exponent)
-        .min(std::time::Duration::from_secs(30 * 60));
+    if passes == 1 {
+        projection_diag(|| format!("unsettled pass 1 ({}); retrying at once", class.as_str()));
+        return;
+    }
+    let wait = std::time::Duration::from_secs(1);
     pending.retry_after = Some(std::time::Instant::now() + wait);
-    let passes = pending.unsettled_passes;
     projection_diag(|| format!("unsettled pass {passes}; next owner pass in {wait:?}"));
 }
 
-/// Whether whole-graph index work is coming: an owner is registered and the
-/// index needs, or is being given, work it will take. Readers wait while this
-/// holds; when it does not (no owner, a backoff, a gone worker) they take
-/// their ordinary route. One predicate, read under `pending`, for every
-/// consumer (GH #543).
-pub(super) fn index_work_coming(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
-    if pending.owners == 0 {
-        return false;
+/// A failure no further attempt can get past (the worker cannot set up its
+/// image): the index is `Failed` at once. The user's Retry reopens the graph,
+/// which starts a new worker, exactly as the next launch would.
+pub(super) fn note_failed(pending: &mut PendingProjection, class: IndexFailureClass) {
+    pending.last_failure = Some(class);
+    pending.failed = Some(class);
+    pending.retry_after = None;
+    report_index_failure(IndexFailureEvent {
+        class,
+        attempt: pending.unsettled_passes.saturating_add(1),
+        terminal: true,
+    });
+}
+
+/// One failed attempt, for whoever records them (the app's flight recorder).
+/// Fixed codes only: no path, message or graph content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexFailureEvent {
+    pub class: IndexFailureClass,
+    /// 1-based, consecutive since the index was last ready.
+    pub attempt: u32,
+    /// This attempt left the index `Failed`.
+    pub terminal: bool,
+}
+
+type IndexFailureObserver = Box<dyn Fn(IndexFailureEvent) + Send + Sync>;
+static INDEX_FAILURE_OBSERVER: std::sync::OnceLock<IndexFailureObserver> =
+    std::sync::OnceLock::new();
+
+/// Install the process's recorder of index failures (index liveness L5). The
+/// release app has no console, so a failure printed to stderr alone was
+/// invisible in every field report (GH #594). The first install wins.
+pub fn set_index_failure_observer(observer: impl Fn(IndexFailureEvent) + Send + Sync + 'static) {
+    let _ = INDEX_FAILURE_OBSERVER.set(Box::new(observer));
+}
+
+fn report_index_failure(event: IndexFailureEvent) {
+    #[cfg(test)]
+    record_index_failure_for_test(event);
+    if let Some(observer) = INDEX_FAILURE_OBSERVER.get() {
+        observer(event);
     }
+}
+
+#[cfg(test)]
+static TEST_INDEX_FAILURE_LOG: Mutex<Vec<IndexFailureEvent>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_index_failure_for_test(event: IndexFailureEvent) {
+    TEST_INDEX_FAILURE_LOG.lock().unwrap().push(event);
+}
+
+/// Every failure reported in this test process so far (tests run in
+/// parallel: filter by class or count increases, never assert equality).
+#[cfg(test)]
+pub(crate) fn index_failures_reported_for_test() -> Vec<IndexFailureEvent> {
+    TEST_INDEX_FAILURE_LOG.lock().unwrap().clone()
+}
+
+/// The index's state apart from readiness at a particular generation: the ONE
+/// answer both the progress a reader is told ([`DirectProjection::progress_at`])
+/// and "is work coming" ([`index_work_coming`]) are read from (GH #594, index
+/// liveness L2). They used to be two computations, and during a backoff one
+/// said "recovering, wait" while the other said "nothing is coming".
+pub(super) fn index_state(shared: &ProjectionShared, pending: &PendingProjection) -> IndexState {
+    use crate::query::QueryReadinessReason as Reason;
+    if pending.stop || pending.lease_wait {
+        return IndexState::Stopped;
+    }
+    // Before the worker's availability: a worker that could not set up its
+    // image exits `Failed`, and that is what readers are told.
+    if let Some(class) = pending.failed {
+        return IndexState::Failed(class);
+    }
+    if !shared.worker_available.load(Ordering::Acquire) {
+        return IndexState::Stopped;
+    }
+    // With an owner registered, whole-graph work the index needs is the
+    // owner's to run; a query reports it and never starts it (GH #543).
+    let owned = pending.owners > 0;
     let need = index_need(shared, pending);
-    match need {
-        IndexNeed::Terminal | IndexNeed::LeaseWait => false,
-        IndexNeed::SettingUp | IndexNeed::InHand => true,
-        IndexNeed::Validate | IndexNeed::Fresh if !backing_off(pending) => true,
-        // Marks a failed turn returned wait out the backoff, and so do
-        // readers not: nothing takes them before it ends.
-        _ => {
-            pending.worker_can_take()
-                || !pending.in_flight.is_empty()
-                || shared.deltas_coming.load(Ordering::Acquire) > 0
-                || shared.worker_busy.load(Ordering::Acquire)
-        }
+    if pending.full.is_some() || (pending.rebuild && owned) {
+        return IndexState::Working(Reason::Recovering);
     }
+    if shared.repairs_in_flight.load(Ordering::Acquire) > 0 {
+        return IndexState::Working(Reason::Recovering);
+    }
+    let owner_pass_coming = owned
+        && matches!(
+            need,
+            IndexNeed::SettingUp | IndexNeed::Validate | IndexNeed::Fresh
+        );
+    if owner_pass_coming && !backing_off(pending) {
+        return IndexState::Working(Reason::Indexing);
+    }
+    // An owed registry capture is queued work too, taken when no rebuild is
+    // owed (`worker_can_take`). One waiting out a failed turn's backoff was
+    // reported as "nothing coming", so readers parsed the whole graph beside
+    // an index that was about to answer (GH #594 L2).
+    if !pending.marks.is_empty()
+        || !pending.in_flight.is_empty()
+        || (pending.registry_owed.is_some() && !pending.rebuild)
+        || shared.deltas_coming.load(Ordering::Acquire) > 0
+    {
+        return IndexState::Working(Reason::PendingEdits);
+    }
+    if owner_pass_coming {
+        // Backing off: the owner retries when the backoff ends, at most a
+        // second away (see `note_unsettled`).
+        return IndexState::Working(Reason::Recovering);
+    }
+    if shared.worker_failed.load(Ordering::Acquire) {
+        // The queue is empty and the last turn failed: nothing is coming.
+        return IndexState::Idle;
+    }
+    if shared.worker_busy.load(Ordering::Acquire) {
+        return IndexState::Working(Reason::Busy);
+    }
+    IndexState::Idle
+}
+
+/// See [`index_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IndexState {
+    /// The worker is gone or waiting for another process's writer lease.
+    Stopped,
+    /// See [`IndexNeed::Failed`].
+    Failed(IndexFailureClass),
+    /// Queued or running work will change the image; the reason is why.
+    Working(crate::query::QueryReadinessReason),
+    /// Nothing is queued or running. The image is ready if it is current;
+    /// otherwise only a repair can make it so.
+    Idle,
+}
+
+/// Whether whole-graph index work is coming: an owner is registered and the
+/// index is [`IndexState::Working`]. Readers wait (bounded) while this holds;
+/// when it does not (no owner, a failed, stopped or idle index) they take
+/// their ordinary route. Read under `pending`, from the one state function
+/// progress is read from (GH #543, GH #594 L2).
+pub(super) fn index_work_coming(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
+    pending.owners > 0 && matches!(index_state(shared, pending), IndexState::Working(_))
 }
 
 /// What an index owner does next; see [`DirectProjection::wait_owner_step`].
@@ -378,8 +521,8 @@ impl DirectProjection {
 
     /// Record an owner pass that ended without the worker taking a payload
     /// that could make the index ready; see [`note_unsettled`].
-    pub(crate) fn note_unsettled_pass(&self) {
-        note_unsettled(&mut self.shared.pending.lock().unwrap());
+    pub(crate) fn note_unsettled_pass(&self, class: IndexFailureClass) {
+        note_unsettled(&mut self.shared.pending.lock().unwrap(), class);
         self.shared.changed.notify_all();
     }
 

@@ -139,6 +139,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "restore_backup",
     "retire_conflict_capsule",
     "retire_editor_activation",
+    "retry_index",
     "reveal_known_graph",
     "rollback_pdf_area_image",
     "run_advanced_query",

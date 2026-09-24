@@ -368,6 +368,9 @@ impl FlightRecorder {
 }
 
 pub(crate) fn flight_init(dir: PathBuf) {
+    // Before the recorder opens: failures until then wait in the early
+    // buffer like any other event.
+    tine_core::set_index_failure_observer(record_index_failure);
     let recorder = FLIGHT.get_or_init(|| {
         match FlightRecorder::open(dir, FLIGHT_SEGMENT_MAX_BYTES) {
             Ok((mut recorder, previous_unclean)) => {
@@ -548,6 +551,18 @@ pub(crate) fn record_direct_save(
         fields.insert("lastBuildBytes".into(), json!(bytes));
     }
     record_fixed_event("direct.save", fields);
+}
+
+/// One failed index build or update attempt, and whether it left the index
+/// failed for the session (GH #594, index liveness L5). The release app has
+/// no console, so a failure the index only printed was invisible in every
+/// field report. Fixed codes only: the class is `IndexFailureClass::as_str`.
+fn record_index_failure(event: tine_core::IndexFailureEvent) {
+    let mut fields = Map::new();
+    fields.insert("class".into(), json!(event.class.as_str()));
+    fields.insert("attempt".into(), json!(event.attempt));
+    fields.insert("terminal".into(), json!(event.terminal));
+    record_fixed_event("index.failure", fields);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1156,6 +1171,31 @@ mod tests {
         assert!(!production.contains("fields.insert(\"detail\""));
         assert!(production.contains("verboseDebugLogIncluded\": false"));
         assert!(production.contains("record_fixed_event(\"watcher.batch\", fields)"));
+        assert!(production.contains("record_fixed_event(\"index.failure\", fields)"));
+    }
+
+    /// GH #594 L5: an index failure reaches a report as three fixed fields,
+    /// and every class it can carry is a fixed code.
+    #[test]
+    fn an_index_failure_is_recorded_as_fixed_codes() {
+        for class in tine_core::query::IndexFailureClass::ALL {
+            let code = class.as_str();
+            assert!(
+                !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{code:?}"
+            );
+        }
+        let source = include_str!("debug.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production diagnostics precede their tests");
+        let body = &production[production
+            .find("fn record_index_failure(")
+            .expect("the recorder exists")..];
+        let body = &body[..body.find("\n}\n").expect("its body ends")];
+        assert_eq!(body.matches("fields.insert(").count(), 3, "{body}");
+        assert!(production.contains("set_index_failure_observer(record_index_failure)"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use super::*;
 use crate::doc::{DocBlock, Document};
 use crate::query::results::{
-    read_admitted_payload, resolve_identity, PayloadChannel, PayloadFacts, ResultIdentity,
+    read_admitted_payload, resolve_identity, PayloadChannel, PayloadFacts,
 };
 
 pub(crate) enum DerivedSelection<'a> {
@@ -89,13 +89,11 @@ impl DirectProjection {
         selection: &DerivedSelection<'_>,
     ) -> Option<Vec<DerivedPage>> {
         let _reader = self.shared_reader_at(generation)?;
-        let identity = ResultIdentity {
-            session_pages: Arc::clone(&self.shared.session_pages.lock().unwrap()),
-            all_session: false,
-        };
         let mut snapshot =
             PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
                 .reported(self)?;
+        let identity =
+            super::capture_result_identity(&self.shared, &mut snapshot).reported(self)?;
         let mut seeds = std::collections::BTreeSet::new();
         let mut read_seeds = |sql: &str, params: &[PhysicalQueryValue]| {
             crate::query::projection_sql::visit(&mut snapshot, sql, params, |row| {
@@ -112,9 +110,12 @@ impl DirectProjection {
                         .map(|id| PhysicalQueryValue::Blob(id.as_bytes().to_vec()))
                         .unwrap_or(PhysicalQueryValue::Null);
                     let spelling = PhysicalQueryValue::Text(id.clone());
+                    // A live id this session gave a block is stored as the
+                    // block's structural id (R3).
+                    let stored = PhysicalQueryValue::Text(identity.stored_id(id).to_owned());
                     read_seeds(
                         "SELECT block_id FROM blocks WHERE result_id = ? OR logseq_uuid = ? OR block_id IN (SELECT o.owner_id FROM properties o JOIN names n ON n.name_id = o.name_id WHERE o.owner_type = 1 AND n.key = 'id' AND o.value = ?)",
-                        &[spelling.clone(), uuid, spelling],
+                        &[stored, uuid, spelling],
                     )?;
                 }
             }

@@ -3189,7 +3189,7 @@
   },
   {
    "id": "REG-OLD-WEBKIT-ENGINE-FLOOR-572",
-   "title": "On a web engine older than Safari 15.4 Tine says so at startup and how to fix it, instead of opening half-working with a failed parser",
+   "title": "On a web engine older than Safari 15.4 (macOS before 12.3) Tine says so at startup and how to fix it, instead of opening half-working with a failed parser",
    "family": "startup-platform",
    "sources": {
     "issues": [
@@ -3211,7 +3211,7 @@
     "scenario": null,
     "failBefore": "proven"
    },
-   "notes": "GH #572, jaemskyle: macOS Big Sur 11.7.8, 0.6.984 DMG. The system WKWebView was Safari-14-era: the lsdoc wasm failed to compile ('can't get 0th argument Type' -- the vendored module declares an externref parameter, the reference-types feature, Safari 15) and the frontend then threw on Array.prototype.at (Safari 15.4), so every page showed 'This page could not be displayed' and the block-renderer banner. Tine's declared floors were false: macOS had Tauri's default 10.13 and iOS was set to 14.0. Martin chose (2026-09-21) to require the Safari 15.4 engine with a clear message rather than support Safari 14: index.html runs an ES5 classic check (at, Object.hasOwn, structuredClone, and WebAssembly.validate of a one-type externref module) before the app module, renders the explanation and remedy (update Safari; iOS 15.4), and main.tsx stops and reveals the window on its flag. iOS minimumSystemVersion is 15.4. A source scan keeps post-15.4 built-ins out of src/. Verified in Chromium against the production build with Array.prototype.at deleted and with the reference-types probe failing: flag set, message shown, app not mounted; unmodified, the app mounts. Not verified on a real Safari 14 engine. Known limit, documented in the Guide: pdf.js needs Safari 17.4 (Promise.withResolvers, AbortSignal.any, class static blocks in the PdfViewer chunk only)."
+   "notes": "GH #572, jaemskyle: macOS Big Sur 11.7.8, 0.6.984 DMG. The system WKWebView was Safari-14-era: the lsdoc wasm failed to compile ('can't get 0th argument Type' -- the vendored module declares an externref parameter, the reference-types feature, Safari 15) and the frontend then threw on Array.prototype.at (Safari 15.4), so every page showed 'This page could not be displayed' and the block-renderer banner. Tine's declared floors were false: macOS had Tauri's default 10.13 and iOS was set to 14.0. Martin chose (2026-09-21) to require the Safari 15.4 engine with a clear message rather than support Safari 14: index.html runs an ES5 classic check (at, Object.hasOwn, structuredClone, and WebAssembly.validate of a one-type externref module) before the app module, renders the explanation and remedy (update Safari; iOS 15.4), and main.tsx stops and reveals the window on its flag. iOS minimumSystemVersion is 15.4. A source scan keeps post-15.4 built-ins out of src/. Verified in Chromium against the production build with Array.prototype.at deleted and with the reference-types probe failing: flag set, message shown, app not mounted; unmodified, the app mounts. Not verified on a real Safari 14 engine. Known limit, documented in the Guide: pdf.js needs Safari 17.4 (Promise.withResolvers, AbortSignal.any, class static blocks in the PdfViewer chunk only). Negative follow-up after v0.6.985 (jaemskyle, 2026-09-21): the Safari APP was 16.5.2 while Tine's web view still lacked Array.prototype.at -- on older macOS a Safari update installs a staged WebKit only Safari uses, so the remedy 'update Safari' was wrong. Martin approved (2026-09-24) a macOS floor instead: bundle.macOS.minimumSystemVersion 12.3 (the release that shipped the Safari 15.4 engine) in tauri.macos.conf.json, and the startup message and Guide now name macOS 12.3 and say updating the Safari app does not help. engineCheck.test.ts ties the message to the bundle floor; failed 5/9 on the old text/config, passes 9/9."
   },
   {
    "id": "REG-CONFIG-STRANDED-ON-FLAG-REFUSING-STORAGE-538",
@@ -7610,7 +7610,7 @@
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "GH #543 indexing audit round 15, R15-08 (and R15-11's dead-branch residue). A fresh build that failed deterministically was rebuilt on backoff forever, bypassing the contradiction_rebuilt latch. A second ContradictoryRows from a fresh build now marks the worker failed and unavailable, so readers take their ordinary route. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md."
+ "notes": "GH #543 indexing audit round 15, R15-08 (and R15-11's dead-branch residue). A fresh build that failed deterministically was rebuilt on backoff forever, bypassing the contradiction_rebuilt latch. A second ContradictoryRows from a fresh build now marks the worker failed and unavailable, so readers take their ordinary route. Superseded 2026-09-24 by REG-INDEX-LIVENESS-594: every failure class (not only contradictions) now ends in Failed(code) after INDEX_ATTEMPTS = 3; the test asserts builds <= INDEX_ATTEMPTS and progress Failed(constraint). Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md."
 },
 {
  "id": "REG-RENAME-UNREADABLE-REFERRER-NAMED-543",
@@ -7635,6 +7635,94 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 15, R15-09 (partial). The referrer scan's read error named no file; it now carries the file path. Skipping the unreadable referrer and reporting it, so the rename proceeds, needs a DTO field and a frontend notice and is carded separately. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md (probe audit543_r15_one_non_utf8_page_does_not_block_every_rename)."
+},
+{
+ "id": "REG-REFERENCES-EDITED-PAGE-REOPEN-594",
+ "title": "Linked and Unlinked References keep the blocks of a page edited before a relaunch",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   594
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_page_edited_before_a_reopen_keeps_its_references",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_block_is_found_by_its_id_in_the_session_and_after_a_reopen",
+   "crates/tine-core/src/direct_projection_tests.rs::live_ids_decode_only_with_the_stored_revisions_exceptions",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge"
+  ],
+  "scenario": null,
+  "failBefore": "tine-agents/evidence/batch-gh594/necessity-liveness.txt (reopen test: backlinks and unlinked references both empty before the fix; found by the L6 reference oracle on seed 9. Reverse lookup: the page hint of a block kept across an insertion is None after a reopen before R3)"
+ },
+ "notes": "Blocking core operation. An editor save stores the session's live block ids in the index; after a relaunch a fresh parse names the same blocks by structural ids (docs/contracts/direct-query-identities.md, R3). The reference panels' candidate filter compared stored ids to parsed ids directly, bypassing ResultIdentity, so every block of a page edited in an earlier session dropped out of other pages' Linked and Unlinked References until that page was edited again. The filter now resolves stored ids through ResultIdentity::public_id, the same function result construction uses. Candidate cause of the reporter's missing backlinks in GH #594 (inference: the report does not say whether the pages were edited before relaunching). The reverse direction (a block's id back to its stored row) failed after a relaunch too; R3 fixes the class at its source: the index stores structural ids only, and the session maps live ids through exceptions keyed by stored source revision (ResultIdentity::stored_id for lookups). FACTS_VERSION 4 re-lowers every page once."
+},
+{
+ "id": "REG-INDEX-LIVENESS-594",
+ "title": "A search index that cannot be built ends in a visible failure with Retry, instead of references and queries staying silently unavailable for the whole session",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   594,
+   543
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend-and-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_build_that_always_fails_ends_failed_and_panels_say_so",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_derived_read_waits_at_most_its_patience",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_reference_panel_asked_while_indexing_is_told_at_once",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::index_readiness_contract_matches_the_code",
+   "crates/tine-core/src/query/execution_error.rs::index_failure_classes_read_real_errors",
+   "src-tauri/src/debug.rs::an_index_failure_is_recorded_as_fixed_codes",
+   "src/components/LinkedReferences.test.tsx::shows a failed index with its code, Retry and the diagnostic report",
+   "src/components/LinkedReferences.test.tsx::says it is indexing while the index is not ready, then shows the references",
+   "src/components/UnlinkedReferences.test.tsx::shows a failed index with its code, Retry and the diagnostic report",
+   "src/components/QueryMacro.currentPage.test.tsx::shows the failure code, Retry and the diagnostic report",
+   "crates/tine-core/src/direct_projection_tests.rs::an_owed_registry_waiting_out_a_backoff_is_work_coming",
+   "crates/tine-core/src/model_gh543_interleaving_tests.rs::gh543_seeded_interleavings_converge",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_an_unhydratable_candidate_does_not_parse_the_graph"
+  ],
+  "scenario": null,
+  "failBefore": "tine-agents/evidence/batch-gh594/necessity-liveness.txt (derived-read and reference-panel tests hang at c2afaaa0; the stuck-state diagnosis showed Working(Recovering) for 70 s across 8 failed builds; the four render tests fail against the pre-change LinkedReferences/UnlinkedReferences/Macro components)"
+ },
+ "notes": "Blocking core operation. GH #594: on a v0.6.985 first launch the owed index rebuild failed on every attempt; the owner retried under backoff forever while progress_at answered Working(Recovering) and index_work_coming answered nothing-coming, so queries and reference panels failed not-ready 4,673 times with no visible state and the failure reached only stderr (absent on the Windows release binary). Contract docs/contracts/index-readiness.md (L1-L6): L1 a failing build or turn gets INDEX_ATTEMPTS = 3 per session, then Failed(code); a worker that cannot set up is Failed at once; retry only on the user's Retry (retry_index = graph reopen) or next launch. L2 one index_state function feeds progress and coming. L3 derived reads wait at most DERIVED_READ_PATIENCE (60 s, thread-local deadline) then fall back to parsed pages; reference panels ask reference_readiness first (250 ms) and get NotReady or IndexFailed at once; rename/delete warm the page list before taking the identity lock. L4 Linked/Unlinked References and query blocks show IndexFailedNotice (code, Retry, Create diagnostic report); Linked References shows indexing… instead of hiding. L5 IndexFailureClass (13 fixed codes, platform-specific OS error tables) recorded as flight-recorder event index.failure. The reporter's root trigger is still unknown (candidates: 32-bit address space on the x86 build, a persistent Windows sharing violation); L5 exists to identify it. Windows is unverified; L6: the interleaving seeds inject 1-4 failed index turns, require every settle to end Ready or Failed(code), require a failed index to answer query and reference reads with IndexFailed within 5 s and recover on relaunch, and compare Linked and Unlinked References per page against a parse-only graph. The oracle found a registry capture waiting out a failure backoff reported as Idle, so readers parsed instead of waiting (seed 5; fixed in index_state; necessity in the evidence file). A long run (800 seeds, 60 steps) then found a Ready-state whole-graph parse: a reference candidate page that could not be parsed, or was deleted outside Tine without a watcher event, made candidate hydration decline as a whole and the panel fell through to walking every page (33/800 seeds). Candidates are a superset hint, so such a page is now skipped; revision-checked sources still decline. Necessity: 12 of 12 pages parsed before the fix. L6 remainder (13k scale lane, unclean relaunch, schema change) is open."
+},
+{
+ "id": "REG-CTRLK-SHORT-SEARCH-SCAN-BUDGET-543",
+ "title": "A one- or two-character Ctrl+K search answers promptly in a large graph and says when older blocks may match",
+ "family": "search",
+ "sources": {
+  "issues": [543],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/friendly_tests.rs::an_unindexed_interactive_scan_stops_at_its_budget_and_says_so",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh543_ctrl_k_records_which_path_answered"
+  ],
+  "scenario": null,
+  "failBefore": "tine-agents/evidence/batch-gh594/necessity-ctrlk.txt (without the budget the scan visited 20052 rows for a pair only the oldest block holds)"
+ },
+ "notes": "Blocking core operation (latency), Martin's Ctrl-K follow-up to GH #543. A needle under three characters has no trigram index, so the interactive read scanned blocks newest first until 300 verified matches; a rare pair visited every block (~1.5 s at 616k blocks, subagent note 2026-09-24-gh543-ctrlk-latency.md). The scan now stops at INTERACTIVE_SCAN_BUDGET (20,000 rows, ~50 ms at that scale) and sets has_more, which the switcher shows as More matches exist. Each Friendly search also logs on the --debug channel whether the index or a page scan answered it, with its elapsed time, and the interactive cursor logs its visits."
 },
 {
  "id": "REG-CASE-VARIANT-PAGE-NAME-597",

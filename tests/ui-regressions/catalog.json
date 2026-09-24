@@ -11947,6 +11947,51 @@
         "failBefore": "proven"
       },
       "notes": "Audit finding IT-08. followIndexingProgress returned once the warm had finished and two polls were empty, and IndexingProgressBar restarts it only on a graph epoch change. A later whole-graph pass in the same session (a repair after a damaged index, which moves no epoch) therefore ran with no toolbar indication. The follower now keeps watching at a 5 s cadence after launch settles, gives a new pass the same 700 ms no-flash grace, skips polls while the window is hidden, and stops on component cleanup. Fail-before: 'shows a later pass in the same graph session' failed (building(400) never published). Evidence: tine-agents/evidence/gh550-batch/it08-later-pass-fail-before.log."
+    },
+    {
+      "id": "UI-UNRESOLVED-BLOCK-REF-SOURCE-TEXT-589",
+      "title": "An unresolved block reference, including `(((uuid)))`, shows its full source text as OG does instead of an eight-character id",
+      "family": "block-references",
+      "sources": {
+        "issues": [
+          589
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/blockRefLive.test.tsx",
+          "src/render/renderedText.test.tsx",
+          "crates/tine-core/src/publish_tests.rs::block_refs_resolve_via_decoration"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Flexible presentation with OG parity. mldoc 1.5.9 and lsdoc v0.5.7 both parse `(((uuid)))` as Block_ref `(uuid` plus plain `)` (grammar `((` take_while1(≠')') `))`); OG's block-reference runs parse-uuid, which rejects `(uuid`, and shows the literal `((id))` as a 'Block ref invalid' warning, so the reporter's expected `(` + content + `)` is beyond OG (Martin chose parity, option A, 2026-09-24). Tine's BlockRefView fell back to `((` + first 8 id chars + `))` for any miss, so `(((uuid)))` read as a short hash, and a valid-but-missing uuid was truncated too. Now: the view shows `((id))` in full and skips the lookup for a non-UUID id; the rendered-text path (in-page find, text export) gives `((id))` for a resolver miss (no-resolver callers keep the bare id); publish replaces lsdoc's 8-char placeholder with the full id when the target is unresolved (labels unchanged). Reference indexing already matched OG (UUID-gated). Fail-before: the three tests fail against the pre-change inline.tsx/renderedText.ts/publish.rs. Workaround in both OG and Tine for a parenthesised ref: `( ((uuid)))` or `[label](((uuid)))`."
+    },
+    {
+      "id": "UI-SWITCHER-KEEPS-RESULTS-WHILE-TYPING-543",
+      "title": "Ctrl+K keeps the previous results visible while a newer search runs, and Enter on them waits for the fresh answer",
+      "family": "search",
+      "sources": {
+        "issues": [543],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QuickSwitcher.test.tsx::keeps the previous results on screen, and Enter chooses from the fresh answer"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: tine-agents/evidence/batch-gh594/necessity-ctrlk.txt (the previous answer was blanked on the new keystroke). Stateful UX, Martin's Ctrl-K latency follow-up to GH #543. Blanking the list on every keystroke made each search look slower than it was. Enter on a stale list defers to the fresh answer so it never opens a row of the earlier query."
     }
   ]
 }

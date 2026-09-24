@@ -68,6 +68,22 @@ function testOnlyModuleFiles(sources: Map<string, string>): Set<string> {
       testOnly.add(path.resolve(path.dirname(file), match[1]!));
     }
   }
+  // A module declared from a test-only file is test-only too, whatever its
+  // own declaration says (model_tests.rs declares its submodules by #[path]).
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const file of [...testOnly]) {
+      const source = sources.get(file);
+      if (source === undefined) continue;
+      for (const match of source.matchAll(/#\[path\s*=\s*"([^"]+)"\]/g)) {
+        const child = path.resolve(path.dirname(file), match[1]!);
+        if (!testOnly.has(child)) {
+          testOnly.add(child);
+          grew = true;
+        }
+      }
+    }
+  }
   return testOnly;
 }
 
@@ -144,6 +160,19 @@ describe("docs are not a product input", () => {
         "`tine-coordination integrate --docs-only` (no gates, no build); importing one into the " +
         "frontend would ship it unbuilt. Link to it instead (see src/components/AboutTab.tsx).",
     ).toEqual([]);
+  });
+
+  it("treats a module declared from a test-only file as test-only, and only that", () => {
+    const synthetic = new Map([
+      ["/r/src/model.rs", '#[cfg(test)]\n#[path = "model_tests.rs"]\nmod tests;\n#[path = "shipped.rs"]\nmod shipped;'],
+      ["/r/src/model_tests.rs", '#[path = "model_contract_tests.rs"]\nmod contract;'],
+      ["/r/src/model_contract_tests.rs", ""],
+      ["/r/src/shipped.rs", ""],
+    ]);
+    expect([...testOnlyModuleFiles(synthetic)].sort()).toEqual([
+      "/r/src/model_contract_tests.rs",
+      "/r/src/model_tests.rs",
+    ]);
   });
 
   it("accepts the house pattern: a contract pinned from a test module", () => {

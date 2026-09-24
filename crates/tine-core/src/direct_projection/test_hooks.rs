@@ -1,11 +1,14 @@
 //! Test hooks on [`DirectProjection`]: the waits, counters and injected
 //! failures fixtures use to observe and steer the worker. Test-only, kept
 //! out of `direct_projection.rs` so the production file stays readable.
+use super::owner::index_need;
 use super::*;
 
 impl DirectProjection {
     /// Wait until the worker has drained its queue and finished its turn, and
-    /// report whether that turn succeeded (`false`: it failed).
+    /// report whether that turn succeeded (`false`: it failed). An index that
+    /// has given up for the session (GH #594, L1) has nothing more coming, so
+    /// it counts as drained, and failed.
     #[cfg(test)]
     #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     pub(crate) fn wait_drained_test(&self) -> bool {
@@ -13,7 +16,11 @@ impl DirectProjection {
         loop {
             {
                 let pending = self.shared.pending.lock().unwrap();
-                if !pending.has_work() && !self.shared.worker_busy.load(Ordering::Acquire) {
+                let idle = !self.shared.worker_busy.load(Ordering::Acquire);
+                if idle && pending.failed.is_some() {
+                    return false;
+                }
+                if !pending.has_work() && idle {
                     return !self.shared.last_turn_failed.load(Ordering::Acquire);
                 }
             }
@@ -89,12 +96,20 @@ impl DirectProjection {
     pub(crate) fn inject_next_turn_failure_test(&self) {
         self.shared
             .inject_turn_failure
-            .store(true, Ordering::Release);
+            .fetch_max(1, Ordering::AcqRel);
+    }
+
+    /// Fail the worker's next `turns` turns as well as any already owed: a
+    /// fault that outlasts the retries (GH #594 L6).
+    pub(crate) fn inject_turn_failures_test(&self, turns: u32) {
+        self.shared
+            .inject_turn_failure
+            .fetch_add(turns, Ordering::AcqRel);
     }
 
     /// Whether an injected turn failure is still waiting for a turn.
     pub(crate) fn turn_failure_injection_pending_test(&self) -> bool {
-        self.shared.inject_turn_failure.load(Ordering::Acquire)
+        self.shared.inject_turn_failure.load(Ordering::Acquire) > 0
     }
 
     /// Refuse the next statement on an intact image, as SQLite refuses a

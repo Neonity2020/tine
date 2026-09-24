@@ -10,6 +10,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- A block reference whose target cannot be found now shows its full
+  `((…))` text, as Logseq does, instead of the first eight characters of its
+  id. This includes `(((uuid)))`, which Logseq and Tine both read as a
+  reference to the id `(uuid`; write `( ((uuid)))` or `[label](((uuid)))` to
+  show a reference in parentheses (GH #589).
+- Linked and Unlinked References no longer lose blocks from pages you edited
+  before restarting Tine. A block you added or moved on a page in one session
+  went missing from other pages' reference panels after a relaunch, and stayed
+  missing until that page was edited again. Looking such a block up by its
+  id after a relaunch works again too. The first launch after this update
+  re-indexes the graph once (GH #594).
+- When the search index cannot be built, Linked and Unlinked References and
+  query blocks now say so instead of staying empty or "indexing" for the rest
+  of the session. Tine tries a failing build at most three times; after that
+  those panels show "couldn't be built" with a short code, a **Retry** button
+  and **Create diagnostic report**, and a relaunch tries again. Each failed
+  attempt is recorded in the diagnostic report as a fixed code with no graph
+  content. While the index is still building, Linked References shows
+  "indexing…" instead of hiding, and reads that can fall back to the pages
+  themselves, such as the page list, wait at most a minute for the index.
+  A page Tine cannot read, or one deleted while Tine was not watching, no
+  longer makes Linked or Unlinked References read every page in the graph
+  (GH #594).
+- **Ctrl+K** answers a one- or two-character search in a large graph in a
+  fraction of the time: such a search now reads only the most recent blocks
+  and says **More matches exist** when older ones may match too, where it
+  could take over a second on a 10,000-page graph. While you type, the
+  previous results stay on screen until the new ones arrive instead of
+  blanking on every key, and **Enter** waits for the new results. With
+  `--debug`, the log says whether each search was answered by the index or
+  by scanning pages, and how long it took (GH #543).
+- On a Mac, Tine now declares macOS 12.3 (Monterey) as its minimum, and the
+  startup message for a too-old web engine no longer says to update Safari: on
+  older macOS, updating the Safari app does not update the engine other apps
+  use, so the advice could not work (GH #572).
 - On Windows and macOS, a page whose name differs from its file name only in
   case (for example **Contents** stored as `contents.md`) opens and can be
   edited again. It failed with "could not be activated for editing" when

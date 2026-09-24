@@ -40,6 +40,7 @@ import { isMobilePlatform } from "../nativeChrome";
 import { resolveBlockBatched } from "../resolveBatch";
 import { readLane } from "../readLane";
 import { doc, setRaw, formatForPage, formatForBlock, blockRef } from "../store";
+import { isBlockRefUuid } from "../store/blockRefs";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro, YoutubeTimestamp, ClozeMacro, ZoteroMacro } from "../components/Macro";
 import { NamespaceMacro } from "../components/Namespace";
@@ -1292,17 +1293,19 @@ function UserMacroView(props: { name: string; template: string; args: string[]; 
 // Inline block reference. Bare `((uuid))` shows the referenced block's full
 // visible body; the labeled form `[label](((uuid)))` shows the label instead. Both
 // navigate to the source page on click and show a hover preview of the full
-// referenced block (mirrors OG); a missing target falls back to a short id.
+// referenced block (mirrors OG); a missing target, or an id that is not a
+// UUID, shows its source `((id))` in full, as OG does (GH #589).
 function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAttrs }): JSX.Element {
   const insidePeek = useContext(PeekContext);
   let anchorEl: HTMLSpanElement | undefined;
   const [grpResource] = createResource(
-    () => `${props.id}\0${graphEpoch()}\0${dataRev()}`,
+    // Not a UUID: nothing to resolve (OG's `parse-uuid` gate), so no lookup.
+    () => isBlockRefUuid(props.id) && `${props.id}\0${graphEpoch()}\0${dataRev()}`,
     () => resolveBlockBatched(props.id)
   );
   // `undefined` on failure, not `null`: `null` is an AUTHORITATIVE miss (see
   // targetRaw below) and a failed lookup has not established that. Undefined
-  // keeps a loaded reactive node winning and otherwise shows the short id.
+  // keeps a loaded reactive node winning and otherwise shows the source id.
   const grp = () => readOr(grpResource, undefined, "block reference target");
   const peek = createPeekBridge(() => insidePeek);
   // A loaded target shares the editor's reactive node, so references update on
@@ -1425,7 +1428,7 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
           else openPageAtBlock({ name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
         }}
       >
-        <Show when={lines() !== undefined} fallback={<>(({props.id.slice(0, 8)}))</>}>
+        <Show when={lines() !== undefined} fallback={<>(({props.id}))</>}>
           <Show when={marker()}>
             {(m) => <><span class={`block-marker marker-${m().toLowerCase()}`}>{m()}</span>{" "}</>}
           </Show>

@@ -239,10 +239,13 @@ fn gh543_r15_cache_fallback_answers_like_the_index_for_an_unreadable_page() {
     // Hold the worker's next turn so the index is mid-turn.
     let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    crate::direct_projection::before_next_apply_test(Box::new(move || {
-        let _ = reached_tx.send(());
-        let _ = release_rx.recv_timeout(Duration::from_secs(20));
-    }));
+    crate::direct_projection::before_next_apply_test(
+        &root,
+        Box::new(move || {
+            let _ = reached_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+        }),
+    );
     fs::write(root.join("pages/p1.md"), "- edited r15c [[p2]]\n").unwrap();
     graph.sync_file_checked(&root.join("pages/p1.md")).unwrap();
     let held = reached_rx.recv_timeout(Duration::from_secs(5)).is_ok();
@@ -442,12 +445,21 @@ fn gh543_r15_a_deterministically_failing_fresh_build_is_not_repeated() {
     let passes = graph.owner_passes_test();
     let parses = graph.page_build_parses_test();
     let state = projection.debug_state_test();
+    let progress = projection.progress_at(graph.cache_generation());
     r10_finish(root, graph, owner);
     eprintln!("R15-06 fresh_builds_in_9s={builds} owner_passes={passes} page_parses={parses} state={state}");
+    // Since GH #594 (L1) this is every failure's rule, not a constraint's own.
     assert!(
-        builds <= 2,
+        builds <= u64::from(crate::direct_projection::INDEX_ATTEMPTS),
         "a fresh build failing on the same constraint every time was started {builds} times in \
-         9 s; a contradiction no rebuild can fix owes one rebuild, then the index stays down"
+         9 s; after its attempts the index stays failed until the user retries"
+    );
+    assert_eq!(
+        progress,
+        crate::direct_projection::ProjectionProgress::Failed(
+            crate::query::IndexFailureClass::Constraint
+        ),
+        "the index says it failed, and why"
     );
 }
 

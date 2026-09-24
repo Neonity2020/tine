@@ -68,6 +68,13 @@ Every failed page save has one fixed-shape native receipt: Direct Files records
 its closed save-failure code and guarded-index counters as `direct.save`. Page
 identity, paths, error prose, and draft content never enter the event.
 
+Every failed index build or update attempt has one fixed-shape native receipt,
+`index.failure`: its class (`IndexFailureClass::as_str`), its attempt number and
+whether it left the index failed for the session. Core reports it through
+`tine_core::set_index_failure_observer`, which `debug.rs::flight_init` installs;
+the error text itself stays behind the debug flag (GH #594, see
+`docs/contracts/index-readiness.md`).
+
 ## Print-site classes
 
 Every row of both censuses carries one of four buckets, and they mean the same

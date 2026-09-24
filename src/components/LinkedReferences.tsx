@@ -11,7 +11,9 @@ import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
-import { createReferenceFetcher, referenceRead } from "../lib/referenceFetch";
+import { createReferenceFetcher, referenceRead, referenceIndexPendingMessage } from "../lib/referenceFetch";
+import { IndexFailedNotice } from "./IndexFailedNotice";
+import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
   sectionOverride,
@@ -102,12 +104,14 @@ const referenceCollapseThreshold = () =>
 
 export function LinkedReferences(props: { name: string }): JSX.Element {
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
-  // The section renders nothing until it has groups, so waiting for the index
-  // looks exactly like the first load already does. No extra affordance here.
+  // The section renders nothing until it has groups. While the index is still
+  // building it says so instead: hidden, it read as "no linked references"
+  // for as long as the index took, or for ever (GH #594, index liveness L4).
+  const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
   const fetchReferences = createReferenceFetcher({
     currentRead: () => referenceRead(props.name),
     setLoadError,
-    setIndexPending: () => {},
+    setIndexPending,
   });
   const [groupsResource] = createResource(
     () => referenceRead(props.name),
@@ -414,13 +418,32 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
       fallback={
         <div class="linked-references reference-error" role="alert">
           <div class="references-header">Linked References</div>
-          <div class="reference-filter-error">
-            {referenceLoadErrorMessage(loadError()!)}
-          </div>
+          <Show
+            when={loadError()!.kind === "index_failed"}
+            fallback={
+              <div class="reference-filter-error">
+                {referenceLoadErrorMessage(loadError()!)}
+              </div>
+            }
+          >
+            <IndexFailedNotice subject="Linked References" failure={loadError()!.indexFailure ?? "other"} />
+          </Show>
         </div>
       }
     >
-    <Show when={groups() && mergedGroups().length > 0}>
+    <Show
+      when={groups() && mergedGroups().length > 0}
+      fallback={
+        <Show when={groupsResource.loading && indexPending()}>
+          <div class="linked-references">
+            <div class="references-header">
+              Linked References
+              <span class="references-loading"> {referenceIndexPendingMessage(indexPending())}</span>
+            </div>
+          </div>
+        </Show>
+      }
+    >
       <Show when={exportChooserOpen()}>
         {/* GH #348: batch export honors the visible (filtered) set, matching
             what the section actually shows the user right now. */}

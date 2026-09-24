@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
-import { backend, QueryNotReadyError } from "../backend";
+import { backend, QueryNotReadyError, QueryUnavailableError } from "../backend";
 import type { BacklinkFilterContext, BacklinkFilterEntry, BlockDto, RefGroup } from "../types";
 import { LinkedReferences } from "./LinkedReferences";
 import { resetReferenceSectionState } from "../referenceSectionState";
@@ -174,6 +174,48 @@ describe("Linked References filters", () => {
     const message = root.querySelector<HTMLElement>('[role="alert"]')?.textContent ?? "";
     expect(message).toContain("Couldn’t load references");
     expect(message).not.toContain("bounded result limit");
+    dispose();
+  });
+
+  // GH #594 (index liveness L4): a failed index is named, with a way out,
+  // instead of an empty panel or a load that never ends.
+  it("shows a failed index with its code, Retry and the diagnostic report", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockRejectedValue(
+      new QueryUnavailableError("index_failed", "The index couldn't be built.", "file_in_use")
+    );
+    const retry = vi.spyOn(backend(), "retryIndex").mockResolvedValue();
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[role="alert"]')?.textContent).toContain("code: file_in_use");
+    });
+    expect(root.querySelector(".index-failed-report")?.textContent).toBe("Create diagnostic report");
+    root.querySelector<HTMLButtonElement>(".index-failed-retry")!.click();
+    expect(retry).toHaveBeenCalledTimes(1);
+    dispose();
+  });
+
+  it("says it is indexing while the index is not ready, then shows the references", async () => {
+    // The index answers on the second ask; hold that answer so the waiting
+    // state is observable rather than a race with the retry timer.
+    const answer = deferred<RefGroup[]>();
+    vi.spyOn(backend(), "getBacklinks")
+      .mockRejectedValueOnce(new QueryNotReadyError("indexing"))
+      .mockReturnValue(answer.promise);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+
+    await vi.waitFor(() => {
+      expect(root.querySelector(".references-loading")?.textContent ?? "").toContain("indexing…");
+    });
+    answer.resolve([{ page: "Source", kind: "page", blocks: [block("one", "[[Target]]")] }]);
+    await vi.waitFor(() => {
+      expect(root.querySelector(".references-count")?.textContent).toBe("1");
+    });
+    expect(root.querySelector(".references-loading")).toBeNull();
     dispose();
   });
 

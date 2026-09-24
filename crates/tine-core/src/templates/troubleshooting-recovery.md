@@ -45,6 +45,12 @@ icon:: 🛟
 	- 1. **Retry**, where the panel offers one, re-fetches just that panel. The rest of the page, and the rest of that panel, keep working.
 	- 2. Smaller pieces degrade quietly rather than saying anything: a code block that could not be highlighted shows as plain text, a formula that could not be typeset shows its LaTeX, a preview that could not load shows nothing in its place. These are display-only, and reopening the page re-tries them.
 	- 3. What you should see: the panel keeps its heading and its controls, and the rest of the window is unaffected. Nothing on disk changes.
+- ## References or queries say the search index couldn't be built
+	- Meaning: queries and the Linked and Unlinked References panels answer from Tine's search index. Building it failed several times in a row this session, so Tine stopped retrying and says so, with a short code, instead of showing "indexing…" forever. Your notes are untouched, and pages still open, edit and save normally.
+	- 1. Choose **Retry** in the panel. Tine reopens the graph and builds the index again. Relaunching Tine does the same.
+	- 2. If it fails again, choose **Create diagnostic report** and attach the report to an issue. It records each failed attempt with its code and no graph content.
+	- 3. What the code means: `file_in_use` — another program (often antivirus or a sync tool) held one of Tine's index files open; `disk_full` — the disk or quota is full; `permission_denied` — Tine may not write its index files; `out_of_memory` — the system ran out of memory; `busy` — another Tine window held the index; `corrupt` — the index file is damaged, and a Retry rebuilds it; other codes are for the report.
+	- 4. What you should see: after a successful Retry the panels fill in and queries answer again.
 - ## Create a privacy-safe diagnostic report
 	- 1. Open Settings → **Help & diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
 	- 2. Review the JSON, then choose **Copy report** (or **Save report…** on desktop). Nothing is uploaded automatically. The recorder excludes graph content, paths, page titles, queries, URLs, credentials, and the opt-in detailed debug log.

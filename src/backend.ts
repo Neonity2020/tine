@@ -307,7 +307,13 @@ export function diagnosticFailureReason(error: unknown): string {
 }
 
 export class QueryUnavailableError extends BackendError {
-  constructor(readonly reasonCode: string, message: string) {
+  constructor(
+    readonly reasonCode: string,
+    message: string,
+    /** Why the index failed, when `reasonCode` is `index_failed`: a fixed
+     *  code (`IndexFailureClass::as_str`), never backend prose (GH #594). */
+    readonly indexFailure: string | null = null,
+  ) {
     super("query-unavailable", message);
     this.name = "QueryUnavailableError";
   }
@@ -441,11 +447,14 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
         ? new QueryNotReadyError(payload.reason_code)
         : null;
     case "query-unavailable": {
-      const detail = payload.detail && typeof payload.detail === "object"
-        ? (payload.detail as Record<string, unknown>).message : undefined;
+      const fields = payload.detail && typeof payload.detail === "object"
+        ? payload.detail as Record<string, unknown> : undefined;
+      const detail = fields?.message;
+      const indexFailure = typeof fields?.indexFailure === "string" && REASON_CODE.test(fields.indexFailure)
+        ? fields.indexFailure : null;
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         && typeof detail === "string" && detail.trim().length > 0
-        ? new QueryUnavailableError(payload.reason_code, detail)
+        ? new QueryUnavailableError(payload.reason_code, detail, indexFailure)
         : null;
     }
     case "query-print-refused":
@@ -1019,6 +1028,9 @@ export interface Backend {
   /** Restore a snapshot (graph text at original paths, config, and sidecars;
    *  snapshots current state first). Destructive — confirm before calling. */
   restoreBackup(stamp: string): Promise<void>;
+  /** Reopen the graph after its index failed, which builds the index again as
+   *  the next launch would (GH #594). */
+  retryIndex(): Promise<void>;
   /** Load the persisted UI session JSON (open tabs / active tab / zoom), or null.
    *  Stored atomically in a backend file so structured session state is independent
    *  of a particular WebView/origin and can be shared across windows. */
@@ -1183,6 +1195,7 @@ export function isTauri(): boolean {
  */
 const REBINDING_COMMANDS = new Set([
   "restore_backup",
+  "retry_index",
 ]);
 
 const DIAGNOSTIC_COMMANDS = new Set([
@@ -2087,6 +2100,9 @@ class TauriBackend implements Backend {
   }
   restoreBackup(stamp: string) {
     return this.call<void>("restore_backup", { stamp });
+  }
+  retryIndex() {
+    return this.call<void>("retry_index");
   }
   loadSession() {
     return this.call<string | null>("load_session");

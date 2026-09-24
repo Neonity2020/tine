@@ -20,6 +20,63 @@ thread_local! {
     /// Set when this thread's last derived read declined because a parsed
     /// cache answers instead; see [`Graph::indexed_or_fallback`].
     static CACHE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When this thread's derived read stops waiting; see [`ReadDeadline`].
+    static READ_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long one derived read (page list, aliases, block-ref counts, ...)
+/// waits for index work before it answers the way it answers when none is
+/// coming: from the parsed pages. Waiting is right while the index is about
+/// to answer -- parsing instead reads every page to answer what that pass
+/// settles (GH #543) -- but no read may wait without end: a build that never
+/// finished kept every such read blocked (GH #594, index liveness L3). The
+/// patience only bounds a stall; a working index answers long before it.
+pub(crate) const DERIVED_READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The one deadline of a derived read, shared by every wait inside it: the
+/// retries of [`Graph::indexed_or_fallback`], the generation follows of
+/// [`Graph::indexed_read`] and the readiness wait each makes. The outermost
+/// read sets it; a nested read inherits it (GH #594, L3).
+pub(super) struct ReadDeadline(Option<std::time::Instant>);
+
+impl ReadDeadline {
+    pub(super) fn enter(graph: &Graph) -> Self {
+        #[cfg(test)]
+        let patience = graph
+            .page_build_test
+            .derived_read_patience
+            .lock()
+            .unwrap()
+            .unwrap_or(DERIVED_READ_PATIENCE);
+        #[cfg(not(test))]
+        let patience = {
+            let _ = graph;
+            DERIVED_READ_PATIENCE
+        };
+        Self(READ_DEADLINE.with(|deadline| {
+            let previous = deadline.get();
+            if previous.is_none() {
+                deadline.set(Some(std::time::Instant::now() + patience));
+            }
+            previous
+        }))
+    }
+
+    /// Whether this thread's derived read has waited as long as it may.
+    pub(super) fn passed() -> bool {
+        READ_DEADLINE.with(|deadline| {
+            deadline
+                .get()
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        })
+    }
+}
+
+impl Drop for ReadDeadline {
+    fn drop(&mut self) {
+        READ_DEADLINE.with(|deadline| deadline.set(self.0));
+    }
 }
 
 /// Marks the current thread as running an index owner for its lifetime.
@@ -105,6 +162,11 @@ impl Graph {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_derived_read_patience_test(&self, patience: std::time::Duration) {
+        *self.page_build_test.derived_read_patience.lock().unwrap() = Some(patience);
+    }
+
+    #[cfg(test)]
     pub(crate) fn indexed_read_attempts_test(&self) -> usize {
         self.page_build_test
             .indexed_read_attempts
@@ -139,6 +201,7 @@ impl Graph {
         &self,
         mut indexed: impl FnMut() -> Option<T>,
     ) -> Result<T, PageFallback> {
+        let _deadline = ReadDeadline::enter(self);
         for _ in 0..3 {
             CACHE_DECLINED.with(|declined| declined.set(false));
             if let Some(answer) = indexed() {
@@ -171,6 +234,7 @@ impl Graph {
         &self,
         mut read: impl FnMut(&Arc<DirectProjection>, u64) -> Option<T>,
     ) -> Option<T> {
+        let _deadline = ReadDeadline::enter(self);
         loop {
             let (projection, generation) = self.derived_reader()?;
             let answer = read(&projection, generation);
@@ -203,12 +267,17 @@ impl Graph {
             // A read that met damage has asked the one decider for a new
             // image; wait for it rather than parse the graph (audit R12-05),
             // and sleep while it comes rather than spin (audit R13-07).
-            if answer.is_none() && projection.coming() {
+            if answer.is_none() && projection.coming() && !ReadDeadline::passed() {
                 projection.wait_while_coming(std::time::Duration::from_millis(50));
                 continue;
             }
             if self.cache_generation() == generation {
                 return answer;
+            }
+            // The graph kept moving under the read past its deadline: the
+            // parsed pages answer instead (L3).
+            if ReadDeadline::passed() {
+                return None;
             }
         }
     }

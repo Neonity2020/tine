@@ -12,6 +12,7 @@ import {
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
 import { createReferenceFetcher, referenceRead, referenceIndexPendingMessage } from "../lib/referenceFetch";
+import { IndexFailedNotice } from "./IndexFailedNotice";
 import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
@@ -135,9 +136,16 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
       </Show>
       <Show when={open()}>
         <Show when={loadError()}>
-          <div class="reference-filter-error reference-error" role="alert">
-            {referenceLoadErrorMessage(loadError()!)}
-          </div>
+          <Show
+            when={loadError()!.kind === "index_failed"}
+            fallback={
+              <div class="reference-filter-error reference-error" role="alert">
+                {referenceLoadErrorMessage(loadError()!)}
+              </div>
+            }
+          >
+            <IndexFailedNotice subject="Unlinked References" failure={loadError()!.indexFailure ?? "other"} />
+          </Show>
         </Show>
         <Show when={occurrenceLimit().truncated}>
           <div class="reference-truncation" role="status">

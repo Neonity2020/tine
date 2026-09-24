@@ -1,4 +1,4 @@
-import { For, Show, createSignal, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
+import { For, Show, batch, createSignal, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { runQueryWhenReady, searchIndexPendingMessage } from "../queryReadiness";
 import { backend } from "../backend";
 import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu } from "../ui";
@@ -97,6 +97,14 @@ export function QuickSwitcher(): JSX.Element {
   // Fetch OG's complete ranked pools once per query. Presentation paging below
   // changes only the rendered slice and therefore does not trigger another scan.
   const [graphResults, setGraphResults] = createSignal<Awaited<ReturnType<ReturnType<typeof backend>["runGraphSearch"]>>>();
+  // The query the shown graph results answer. While a newer query is being
+  // searched the previous answer stays on screen (GH #543: blanking the list
+  // on every keystroke made each search look slower than it was), and Enter
+  // on that stale list waits for the fresh answer instead of choosing a row
+  // of the old one.
+  const [answeredQuery, setAnsweredQuery] = createSignal<string | null>(null);
+  const resultsStale = () => graphResults() !== undefined && answeredQuery() !== query();
+  let deferredEnter: ((it: Item | undefined) => void) | null = null;
   const [searchPending, setSearchPending] = createSignal<string | null>(null);
   const [searchError, setSearchError] = createSignal<string | null>(null);
   const [searchRetry, setSearchRetry] = createSignal(0);
@@ -117,10 +125,14 @@ export function QuickSwitcher(): JSX.Element {
     const mine = ++searchRequest;
     const controller = new AbortController();
     onCleanup(() => controller.abort());
-    setGraphResults(undefined);
     setSearchError(null);
     setSearchPending(null);
-    if (!open || commands || !raw.trim()) return;
+    if (!open || commands || !raw.trim()) {
+      setGraphResults(undefined);
+      setAnsweredQuery(null);
+      deferredEnter = null;
+      return;
+    }
     setSearchPending("Searching…");
     if (raw !== s.q) return;
     const isCurrent = () => mine === searchRequest && !controller.signal.aborted;
@@ -137,9 +149,26 @@ export function QuickSwitcher(): JSX.Element {
       signal: controller.signal,
       isCurrent,
       onPending: (error) => setSearchPending(searchIndexPendingMessage(error)),
-    }).then((answer) => { if (isCurrent()) setGraphResults(answer); })
+    }).then((answer) => {
+      if (!isCurrent()) return;
+      batch(() => {
+        setGraphResults(answer);
+        setAnsweredQuery(s.q);
+      });
+      if (deferredEnter && !resultsStale()) {
+        const run = deferredEnter;
+        deferredEnter = null;
+        run(flat()[sel()]);
+      }
+    })
       .catch((error: unknown) => {
-        if (isCurrent()) setSearchError(error instanceof Error ? error.message : String(error));
+        if (!isCurrent()) return;
+        batch(() => {
+          setGraphResults(undefined);
+          setAnsweredQuery(null);
+        });
+        deferredEnter = null;
+        setSearchError(error instanceof Error ? error.message : String(error));
       });
   });
 
@@ -468,8 +497,8 @@ export function QuickSwitcher(): JSX.Element {
       move(-1);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const it = flat()[sel()];
-      if (it) {
+      const activate = (it: Item | undefined) => {
+        if (!it) return;
         // GH #463: the keyboard half of the same ladder the pointer already
         // implements below. Ctrl/Cmd+Enter was the one rung missing, so it fell
         // through to plain navigation and the modifier did nothing — while
@@ -482,7 +511,9 @@ export function QuickSwitcher(): JSX.Element {
         else if (cmdCtrlOnly && (it.t === "page" || it.t === "block")) openInBackground(it);
         else if (e.altKey && !switcherEmbryo()) void chooseOther(it);
         else choose(it);
-      }
+      };
+      if (resultsStale()) deferredEnter = activate;
+      else activate(flat()[sel()]);
     } else if (e.key === "Escape") {
       if (e.isComposing || e.keyCode === 229) return;
       if (dismissTopTransient("escape")) e.preventDefault();

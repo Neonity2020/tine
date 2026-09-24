@@ -28,7 +28,9 @@ mod oracle_gate1;
 #[cfg(test)]
 #[path = "query/oracle_walk_tests.rs"]
 mod oracle_walk;
-pub use execution_error::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
+pub use execution_error::{
+    IndexFailureClass, QueryExecutionError, QueryReadinessReason, QueryUnavailableReason,
+};
 mod advanced_patterns;
 use advanced_patterns::{scan_groups, where_groups};
 pub mod ir;
@@ -1374,6 +1376,7 @@ pub fn backlinks_bounded_indexed<G: QueryGraph>(
     max_rows: usize,
     max_bytes: usize,
 ) -> Result<BoundedGroups, QueryExecutionError> {
+    graph.reference_readiness(target, ReferenceKind::Explicit)?;
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let candidate_pages = graph.reference_candidate_pages_indexed(
@@ -1746,6 +1749,7 @@ pub(crate) fn unlinked_refs_bounded_indexed_with_source<G: QueryGraph>(
     max_rows: usize,
     max_bytes: usize,
 ) -> Result<IndexedReferenceGroups, QueryExecutionError> {
+    graph.reference_readiness(target, ReferenceKind::Plain)?;
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let candidate_pages =

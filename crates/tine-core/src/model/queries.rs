@@ -506,7 +506,7 @@ impl Graph {
     ) -> Result<T, crate::publish::PrintPreparationError> {
         use crate::query::rank::PageRecencyPrograms;
         use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
-        use crate::query::results::{RecencyPage, ResultIdentity};
+        use crate::query::results::RecencyPage;
         let render = std::cell::RefCell::new(Some(render));
         let today = crate::date::JournalDate::today();
         self.dispatch_direct_query(|request| {
@@ -515,10 +515,7 @@ impl Graph {
                 crate::direct_projection::RegistrySensitivity::Required,
                 |job| {
                     let registry = self.direct_lowering_registry(true, job)?;
-                    let identity = ResultIdentity {
-                        session_pages: Arc::clone(&job.session_pages),
-                        all_session: false,
-                    };
+                    let identity = job.identity.clone();
                     let recency = |page: RecencyPage<'_>| {
                         crate::query::page_recency_secs_for(
                             page.journal_day,

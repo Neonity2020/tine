@@ -149,6 +149,13 @@ export function blockRef(id: string): LoadedBlockRef {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Whether a block reference's id can name a block at all. OG resolves
+ *  `((id))` only when `parse-uuid` accepts the id; `(((uuid)))` parses as the
+ *  id `(uuid`, which it shows as an invalid reference (GH #589). */
+export function isBlockRefUuid(id: string): boolean {
+  return UUID_RE.test(id);
+}
+
 /** Ensure a block has a durable external UUID synchronously, while deliberately
  * leaving its live store key unchanged. Existing ids win; otherwise the block
  * always receives a fresh UUID in the page's Markdown/Org property syntax.

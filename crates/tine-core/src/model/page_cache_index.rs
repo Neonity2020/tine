@@ -200,6 +200,8 @@ pub(super) struct PageBuildTestState {
     /// Index-backed derived reads answer `None` while this is set, as one
     /// that met damage does.
     pub(super) unanswered_indexed_reads: std::sync::atomic::AtomicBool,
+    /// Overrides [`super::derived_reads::DERIVED_READ_PATIENCE`].
+    pub(super) derived_read_patience: std::sync::Mutex<Option<std::time::Duration>>,
     /// Attempts `indexed_read` made.
     pub(super) indexed_read_attempts: std::sync::atomic::AtomicUsize,
     pub(super) enumerations: std::sync::atomic::AtomicUsize,

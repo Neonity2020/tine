@@ -414,3 +414,25 @@ describe("query `<% current page %>` dispatch to the focused pane (GH #301)", ()
     }
   });
 });
+
+// GH #594 (index liveness L4): a query whose index failed says so, with the
+// code and a way out, instead of a generic "unavailable" line.
+describe("a query block over a failed index (GH #594)", () => {
+  it("shows the failure code, Retry and the diagnostic report", async () => {
+    loadQueryDoc("{{query (task TODO)}}");
+    vi.spyOn(backend(), "queryRun").mockRejectedValue(
+      new QueryUnavailableError("index_failed", "The index couldn't be built.", "permission_denied")
+    );
+    const retry = vi.spyOn(backend(), "retryIndex").mockResolvedValue();
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settle();
+      await vi.waitFor(() => expect(root.textContent).toContain("code: permission_denied"));
+      expect(root.querySelector(".index-failed-report")?.textContent).toBe("Create diagnostic report");
+      root.querySelector<HTMLButtonElement>(".index-failed-retry")!.click();
+      expect(retry).toHaveBeenCalledTimes(1);
+    } finally {
+      dispose();
+    }
+  });
+});

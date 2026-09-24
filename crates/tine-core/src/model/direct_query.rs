@@ -203,6 +203,10 @@ impl Graph {
                     return Err(Error::NotReady(Readiness::PendingEdits))
                 }
                 Some(ProjectionProgress::Working(reason)) => return Err(Error::NotReady(reason)),
+                // Stopped trying this session: no repair, no retry loop (GH #594).
+                Some(ProjectionProgress::Failed(class)) => {
+                    return Err(Error::Unavailable(Reason::IndexFailed(class)))
+                }
                 Some(ProjectionProgress::Stopped) | None => {
                     return Err(Error::Unavailable(Reason::ProjectionUnavailable))
                 }
@@ -240,6 +244,9 @@ impl Graph {
             DirectAttempt::NotReady => match self.direct_projection_progress() {
                 Some(ProjectionProgress::Ready) => Err(Error::NotReady(Readiness::PendingEdits)),
                 Some(ProjectionProgress::Working(reason)) => Err(Error::NotReady(reason)),
+                Some(ProjectionProgress::Failed(class)) => {
+                    Err(Error::Unavailable(Reason::IndexFailed(class)))
+                }
                 Some(ProjectionProgress::Stopped) | None => {
                     Err(Error::Unavailable(Reason::ProjectionUnavailable))
                 }
@@ -360,13 +367,10 @@ impl Graph {
         // and the identity capture; `read_results` owns the descriptor read,
         // the budget and the payload batches, and installs the statement's
         // compiled-regex program on the job's own connection.
-        // The identity policy, captured with the snapshot: a page THIS process
-        // lowered answers with its stored live id; a row reused from an earlier
-        // session answers with the structural id the fresh parse assigns it.
-        let identity = crate::query::results::ResultIdentity {
-            session_pages: Arc::clone(&job.session_pages),
-            all_session: false,
-        };
+        // The identity decoder, captured with the snapshot: a row answers with
+        // its stored structural id, unless this session's document names that
+        // block by a live id recorded at the row's revision (R3).
+        let identity = job.identity.clone();
         // The recency axis is the WALK'S producer, by the two inputs the
         // projection stores; it runs only for a page the answer admitted.
         let recency = |page: crate::query::results::RecencyPage<'_>| {
@@ -440,10 +444,7 @@ impl Graph {
         self.dispatch_direct_query(|request| {
             self.direct_projection_read_job(request, sensitivity, |job| {
                 let registry = self.direct_lowering_registry(prepared.requires_registry(), job)?;
-                let identity = crate::query::results::ResultIdentity {
-                    session_pages: Arc::clone(&job.session_pages),
-                    all_session: false,
-                };
+                let identity = job.identity.clone();
                 let recency = |page: crate::query::results::RecencyPage<'_>| {
                     crate::query::page_recency_secs_for(
                         page.journal_day,
@@ -511,10 +512,7 @@ impl Graph {
                         )));
                     }
                     let registry = self.direct_lowering_registry(true, job)?;
-                    let identity = ResultIdentity {
-                        session_pages: Arc::new(HashSet::new()),
-                        all_session: false,
-                    };
+                    let identity = ResultIdentity::structural();
                     let recency = |page: RecencyPage<'_>| {
                         crate::query::page_recency_secs_for(
                             page.journal_day,
@@ -837,10 +835,7 @@ impl Graph {
                     )
                 })
                 .collect::<Vec<_>>();
-            let identity = crate::query::results::ResultIdentity {
-                session_pages: Arc::clone(&job.session_pages),
-                all_session: false,
-            };
+            let identity = job.identity.clone();
             let recency = |page: crate::query::results::RecencyPage<'_>| {
                 crate::query::page_recency_secs_for(page.journal_day, &self.root.join(page.path))
             };
@@ -992,7 +987,12 @@ impl Graph {
         let mut pages = Vec::new();
         for relative in paths {
             let path = self.root.join(&relative);
-            let slot = cache_index.by_path.get(&path).copied()?;
+            // A candidate the parsed cache does not hold (gone, or it did not
+            // parse) is absent from the walk this read replaces too: skip it,
+            // as `parse_pages_on_demand` does (GH #594 L6).
+            let Some(slot) = cache_index.by_path.get(&path).copied() else {
+                continue;
+            };
             let page = snapshot.get(slot)?;
             if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
                 return None;

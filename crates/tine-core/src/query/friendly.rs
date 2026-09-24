@@ -13,7 +13,9 @@ use std::sync::Arc;
 use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
 use crate::direct_projection::page_kind_from_sql;
-use crate::query::candidate::{expression_plan, CandidateMode, CandidatePlan};
+use crate::query::candidate::{
+    expression_plan, CandidateMode, CandidatePlan, INTERACTIVE_SCAN_BUDGET,
+};
 use crate::query::ir::FriendlyPageMatchScope;
 use crate::query::rank::QueryRankPrograms;
 use crate::query::results::{
@@ -662,9 +664,12 @@ fn read_pages(
         ),
         _ => None,
     };
+    let content_budget_spent = interactive_content_ids
+        .as_ref()
+        .is_some_and(|verified| verified.budget_spent);
     let content_block_source = match content {
-        Some((content_branch, _)) => match interactive_content_ids.as_deref() {
-            Some(ids) => verified_id_block_source(&mut params, ids),
+        Some((content_branch, _)) => match interactive_content_ids.as_ref() {
+            Some(verified) => verified_id_block_source(&mut params, &verified.ids),
             None => indexed_block_source(&mut params, &content_branch.predicate).sql,
         },
         None => "blocks b".to_string(),
@@ -768,7 +773,7 @@ fn read_pages(
         .map(|row| decode_page_descriptor(row, hydrate))
         .collect::<Result<Vec<_>, _>>()
         .map_err(ResultReadError::Corrupt)?;
-    let has_more = descriptors.len() > branch.limit;
+    let has_more = descriptors.len() > branch.limit || content_budget_spent;
     descriptors.truncate(branch.limit);
     // Hydrate only ADMITTED stored pages, through the shared page hydrator, and
     // only once the descriptors are final. A virtual suggestion names no stored
@@ -1112,24 +1117,44 @@ fn interactive_block_cursor_statement(
     (sql, params)
 }
 
+/// The verified candidates of one interactive read.
+struct VerifiedIds {
+    ids: Vec<i64>,
+    /// An unindexed scan stopped at [`INTERACTIVE_SCAN_BUDGET`] before the
+    /// window filled: older blocks were not visited, so more may match.
+    budget_spent: bool,
+}
+
 /// Consume rowid-descending candidates until `window` exact matches survive.
 /// This is deliberately a Rust cursor: putting the exact callback in a
 /// materialized SQL CTE evaluates the complete candidate set before LIMIT and
-/// turns a verified-match window back into graph-sized work.
+/// turns a verified-match window back into graph-sized work. A scan no index
+/// drives also stops at [`INTERACTIVE_SCAN_BUDGET`] visited rows.
 fn interactive_verified_block_ids(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     plan: &QueryPlan,
     branch: &QueryBranch,
     window: usize,
     lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-) -> Result<Vec<i64>, ResultReadError> {
+) -> Result<VerifiedIds, ResultReadError> {
     let (sql, params) = interactive_block_cursor_statement(plan, branch);
+    let budget = match expression_plan(&branch.predicate) {
+        CandidatePlan::Scan => Some(INTERACTIVE_SCAN_BUDGET),
+        CandidatePlan::Index { .. } => None,
+    };
     let mut ids = Vec::with_capacity(window);
+    let mut visits = 0usize;
+    let mut budget_spent = false;
     let mut damage = None;
     let cancellation = snapshot.cancellation();
     crate::query::projection_sql::visit(snapshot, &sql, &params, |row| {
         #[cfg(test)]
         note_friendly(|census| census.block_candidate_visits += 1);
+        if budget.is_some_and(|budget| visits == budget) {
+            budget_spent = true;
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+        visits += 1;
         if lane.as_ref().is_some_and(|cancelled| cancelled()) {
             cancellation.cancel();
         }
@@ -1180,7 +1205,14 @@ fn interactive_verified_block_ids(
     if let Some(message) = damage {
         return Err(ResultReadError::Corrupt(message));
     }
-    Ok(ids)
+    crate::direct_projection::projection_diag(|| {
+        format!(
+            "interactive block candidates: visits={visits} verified={} indexed={} budget_spent={budget_spent}",
+            ids.len(),
+            budget.is_none()
+        )
+    });
+    Ok(VerifiedIds { ids, budget_spent })
 }
 
 fn read_blocks(
@@ -1213,11 +1245,13 @@ fn read_blocks(
     // interactive cursor LEFT-joins and validates text/page rows before it
     // counts W; this ranked statement likewise keeps its LEFT joins and orders
     // `missing_text` first so descriptor decoding fails the whole read.
+    let mut budget_spent = false;
     let block_source = match plan.candidate_mode() {
         CandidateMode::Exhaustive => indexed_block_source(&mut params, &branch.predicate).sql,
         CandidateMode::Interactive { window } => {
-            let ids = interactive_verified_block_ids(snapshot, plan, branch, window, lane)?;
-            verified_id_block_source(&mut params, &ids)
+            let verified = interactive_verified_block_ids(snapshot, plan, branch, window, lane)?;
+            budget_spent = verified.budget_spent;
+            verified_id_block_source(&mut params, &verified.ids)
         }
     };
     let scope_sql = if conditions.is_empty() {
@@ -1278,7 +1312,7 @@ fn read_blocks(
         .map(|row| decode_block_descriptor(row, identity))
         .collect::<Result<Vec<_>, _>>()
         .map_err(ResultReadError::Corrupt)?;
-    let has_more = descriptors.len() > branch.limit;
+    let has_more = descriptors.len() > branch.limit || budget_spent;
     descriptors.truncate(branch.limit);
     let mut seen = HashSet::new();
     for descriptor in &descriptors {

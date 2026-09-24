@@ -15,6 +15,13 @@
 //!    the index held for it, by design);
 //! 4. no consumer ran a whole-graph parse while the projection was alive.
 //!
+//! Index faults are injected too: bursts of failed worker turns, some longer
+//! than the index's attempts. Within the settle bound after the last fault the
+//! index is ready or visibly `Failed`, and every derived read -- queries,
+//! Linked and Unlinked References, the page list -- answers or reports the
+//! failure; none waits without end. A failed index converges after the
+//! reopen the user's Retry performs (GH #594, index liveness L6).
+//!
 //! Stage 0 of the one-indexing-owner design
 //! (`tine-agents/specs/notes/2026-09-22-single-indexing-owner-design.md`).
 
@@ -123,21 +130,43 @@ impl Session {
                 let mut turn = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     let started = Instant::now();
-                    match turn % 3 {
-                        0 => match graph.run_query_bounded(
-                            QUERIES[turn % QUERIES.len()],
-                            100,
-                            1 << 20,
-                        ) {
-                            Ok(_) | Err(crate::query::QueryExecutionError::NotReady(_)) => {}
-                            Err(other) => errors.lock().unwrap().push(format!("query: {other}")),
-                        },
+                    let target = format!("p{}", turn % 7);
+                    let answered = match turn % 5 {
+                        0 => graph
+                            .run_query_bounded(QUERIES[turn % QUERIES.len()], 100, 1 << 20)
+                            .map(|_| ()),
                         1 => {
                             let _ = graph.list_pages();
+                            Ok(())
                         }
+                        2 => {
+                            crate::query::backlinks_bounded_indexed(&*graph, &target, 100, 1 << 20)
+                                .map(|_| ())
+                        }
+                        3 => crate::query::unlinked_refs_bounded_indexed(
+                            &*graph,
+                            &target,
+                            100,
+                            1 << 20,
+                        )
+                        .map(|_| ()),
                         _ => {
                             let _ = graph.referenced_page_names();
+                            Ok(())
                         }
+                    };
+                    // Answered, not ready yet, or visibly failed: anything
+                    // else is a reader told something it cannot act on.
+                    match answered {
+                        Ok(())
+                        | Err(crate::query::QueryExecutionError::NotReady(_))
+                        | Err(crate::query::QueryExecutionError::Unavailable(
+                            crate::query::QueryUnavailableReason::IndexFailed(_),
+                        )) => {}
+                        Err(other) => errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("read {} of {target}: {other}", turn % 5)),
                     }
                     slowest.fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     turn += 1;
@@ -242,7 +271,9 @@ fn check_session_work(
     findings: &mut Vec<String>,
 ) {
     let parses = graph.consumer_page_parses_test() - acting_parses;
-    if parses > 0 {
+    // A failed index is read around by design: the page list and the other
+    // reads that can fall back parse the pages (GH #594 L3).
+    if parses > 0 && index_failure(graph).is_none() {
         findings.push(format!(
             "{parses} consumer parse(s) while the projection was alive"
         ));
@@ -261,22 +292,111 @@ const CONFIGS: &[&str] = &[
     "{:block-hidden-properties #{:status}}",
 ];
 
-fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<String>) {
+/// The class the index failed with, if it has stopped trying this session.
+fn index_failure(graph: &Graph) -> Option<crate::query::IndexFailureClass> {
+    match graph
+        .direct_projection_test()?
+        .progress_at(graph.cache_generation())
+    {
+        crate::direct_projection::ProjectionProgress::Failed(class) => Some(class),
+        _ => None,
+    }
+}
+
+/// Wait for the index to be ready at the current generation or visibly
+/// failed; `None` (and a finding) when it is neither within the bound.
+fn wait_ready_or_failed(
+    graph: &Graph,
+    findings: &mut Vec<String>,
+) -> Option<Option<crate::query::IndexFailureClass>> {
     let started = Instant::now();
-    while !graph.direct_projection_ready_test() {
+    loop {
+        if graph.direct_projection_ready_test() {
+            return Some(None);
+        }
+        if let Some(class) = index_failure(graph) {
+            return Some(Some(class));
+        }
         if started.elapsed() > SETTLE_BOUND {
             findings.push(format!(
-                "readiness never reached cache_generation={} ({})",
+                "the index was neither ready at cache_generation={} nor failed ({})",
                 graph.cache_generation(),
                 graph
                     .direct_projection_test()
                     .map(|projection| projection.debug_state_test())
                     .unwrap_or_else(|| "no projection".to_owned())
             ));
-            return;
+            return None;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Run `read` on its own thread; `None` when it has not returned in `limit`.
+fn within<T: Send + 'static>(
+    limit: Duration,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(read());
+    });
+    receiver.recv_timeout(limit).ok()
+}
+
+/// A failed index is reported, at once, by every read that needs it, and
+/// the reads that can fall back answer (GH #594 L3/L4).
+fn check_failed_reads(
+    graph: &Arc<Graph>,
+    class: crate::query::IndexFailureClass,
+    findings: &mut Vec<String>,
+) {
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    const PROMPTLY: Duration = Duration::from_secs(5);
+    let reads: [(&str, fn(&Graph) -> Result<(), QueryExecutionError>); 3] = [
+        ("query", |graph| {
+            graph
+                .run_query_bounded(QUERIES[0], 100, 1 << 20)
+                .map(|_| ())
+        }),
+        ("linked references", |graph| {
+            crate::query::backlinks_bounded_indexed(graph, "p1", 100, 1 << 20).map(|_| ())
+        }),
+        ("unlinked references", |graph| {
+            crate::query::unlinked_refs_bounded_indexed(graph, "p1", 100, 1 << 20).map(|_| ())
+        }),
+    ];
+    for (what, read) in reads {
+        let graph = Arc::clone(graph);
+        match within(PROMPTLY, move || read(&graph)) {
+            Some(Err(QueryExecutionError::Unavailable(QueryUnavailableReason::IndexFailed(
+                reported,
+            )))) if reported == class => {}
+            None => findings.push(format!("{what} over a failed index did not return")),
+            Some(other) => findings.push(format!(
+                "{what} over an index failed with {class:?} said {other:?}"
+            )),
+        }
+    }
+    let listed = {
+        let graph = Arc::clone(graph);
+        within(PROMPTLY, move || graph.list_pages().len())
+    };
+    if listed.is_none() {
+        findings.push("the page list over a failed index did not return".to_owned());
+    }
+}
+
+fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<String>) {
+    match wait_ready_or_failed(graph, findings) {
+        Some(None) => check_answers(root, graph, bad, findings),
+        Some(Some(class)) => findings.push(format!("the index failed with {class:?}")),
+        None => {}
+    }
+}
+
+/// The ready index answers what a fresh parse of the disk answers.
+fn check_answers(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<String>) {
     let oracle = Graph::open(root);
     for query in QUERIES {
         let expected = crate::query::run_query_bounded(&oracle, query, 1_000, 1 << 24);
@@ -305,6 +425,52 @@ fn check_settled(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<
                 }
             }
             Err(error) => findings.push(format!("{query}: ready index refused: {error}")),
+        }
+    }
+    // Linked and Unlinked References, per page, as the panels ask them.
+    let rows = |groups: &[crate::model::RefGroup]| {
+        let mut rows = groups
+            .iter()
+            .filter(|group| !bad.contains(&group.page.to_lowercase()))
+            .flat_map(|group| {
+                group
+                    .blocks
+                    .iter()
+                    .map(move |block| format!("{}|{}", group.page, block.raw))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    for entry in oracle.list_pages() {
+        let target = entry.name.to_lowercase();
+        if bad.contains(&target) {
+            continue;
+        }
+        let expected = crate::query::backlinks_bounded(&oracle, &target, usize::MAX, usize::MAX);
+        match crate::query::backlinks_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
+            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
+            Ok(indexed) => findings.push(format!(
+                "linked references of {target}: index {:?} != disk {:?}",
+                rows(&indexed.groups),
+                rows(&expected.groups)
+            )),
+            Err(error) => findings.push(format!(
+                "linked references of {target}: ready index refused: {error}"
+            )),
+        }
+        let expected =
+            crate::query::unlinked_refs_bounded(&oracle, &target, usize::MAX, usize::MAX);
+        match crate::query::unlinked_refs_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
+            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
+            Ok(indexed) => findings.push(format!(
+                "unlinked references of {target}: index {:?} != disk {:?}",
+                rows(&indexed.groups),
+                rows(&expected.groups)
+            )),
+            Err(error) => findings.push(format!(
+                "unlinked references of {target}: ready index refused: {error}"
+            )),
         }
     }
     let names = |graph: &Graph| {
@@ -413,6 +579,8 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
     // Parses made by whole-graph acting reads, which parse by design.
     let mut acting_parses = 0usize;
     let mut session_steps = 0usize;
+    // Whether this session was given an index fault.
+    let mut faulted = false;
 
     for step in 0..steps {
         std::thread::sleep(Duration::from_millis(rng.below(6)));
@@ -442,7 +610,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
         }
         let pick =
             |rng: &mut Rng, names: &[String]| names[rng.below(names.len() as u64) as usize].clone();
-        let op = rng.below(120);
+        let op = rng.below(126);
         if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
             eprintln!("seed {seed} step {step}: op {op} names {names:?}");
         }
@@ -581,6 +749,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
                 // launch check is what must find it.
                 missed.clear();
                 session = Session::open(&root, &database);
+                faulted = false;
                 Ok(())
             }
             // A page's parse starts panicking: an external edit, reported
@@ -644,6 +813,16 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
                 graph.direct_projection_owe_validation_test();
                 Ok(())
             }
+            // A fault that fails the index's next turns: a short burst it
+            // retries past, or one that outlasts its attempts and leaves it
+            // `Failed` for the session (GH #594 L6).
+            120..=125 => {
+                if let Some(projection) = graph.direct_projection_test() {
+                    projection.inject_turn_failures_test(1 + rng.below(4) as u32);
+                    faulted = true;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         };
         // An operation may be refused (a stale base, a name clash); what
@@ -667,13 +846,45 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
             eprintln!("  settle reconcile {missed_now:?} -> {settled:?}");
         }
     }
-    if session.quiesce(&mut findings) {
-        check_settled(&root, &graph, &bad, &mut findings);
-        check_session_work(&graph, acting_parses, session_steps, &mut findings);
-        drop(graph);
-        session.close(&mut findings);
-        let _ = fs::remove_dir_all(&root);
+    if !session.quiesce(&mut findings) {
+        return findings;
     }
+    if std::env::var_os("TINE_INTERLEAVING_TRACE").is_some() {
+        for dir in ["logseq", "pages", "journals"] {
+            for entry in fs::read_dir(root.join(dir)).into_iter().flatten().flatten() {
+                let text = fs::read_to_string(entry.path()).unwrap_or_default();
+                eprintln!("  {dir}/{}: {text:?}", entry.file_name().to_string_lossy());
+            }
+        }
+    }
+    let settled = wait_ready_or_failed(&graph, &mut findings);
+    check_session_work(&graph, acting_parses, session_steps, &mut findings);
+    match settled {
+        None => return findings,
+        Some(None) => {
+            check_answers(&root, &graph, &bad, &mut findings);
+            drop(graph);
+        }
+        Some(Some(class)) => {
+            if !faulted {
+                findings.push(format!("the index failed with {class:?} and no fault"));
+            }
+            check_failed_reads(&graph, class, &mut findings);
+            // The user's Retry: reopen the graph. The index converges.
+            drop(graph);
+            session.close(&mut findings);
+            session = Session::open(&root, &database);
+            let graph = Arc::clone(&session.graph);
+            if !session.quiesce(&mut findings) {
+                return findings;
+            }
+            check_settled(&root, &graph, &bad, &mut findings);
+            check_session_work(&graph, 0, 0, &mut findings);
+            drop(graph);
+        }
+    }
+    session.close(&mut findings);
+    let _ = fs::remove_dir_all(&root);
     findings
 }
 
@@ -723,7 +934,7 @@ fn gh543_long_interleaving_run() {
     run_seeds(first..first + env("TINE_INTERLEAVING_SEEDS", 200), 60);
 }
 
-fn save_existing(graph: &Graph, name: &str, text: &str) {
+pub(super) fn save_existing(graph: &Graph, name: &str, text: &str) {
     let mut page = graph
         .load_named(name, PageKind::Page)
         .unwrap()
@@ -1622,3 +1833,239 @@ fn gh543_a_retired_graphs_owner_runs_no_more_passes() {
     let _ = fs::remove_dir_all(&root);
     assert_eq!(passes, 0, "the owner walked a retired graph");
 }
+
+/// GH #594 scale repro (diagnosis, local only): on a large graph, the linked
+/// references read must eventually answer after (a) a fresh build, (b) an
+/// abrupt close part-way through a build, and (c) edits during the reopen's
+/// catch-up. `TINE_GH594_ROOT` names a graph to COPY (it is not modified);
+/// `TINE_GH594_TARGET` the page whose references are read. Prints a readiness
+/// timeline instead of asserting a bound, since the bound is what we measure.
+#[test]
+#[ignore = "GH #594 scale diagnosis"]
+fn gh594_scale_references_answer_after_abrupt_restart() {
+    let Some(source) = std::env::var_os("TINE_GH594_ROOT") else {
+        eprintln!("TINE_GH594_ROOT unset; skipping");
+        return;
+    };
+    let target = std::env::var("TINE_GH594_TARGET").unwrap_or_else(|_| "Area 0/Topic 0".into());
+    let abrupt_after = Duration::from_secs(
+        std::env::var("TINE_GH594_ABRUPT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20),
+    );
+    let give_up = Duration::from_secs(
+        std::env::var("TINE_GH594_GIVE_UP_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1800),
+    );
+    let root = scratch("gh594-scale");
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(format!("{}/.", Path::new(&source).display()))
+        .arg(&root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let database = root.join("private/projection.sqlite");
+    let mut findings = Vec::new();
+
+    // Poll the panel's read until it answers; print each reason change.
+    let poll = |graph: &Graph, phase: &str, edit_every: Option<Duration>| -> Option<Duration> {
+        let started = Instant::now();
+        let mut last = String::new();
+        let mut last_edit = Instant::now();
+        let mut edits = 0usize;
+        loop {
+            let answer = graph.backlinks_bounded_indexed(&target, 100, 1 << 20);
+            let unlinked = graph.unlinked_refs_bounded_indexed(&target, 100, 1 << 20);
+            let now = match (&answer, &unlinked) {
+                (Ok(a), Ok(u)) => format!("ANSWERED linked={} unlinked={}", a.total, u.total),
+                (a, u) => format!(
+                    "linked={:?} unlinked={:?}",
+                    a.as_ref().err().map(|e| e.to_string()),
+                    u.as_ref().err().map(|e| e.to_string())
+                ),
+            };
+            if now != last {
+                eprintln!("[{phase} +{:>7.1}s] {now}", started.elapsed().as_secs_f64());
+                last = now.clone();
+            }
+            if answer.is_ok() && unlinked.is_ok() {
+                return Some(started.elapsed());
+            }
+            if started.elapsed() > give_up {
+                eprintln!("[{phase}] GAVE UP after {give_up:?} ({edits} edits)");
+                return None;
+            }
+            if let Some(every) = edit_every {
+                if last_edit.elapsed() >= every {
+                    let path = root.join("pages/gh594-edit.md");
+                    fs::write(&path, format!("- edit {edits} [[{target}]]\n")).unwrap();
+                    let _ = watcher_reconcile(graph, false, vec![path]);
+                    edits += 1;
+                    last_edit = Instant::now();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+
+    // (a) fresh build.
+    let session = Session::open(&root, &database);
+    let fresh = poll(&session.graph, "fresh", None);
+    eprintln!("fresh build answered after {fresh:?}");
+    let mut session = session;
+    session.quiesce(&mut findings);
+    session.close(&mut findings);
+
+    // (b) invalidate the image (a config change forces a rebuild), then quit
+    // part-way through that rebuild.
+    fs::create_dir_all(root.join("logseq")).unwrap();
+    let config_path = root.join("logseq/config.edn");
+    let mut config = fs::read_to_string(&config_path).unwrap_or_else(|_| "{}".into());
+    config.push_str("\n;; gh594 digest change\n");
+    fs::write(&config_path, &config).unwrap();
+    let session = Session::open(&root, &database);
+    std::thread::sleep(abrupt_after);
+    eprintln!(
+        "[abrupt] closing after {abrupt_after:?}; linked read now: {:?}",
+        session
+            .graph
+            .backlinks_bounded_indexed(&target, 100, 1 << 20)
+            .map(|a| a.total)
+    );
+    session.close_abruptly(&mut findings);
+
+    // (c) reopen after the abrupt close, with an edit every 5 s meanwhile.
+    let mut session = Session::open(&root, &database);
+    let reopened = poll(&session.graph, "reopen+edits", Some(Duration::from_secs(5)));
+    eprintln!("reopen after abrupt close answered after {reopened:?}");
+    session.quiesce(&mut findings);
+    session.close(&mut findings);
+    eprintln!("findings: {findings:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// GH #594 (diagnosis, local only): the first launch after an upgrade owes a
+/// fresh build; the user keeps editing through the app while it runs. Does
+/// readiness arrive? `TINE_GH594_ROOT` names a graph to COPY; the copy has
+/// no index, as after a schema change. `TINE_GH594_SAVE_MS` is the interval
+/// between app-path saves (0: none), `TINE_GH594_RENAME_SECS` between
+/// renames (0: none). Prints a readiness timeline and panics if the index is
+/// still not ready after `TINE_GH594_GIVE_UP_SECS`.
+#[test]
+#[ignore = "GH #594 scale diagnosis"]
+fn gh594_fresh_build_with_app_edits_becomes_ready() {
+    let Some(source) = std::env::var_os("TINE_GH594_ROOT") else {
+        eprintln!("TINE_GH594_ROOT unset; skipping");
+        return;
+    };
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let save_every = Duration::from_millis(env("TINE_GH594_SAVE_MS", 2_000));
+    let rename_every = Duration::from_secs(env("TINE_GH594_RENAME_SECS", 0));
+    let give_up = Duration::from_secs(env("TINE_GH594_GIVE_UP_SECS", 600));
+    if env("TINE_GH594_DIAG", 0) == 1 {
+        crate::backend_error::set_runtime_debug_diagnostics(true);
+    }
+    let root = scratch("gh594-fresh");
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(format!("{}/.", Path::new(&source).display()))
+        .arg(&root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let database = root.join("private/projection.sqlite");
+    let _ = fs::remove_file(&database);
+    let mut findings = Vec::new();
+    let session = Session::open(&root, &database);
+    let graph = Arc::clone(&session.graph);
+    let started = Instant::now();
+    let mut last_state = String::new();
+    let mut last_save = Instant::now();
+    let mut last_rename = Instant::now();
+    let (mut saves, mut renames) = (0usize, 0usize);
+    let mut rename_from = "Topic 509 note".to_owned();
+    let ready_after = loop {
+        let generation = graph.cache_generation();
+        let projection = graph.direct_projection_test().unwrap();
+        let progress = format!("{:?}", projection.progress_at(generation));
+        let state = format!("{progress} | {}", projection.debug_state_test());
+        // Print on a change of the progress answer or the queue's shape, not
+        // on every generation move.
+        let shape: String = state
+            .split(' ')
+            .filter(|field| {
+                !field.starts_with("latest_generation=")
+                    && !field.starts_with("ready_generation=")
+                    && !field.starts_with("floor=")
+                    && !field.starts_with("applied=")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if shape != last_state {
+            eprintln!(
+                "[+{:>7.1}s saves={saves} renames={renames} gen={generation}] {state}",
+                started.elapsed().as_secs_f64()
+            );
+            last_state = shape;
+        }
+        if progress == "Ready" {
+            break Some(started.elapsed());
+        }
+        if started.elapsed() > give_up {
+            break None;
+        }
+        if !save_every.is_zero() && last_save.elapsed() >= save_every {
+            let name = ["Topic 5089 plan", "Topic 5090 sketch", "Topic 5091 outline"][saves % 3]
+                .to_owned();
+            save_existing(
+                &graph,
+                &name,
+                &format!("- gh594 save {saves} [[Area 0/Topic 0]]\n- TODO gh594 {saves}\n"),
+            );
+            saves += 1;
+            last_save = Instant::now();
+        }
+        if !rename_every.is_zero() && last_rename.elapsed() >= rename_every {
+            let to = format!("gh594 renamed {renames}");
+            let begun = Instant::now();
+            match graph.rename_page(&rename_from, &to) {
+                Ok(_) => {
+                    eprintln!(
+                        "[+{:>7.1}s] rename {rename_from:?} -> {to:?} took {:?}",
+                        started.elapsed().as_secs_f64(),
+                        begun.elapsed()
+                    );
+                    rename_from = to;
+                }
+                Err(error) => eprintln!("rename failed: {error}"),
+            }
+            renames += 1;
+            last_rename = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("ready after {ready_after:?} ({saves} saves, {renames} renames)");
+    let session = session;
+    session.stop.store(true, Ordering::Relaxed);
+    session.close_abruptly(&mut findings);
+    let _ = &mut findings;
+    eprintln!("findings: {findings:?}");
+    let _ = fs::remove_dir_all(&root);
+    assert!(
+        ready_after.is_some(),
+        "the index was still not ready after {give_up:?} ({saves} saves, {renames} renames)"
+    );
+}
+
+// The GH #594 stuck-state diagnosis (a fresh build failing with os error 32
+// forever while progress said Recovering) is now the liveness test
+// `gh594_liveness::gh594_a_build_that_always_fails_ends_failed_and_panels_say_so`.

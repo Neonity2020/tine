@@ -84,6 +84,14 @@ describe("renderedBlockText", () => {
     ).toBe("see Referenced first line\nsecond line");
   });
 
+  // GH #589: an unresolved reference reads as its source text, as OG shows
+  // it; `(((uuid)))` parses as the id `(uuid` followed by `)`.
+  it("renders an unresolved block ref as its full source text", () => {
+    const miss: RenderedTextOptions = { ...O, resolveBlockRef: () => null };
+    expect(renderedBlockText(`see ((${REF_ID}))`, "md", miss)).toBe(`see ((${REF_ID}))`);
+    expect(renderedBlockText(`(((${REF_ID})))`, "md", miss)).toBe(`(((${REF_ID})))`);
+  });
+
   it("keeps labeled block refs as labels and does not consult the resolver", () => {
     let calls = 0;
     expect(

@@ -61,7 +61,11 @@ fn projection_statement_sites_are_pinned() {
     }
     let expected: BTreeMap<String, usize> = [
         // P3B unified the page/block plain-reference candidates at one statement site.
-        ("crates/tine-core/src/direct_projection.rs", 3),
+        // 3 → 5 (GH #594 R3, 2026-09-24): explicit reference candidates read
+        // each block's structural identity (result_id, order_key) through the
+        // shared statement door, and a result's identity capture reads the
+        // stored source revisions inside the same snapshot.
+        ("crates/tine-core/src/direct_projection.rs", 5),
         // GH #543 (decision DK4): a fresh build reads back the pages it
         // carries over from the image it replaces.
         ("crates/tine-core/src/direct_projection/carried.rs", 2),

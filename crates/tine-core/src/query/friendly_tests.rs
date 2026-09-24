@@ -2,9 +2,7 @@
 //! packet intentionally does not execute them; the manager runs them after
 //! wiring the public adapters on the combined exact head.
 
-use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 
 use tine_storage::sqlite::PhysicalProjectionQuerySnapshot;
 
@@ -78,10 +76,7 @@ fn friendly_main_reader_matches_the_independent_walk_for_rank_and_identity_shape
         QueryPlan::friendly("alpha OR Café", 8, 8),
         QueryPlan::friendly("-draft", 8, 8),
     ];
-    let structural = ResultIdentity {
-        session_pages: Arc::new(HashSet::new()),
-        all_session: false,
-    };
+    let structural = ResultIdentity::structural();
     for plan in &plans {
         let expected = plan.execute_with_explain(&corpus.graph, || false, true);
         let stored = read(&corpus, plan, &ResultIdentity::session_owned())
@@ -506,10 +501,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let root = scratch("q3-friendly-scope");
     write_membership_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let structural = ResultIdentity {
-        session_pages: Arc::new(HashSet::new()),
-        all_session: false,
-    };
+    let structural = ResultIdentity::structural();
 
     // ---- Names: exactly the name and alias owners, and NOTHING body-only ----
     let names = read_with(
@@ -1083,7 +1075,7 @@ fn interactive_block_ids(corpus: &Corpus, plan: &QueryPlan) -> Vec<i64> {
     let ids = interactive_verified_block_ids(&mut snapshot, plan, branch, window, &None)
         .expect("interactive candidate cursor answers");
     snapshot.finish();
-    ids
+    ids.ids
 }
 
 #[test]
@@ -1590,4 +1582,51 @@ fn page_rank_composite_key_preserves_candidates_and_ranks_each_once() {
             "{query} must retain its title/alias/virtual winner and tie behavior: {answer:#?}"
         );
     }
+}
+
+/// GH #543 Ctrl-K: a needle under three characters has no trigram index to
+/// drive it, so the interactive read scans blocks newest first. A pair only
+/// the oldest block contains made that scan visit every block in the graph
+/// (~1.5 s per keystroke at 616k blocks). It now stops at
+/// `INTERACTIVE_SCAN_BUDGET` rows and says more matches may exist; a recent
+/// match still answers.
+#[test]
+fn an_unindexed_interactive_scan_stops_at_its_budget_and_says_so() {
+    let _serial = serialize();
+    let root = scratch("friendly-scan-budget");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let mut body = String::from("- zq oldest\n");
+    for at in 0..INTERACTIVE_SCAN_BUDGET + 50 {
+        body.push_str(&format!("- plain {at}\n"));
+    }
+    body.push_str("- xj newest\n");
+    std::fs::write(root.join("pages/Many.md"), body).expect("many page");
+    let corpus = Corpus::open(root, true);
+    let plan = |needle: &str| {
+        crate::query_plan::friendly_search_plan_for(
+            needle,
+            0,
+            10,
+            None,
+            crate::query_plan::FriendlyDisplayOptions::default(),
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        )
+    };
+
+    reset_friendly_read_census();
+    let old = read(&corpus, &plan("zq"), &ResultIdentity::session_owned()).expect("old pair");
+    let census = friendly_read_census();
+    assert!(
+        census.block_candidate_visits <= INTERACTIVE_SCAN_BUDGET + 1,
+        "the scan visited {} rows",
+        census.block_candidate_visits
+    );
+    assert!(old.hits.is_empty(), "the oldest block lies past the budget");
+    assert!(old.has_more.blocks, "a stopped scan says more may match");
+
+    let recent = read(&corpus, &plan("xj"), &ResultIdentity::session_owned()).expect("new pair");
+    assert!(matches!(
+        recent.hits.first(),
+        Some(QueryHit::Block { display_text, .. }) if display_text == "xj newest"
+    ));
 }

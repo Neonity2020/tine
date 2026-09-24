@@ -18,7 +18,7 @@
 //! artifact — difference lines carry a shape source, an index and a field name,
 //! and nothing else, so the `#[ignore]`d real-corpus twins are safe to run.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -523,10 +523,7 @@ fn a_fresh_direct_session_resolves_the_same_ids_structurally() {
     let root = scratch("r3-structural");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let identity = ResultIdentity {
-        session_pages: Arc::new(HashSet::new()),
-        all_session: false,
-    };
+    let identity = ResultIdentity::structural();
     let (differences, rows) = parity_over(&corpus, &identity);
     assert!(
         rows > 0,
@@ -551,13 +548,7 @@ fn the_database_result_equals_the_walk_over_a_real_corpus() {
     };
     let corpus = Corpus::open(PathBuf::from(&root), false);
     let (stored, rows) = parity_over(&corpus, &ResultIdentity::session_owned());
-    let (structural, _) = parity_over(
-        &corpus,
-        &ResultIdentity {
-            session_pages: Arc::new(HashSet::new()),
-            all_session: false,
-        },
-    );
+    let (structural, _) = parity_over(&corpus, &ResultIdentity::structural());
     eprintln!(
         "r3_result_read_over_a_real_corpus shapes={} admitted_rows={rows} \
          stored_disagreements={} structural_disagreements={}",
@@ -2218,14 +2209,25 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
         .collect();
     assert!(!walk_ids.is_empty(), "the identity fixture matches nothing");
 
-    // The page IS in the session set: its rows keep the PRESERVED id, and the
-    // stored estimate (which already describes that id) is used unchanged.
-    // Every OTHER page still resolves structurally, which is the same decision
-    // taken per page and not per read.
-    let mut session = HashSet::new();
-    session.insert(page_id);
+    // The page's live ids are recorded as exceptions (R3): its rows answer
+    // the live id, with the identity term of the estimate moved to it. Every
+    // OTHER page still resolves structurally, the same decision taken per
+    // block and not per read.
+    let live = walk
+        .groups
+        .iter()
+        .filter(|group| group.page == "regex")
+        .flat_map(|group| group.blocks.iter())
+        .map(|block| (block.id.clone(), format!("{{{}}}", block.id)))
+        .collect();
     let preserved = read(&ResultIdentity {
-        session_pages: Arc::new(session),
+        live: Arc::new(HashMap::from([(
+            page_id,
+            Arc::new(crate::query::results::PageLiveIds {
+                revision: String::new(),
+                ids: live,
+            }),
+        )])),
         all_session: false,
     })
     .expect("the session-owned read answers");
@@ -2263,11 +2265,7 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
 
     // `all_session` takes the same decision for every page at once: the stored
     // id everywhere, which is the rewritten one where it was rewritten.
-    let all = read(&ResultIdentity {
-        session_pages: Arc::new(HashSet::new()),
-        all_session: true,
-    })
-    .expect("the all-session read answers");
+    let all = read(&ResultIdentity::session_owned()).expect("the all-session read answers");
     assert_eq!(
         all.groups
             .iter()
@@ -2279,11 +2277,7 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
     // The page is NOT in the session set: its rows resolve STRUCTURALLY back
     // to the walk's ids, and the identity-term adjustment (38 bytes out, 36
     // in) has to be exact or `emit_batch`'s estimate check fails the read.
-    let structural = read(&ResultIdentity {
-        session_pages: Arc::new(HashSet::new()),
-        all_session: false,
-    })
-    .expect("the fresh-session read answers");
+    let structural = read(&ResultIdentity::structural()).expect("the fresh-session read answers");
     assert_eq!(
         structural
             .groups
@@ -2333,10 +2327,7 @@ fn an_impossible_stored_estimate_fails_the_read() {
         &mut snapshot,
         &ResultReadInputs {
             statement: &statement,
-            identity: &ResultIdentity {
-                session_pages: Arc::new(HashSet::new()),
-                all_session: false,
-            },
+            identity: &ResultIdentity::structural(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
             profile: ConstructionProfile::default(),
