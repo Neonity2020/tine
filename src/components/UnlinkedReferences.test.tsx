@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
-import { backend } from "../backend";
+import { backend, QueryUnavailableError } from "../backend";
 import type { RefGroup } from "../types";
 import { resetStore, setDoc } from "../store";
 import { editingId, endEdit } from "../editorController";
@@ -217,6 +217,26 @@ describe("Unlinked References evidence and disclosure (GH #144/#145)", () => {
     expect(root.querySelector<HTMLElement>('[role="alert"]')?.textContent).toContain(
       "bounded result limit was exceeded"
     );
+    dispose();
+  });
+
+  // GH #594 (index liveness L4).
+  it("shows a failed index with its code, Retry and the diagnostic report", async () => {
+    vi.spyOn(backend(), "getUnlinkedRefs").mockRejectedValue(
+      new QueryUnavailableError("index_failed", "The index couldn't be built.", "disk_full")
+    );
+    const retry = vi.spyOn(backend(), "retryIndex").mockResolvedValue();
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <UnlinkedReferences name="Target" />, root);
+
+    root.querySelector<HTMLElement>(".references-header")!.click();
+    await vi.waitFor(() => {
+      expect(root.querySelector('[role="alert"]')?.textContent).toContain("code: disk_full");
+    });
+    expect(root.querySelector(".index-failed-report")?.textContent).toBe("Create diagnostic report");
+    root.querySelector<HTMLButtonElement>(".index-failed-retry")!.click();
+    expect(retry).toHaveBeenCalledTimes(1);
     dispose();
   });
 
