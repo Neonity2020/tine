@@ -1622,3 +1622,349 @@ fn gh543_a_retired_graphs_owner_runs_no_more_passes() {
     let _ = fs::remove_dir_all(&root);
     assert_eq!(passes, 0, "the owner walked a retired graph");
 }
+
+/// GH #594 scale repro (diagnosis, local only): on a large graph, the linked
+/// references read must eventually answer after (a) a fresh build, (b) an
+/// abrupt close part-way through a build, and (c) edits during the reopen's
+/// catch-up. `TINE_GH594_ROOT` names a graph to COPY (it is not modified);
+/// `TINE_GH594_TARGET` the page whose references are read. Prints a readiness
+/// timeline instead of asserting a bound, since the bound is what we measure.
+#[test]
+#[ignore = "GH #594 scale diagnosis"]
+fn gh594_scale_references_answer_after_abrupt_restart() {
+    let Some(source) = std::env::var_os("TINE_GH594_ROOT") else {
+        eprintln!("TINE_GH594_ROOT unset; skipping");
+        return;
+    };
+    let target = std::env::var("TINE_GH594_TARGET").unwrap_or_else(|_| "Area 0/Topic 0".into());
+    let abrupt_after = Duration::from_secs(
+        std::env::var("TINE_GH594_ABRUPT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20),
+    );
+    let give_up = Duration::from_secs(
+        std::env::var("TINE_GH594_GIVE_UP_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(1800),
+    );
+    let root = scratch("gh594-scale");
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(format!("{}/.", Path::new(&source).display()))
+        .arg(&root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let database = root.join("private/projection.sqlite");
+    let mut findings = Vec::new();
+
+    // Poll the panel's read until it answers; print each reason change.
+    let poll = |graph: &Graph, phase: &str, edit_every: Option<Duration>| -> Option<Duration> {
+        let started = Instant::now();
+        let mut last = String::new();
+        let mut last_edit = Instant::now();
+        let mut edits = 0usize;
+        loop {
+            let answer = graph.backlinks_bounded_indexed(&target, 100, 1 << 20);
+            let unlinked = graph.unlinked_refs_bounded_indexed(&target, 100, 1 << 20);
+            let now = match (&answer, &unlinked) {
+                (Ok(a), Ok(u)) => format!("ANSWERED linked={} unlinked={}", a.total, u.total),
+                (a, u) => format!(
+                    "linked={:?} unlinked={:?}",
+                    a.as_ref().err().map(|e| e.to_string()),
+                    u.as_ref().err().map(|e| e.to_string())
+                ),
+            };
+            if now != last {
+                eprintln!("[{phase} +{:>7.1}s] {now}", started.elapsed().as_secs_f64());
+                last = now.clone();
+            }
+            if answer.is_ok() && unlinked.is_ok() {
+                return Some(started.elapsed());
+            }
+            if started.elapsed() > give_up {
+                eprintln!("[{phase}] GAVE UP after {give_up:?} ({edits} edits)");
+                return None;
+            }
+            if let Some(every) = edit_every {
+                if last_edit.elapsed() >= every {
+                    let path = root.join("pages/gh594-edit.md");
+                    fs::write(&path, format!("- edit {edits} [[{target}]]\n")).unwrap();
+                    let _ = watcher_reconcile(graph, false, vec![path]);
+                    edits += 1;
+                    last_edit = Instant::now();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+
+    // (a) fresh build.
+    let session = Session::open(&root, &database);
+    let fresh = poll(&session.graph, "fresh", None);
+    eprintln!("fresh build answered after {fresh:?}");
+    let mut session = session;
+    session.quiesce(&mut findings);
+    session.close(&mut findings);
+
+    // (b) invalidate the image (a config change forces a rebuild), then quit
+    // part-way through that rebuild.
+    fs::create_dir_all(root.join("logseq")).unwrap();
+    let config_path = root.join("logseq/config.edn");
+    let mut config = fs::read_to_string(&config_path).unwrap_or_else(|_| "{}".into());
+    config.push_str("\n;; gh594 digest change\n");
+    fs::write(&config_path, &config).unwrap();
+    let session = Session::open(&root, &database);
+    std::thread::sleep(abrupt_after);
+    eprintln!(
+        "[abrupt] closing after {abrupt_after:?}; linked read now: {:?}",
+        session.graph.backlinks_bounded_indexed(&target, 100, 1 << 20).map(|a| a.total)
+    );
+    session.close_abruptly(&mut findings);
+
+    // (c) reopen after the abrupt close, with an edit every 5 s meanwhile.
+    let mut session = Session::open(&root, &database);
+    let reopened = poll(&session.graph, "reopen+edits", Some(Duration::from_secs(5)));
+    eprintln!("reopen after abrupt close answered after {reopened:?}");
+    session.quiesce(&mut findings);
+    session.close(&mut findings);
+    eprintln!("findings: {findings:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// GH #594 (diagnosis, local only): the first launch after an upgrade owes a
+/// fresh build; the user keeps editing through the app while it runs. Does
+/// readiness arrive? `TINE_GH594_ROOT` names a graph to COPY; the copy has
+/// no index, as after a schema change. `TINE_GH594_SAVE_MS` is the interval
+/// between app-path saves (0: none), `TINE_GH594_RENAME_SECS` between
+/// renames (0: none). Prints a readiness timeline and panics if the index is
+/// still not ready after `TINE_GH594_GIVE_UP_SECS`.
+#[test]
+#[ignore = "GH #594 scale diagnosis"]
+fn gh594_fresh_build_with_app_edits_becomes_ready() {
+    let Some(source) = std::env::var_os("TINE_GH594_ROOT") else {
+        eprintln!("TINE_GH594_ROOT unset; skipping");
+        return;
+    };
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let save_every = Duration::from_millis(env("TINE_GH594_SAVE_MS", 2_000));
+    let rename_every = Duration::from_secs(env("TINE_GH594_RENAME_SECS", 0));
+    let give_up = Duration::from_secs(env("TINE_GH594_GIVE_UP_SECS", 600));
+    if env("TINE_GH594_DIAG", 0) == 1 {
+        crate::backend_error::set_runtime_debug_diagnostics(true);
+    }
+    let root = scratch("gh594-fresh");
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(format!("{}/.", Path::new(&source).display()))
+        .arg(&root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let database = root.join("private/projection.sqlite");
+    let _ = fs::remove_file(&database);
+    let mut findings = Vec::new();
+    let session = Session::open(&root, &database);
+    let graph = Arc::clone(&session.graph);
+    let started = Instant::now();
+    let mut last_state = String::new();
+    let mut last_save = Instant::now();
+    let mut last_rename = Instant::now();
+    let (mut saves, mut renames) = (0usize, 0usize);
+    let mut rename_from = "Topic 509 note".to_owned();
+    let ready_after = loop {
+        let generation = graph.cache_generation();
+        let projection = graph.direct_projection_test().unwrap();
+        let progress = format!("{:?}", projection.progress_at(generation));
+        let state = format!("{progress} | {}", projection.debug_state_test());
+        // Print on a change of the progress answer or the queue's shape, not
+        // on every generation move.
+        let shape: String = state
+            .split(' ')
+            .filter(|field| {
+                !field.starts_with("latest_generation=")
+                    && !field.starts_with("ready_generation=")
+                    && !field.starts_with("floor=")
+                    && !field.starts_with("applied=")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if shape != last_state {
+            eprintln!(
+                "[+{:>7.1}s saves={saves} renames={renames} gen={generation}] {state}",
+                started.elapsed().as_secs_f64()
+            );
+            last_state = shape;
+        }
+        if progress == "Ready" {
+            break Some(started.elapsed());
+        }
+        if started.elapsed() > give_up {
+            break None;
+        }
+        if !save_every.is_zero() && last_save.elapsed() >= save_every {
+            let name = ["Topic 5089 plan", "Topic 5090 sketch", "Topic 5091 outline"]
+                [saves % 3]
+                .to_owned();
+            save_existing(
+                &graph,
+                &name,
+                &format!("- gh594 save {saves} [[Area 0/Topic 0]]\n- TODO gh594 {saves}\n"),
+            );
+            saves += 1;
+            last_save = Instant::now();
+        }
+        if !rename_every.is_zero() && last_rename.elapsed() >= rename_every {
+            let to = format!("gh594 renamed {renames}");
+            let begun = Instant::now();
+            match graph.rename_page(&rename_from, &to) {
+                Ok(_) => {
+                    eprintln!(
+                        "[+{:>7.1}s] rename {rename_from:?} -> {to:?} took {:?}",
+                        started.elapsed().as_secs_f64(),
+                        begun.elapsed()
+                    );
+                    rename_from = to;
+                }
+                Err(error) => eprintln!("rename failed: {error}"),
+            }
+            renames += 1;
+            last_rename = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("ready after {ready_after:?} ({saves} saves, {renames} renames)");
+    let mut session = session;
+    session.stop.store(true, Ordering::Relaxed);
+    session.close_abruptly(&mut findings);
+    let _ = &mut findings;
+    eprintln!("findings: {findings:?}");
+    let _ = fs::remove_dir_all(&root);
+    assert!(
+        ready_after.is_some(),
+        "the index was still not ready after {give_up:?} ({saves} saves, {renames} renames)"
+    );
+}
+
+/// GH #594 root cause: a fresh build that fails for a reason other than a
+/// constraint violation (here a Windows sharing violation at publication) is
+/// retried under the owner backoff forever, and `progress_at` answers
+/// `Working(Recovering)` the whole time (`pending.rebuild && owned` is checked
+/// before the backoff), while `coming()` is false so readers parse the graph
+/// themselves. The user outcome: references and queries never answer.
+#[test]
+#[ignore = "GH #594 diagnosis: fails by design, shows the stuck state"]
+fn gh594_a_repeatedly_failing_fresh_build_reports_recovering_forever() {
+    use super::gh543_r10::{r10_finish, r10_pages, r10_scratch, R10Owner};
+    let bound = Duration::from_secs(
+        std::env::var("TINE_GH594_BOUND_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(40),
+    );
+    let root = r10_scratch("gh594-failing-fresh-build");
+    r10_pages(&root, 40);
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let arming = {
+        let projection = Arc::clone(&projection);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                projection.fail_next_fresh_publication_test(
+                    "The process cannot access the file because it is being used by another \
+                     process. (os error 32)",
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    let owner = R10Owner::start(&graph);
+    let started = Instant::now();
+    let mut last = String::new();
+    let mut ready_after = None;
+    let mut backlinks = Vec::new();
+    let mut coming_false_while_recovering = 0u64;
+    let mut polls_recovering = 0u64;
+    let mut polls = 0u64;
+    while started.elapsed() < bound {
+        let progress = projection.progress_at(graph.cache_generation());
+        let coming = projection.coming();
+        polls += 1;
+        if format!("{progress:?}") == "Ready" {
+            ready_after = Some(started.elapsed());
+            break;
+        }
+        if format!("{progress:?}").contains("Recovering") {
+            polls_recovering += 1;
+            if !coming {
+                coming_false_while_recovering += 1;
+            }
+        }
+        let state = projection.debug_state_test();
+        let shape = format!(
+            "{progress:?} coming={coming} fresh_builds={} {}",
+            projection.fresh_builds_test(),
+            state
+                .split(' ')
+                .filter(|field| ["rebuild=", "need=", "backing_off=", "worker_failed=", "full="]
+                    .iter()
+                    .any(|key| field.starts_with(key)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if shape != last {
+            eprintln!("[+{:>6.1}s] {shape}", started.elapsed().as_secs_f64());
+            last = shape;
+        }
+        if polls == 500 {
+            // The field's two renames: a rename discards the parsed cache,
+            // and with nothing coming the next reads parse the graph.
+            let asked = Instant::now();
+            let renamed = graph.rename_page("p5", "gh594 renamed").map(|_| ());
+            eprintln!(
+                "[+{:>6.1}s] rename p5 -> {renamed:?} in {:?}",
+                started.elapsed().as_secs_f64(),
+                asked.elapsed()
+            );
+        }
+        if polls % 50 == 0 || polls == 501 {
+            let parses_before = graph.consumer_page_parses_test();
+            let asked = Instant::now();
+            let answer = graph
+                .backlinks_bounded_indexed("p1", 100, 1 << 20)
+                .map(|answer| answer.total)
+                .map_err(|error| format!("{error:?}"));
+            let line = format!(
+                "[+{:>6.1}s] get_backlinks(p1) -> {answer:?} in {:?}, consumer parses +{}",
+                started.elapsed().as_secs_f64(),
+                asked.elapsed(),
+                graph.consumer_page_parses_test() - parses_before
+            );
+            eprintln!("{line}");
+            backlinks.push(line);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, Ordering::Release);
+    arming.join().unwrap();
+    let builds = projection.fresh_builds_test();
+    let passes = graph.owner_passes_test();
+    let parses = graph.consumer_page_parses_test();
+    r10_finish(root, graph, owner);
+    eprintln!(
+        "GH594 bound={bound:?} fresh_builds={builds} owner_passes={passes} consumer_parses={parses} \
+         polls={polls} recovering={polls_recovering} recovering_with_nothing_coming={coming_false_while_recovering}"
+    );
+    assert!(
+        ready_after.is_some(),
+        "references and queries stayed not-ready:recovering for {bound:?}: {builds} fresh builds \
+         failed and were retried under the backoff; {coming_false_while_recovering} of \
+         {polls_recovering} Recovering polls had nothing coming"
+    );
+}
