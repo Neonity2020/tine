@@ -7726,6 +7726,34 @@
   "failBefore": "tine-agents/evidence/batch-gh594/necessity-ctrlk.txt (without the budget the scan visited 20052 rows for a pair only the oldest block holds)"
  },
  "notes": "Blocking core operation (latency), Martin's Ctrl-K follow-up to GH #543. A needle under three characters has no trigram index, so the interactive read scanned blocks newest first until 300 verified matches; a rare pair visited every block (~1.5 s at 616k blocks, subagent note 2026-09-24-gh543-ctrlk-latency.md). The scan now stops at INTERACTIVE_SCAN_BUDGET (20,000 rows, ~50 ms at that scale) and sets has_more, which the switcher shows as More matches exist. Each Friendly search also logs on the --debug channel whether the index or a page scan answered it, with its elapsed time, and the interactive cursor logs its visits. A needle with Han, kana or Hangul is exempt from the budget (interactive_scan_budget): one or two characters are an ordinary word there, and the budgeted scan returned 0 of 26 matches for one measured word at 10k pages (subagent note 2026-09-24-ctrlk-0.6.982-parity.md; necessity tine-agents/evidence/batch-ctrlk-cjk/necessity-cjk-budget.txt). Such a needle scans every block, as in v0.6.985; an index for short CJK words is a separate decision. The pre-ready page fallback ranks on the cached fold (visible_lower, asserted equal to canonical_fold by a source test) and builds its page inventory once per cache generation (necessity-inventory-memo.txt: 3 builds for 3 keystrokes before); the frontend readiness retry is capped at 250 ms instead of 800 (necessity-retry-cap.txt)."
+},
+{
+ "id": "REG-CASE-VARIANT-PAGE-NAME-597",
+ "title": "A page opened by a name that differs from its file name only in case opens and can be edited, and is listed once",
+ "family": "filesystem-safety",
+ "sources": {
+  "issues": [
+   597
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "windows",
+  "macos"
+ ],
+ "layer": "unit",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh597_a_case_variant_name_opens_the_file_under_its_disk_spelling",
+   "crates/tine-core/src/model_gh597_tests.rs::gh597_a_case_only_rename_outside_tine_leaves_one_page",
+   "crates/tine-core/src/model_gh597_tests.rs::gh597_a_path_saved_under_another_case_spelling_opens_the_file",
+   "src/components/Page.test.tsx::opens the file under its disk spelling and re-keys the tab and Recent entry"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Blocking core operation. GH #597 (Windows 10, v0.6.985; the reporter also saw it on v0.6.982): with only pages/contents.md on disk, opening \"Contents\" (home page, search, sidebar) failed with \"could not be activated for editing\". Every path built from a page name (the IT-05 and GH #550 by-name fast paths in lookup.rs, graph_text_path_for for activation by name) trusted an existence probe that a case-insensitive filesystem answers for another spelling, so the page was handed out, published and activated as pages/Contents.md, which resolve_rel refuses (path_uses_graph_text_alias) and which added a second page to search. The same probe let the launch check keep a stored row whose file was renamed by case only, and let the checked watcher entry publish an alias spelling. All four now apply the editor boundary's own alias rule: the fast paths fall back to the case-insensitive inventory, activation by name resolves the on-disk spelling, a stored alias spelling counts as gone, and the watcher entry ignores it. Tests check something only where the alias spelling resolves (Windows, default macOS); fail-before and pass-after are the focused hosted Windows runs (evidence tine-agents/evidence/batch-gh597/). macOS is unverified. A tab, Recent or sidebar entry already saved with the alias spelling opens: load_by_path follows a path that differs from the disk spelling only by case, and the page view re-keys every navigation entry to the disk spelling (necessity of the render test: tine-agents/evidence/batch-gh597/necessity-pinned-route.txt)."
 }
 ]
 }

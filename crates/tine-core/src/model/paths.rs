@@ -191,6 +191,26 @@ impl Graph {
         Some(abs)
     }
 
+    /// GH #597: a path saved under another case spelling of its file (a tab,
+    /// Recent entry or sidebar item recorded while Tine handed out
+    /// `pages/Contents.md` for `contents.md`) resolves to the file's spelling
+    /// on disk. Only a spelling that differs from the disk's by case is
+    /// followed, and the result passes [`Self::resolve_rel`] itself.
+    pub(super) fn resolve_rel_disk_spelling(&self, rel: &str) -> Option<PathBuf> {
+        let rel = rel.trim().replace('\\', "/");
+        let canonical_root = fs::canonicalize(&self.root).ok()?;
+        let actual = fs::canonicalize(self.resolve_rel_lexical(&rel)?).ok()?;
+        let disk_rel = actual
+            .strip_prefix(&canonical_root)
+            .ok()?
+            .to_str()?
+            .replace('\\', "/");
+        if disk_rel == rel || disk_rel.to_lowercase() != rel.to_lowercase() {
+            return None;
+        }
+        self.resolve_rel(&disk_rel)
+    }
+
     pub(super) fn resolve_graph_text_rel(
         &self,
         permit: &GraphTextWritePermit,

@@ -741,6 +741,32 @@ impl Graph {
         Ok(variants > 1)
     }
 
+    /// GH #597: a path built from a page name names the page's file only in
+    /// the file's own spelling. On a case- (or normalization-) insensitive
+    /// filesystem `pages/Contents.md` also finds `contents.md`; handing that
+    /// spelling out gives the editor a path `resolve_rel` refuses. Such a hit
+    /// is answered from the inventory, which matches names case-insensitively
+    /// and carries each file's spelling on disk.
+    fn graph_text_as_spelled(
+        &self,
+        permit: &GraphTextWritePermit,
+        found: PathBuf,
+        name: &str,
+        kind: PageKind,
+    ) -> io::Result<PathBuf> {
+        if !path_uses_graph_text_alias(&self.root, &found) {
+            return Ok(found);
+        }
+        self.graph_text_find_entry(permit, name, kind)?
+            .map(|entry| entry.path)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the page's file is not spelled as its name on disk",
+                )
+            })
+    }
+
     pub(super) fn graph_text_path_for(
         &self,
         permit: &GraphTextWritePermit,
@@ -767,14 +793,14 @@ impl Graph {
                     .pages_path()
                     .join(format!("{encoded}.{}", preferred.ext()));
                 if self.graph_text_exists(permit, &primary)? {
-                    return Ok(primary);
+                    return self.graph_text_as_spelled(permit, primary, name, kind);
                 }
                 for alternate in configured_text_variant_paths(&self.pages_path(), &encoded) {
                     if alternate == primary {
                         continue;
                     }
                     if self.graph_text_exists(permit, &alternate)? {
-                        return Ok(alternate);
+                        return self.graph_text_as_spelled(permit, alternate, name, kind);
                     }
                 }
                 Ok(primary)

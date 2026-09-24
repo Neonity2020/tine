@@ -356,6 +356,18 @@ export function PageView(): JSX.Element {
               ? await backend().getPageByPath(r.path)
               : await backend().getPage(r.name, r.pageKind);
             if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
+            // A route pinned to another case spelling of the file (saved while
+            // Tine handed out `pages/Contents.md` for `contents.md`, GH #597)
+            // loads the file under its disk spelling. Re-key every tab, Recent
+            // and sidebar entry to that spelling once, then route there.
+            if (r.path && dto?.path && dto.path !== r.path && dto.kind === r.pageKind
+              && dto.path.toLowerCase() === r.path.toLowerCase()) {
+              const from = { name: r.name, pageKind: r.pageKind, path: r.path };
+              const to = { name: dto.name, pageKind: dto.kind, path: dto.path };
+              renamePageInNavigation(from, to);
+              router.rewritePageTarget(from, to);
+              return;
+            }
             if (r.path && (!dto || dto.path !== r.path || dto.name !== r.name || dto.kind !== r.pageKind)) {
               throw new Error("The selected physical page is no longer available at that path.");
             }

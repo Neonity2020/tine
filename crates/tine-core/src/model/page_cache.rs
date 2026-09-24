@@ -1087,8 +1087,14 @@ impl Graph {
             .filter_map(|rel_path| {
                 let path = self.root.join(&rel_path);
                 // Gone means the read finds no file. A file or directory that
-                // cannot be read keeps its rows.
-                if !matches!(self.graph_text_read_optional_text(permit, &path), Ok(None)) {
+                // cannot be read keeps its rows. GH #597: a stored spelling
+                // that reads only because the filesystem ignores case (the
+                // file was renamed `Contents.md` -> `contents.md`, or a row was
+                // recorded under a name-built spelling) is gone too: the
+                // listing found the file under its own spelling.
+                if !path_uses_graph_text_alias(&self.root, &path)
+                    && !matches!(self.graph_text_read_optional_text(permit, &path), Ok(None))
+                {
                     return None;
                 }
                 Some(crate::direct_projection::PageSetChange::Delete {
