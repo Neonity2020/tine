@@ -5811,6 +5811,7 @@ fn empty_projection_shared() -> ProjectionShared {
         after_sql_commit: Mutex::new(None),
         after_lowering_batch: Mutex::new(None),
         before_fresh_publication: Mutex::new(None),
+        fresh_publication_failure: Mutex::new(None),
         fresh_builds: AtomicU64::new(0),
         after_fresh_publication: Mutex::new(None),
         before_shared_reader_admission: Mutex::new(None),

@@ -460,6 +460,9 @@ struct ProjectionShared {
     after_lowering_batch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_fresh_publication: Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
+    /// Fails every fresh build just before it publishes, while set.
+    #[cfg(test)]
+    fresh_publication_failure: Mutex<Option<String>>,
     /// From-scratch builds this index has started.
     #[cfg(test)]
     fresh_builds: AtomicU64,
@@ -1096,6 +1099,8 @@ impl DirectProjection {
             after_lowering_batch: Mutex::new(None),
             #[cfg(test)]
             before_fresh_publication: Mutex::new(None),
+            #[cfg(test)]
+            fresh_publication_failure: Mutex::new(None),
             #[cfg(test)]
             fresh_builds: AtomicU64::new(0),
             #[cfg(test)]
@@ -3451,6 +3456,10 @@ fn build_and_publish_fresh_projection(
             let hook = shared.before_fresh_publication.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook().map_err(LoweringError::Failed)?;
+            }
+            let failure = shared.fresh_publication_failure.lock().unwrap().clone();
+            if let Some(message) = failure {
+                return Err(LoweringError::Failed(message));
             }
         }
         // This is the cancellation boundary. Once the storage primitive below

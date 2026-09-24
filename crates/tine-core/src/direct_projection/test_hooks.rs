@@ -198,13 +198,12 @@ impl DirectProjection {
         self.shared.fresh_builds.load(Ordering::SeqCst)
     }
 
-    /// Fail the next fresh build just before it publishes, with `message`:
-    /// a deterministic lowering failure (audit R15-08).
+    /// Fail every fresh build just before it publishes, with `message`: a
+    /// deterministic lowering failure (audit R15-08). Persistent rather than
+    /// re-armed, so no build can slip through between two arms under load.
     #[cfg(test)]
-    pub(crate) fn fail_next_fresh_publication_test(&self, message: &str) {
-        let message = message.to_owned();
-        *self.shared.before_fresh_publication.lock().unwrap() =
-            Some(Box::new(move || Err(message)));
+    pub(crate) fn fail_every_fresh_publication_test(&self, message: &str) {
+        *self.shared.fresh_publication_failure.lock().unwrap() = Some(message.to_owned());
     }
 
     /// Hold the next fresh build just before it publishes: the first barrier

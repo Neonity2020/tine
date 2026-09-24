@@ -425,22 +425,9 @@ fn gh543_r15_a_deterministically_failing_fresh_build_is_not_repeated() {
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
     let projection = graph.direct_projection_test().unwrap();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let arming = {
-        let projection = Arc::clone(&projection);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                projection
-                    .fail_next_fresh_publication_test("UNIQUE constraint failed: blocks.result_id");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        })
-    };
+    projection.fail_every_fresh_publication_test("UNIQUE constraint failed: blocks.result_id");
     let owner = R10Owner::start(&graph);
     std::thread::sleep(Duration::from_secs(9));
-    stop.store(true, std::sync::atomic::Ordering::Release);
-    arming.join().unwrap();
     let builds = projection.fresh_builds_test();
     let passes = graph.owner_passes_test();
     let parses = graph.page_build_parses_test();

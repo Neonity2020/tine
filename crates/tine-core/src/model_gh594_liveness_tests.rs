@@ -6,7 +6,6 @@ use super::gh543_r10::{r10_finish, r10_pages, r10_scratch, r10_settle, R10Owner}
 use super::*;
 use crate::direct_projection::ProjectionProgress;
 use crate::query::{IndexFailureClass, QueryExecutionError, QueryUnavailableReason};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,17 +39,7 @@ fn gh594_a_build_that_always_fails_ends_failed_and_panels_say_so() {
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
     let projection = graph.direct_projection_test().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let arming = {
-        let projection = Arc::clone(&projection);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                projection.fail_next_fresh_publication_test(SHARING_VIOLATION);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
+    projection.fail_every_fresh_publication_test(SHARING_VIOLATION);
     let owner = R10Owner::start(&graph);
     let started = Instant::now();
     let mut progress = projection.progress_at(graph.cache_generation());
@@ -68,8 +57,6 @@ fn gh594_a_build_that_always_fails_ends_failed_and_panels_say_so() {
                 .map(|groups| groups.groups.len())
         })
     };
-    stop.store(true, Ordering::Release);
-    arming.join().unwrap();
     let recorded = crate::direct_projection::index_failures_reported_for_test()
         .into_iter()
         .any(|event| event.class == IndexFailureClass::FileInUse && event.terminal);
