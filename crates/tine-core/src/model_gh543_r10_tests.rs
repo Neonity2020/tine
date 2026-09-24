@@ -372,25 +372,17 @@ fn gh543_the_bar_shows_while_readers_wait_for_a_full_repair() {
 fn gh543_a_consumer_parse_starts_no_index_build_during_the_backoff() {
     let (root, graph, owner) = r10_ready_graph("consumer-backoff");
     let projection = graph.direct_projection_test().unwrap();
-    // Every worker turn fails until the owner is backing off.
-    let injecting = Arc::new(AtomicBool::new(true));
-    let injector = {
-        let (projection, injecting) = (Arc::clone(&projection), Arc::clone(&injecting));
-        std::thread::spawn(move || {
-            while injecting.load(Ordering::Acquire) {
-                projection.inject_next_turn_failure_test();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        })
-    };
+    // The first failed turn is retried at once and the second waits out a
+    // backoff, so exactly two failures put the owner in one. (A thread that
+    // re-armed one failure every millisecond lost the race to the immediate
+    // retry under load, and the owner went Ready without backing off.)
+    projection.inject_turn_failures_test(2);
     fs::write(root.join("pages/p1.md"), "- edit that fails to index\n").unwrap();
     let _ = graph.sync_file_checked(&root.join("pages/p1.md"));
     let started = Instant::now();
     while !projection.backing_off() && started.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(5));
     }
-    injecting.store(false, Ordering::Release);
-    injector.join().unwrap();
     assert!(
         projection.backing_off(),
         "precondition: the owner is backing off"
