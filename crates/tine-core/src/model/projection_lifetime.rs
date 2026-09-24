@@ -494,6 +494,12 @@ impl Graph {
     /// R6: parse exactly the named pages for reference/fuzzy hydration when no
     /// parsed cache exists. The documents are returned to the caller and
     /// dropped after use — nothing is installed or retained.
+    ///
+    /// The paths are the index's candidates, a superset hint: a candidate
+    /// that is gone from disk or does not parse is left out, as the page walk
+    /// this read replaces leaves it out. Declining instead sent the caller to
+    /// that walk, a whole-graph parse per reference panel, for as long as one
+    /// page stayed unparseable or a delete stayed unreported (GH #594 L6).
     pub(super) fn parse_pages_on_demand(
         &self,
         generation: u64,
@@ -528,14 +534,28 @@ impl Graph {
         let mut pages = Vec::with_capacity(sources.len());
         let config_digest = self.config().parse_config().digest();
         for (relative, projected_revision) in sources {
+            // A revision-checked source (a query's) must decline on any
+            // mismatch; a candidate hint skips a page it cannot hydrate.
+            let hint = projected_revision.is_none();
             let absolute = self.root.join(&relative);
-            let entry = self.graph_inventory_entry(&absolute).ok()??;
+            let Some(entry) = self.graph_inventory_entry(&absolute).ok()? else {
+                if hint {
+                    continue;
+                }
+                return None;
+            };
             if entry.rel_path != relative.to_string_lossy() {
                 return None;
             }
-            let (content, _) = self
+            let Some((content, _)) = self
                 .graph_text_read_optional_text_with_identity(&permit, &entry.path)
-                .ok()??;
+                .ok()?
+            else {
+                if hint {
+                    continue;
+                }
+                return None;
+            };
             if projected_revision.is_some_and(|expected| {
                 crate::direct_projection::projection_source_revision(
                     &content_rev(&content),
@@ -548,11 +568,15 @@ impl Graph {
             self.page_build_test
                 .on_demand_parses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (effective, document, _) =
-                isolate_page_parse(entry, &self.journal_format, |entry| {
-                    Some(self.parse_session_page_content(entry, &content))
-                })
-                .ok()??;
+            let parsed = isolate_page_parse(entry, &self.journal_format, |entry| {
+                Some(self.parse_session_page_content(entry, &content))
+            });
+            let Ok(Some((effective, document, _))) = parsed else {
+                if hint {
+                    continue;
+                }
+                return None;
+            };
             pages.push((effective, Arc::new(document)));
         }
         #[cfg(test)]

@@ -45,6 +45,11 @@ retry.
   waits for index work that is coming at most `DERIVED_READ_PATIENCE` = 60 s,
   shared by every wait inside it (`derived_reads.rs::ReadDeadline`). After that
   it answers the way it answers when nothing is coming: from the parsed pages.
+- When the index is Ready, a reference panel parses only the candidate pages
+  the index names. A candidate the index still lists but that is gone from
+  disk or cannot be parsed is skipped, not a reason to walk every page:
+  candidates are a superset hint. A source whose indexed revision is checked
+  still declines on a mismatch (`parse_pages_on_demand_inner`).
 - A reference panel (Linked or Unlinked References) first asks
   `Graph::reference_readiness`, which waits at most the 250 ms reference wait:
   while the index is Working it is told `not-ready` at once, and once Failed it
@@ -90,4 +95,6 @@ class, attempt number and whether it was terminal
 `model_gh594_liveness_tests.rs` pins: a build that always fails ends Failed
 with its class within the attempts and the panels say so, and a reopen then
 builds it; a derived read answers within its patience while announced work
-never arrives; a reference panel asked while indexing is told at once.
+never arrives; a reference panel asked while indexing is told at once; a
+candidate page that is unparseable or deleted outside Tine parses no other
+page (`gh594_an_unhydratable_candidate_does_not_parse_the_graph`).

@@ -987,7 +987,12 @@ impl Graph {
         let mut pages = Vec::new();
         for relative in paths {
             let path = self.root.join(&relative);
-            let slot = cache_index.by_path.get(&path).copied()?;
+            // A candidate the parsed cache does not hold (gone, or it did not
+            // parse) is absent from the walk this read replaces too: skip it,
+            // as `parse_pages_on_demand` does (GH #594 L6).
+            let Some(slot) = cache_index.by_path.get(&path).copied() else {
+                continue;
+            };
             let page = snapshot.get(slot)?;
             if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
                 return None;

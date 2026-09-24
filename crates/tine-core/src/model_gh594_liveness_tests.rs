@@ -483,3 +483,67 @@ fn gh543_ctrl_k_records_which_path_answered() {
     assert_eq!(search(&graph), Some("index"));
     r10_finish(root, graph, owner);
 }
+
+/// L6 (seeds 1137/1296): a page Tine cannot hydrate (it does not parse, or it
+/// was deleted without the watcher hearing) keeps its index rows, so the
+/// index still names it as a reference candidate. Hydrating the candidates
+/// declined as a whole on that one page, and the panel fell back to parsing
+/// every page in the graph, on every read, while the index was Ready. Now the
+/// page is left out, as the page walk leaves it out, and nothing is parsed
+/// beyond the candidates.
+#[test]
+fn gh594_an_unhydratable_candidate_does_not_parse_the_graph() {
+    for case in [
+        "unparseable-unreported",
+        "unparseable-reported",
+        "deleted-unreported",
+    ] {
+        let root = r10_scratch(&format!("gh594-unhydratable-{case}"));
+        r10_pages(&root, 12);
+        let database = root.join("private/projection.sqlite");
+        super::gh543_r10::r10_prebuild(&root, &database);
+        let graph = Arc::new(Graph::open(&root));
+        graph.attach_direct_projection(database).unwrap();
+        let owner = R10Owner::start(&graph);
+        r10_settle(&graph);
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "{case}: precondition, no parsed cache"
+        );
+        // p0 references p1; p11 references p0.
+        let bad = root.join("pages/p0.md");
+        match case {
+            "deleted-unreported" => fs::remove_file(&bad).unwrap(),
+            _ => fs::write(
+                &bad,
+                format!("- {}\n", super::page_parse::TEST_PAGE_PARSE_PANIC_SENTINEL),
+            )
+            .unwrap(),
+        }
+        if case == "unparseable-reported" {
+            let _ = graph.sync_file_checked(&bad);
+            r10_settle(&graph);
+        }
+        let parses = graph.consumer_page_parses_test();
+        let linked = crate::query::backlinks_bounded_indexed(&*graph, "p1", 100, 1 << 20);
+        let unlinked = crate::query::unlinked_refs_bounded_indexed(&*graph, "p1", 100, 1 << 20);
+        let after = graph.consumer_page_parses_test();
+        assert!(
+            linked.is_ok(),
+            "{case}: linked references answer: {:?}",
+            linked.err()
+        );
+        assert!(
+            unlinked.is_ok(),
+            "{case}: unlinked references answer: {:?}",
+            unlinked.err()
+        );
+        assert_eq!(
+            after,
+            parses,
+            "{case}: the panels parsed {} page(s)",
+            after - parses
+        );
+        r10_finish(root, graph, owner);
+    }
+}

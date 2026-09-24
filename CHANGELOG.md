@@ -29,7 +29,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   attempt is recorded in the diagnostic report as a fixed code with no graph
   content. While the index is still building, Linked References shows
   "indexing…" instead of hiding, and reads that can fall back to the pages
-  themselves, such as the page list, wait at most a minute for the index
+  themselves, such as the page list, wait at most a minute for the index.
+  A page Tine cannot read, or one deleted while Tine was not watching, no
+  longer makes Linked or Unlinked References read every page in the graph
   (GH #594).
 - **Ctrl+K** answers a one- or two-character search in a large graph in a
   fraction of the time: such a search now reads only the most recent blocks

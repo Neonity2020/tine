@@ -3,9 +3,9 @@
 
 use super::*;
 
-/// The path that answered this thread's last Friendly search (test only).
 #[cfg(test)]
 thread_local! {
+    /// The path that answered this thread's last Friendly search (test only).
     pub(crate) static LAST_FRIENDLY_SERVED_BY: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
 }
