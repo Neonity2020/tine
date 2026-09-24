@@ -76,8 +76,8 @@ use debug::{
 use graph::{
     app_platform, approve_external_assets, begin_direct_cross_page_move, capture_graph_binding,
     capture_target, create_graph, default_graph_parent, finish_direct_cross_page_move,
-    indexing_progress, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
-    warm_done,
+    indexing_progress, inspect_graph_access, load_graph, open_graph_window, retry_index,
+    startup_graph_path, warm_done,
 };
 use graph_verification::{
     cancel_graph_verification, create_graph_verification, save_graph_verification_report,
@@ -971,6 +971,7 @@ pub fn run() {
             watcher_latency_recent,
             list_backups,
             restore_backup,
+            retry_index,
             load_session,
             save_session,
             load_workspaces,

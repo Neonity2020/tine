@@ -806,6 +806,20 @@ mod tests {
         assert!(page
             .markdown
             .contains("A panel says it could not load something"));
+        // GH #594 (index liveness L4/L5): a failed index is named, with the
+        // way out and the codes the panel shows.
+        assert!(page
+            .markdown
+            .contains("References or queries say the search index couldn't be built"));
+        assert!(page.markdown.contains("Tine stopped retrying"));
+        for code in [
+            "file_in_use",
+            "disk_full",
+            "permission_denied",
+            "out_of_memory",
+        ] {
+            assert!(page.markdown.contains(&format!("`{code}`")), "{code}");
+        }
         assert!(page.markdown.contains("Use disk version"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page
@@ -1746,7 +1760,9 @@ mod tests {
         // on older macOS, so the remedy is the macOS version, not Safari.
         assert!(page.markdown.contains("Safari 15.4 or later"));
         assert!(page.markdown.contains("macOS 12.3 (Monterey) or later"));
-        assert!(!page.markdown.contains("updating Safari through Software Update"));
+        assert!(!page
+            .markdown
+            .contains("updating Safari through Software Update"));
         assert!(page.markdown.contains("testflight.apple.com/join/rpGGpTVW"));
         assert!(page.markdown.contains("Plugins do not run on iOS yet"));
         assert!(page.markdown.contains("f-droid.org/packages/page.tine.app"));

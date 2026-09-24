@@ -2152,6 +2152,9 @@ export function mockBackend(): Backend {
     async restoreBackup(): Promise<void> {
       notifyGraphRebound();
     },
+    async retryIndex(): Promise<void> {
+      notifyGraphRebound();
+    },
     async loadSession(): Promise<string | null> {
       return mockSession;
     },

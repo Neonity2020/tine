@@ -77,6 +77,8 @@ import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { graphBinding } from "../persistence";
 import { createReadyQueryResource } from "../createReadyQueryResource";
 import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
+import { indexFailureOf } from "../lib/indexFailure";
+import { IndexFailedNotice } from "./IndexFailedNotice";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
@@ -2158,9 +2160,16 @@ export function QueryMacro(props: {
             </Show>
             <Show when={groupsError()}>
               {(message) => (
-                <div class="query-unsupported" role="alert">
-                  {message().lead} {message().message}
-                </div>
+                <Show
+                  when={indexFailureOf(groupResource.error)}
+                  fallback={
+                    <div class="query-unsupported" role="alert">
+                      {message().lead} {message().message}
+                    </div>
+                  }
+                >
+                  {(failure) => <IndexFailedNotice subject="Queries" failure={failure()} />}
+                </Show>
               )}
             </Show>
             <Show when={groupsPending() ?? parsePending() ?? explanationPending()}>

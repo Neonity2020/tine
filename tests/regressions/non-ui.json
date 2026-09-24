@@ -7610,7 +7610,7 @@
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "GH #543 indexing audit round 15, R15-08 (and R15-11's dead-branch residue). A fresh build that failed deterministically was rebuilt on backoff forever, bypassing the contradiction_rebuilt latch. A second ContradictoryRows from a fresh build now marks the worker failed and unavailable, so readers take their ordinary route. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md."
+ "notes": "GH #543 indexing audit round 15, R15-08 (and R15-11's dead-branch residue). A fresh build that failed deterministically was rebuilt on backoff forever, bypassing the contradiction_rebuilt latch. A second ContradictoryRows from a fresh build now marks the worker failed and unavailable, so readers take their ordinary route. Superseded 2026-09-24 by REG-INDEX-LIVENESS-594: every failure class (not only contradictions) now ends in Failed(code) after INDEX_ATTEMPTS = 3; the test asserts builds <= INDEX_ATTEMPTS and progress Failed(constraint). Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md."
 },
 {
  "id": "REG-RENAME-UNREADABLE-REFERRER-NAMED-543",
@@ -7635,6 +7635,39 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 indexing audit round 15, R15-09 (partial). The referrer scan's read error named no file; it now carries the file path. Skipping the unreadable referrer and reporting it, so the rename proceeds, needs a DTO field and a frontend notice and is carded separately. Fail-before: tine-agents/evidence/gh550-batch/indexing-audit-r15/RECEIPT-indexing-audit-r15.md (probe audit543_r15_one_non_utf8_page_does_not_block_every_rename)."
+},
+{
+ "id": "REG-INDEX-LIVENESS-594",
+ "title": "A search index that cannot be built ends in a visible failure with Retry, instead of references and queries staying silently unavailable for the whole session",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   594,
+   543
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend-and-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_build_that_always_fails_ends_failed_and_panels_say_so",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_derived_read_waits_at_most_its_patience",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh594_a_reference_panel_asked_while_indexing_is_told_at_once",
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::index_readiness_contract_matches_the_code",
+   "crates/tine-core/src/query/execution_error.rs::index_failure_classes_read_real_errors",
+   "src-tauri/src/debug.rs::an_index_failure_is_recorded_as_fixed_codes",
+   "src/components/LinkedReferences.test.tsx::shows a failed index with its code, Retry and the diagnostic report",
+   "src/components/LinkedReferences.test.tsx::says it is indexing while the index is not ready, then shows the references"
+  ],
+  "scenario": null,
+  "failBefore": "tine-agents/evidence/batch-gh594/necessity-liveness.txt (derived-read and reference-panel tests hang at c2afaaa0; the stuck-state diagnosis showed Working(Recovering) for 70 s across 8 failed builds; both render tests fail against the pre-change LinkedReferences.tsx)"
+ },
+ "notes": "Blocking core operation. GH #594: on a v0.6.985 first launch the owed index rebuild failed on every attempt; the owner retried under backoff forever while progress_at answered Working(Recovering) and index_work_coming answered nothing-coming, so queries and reference panels failed not-ready 4,673 times with no visible state and the failure reached only stderr (absent on the Windows release binary). Contract docs/contracts/index-readiness.md (L1-L6): L1 a failing build or turn gets INDEX_ATTEMPTS = 3 per session, then Failed(code); a worker that cannot set up is Failed at once; retry only on the user's Retry (retry_index = graph reopen) or next launch. L2 one index_state function feeds progress and coming. L3 derived reads wait at most DERIVED_READ_PATIENCE (60 s, thread-local deadline) then fall back to parsed pages; reference panels ask reference_readiness first (250 ms) and get NotReady or IndexFailed at once; rename/delete warm the page list before taking the identity lock. L4 Linked/Unlinked References and query blocks show IndexFailedNotice (code, Retry, Create diagnostic report); Linked References shows indexing… instead of hiding. L5 IndexFailureClass (13 fixed codes, platform-specific OS error tables) recorded as flight-recorder event index.failure. The reporter's root trigger is still unknown (candidates: 32-bit address space on the x86 build, a persistent Windows sharing violation); L5 exists to identify it. Windows is unverified; L6 remainder (liveness oracle in the interleaving seeds, 13k scale lane, unclean relaunch, schema change) is open."
 }
 ]
 }

@@ -1204,6 +1204,17 @@ pub(crate) fn indexing_progress(
         .indexing_progress())
 }
 
+/// The user's Retry after the index failed (GH #594, index liveness L4):
+/// reopen the graph, which starts a new index worker with a fresh budget of
+/// attempts, exactly as the next launch would.
+#[tauri::command]
+pub(crate) async fn retry_index(
+    state: crate::state::GraphContext<'_>,
+) -> Result<(), crate::command_error::CommandError> {
+    let (app, label, _) = crate::state::owned_graph_context(state)?;
+    crate::state::refresh_graph(app, label, || Ok(())).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

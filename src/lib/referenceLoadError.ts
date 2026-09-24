@@ -11,16 +11,22 @@
  * So: classify for the message we render, and keep the detail for the user who
  * asks for it and for the console.
  */
-export type ReferenceLoadErrorKind = "bounded" | "backend";
+import { indexFailureOf } from "./indexFailure";
+
+export type ReferenceLoadErrorKind = "bounded" | "backend" | "index_failed";
 
 export type ReferenceLoadError = {
   kind: ReferenceLoadErrorKind;
   /** The backend's own message, never discarded. */
   detail: string;
+  /** The index's failure code, for `index_failed` (GH #594). */
+  indexFailure?: string;
 };
 
 export function classifyReferenceLoadError(error: unknown): ReferenceLoadError {
   const detail = error instanceof Error ? error.message : String(error);
+  const indexFailure = indexFailureOf(error);
+  if (indexFailure !== null) return { kind: "index_failed", detail, indexFailure };
   return {
     kind: detail.startsWith("result-too-large:") ? "bounded" : "backend",
     detail,

@@ -10,6 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- When the search index cannot be built, Linked and Unlinked References and
+  query blocks now say so instead of staying empty or "indexing" for the rest
+  of the session. Tine tries a failing build at most three times; after that
+  those panels show "couldn't be built" with a short code, a **Retry** button
+  and **Create diagnostic report**, and a relaunch tries again. Each failed
+  attempt is recorded in the diagnostic report as a fixed code with no graph
+  content. While the index is still building, Linked References shows
+  "indexing…" instead of hiding, and reads that can fall back to the pages
+  themselves, such as the page list, wait at most a minute for the index
+  (GH #594).
 - On a Mac, Tine now declares macOS 12.3 (Monterey) as its minimum, and the
   startup message for a too-old web engine no longer says to update Safari: on
   older macOS, updating the Safari app does not update the engine other apps
