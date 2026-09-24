@@ -385,7 +385,11 @@ the active writer, checkpoints the old WAL, and asks `tine-storage` to
 atomically replace the destination. Core never renames or copies the database
 bytes itself. The unpublished connection alone uses journal and synchronous
 mode OFF; the serving writer is reopened WAL/NORMAL with the resting page-cache
-budget.
+budget, temporary files in memory, and SQLite's inline autocheckpoint off (the
+WAL is capped at 64 MB when it resets). After a turn commits, if the WAL has
+reached 4 MB, a background thread runs one `PRAGMA wal_checkpoint(PASSIVE)` on a
+connection of its own; a drain waits for that thread before a replacement image
+is published. No checkpoint or fsync of the image runs inside a turn (GH #543).
 
 The bounded batches stream through one storage-owned fresh-build transaction.
 Its ordinary secondary indexes are absent for every base chunk; the fresh-only
@@ -401,8 +405,10 @@ the resulting closed finalized-stage token can invoke publication through the
 directory capability bound to the stage's exact regular-file identity at
 construction; callers cannot substitute a same-basename second directory. An
 append error, repeated page/block identity, cancellation, failed finish, or abandoned
-token removes the OFF-mode stage. Active WAL/NORMAL applies retain their
-existing per-apply atomic rollback behavior.
+token removes the OFF-mode stage. On the serving writer a worker turn is one
+transaction however many batches it lowers: a stopped or failed turn commits
+nothing and its marks re-lower every page, and a reader never sees part of a
+turn.
 
 Cancellation is checked between build batches and immediately before the
 storage publication boundary. A stop or failure before that boundary discards

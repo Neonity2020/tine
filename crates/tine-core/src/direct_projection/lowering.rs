@@ -55,9 +55,9 @@ const LOWERING_BATCH: usize = 32;
 /// unreadable page took the in-place repair over the whole graph, 74 s on 10k
 /// pages with a close waiting all of it (audit R11-01), and a bulk external
 /// change queued as page updates was the same one turn. `write` is the only
-/// thing that differs: append to a staged build, or apply to the live image,
-/// where each batch commits its rows with their source revisions, so a
-/// stopped turn resumes from what it wrote. `deletions` go with the first
+/// thing that differs: append to a staged build, or apply to the live image
+/// inside the turn's one transaction (`apply_deltas`), which a stopped turn
+/// rolls back whole. `deletions` go with the first
 /// batch. Progress is reported for work of more than one batch: a single
 /// batch is done before a bar could help.
 pub(super) fn lower_in_batches(

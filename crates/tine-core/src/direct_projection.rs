@@ -292,6 +292,9 @@ struct PendingProjection {
     /// The background integrity check ([`integrity`]) holds a read connection
     /// on the image. A drain waits for it to let go.
     integrity_running: bool,
+    /// The background WAL checkpoint ([`checkpoint`]) holds a connection on
+    /// the image. A drain waits for it to let go.
+    checkpoint_running: bool,
     /// The worker is running a fresh build. Queries do not capture from an
     /// image being replaced.
     building: bool,
@@ -568,6 +571,10 @@ impl ProjectionShared {
         reject_query_captures(captures);
         self.changed.notify_all();
         integrity::cancel_and_wait(self);
+        if !close {
+            // A close replaces nothing: the checkpoint may finish on its own.
+            checkpoint::wait(self);
+        }
         fence
     }
 
@@ -2983,9 +2990,9 @@ fn projection_worker(shared: Arc<ProjectionShared>, launch_config: Option<Arc<Pa
                 shared.ready.store(false, Ordering::Release);
                 // K1: a failed turn owes a new image only when it was building
                 // one (the old image went with it) or the image is damaged.
-                // On an intact image the turn left at most some of its
-                // batches committed, and the marks it returns below re-lower
-                // exactly those pages (audit R11-07). Asked before `pending`:
+                // On an intact image the turn committed nothing (it is one
+                // transaction), and the marks it returns below re-lower its
+                // pages (audit R11-07). Asked before `pending`:
                 // the check reads the image.
                 let failure = match &error {
                     ProjectionRefusal::Failed(message) => {
@@ -3086,6 +3093,7 @@ fn projection_worker(shared: Arc<ProjectionShared>, launch_config: Option<Arc<Pa
         publish_if_current(&shared, &mut pending);
         drop(pending);
         shared.changed.notify_all();
+        checkpoint::start_if_due(&shared);
         // Source-change events may have preceded this commit. Wake the existing
         // application watcher after every serving-image publication, without
         // retaining a query or requiring any edit to be covered by its read.
@@ -3150,7 +3158,20 @@ fn open_existing_projection_database(
         return None;
     }
     let database = PhysicalGraphProjectionDatabase::open_writable(&shared.path).ok()?;
-    database.validate_schema().is_ok().then_some(database)
+    (database.validate_schema().is_ok() && configure_live_writer(&database).is_ok())
+        .then_some(database)
+}
+
+/// The worker's writer applies bounded turns: its statement journals fit in
+/// memory, and a cascaded multi-page delete then writes no second copy of the
+/// pages it touches (16-30 MB per 32-page batch on 10k pages, GH #543).
+/// Its commits never checkpoint the WAL either: [`checkpoint`] copies it on a
+/// thread of its own, so a turn publishes as soon as it commits.
+fn configure_live_writer(database: &PhysicalGraphProjectionDatabase) -> Result<(), String> {
+    database
+        .keep_temporary_files_in_memory()
+        .and_then(|()| database.disable_automatic_checkpoints())
+        .map_err(|error| error.to_string())
 }
 
 const PROJECTION_STAGE_MARKER: &str = ".tine-projection-build-";
@@ -3496,6 +3517,7 @@ fn build_and_publish_fresh_projection(
         database
             .checkpoint_truncate()
             .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        configure_live_writer(&database).map_err(LoweringError::Failed)?;
         database
             .shrink_page_cache_budget(crate::projection_budget::resting_page_cache_budget(
                 text_bytes,
@@ -3546,13 +3568,21 @@ fn apply_deltas(
     let (pages, deletions) = delta_inputs(deltas);
     let mut applied = AppliedTurn::default();
     applied.pages.deleted = deletions.clone();
+    // One transaction for the whole turn: an index page every batch touches
+    // is then written once, not once per batch (GH #543: a 261-page rename
+    // wrote 620 MB as nine transactions). A stopped or failed turn commits
+    // nothing, and its marks re-lower every page.
+    let mut turn = database
+        .begin_turn()
+        .map_err(|error| LoweringError::Failed(error.to_string()))?;
     applied.pages.lowered =
         lower_in_batches(shared, pages, deletions, |change, revisions, aliases| {
-            database
-                .apply_with_source_revisions_and_aliases(&change, &revisions, &aliases)
+            turn.apply_with_source_revisions_and_aliases(&change, &revisions, &aliases)
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         })?;
+    turn.commit()
+        .map_err(|error| LoweringError::Failed(error.to_string()))?;
     Ok(applied)
 }
 
@@ -3646,6 +3676,7 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
 }
 
 mod carried;
+mod checkpoint;
 pub(crate) mod derived_reads;
 mod integrity;
 #[cfg(test)]

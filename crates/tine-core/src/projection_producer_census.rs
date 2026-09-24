@@ -1455,7 +1455,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.28.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.28.1\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1649,10 +1649,16 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `short_word_fts` table, written from the new `short_word_tokens` field
     // inside storage's existing page transaction). Lowering fills one more
     // field; the production import and direct-call inventory is unchanged.
+    // 2026-09-24: GH #543 stabilization pins tine-storage v0.28.1. A worker
+    // turn applies through one `PhysicalGraphProjectionTurn` (one transaction
+    // per turn instead of one per 32 pages); the live writer keeps temporary
+    // files in memory and disables inline autocheckpoints, and a background
+    // thread runs `checkpoint_passive_at` on its own connection. Same writes
+    // and schema; fewer transactions and no fsync inside a turn.
     let digest = inventory_digest(&dependency_surface);
     assert_eq!(
         digest,
-        "0e561394bc9932c9b2b468195578d1d04e11c161669edd6c832403cd15b62dab",
+        "2f62b2b0d2a53880a737ee6c1791d616eb0b9b661e8c919b06a0da213289090e",
         "the complete tine-storage import/direct-call surface changed (digest now {digest}): {dependency_surface:#?}"
     );
 }

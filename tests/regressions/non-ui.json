@@ -5009,12 +5009,76 @@
    "crates/tine-core/tests/gh546_page_header_mid_edit.rs::a_mid_edit_page_header_bullet_is_refused_with_the_typed_data_preservation_code",
    "crates/tine-core/src/model_tests.rs::a_data_preservation_refusal_has_its_own_no_retry_code",
    "src/store.test.ts::is not retried, says so once, offers the draft, and clears when the page saves",
-   "src/persistence.test.ts::does not retry failures a retry cannot change"
+   "src/persistence.test.ts::does not retry failures a retry cannot change",
+   "src-tauri/src/commands/direct_save_helpers.rs::a_data_preservation_refusal_reaches_the_app_as_one"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "Every ProjectionSemanticRefusal (merge markers, a dropped preamble, a page-header property moved into the outline, an Org file that cannot round-trip) reached the frontend as `reason code: unknown`: retried at 100/300 ms, then a transient 'after 3 tries' toast, then a page that silently never saved while each further edit repeated the cycle (GH #546 screenshot; DanTremonti's GH #540 report; the remaining gap after GH #535). The refusal is a verdict on the draft's content, so direct_save_failure_code now maps that marker type to `refused.data_preservation` (no retry) in one arm covering every producer, and the frontend shows one sticky, deduplicated message per page with a Review unsaved action (the close-path recovery panel: Copy draft, Open page), dismissed when the page saves or leaves the working set. Fail-before: the core tests return `unknown`; the store test sees 6 save attempts instead of 4 without the frontend policy change. The firewall itself is unchanged."
+ "notes": "Every ProjectionSemanticRefusal (merge markers, a dropped preamble, a page-header property moved into the outline, an Org file that cannot round-trip) reached the frontend as `reason code: unknown`: retried at 100/300 ms, then a transient 'after 3 tries' toast, then a page that silently never saved while each further edit repeated the cycle (GH #546 screenshot; DanTremonti's GH #540 report; the remaining gap after GH #535). The refusal is a verdict on the draft's content, so direct_save_failure_code now maps that marker type to `refused.data_preservation` (no retry) in one arm covering every producer, and the frontend shows one sticky, deduplicated message per page with a Review unsaved action (the close-path recovery panel: Copy draft, Open page), dismissed when the page saves or leaves the working set. Fail-before: the core tests return `unknown`; the store test sees 6 save attempts instead of 4 without the frontend policy change. The firewall itself is unchanged. CORRECTION 2026-09-24: the v0.6.985 release claim was wrong at the app boundary. Every covering test above called direct_save_failure_code on the bare refusal, but the save command first passes the error through ensure_io, which wraps it as DirectSaveError{Unknown}; the classifier matched the outer tag, so the shipped app still reported `unknown` and retried. direct_save_failure_code now looks through that wrapper. The added src-tauri test drives the command helper on a real conflict-marker page and returned `unknown` before the fix."
+},
+{
+ "id": "REG-SAVE-FAILURE-NAMES-PLATFORM-STEP-538",
+ "title": "A save that fails on the platform says which call failed and with which OS error",
+ "family": "direct-files",
+ "sources": {
+  "issues": [538, 590],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "native",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/commands/direct_save_helpers.rs::a_platform_failure_carries_its_call_and_os_error",
+   "crates/tine-core/src/model_tests.rs::a_platform_failure_keeps_its_call_and_os_error_through_the_save_tag",
+   "src/backendCallFunnel.test.ts::names the failed platform call and OS error in the save-failure message (GH #538)",
+   "src/safeErrorDetail.test.ts::keeps the failed platform call and OS error of a save failure (GH #538)"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #538 (Android) and GH #590: save failures reached the user as `reason code: unknown` with only an io error kind, so the reporter's screenshot could not tell a refused RENAME_NOREPLACE on Android's MediaProvider FUSE (EINVAL) from a permission or disk error. The projection's platform errors now carry a PlatformStepError naming the step (a fixed backend string, never a path), and the save detail sends `operation` and `os_error`; the frontend shows them in the save-failure message and the safe error detail and drops an operation outside its fixed character set. Diagnosis only: this does not make saves succeed on storage that refuses the flag (a separate decision, contract §2.10b), and the cause of GH #590 is not yet known. Fail-before: the src-tauri test found no os_error in the detail before save_os_error looked through the DirectSaveError wrapper."
+},
+{
+ "id": "REG-REFERENCED-NAMES-DIGEST-JS-SAFE-543",
+ "title": "An edit that adds or removes no link does not resend the whole reference-name list",
+ "family": "performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests.rs::the_reference_digest_survives_a_javascript_round_trip"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543. The referenced-names answer short-circuits to `unchanged` when the caller presents the current digest, but the digest was a full-width u64 and came back from JavaScript rounded, so it never matched and every save shipped the whole set (307 KB on the 10,000-page graph). The digest is now kept within Number.MAX_SAFE_INTEGER. Fail-before: the round-trip test fails on the unmasked digest."
+},
+{
+ "id": "REG-INDEX-TURN-WRITE-COST-543",
+ "title": "Renaming a page or an external change to many files does not stall on index writes",
+ "family": "performance",
+ "sources": {
+  "issues": [543],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_a_rename_turn_commits_its_batches_together"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543. A worker turn committed one transaction per 32 pages; each wrote the shared index pages to the WAL again and could run an inline autocheckpoint (two fsyncs), which on Windows made a rename stall for about a minute. A turn is now one transaction (tine-storage v0.28.1 PhysicalGraphProjectionTurn), the live writer keeps temporary files in memory and disables inline autocheckpoints, and a background thread checkpoints passively once the WAL passes 4 MB. The referenced-names reader is an EXISTS over names in index order instead of a DISTINCT join, which under real statistics sorted through a temp B-tree. Measured on the 10,000-page generated graph (Linux, write-side probe): rename 603 -> 200 MB written and 3.2 -> 1.6 s index turn; external change 458 -> 257 MB; 60-block edit 736 -> 420 KB. Fail-before: without the autocheckpoint disable the checkpoint test's image grows 7 MB inline; the plan guard rejects the old DISTINCT-join form under injected statistics. In tine-storage: a_turn_commits_its_applies_together, checkpoints_run_only_where_the_caller_puts_them and paged_navigation_readers_use_an_index_range. Windows wall-clock not yet measured. Remaining cost (about 90 MB of dirty pages per rename, from delete-and-reinsert lowering) is campaign work."
 },
 {
  "id": "REG-LIVE-CONFLICT-REVIEW-AFTER-REVOKE-490",

@@ -2,14 +2,14 @@
   "schema": 1,
   "package": "tine-storage",
   "repository": "https://github.com/martinkoutecky/tine-storage",
-  "version": "0.28.0",
-  "tag": "v0.28.0",
-  "commit": "e14c0712c81d0e40ef010f9b18f5a5376b9cc3b9",
-  "certificationRun": "https://github.com/martinkoutecky/tine-storage/actions/runs/36001111719",
-  "release": "https://github.com/martinkoutecky/tine-storage/releases/tag/v0.28.0",
-  "receiptFile": "tine-storage-v0.28.0.txt",
-  "receiptUrl": "https://github.com/martinkoutecky/tine-storage/releases/download/v0.28.0/certification-receipt.txt",
-  "receiptSha256": "c8e98b62923e331dc78b8649985041ae8bf0f0e4f99fba10d2d2ce8fbe84018f",
+  "version": "0.28.1",
+  "tag": "v0.28.1",
+  "commit": "a590ea64a3194736a94a025737ff0070371a9708",
+  "certificationRun": "https://github.com/martinkoutecky/tine-storage/actions/runs/36051924269",
+  "release": "https://github.com/martinkoutecky/tine-storage/releases/tag/v0.28.1",
+  "receiptFile": "tine-storage-v0.28.1.txt",
+  "receiptUrl": "https://github.com/martinkoutecky/tine-storage/releases/download/v0.28.1/certification-receipt.txt",
+  "receiptSha256": "b7418ce4652516db31d9323f77876de57de20a2c07d1dba922879575a37e6a83",
   "formatManifestSha256": "fd856608cf214bd997a4659a489f3f527b934349b896f79784c8ba854c78809b",
-  "attestation": "https://github.com/martinkoutecky/tine-storage/attestations/49850570"
+  "attestation": "https://github.com/martinkoutecky/tine-storage/attestations/49976738"
 }

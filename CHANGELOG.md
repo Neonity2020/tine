@@ -10,6 +10,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Renaming a page that many pages link to, or a sync tool changing many
+  files at once, no longer holds up searches and references while Tine updates
+  its index. The update is written as one transaction instead of one per 32
+  pages, and copying the index's log into the index file moved off the update
+  onto a background thread. On a 10,000-page graph a rename now writes about
+  a third as much (603 to 200 MB) and finishes in half the time; on Windows,
+  where each of those copies flushed the disk, a rename took about a minute
+  (GH #543). Internal: tine-storage v0.28.1.
+- Typing in a block no longer resends the list of every linked page name to
+  the editor after each save when no link changed: a precision loss in the
+  check made it resend all of it, 307 KB on a 10,000-page graph (GH #543).
+- A save refused to protect data in the file, such as a page with unresolved
+  merge markers or a page-header property moved into the outline, is now
+  reported once and not retried. v0.6.985 said this was fixed, but the app
+  still received the refusal as `unknown` and retried it (GH #535, GH #546).
+- When a save fails because the device refuses a file operation, the message
+  now names the operation and the system's error number, so a report or
+  screenshot tells which step failed (GH #538, GH #590).
+
 - Search no longer treats letters that differ by a mark as the same letter
   where the mark makes a different letter or syllable: `か` no longer finds
   `が`, `и` no longer finds `й`, and in Hindi, Thai or Tibetan a vowel sign

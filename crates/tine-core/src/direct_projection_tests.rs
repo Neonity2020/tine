@@ -11007,3 +11007,77 @@ fn d1_every_tine_platform_knows_its_boot_time() {
         .as_secs() as i64;
     assert!(boot > 0 && boot <= now);
 }
+
+/// A worker turn is one transaction (GH #543). A rename that rewrote 261
+/// referrers used to commit every 32-page batch on its own, writing the shared
+/// index pages to the WAL once per batch (620 MB) and running inline
+/// checkpoints on the worker, ~60 s on a Windows disk. A reader that looks
+/// between two batches must still see the image from before the turn.
+#[test]
+fn gh543_a_rename_turn_commits_its_batches_together() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-one-transaction-turn");
+    std::fs::write(root.join("pages/hub.md"), "- hub\n").unwrap();
+    for index in 0..80 {
+        std::fs::write(
+            root.join("pages").join(format!("referrer-{index:03}.md")),
+            format!("- referrer {index:03} links [[hub]]\n"),
+        )
+        .unwrap();
+    }
+    let database = root.join("private/projection.sqlite");
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+
+    let count_new_name = {
+        let database = database.clone();
+        move || {
+            let reader = rusqlite::Connection::open_with_flags(
+                &database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            reader
+                .query_row(
+                    "SELECT count(*) FROM names WHERE lower(raw) = 'moved hub'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        }
+    };
+    let (seen, between_batches) = mpsc::channel();
+    projection.after_next_lowering_batch_test(Box::new(move || {
+        seen.send(count_new_name()).unwrap();
+    }));
+    graph.rename_page("hub", "moved hub").unwrap();
+    let mid_turn = between_batches
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the rename's turn lowers more than one batch");
+    wait_ready(&graph);
+
+    assert_eq!(
+        mid_turn, 0,
+        "a reader between two batches of one turn saw the turn's rows: the \
+         batches committed separately"
+    );
+    let reader = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let after: i64 = reader
+        .query_row(
+            "SELECT count(*) FROM names WHERE lower(raw) = 'moved hub'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(after > 0, "the committed turn publishes the renamed name");
+    drop(reader);
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
+}
