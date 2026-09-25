@@ -38,7 +38,7 @@ impl DirectProjection {
     pub(crate) fn debug_state_test(&self) -> String {
         let pending = self.shared.pending.lock().unwrap();
         format!(
-            "ready={} validated={} ready_generation={} latest_generation={} floor={} full={} marks={} in_flight={} applied={} rebuild={} building={} stop={} worker_available={} worker_failed={} worker_busy={} need={:?} backing_off={} turn_failed={}",
+            "ready={} validated={} ready_generation={} latest_generation={} floor={} full={} marks={} registry_owed={} in_flight={} applied={} rebuild={} building={} stop={} worker_available={} worker_failed={} worker_busy={} need={:?} backing_off={} turn_failed={}",
             self.shared.ready.load(Ordering::Acquire),
             self.shared.validated.load(Ordering::Acquire),
             self.shared.ready_generation.load(Ordering::Acquire),
@@ -46,6 +46,7 @@ impl DirectProjection {
             pending.floor,
             pending.full.is_some(),
             pending.marks.len(),
+            pending.registry_owed.is_some(),
             pending.in_flight.len(),
             pending.applied.len(),
             pending.rebuild,

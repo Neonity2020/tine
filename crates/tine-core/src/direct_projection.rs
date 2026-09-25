@@ -1323,7 +1323,14 @@ impl DirectProjection {
     /// outlast the bounded wait used by derived-map reads. Returns `false`
     /// when readiness at this generation is no longer coming: a newer
     /// generation, the worker gone or failed, an idle queue that did not
-    /// publish, or `cancelled`.
+    /// publish, owner work next, or `cancelled`.
+    ///
+    /// Owner work next: a rebuild, a validation or a failed index's retry is
+    /// work only an owner pass does, and the worker takes no queued edit while
+    /// a rebuild is owed. The caller is an owner, so waiting would wait on
+    /// itself -- forever when nothing cancels it (the CLI's `warm_cache`; a
+    /// rebuild the integrity check requested beside a queued edit hung a test
+    /// for 600 s).
     #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
     pub(crate) fn wait_until_ready_at(
         &self,
@@ -1341,6 +1348,10 @@ impl DirectProjection {
                 || !self.shared.worker_available.load(Ordering::Acquire)
                 || self.shared.worker_failed.load(Ordering::Acquire)
                 || pending.latest_generation > generation
+                || matches!(
+                    owner::index_need(&self.shared, &pending),
+                    IndexNeed::Fresh | IndexNeed::Validate | IndexNeed::Failed
+                )
             {
                 return false;
             }

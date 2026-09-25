@@ -10916,6 +10916,62 @@ fn d1_damage_found_by_the_background_check_rebuilds_the_index() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// An owner waiting for readiness returns when the next step is owner work.
+/// A rebuild the integrity check requested while an edit was queued left the
+/// edit for the worker, which takes nothing while a rebuild is owed; the
+/// owner that must run the rebuild was the one waiting, so it waited forever
+/// (a CI hang of `d1_damage_found_by_the_background_check_rebuilds_the_index`
+/// at 600 s; the headless CLI's `warm_cache` is the same wait).
+#[test]
+fn a_readiness_wait_returns_when_the_next_step_is_owner_work() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("owner-work-wait");
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+    projection.request_rebuild();
+    let entry = graph
+        .list_pages()
+        .into_iter()
+        .find(|entry| {
+            graph
+                .load_page(entry)
+                .is_ok_and(|page| !page.blocks.is_empty())
+        })
+        .unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "TODO queued behind the rebuild".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    let (answer, answered) = mpsc::channel();
+    {
+        let projection = Arc::clone(&projection);
+        let generation = graph.cache_generation();
+        std::thread::spawn(move || {
+            let _ = answer.send(projection.wait_until_ready_at(generation, &|| false));
+        });
+    }
+    let waited = answered.recv_timeout(Duration::from_secs(5));
+    assert_eq!(
+        waited,
+        Ok(false),
+        "an owner waited for readiness that only an owner pass can bring: {}",
+        projection.debug_state_test()
+    );
+    graph.warm_cache();
+    wait_ready(&graph);
+    assert!(projection_contains(
+        &root.join("private/projection.sqlite"),
+        "TODO queued behind the rebuild"
+    ));
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// D1: closing the graph interrupts a running check and waits for it to let
 /// go of the image (on Windows an open reader blocks a replacement); nothing
 /// is recorded for a check that did not finish.

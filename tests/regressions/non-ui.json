@@ -7846,6 +7846,28 @@
  "notes": "Blocking core operation (latency). ADR 0069 (accepted by Martin 2026-09-24): a one- or two-character needle written entirely in Han, kana or Hangul was exempt from the scan budget and scanned every block (1.5 s per keystroke for a rare word at 616k blocks). tine-storage 0.28.0 adds short_word_fts (schema 31), fed from candidate::short_word_tokens, the unigrams and bigrams of each CJK run of the same folded text, by the router's own script predicate; the planner bounds such needles by it for Ctrl-K, content-match queries and unlinked references. Completeness: every 1-2 scalar CJK substring of indexed text is one of its tokens (property test); candidates are still verified exactly. Mixed short needles and OR arms bounded by different tables keep the unbudgeted scan. Unit cost measured through Tine's writer: +12.4 KB WAL per 1-block CJK edit, +25-33 KB per 60-block CJK edit, 0 without CJK. Shares the FACTS_VERSION 5 / schema 31 rebuild with the search-fold change. Not measured on the 10k CJK graph in Tine."
 },
 {
+ "id": "REG-OWNER-READINESS-WAIT-ON-OWNER-WORK-001",
+ "title": "An index owner waiting for readiness does not wait for work only an owner pass can do",
+ "family": "index-readiness",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Full CI run 36073511057 (v0.6.986 candidate 45d34787): d1_damage_found_by_the_background_check_rebuilds_the_index hung 600 s"
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_readiness_wait_returns_when_the_next_step_is_owner_work",
+   "crates/tine-core/src/direct_projection_tests.rs::d1_damage_found_by_the_background_check_rebuilds_the_index"
+  ],
+  "scenario": null,
+  "failBefore": "a_readiness_wait_returns_when_the_next_step_is_owner_work timed out at 5 s with marks=1 rebuild=true need=Fresh before the fix. A loaded loop of the d1 test (3 workers beside the full tine-core suite) hung 7 times in about 20 minutes, every time inside warm_cache with rebuild=true need=Fresh."
+ },
+ "notes": "Exact availability (no hang). wait_until_ready_at, the owner's unbounded readiness wait (warm_cache: CLI, headless runs, tests), kept waiting while has_work() was true; a queued edit or registry snapshot counts as work, but the worker takes neither while a rebuild is owed, and a rebuild, validation or failed index's retry is owner work. The waiting owner waited on itself. It now returns when the index need is Fresh, Validate or Failed. The integrity check's rebuild request arriving beside queued work exposed it. At 45d34787 the wait's only production caller was the headless CLI's warm_cache (src-tauri/src/cli.rs)."
+},
+{
  "id": "REG-SEARCH-FOLD-KEEPS-LETTER-MARKS-001",
  "title": "Search folds accents but keeps a mark that makes a different letter or syllable",
  "family": "search",
