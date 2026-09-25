@@ -1,5 +1,5 @@
 import { getOwner, onCleanup } from "solid-js";
-import { OperationCancelledError, QueryNotReadyError } from "./backend";
+import { OperationCancelledError, QueryNotReadyError, QueryUnavailableError } from "./backend";
 import { graphMeta, graphTransitioning } from "./ui";
 
 export interface QueryReadinessOwner {
@@ -165,6 +165,39 @@ export async function runQueryWhenReady<T>(
     }
   } finally {
     if (!owner.signal.aborted && owner.isCurrent()) owner.onPending(null);
+  }
+}
+
+/** How long a search shown from the page scan waits before asking a failed
+ *  index again: the backend retries a failed build on a ~100 s cycle. */
+const FAILED_INDEX_RETRY_MS = 30_000;
+
+/** A search that shows the page scan's answer while the index cannot give one,
+ *  then answers from the index (GH #543: the search tab spun on "Rebuilding the
+ *  query index…" for a whole session while Ctrl+K answered).
+ *
+ *  `scan` may answer from the page scan (it says so with `page_scan`); `indexed`
+ *  never does. A scan answer goes to `onScan` and this keeps waiting for the
+ *  index — through a failed index too, which the backend keeps retrying — so
+ *  the caller shows the scan answer meanwhile and the index's answer replaces
+ *  it. The resolved value is always an indexed answer. */
+export async function searchFromScanThenIndex<T extends { page_scan?: boolean }>(
+  scan: () => Promise<T>,
+  indexed: () => Promise<T>,
+  owner: Pick<QueryReadinessOwner, "signal" | "isCurrent">,
+  onScan: (answer: T) => void,
+): Promise<T> {
+  const first = await scan();
+  requireCurrent({ ...owner, onPending: () => {} });
+  if (!first.page_scan) return first;
+  onScan(first);
+  while (true) {
+    try {
+      return await runQueryWhenReady(indexed, { ...owner, onPending: () => {} });
+    } catch (error) {
+      if (!(error instanceof QueryUnavailableError)) throw error;
+      await delay(FAILED_INDEX_RETRY_MS, owner.signal);
+    }
   }
 }
 

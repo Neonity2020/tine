@@ -536,6 +536,9 @@ export interface QueryExecution {
   /** Absent only when talking to an older backend or using an older test fixture. */
   has_more?: { pages: boolean; blocks: boolean };
   cancelled: boolean;
+  /** Answered by a scan of the loaded pages because the index could not: page
+   *  order, no ranking, sort, page-match scope or table rows. Absent otherwise. */
+  page_scan?: boolean;
 }
 
 /** A single routed page used to scope block search. When present, `path` is the

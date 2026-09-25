@@ -72,9 +72,15 @@ is indexing or recovering they walk the parsed pages already in memory, and
 say "indexing…" only when none are loaded, so they never parse beside a
 build. Waiting for pending edits or a busy turn stays "indexing…": the index
 answers it sooner than a walk. v0.6.982 always walked, and on a graph whose
-index fails every build the panels otherwise never answered. Search keeps
-answering from an already-parsed page cache, as it does for any unavailable
-index.
+index fails every build the panels otherwise never answered.
+
+Search answers from an already-parsed page cache while the index is not ready
+or has failed, on the surfaces whose consumer takes it
+(`FriendlyConsumer::answers_before_ready`): Ctrl+K and the search tab. The
+search tab labels that answer (`QueryExecution.page_scan`: page order, no
+ranking, sort, page-match scope or table rows) and keeps asking the index,
+which replaces it when it answers; its Save page validation takes the scan's
+answer too, since it reads only diagnostics and the explanation (GH #543).
 
 ## L5 · Every failure is observable
 

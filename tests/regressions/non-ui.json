@@ -7797,6 +7797,34 @@
  "notes": "Blocking core operation. GH #594: on a v0.6.985 first launch the owed index rebuild failed on every attempt; the owner retried under backoff forever while progress_at answered Working(Recovering) and index_work_coming answered nothing-coming, so queries and reference panels failed not-ready 4,673 times with no visible state and the failure reached only stderr (absent on the Windows release binary). Contract docs/contracts/index-readiness.md (L1-L6): L1 a failing build or turn gets INDEX_ATTEMPTS = 3 per session, then Failed(code); a worker that cannot set up is Failed at once; retry only on the user's Retry (retry_index = graph reopen) or next launch. L2 one index_state function feeds progress and coming. L3 derived reads wait at most DERIVED_READ_PATIENCE (60 s, thread-local deadline) then fall back to parsed pages; reference panels ask reference_readiness first (250 ms) and get NotReady or IndexFailed at once; rename/delete warm the page list before taking the identity lock. L4 query blocks show IndexFailedNotice (code, Retry, Create diagnostic report); since 2026-09-25 (Martin, reversing the 09-24 no-fallback rule) Linked/Unlinked References walk the pages once Failed and walk the already-parsed pages while Indexing/Recovering (never parsing beside a build), because on EllisMorrow's graph the index fails every build and the panels never answered; the interleaving oracle now requires a failed index to answer references exactly as a parse-only graph does. Necessity: gh594_a_build_that_always_fails_ends_failed_and_panels_say_so and ..._answers_from_parsed_pages fail on the pre-change lookup.rs. L5 IndexFailureClass (13 fixed codes, platform-specific OS error tables) recorded as flight-recorder event index.failure. The reporter's root trigger is still unknown (candidates: 32-bit address space on the x86 build, a persistent Windows sharing violation); L5 exists to identify it. Windows is unverified; L6: the interleaving seeds inject 1-4 failed index turns, require every settle to end Ready or Failed(code), require a failed index to answer query and reference reads with IndexFailed within 5 s and recover on relaunch, and compare Linked and Unlinked References per page against a parse-only graph. The oracle found a registry capture waiting out a failure backoff reported as Idle, so readers parsed instead of waiting (seed 5; fixed in index_state; necessity in the evidence file). A long run (800 seeds, 60 steps) then found a Ready-state whole-graph parse: a reference candidate page that could not be parsed, or was deleted outside Tine without a watcher event, made candidate hydration decline as a whole and the panel fell through to walking every page (33/800 seeds). Candidates are a superset hint, so such a page is now skipped; revision-checked sources still decline. Necessity: 12 of 12 pages parsed before the fix. L6 remainder (13k scale lane, unclean relaunch, schema change) is open."
 },
 {
+ "id": "REG-SEARCH-TAB-BEFORE-READY-543",
+ "title": "The search tab shows results while the search index is building or has failed, labelled as a page scan, instead of spinning for the whole session",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   543,
+   594
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend-and-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh594_liveness_tests.rs::gh543_the_search_tab_answers_from_the_pages_while_the_index_cannot",
+   "src/components/QueryWorkspace.test.tsx::shows the page scan's answer while the index cannot answer, then the index's (GH #543)",
+   "src/components/QueryWorkspace.test.tsx::keeps the page scan's answer through a failed index and asks the index again later"
+  ],
+  "scenario": null,
+  "failBefore": "tine-agents/evidence/batch-ellis-usability/necessity-search-tab.txt (both render tests fail against the pre-change QueryWorkspace.tsx)"
+ },
+ "notes": "Blocking core operation. EllisMorrow and Brikas: 'Open search tab' works in v0.6.982, not in v0.6.985/986. v0.6.983 (371241774) moved all search onto the index; v0.6.985 (1f80e35a1) gave Ctrl+K a page-scan fallback and left the tab index-only, so on a graph whose index stayed recovering (Brikas: 275 failed tab searches in one session) or failed (EllisMorrow) the tab never answered. FriendlyConsumer::SearchTab takes the same page-scan answer, flagged QueryExecution.page_scan; the tab labels it (page order, no ranking, sort, page-match scope or table rows) and keeps asking the index (NotReady at the readiness cadence, a failed index every 30 s), replacing the scan answer when the index answers. Save page validation takes the scan answer (diagnostics and explanation only). Query blocks, export and print stay index-only (contract L4). Native: not driven; no way to force a stuck index in the real app. Relation to the index root cause (GH #594) is unchanged: this is the fallback, not the liveness fix."
+},
+{
  "id": "REG-CTRLK-SHORT-SEARCH-SCAN-BUDGET-543",
  "title": "A one- or two-character Ctrl+K search answers promptly in a large graph and says when older blocks may match",
  "family": "search",

@@ -65,6 +65,7 @@ pub(crate) fn friendly_without_read(
         },
         has_more: QueryHasMore::default(),
         cancelled,
+        page_scan: false,
     })
 }
 
@@ -179,6 +180,7 @@ pub(crate) fn read_friendly_results(
             explanation,
             has_more: QueryHasMore::default(),
             cancelled: false,
+            page_scan: false,
         });
     }
     cancelled(snapshot)?;
@@ -358,6 +360,7 @@ pub(crate) fn read_friendly_results(
         explanation,
         has_more,
         cancelled: false,
+        page_scan: false,
     })
 }
 

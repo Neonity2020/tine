@@ -11,6 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Fixed
 
 - Linked and Unlinked References answer again while the search index is building or has failed, by reading the pages as v0.6.982 did. Before, a graph whose index could not be built showed no references for the whole session. Query blocks still wait for the index (GH #594, #543).
+- The search tab ("Open search tab" in Ctrl+K) shows results again while the search index is building or has failed, as it did in v0.6.982. Until the index is ready they come from a scan of your pages, in page order, and the tab says so; they are replaced by the index's results once it answers. Before, the tab showed "Rebuilding the query index…" for as long as the index was not ready, while Ctrl+K worked (GH #543).
 
 ### Changed
 

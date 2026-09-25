@@ -591,6 +591,53 @@ fn gh543_ctrl_k_records_which_path_answered() {
     r10_finish(root, graph, owner);
 }
 
+/// The search tab answers while the index cannot, and says it did (GH #543:
+/// the tab stayed on "Rebuilding the query index…" for a whole session while
+/// Ctrl+K answered). Other non-interactive readers stay index-only (L4), and a
+/// ready index answers the tab itself, unflagged.
+#[test]
+fn gh543_the_search_tab_answers_from_the_pages_while_the_index_cannot() {
+    let search = |graph: &Graph, consumer| {
+        graph.run_graph_search_latest_displayed_for(
+            "query-workspace:t",
+            "TODO",
+            10,
+            10,
+            None,
+            false,
+            crate::query_plan::FriendlyDisplayOptions::default(),
+            consumer,
+        )
+    };
+    use crate::query_plan::FriendlyConsumer::{NonInteractive, SearchTab};
+    let root = r10_scratch("search-tab-before-ready");
+    r10_pages(&root, 4);
+    let unindexed = Graph::open(&root);
+    unindexed.warm_cache();
+    assert!(
+        search(&unindexed, NonInteractive).is_err(),
+        "a non-interactive reader still waits for the index"
+    );
+    let answer = search(&unindexed, SearchTab).expect("the search tab answers");
+    assert!(!answer.hits.is_empty(), "the page scan finds the tasks");
+    assert!(answer.page_scan, "the answer says it came from the page scan");
+    let wire = serde_json::to_value(&answer).unwrap();
+    assert_eq!(wire["page_scan"], serde_json::json!(true));
+    drop(unindexed);
+
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let owner = R10Owner::start(&graph);
+    r10_settle(&graph);
+    let answer = search(&graph, SearchTab).expect("the ready index answers the tab");
+    assert!(!answer.hits.is_empty());
+    assert!(!answer.page_scan, "an indexed answer is not flagged");
+    assert!(serde_json::to_value(&answer).unwrap().get("page_scan").is_none());
+    r10_finish(root, graph, owner);
+}
+
 /// Ctrl-K while the index is not ready answers from the parsed pages. Its
 /// page side (every page, alias and referenced name) cost ~105 ms at 10k
 /// pages and was rebuilt on every keystroke; it is now built once per cache

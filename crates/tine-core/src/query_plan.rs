@@ -151,14 +151,28 @@ pub enum FriendlyConsumer {
     #[default]
     NonInteractive,
     CtrlK,
+    /// The search tab: exhaustive like `NonInteractive`, but it answers from
+    /// the page scan while the index cannot, flagged `page_scan` so the tab
+    /// can say so (GH #543: the tab stayed on "Rebuilding the query index…"
+    /// for a whole session while Ctrl+K answered).
+    SearchTab,
 }
 
 impl FriendlyConsumer {
     pub(crate) const fn candidate_mode(self) -> crate::query::candidate::CandidateMode {
         match self {
-            Self::NonInteractive => crate::query::candidate::CandidateMode::Exhaustive,
+            Self::NonInteractive | Self::SearchTab => {
+                crate::query::candidate::CandidateMode::Exhaustive
+            }
             Self::CtrlK => crate::query::candidate::CandidateMode::interactive(),
         }
+    }
+
+    /// Whether this surface takes the page scan's answer while the index
+    /// cannot give one. Query blocks, export and print do not: they stay
+    /// index-only (index-readiness contract L4).
+    pub(crate) const fn answers_before_ready(self) -> bool {
+        matches!(self, Self::CtrlK | Self::SearchTab)
     }
 }
 
@@ -288,6 +302,11 @@ pub struct QueryExecution {
     pub has_more: QueryHasMore,
     /// A cancelled latest-wins lane returns no partial results.
     pub cancelled: bool,
+    /// Answered by scanning the loaded pages because the index could not:
+    /// matches in page order, without the index's ranking, sort, page-match
+    /// scope or table rows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub page_scan: bool,
 }
 
 /// **The Display facts a Friendly search runs under** (SPEC §7.6, Q3).
@@ -700,6 +719,7 @@ impl QueryPlan {
                 explanation,
                 has_more: QueryHasMore::default(),
                 cancelled: false,
+                page_scan: false,
             };
         }
         let mut hits = Vec::new();
@@ -727,6 +747,7 @@ impl QueryPlan {
             explanation,
             has_more,
             cancelled: false,
+            page_scan: false,
         }
     }
 }
@@ -738,6 +759,7 @@ fn cancelled_execution(plan: &QueryPlan, explanation: QueryExplanation) -> Query
         explanation,
         has_more: QueryHasMore::default(),
         cancelled: true,
+        page_scan: false,
     }
 }
 
@@ -2089,6 +2111,7 @@ pub(crate) fn pre_ready_interactive_snapshot(
             explanation,
             has_more: QueryHasMore::default(),
             cancelled: false,
+            page_scan: false,
         };
     }
 
@@ -2204,6 +2227,7 @@ pub(crate) fn pre_ready_interactive_snapshot(
         explanation,
         has_more,
         cancelled: false,
+        page_scan: true,
     }
 }
 

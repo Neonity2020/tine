@@ -103,7 +103,7 @@ impl Graph {
             &plan,
             explain,
             None,
-            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
+            consumer.answers_before_ready(),
         )
     }
 
@@ -226,7 +226,7 @@ impl Graph {
             &plan,
             explain,
             Some(Arc::new(move || epoch.load(Ordering::Acquire) != mine)),
-            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
+            consumer.answers_before_ready(),
         )
     }
 

@@ -12,6 +12,7 @@ import {
 } from "solid-js";
 import { backend } from "../backend";
 import type {
+  GraphSearchConsumer,
   GraphSearchDisplayOptions,
   QueryResult,
   QueryStatistics,
@@ -46,7 +47,7 @@ import { isSaveConflictFailure } from "../persistence";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
 import { createReadyQueryResource } from "../createReadyQueryResource";
 import { readLatestOr } from "../resourceRead";
-import { runQueryWhenReady } from "../queryReadiness";
+import { runQueryWhenReady, searchFromScanThenIndex } from "../queryReadiness";
 import { onGraphRebound } from "../modeHooks";
 import { markdownRawWithProperty, orgRawWithProperty } from "../editor/properties";
 import {
@@ -113,6 +114,8 @@ export interface MaterializeQueryDependencies {
     lane: string,
     explain: boolean,
     options?: GraphSearchDisplayOptions,
+    /** `search_tab` may answer from the page scan while the index cannot. */
+    consumer?: GraphSearchConsumer,
   ): Promise<QueryExecution>;
 }
 
@@ -257,7 +260,9 @@ export async function materializeQueryWorkspace(
   if (input.sourceKind === "search") {
     try {
       const execution = await runQueryWhenReady(
-        () => deps.runGraphSearch(input.source.trim(), 0, 0, `query-workspace:${input.routeId}:materialize`, true),
+        // Validation reads only the diagnostics and the explanation, which the
+        // page scan answers exactly, so saving does not wait for the index.
+        () => deps.runGraphSearch(input.source.trim(), 0, 0, `query-workspace:${input.routeId}:materialize`, true, undefined, "search_tab"),
         { signal, isCurrent, onPending: () => {} },
       );
       if (!isCurrent()) return superseded();
@@ -330,8 +335,8 @@ function defaultDependencies(): QueryWorkspaceDependencies {
   return {
     getPage: (name, kind) => api.getPage(name, kind),
     savePage: (page, baseRev, force) => api.savePage(page, baseRev, force),
-    runGraphSearch: (source, pageLimit, blockLimit, lane, explain, options) =>
-      api.runGraphSearch(source, pageLimit, blockLimit, lane, explain, undefined, options),
+    runGraphSearch: (source, pageLimit, blockLimit, lane, explain, options, consumer) =>
+      api.runGraphSearch(source, pageLimit, blockLimit, lane, explain, undefined, options, consumer),
     runQuery: async (source, views) => {
       const parsed = await api.parseQuery(source, "og");
       // The effective view of the anchor this query DECLARES (§7.6, Q3). With
@@ -859,8 +864,9 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     blockView: blockView(),
   }));
 
-  const [executionResource, executionPending] = createReadyQueryResource(
-    () => ({
+  /** The page scan's answer, shown while this request waits for the index. */
+  const [scanAnswer, setScanAnswer] = createSignal<{ request: unknown; execution: QueryExecution }>();
+  const executionRequest = createMemo(() => ({
       id: props.route.id,
       source: source().trim(),
       sourceKind: sourceKind(),
@@ -871,19 +877,28 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
       // different questions, and re-using one's answer for the other is how a
       // late result lands on the wrong state (I-20).
       display: JSON.stringify(displayOptions()),
-    }),
-    async (request): Promise<QueryExecution & { statistics?: QueryStatistics }> => {
+  }));
+  const [executionResource, executionPending] = createReadyQueryResource(
+    executionRequest,
+    async (request, signal): Promise<QueryExecution & { statistics?: QueryStatistics }> => {
       if (!request.source) {
         return { hits: [], diagnostics: [], explanation: { branches: [] }, cancelled: false };
       }
       if (request.sourceKind === "search") {
-        return deps().runGraphSearch(
+        const search = (consumer: GraphSearchConsumer) => () => deps().runGraphSearch(
           request.source,
           PAGE_LIMIT,
           BLOCK_LIMIT,
           `query-workspace:${request.id}`,
           request.explain,
           JSON.parse(request.display) as GraphSearchDisplayOptions,
+          consumer,
+        );
+        return searchFromScanThenIndex(
+          search("search_tab"),
+          search("non_interactive"),
+          { signal, isCurrent: () => executionRequest() === request },
+          (execution) => setScanAnswer({ request, execution }),
         );
       }
       if (ADVANCED_QUERY_RE.test(request.source)) {
@@ -924,8 +939,15 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     }
   );
 
+  /** The scan answer for the request still waiting on the index, if any. */
+  const shownScan = () => {
+    const scan = scanAnswer();
+    return executionResource.loading && scan?.request === executionRequest() ? scan.execution : undefined;
+  };
+  /** Waiting with nothing to show: a scan answer on screen is not "Searching…". */
+  const searching = () => executionResource.loading && !shownScan();
   const execution = createMemo<(QueryExecution & { statistics?: QueryStatistics }) | undefined>(
-    (previous) => executionResource.error ? previous : readOr(executionResource, undefined, "query execution"),
+    (previous) => shownScan() ?? (executionResource.error ? previous : readOr(executionResource, undefined, "query execution")),
   );
   const statisticsSummary = createMemo(() => querySummary({ statistics: execution()?.statistics }));
   const hits = () => execution()?.hits ?? [];
@@ -1177,7 +1199,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
 
       <section class="query-workspace-status" aria-live="polite" aria-atomic="true">
         <Show when={!source().trim()}>{sourceKind() === "search" ? "Enter a search to begin." : "Enter a query to begin."}</Show>
-        <Show when={!!source().trim() && executionResource.loading}>{executionPending()?.message ?? "Searching…"}</Show>
+        <Show when={!!source().trim() && searching()}>{executionPending()?.message ?? "Searching…"}</Show>
         <Show when={!!source().trim() && !executionResource.loading && executionResource.error}>
           Search failed: {executionResource.error instanceof Error ? executionResource.error.message : String(executionResource.error)}
         </Show>
@@ -1186,6 +1208,10 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         </Show>
         <Show when={!!source().trim() && !executionResource.loading && !executionResource.error && execution() && !execution()?.cancelled}>
           {hits().length} result{hits().length === 1 ? "" : "s"}
+        </Show>
+        <Show when={!!source().trim() && shownScan()}>
+          {hits().length} result{hits().length === 1 ? "" : "s"} from a scan of your pages, in page order. The search index
+          isn't ready yet; ranking, sorting and table columns return when it is, and these results update then.
         </Show>
       </section>
 
@@ -1220,7 +1246,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         </section>
       </Show>
 
-      <Show when={!executionResource.loading && !executionResource.error && !hits().length && source().trim() && !execution()?.diagnostics.length}>
+      <Show when={!searching() && !executionResource.error && !hits().length && source().trim() && !execution()?.diagnostics.length}>
         <p class="query-workspace-empty">No matching pages or blocks.</p>
       </Show>
 
@@ -1230,10 +1256,10 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
           complete matched set, so a re-sort here would silently replace a
           complete answer with an answer about whatever fitted. */}
       <QueryResultSections
-        pending={() => !!source().trim() && executionResource.loading}
+        pending={() => !!source().trim() && searching()}
         pendingMessage={() => executionPending()?.message ?? "Searching…"}
         failure={() => {
-          if (!source().trim() || executionResource.loading) return null;
+          if (!source().trim() || searching()) return null;
           const error = executionResource.error;
           if (error) {
             return `Search failed: ${error instanceof Error ? error.message : String(error)}`;

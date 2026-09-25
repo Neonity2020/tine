@@ -111,8 +111,8 @@ describe("materializeQueryWorkspace", () => {
     await materializeQueryWorkspace(input, deps);
     await materializeQueryWorkspace(input, deps);
     expect(validate).toHaveBeenCalledTimes(2);
-    expect(validate).toHaveBeenNthCalledWith(1, "alpha", 0, 0, "query-workspace:query-stable:materialize", true);
-    expect(validate).toHaveBeenNthCalledWith(2, "alpha", 0, 0, "query-workspace:query-stable:materialize", true);
+    expect(validate).toHaveBeenNthCalledWith(1, "alpha", 0, 0, "query-workspace:query-stable:materialize", true, undefined, "search_tab");
+    expect(validate).toHaveBeenNthCalledWith(2, "alpha", 0, 0, "query-workspace:query-stable:materialize", true, undefined, "search_tab");
 
     const blank = materializeDeps();
     await materializeQueryWorkspace({ ...input, source: "   " }, blank);
@@ -124,7 +124,7 @@ describe("materializeQueryWorkspace", () => {
     const input = { title: "Unsafe", sourceKind: "search" as const, source: "/(unclosed/", presentation: "search" as const, routeId: "query-rejected" };
     const diagnostic = materializeDeps({ runGraphSearch: vi.fn(async () => ({ hits: [], diagnostics: [{ code: "invalid_regex", message: "invalid regex" }], explanation: { branches: [] }, cancelled: false })) });
     await materializeQueryWorkspace(input, diagnostic);
-    expect(diagnostic.runGraphSearch).toHaveBeenCalledWith("/(unclosed/", 0, 0, "query-workspace:query-rejected:materialize", true);
+    expect(diagnostic.runGraphSearch).toHaveBeenCalledWith("/(unclosed/", 0, 0, "query-workspace:query-rejected:materialize", true, undefined, "search_tab");
     expect(diagnostic.getPage).not.toHaveBeenCalled(); expect(diagnostic.savePage).not.toHaveBeenCalled();
     const cancelled = materializeDeps({ runGraphSearch: vi.fn(async () => ({ hits: [], diagnostics: [], explanation: { branches: [] }, cancelled: true })) });
     await materializeQueryWorkspace({ ...input, source: "alpha" }, cancelled);
@@ -477,6 +477,62 @@ describe("QueryWorkspace", () => {
     } finally { dispose(); }
   });
 
+  it("shows the page scan's answer while the index cannot answer, then the index's (GH #543)", async () => {
+    // The field symptom: the tab spun on "Rebuilding the query index…" for a
+    // whole session while Ctrl+K, which may answer from the page scan, worked.
+    const route: QueryRoute = { kind: "query", id: "scan-then-index", sourceKind: "search", source: "alpha", presentation: "search" };
+    const deps = workspaceDeps();
+    const { wait, open } = gate();
+    const scanned: QueryExecution = {
+      ...executionFixture(false),
+      hits: [executionFixture(false).hits[1]],
+      page_scan: true,
+    };
+    deps.runGraphSearch = vi.fn(async (_source, _pageLimit, _blockLimit, _lane, _explain, _options, consumer) => {
+      if (consumer === "search_tab") return scanned;
+      await wait;
+      return executionFixture(false);
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await waitFor(() => expect(text(root, ".query-workspace-status")).toContain("1 result from a scan of your pages"));
+      expect(root.textContent).toContain("An alpha result");
+      expect(root.textContent).not.toContain("Searching…");
+      expect(root.textContent).not.toContain("Alpha notes");
+      open();
+      await waitFor(() => expect(root.textContent).toContain("Alpha notes"));
+      expect(text(root, ".query-workspace-status")).toContain("2 results");
+      expect(text(root, ".query-workspace-status")).not.toContain("scan of your pages");
+    } finally { dispose(); }
+  });
+
+  it("keeps the page scan's answer through a failed index and asks the index again later", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const route: QueryRoute = { kind: "query", id: "scan-failed-index", sourceKind: "search", source: "alpha", presentation: "search" };
+    const deps = workspaceDeps();
+    let indexed = 0;
+    deps.runGraphSearch = vi.fn(async (_source, _pageLimit, _blockLimit, _lane, _explain, _options, consumer) => {
+      if (consumer === "search_tab") return { ...executionFixture(false), page_scan: true };
+      indexed += 1;
+      if (indexed === 1) throw new QueryUnavailableError("index_failed", "The search index could not be built.", "other");
+      return executionFixture(false);
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await waitFor(() => expect(indexed).toBe(1));
+      expect(text(root, ".query-workspace-status")).toContain("from a scan of your pages");
+      expect(root.textContent).not.toContain("Search failed");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await waitFor(() => expect(text(root, ".query-workspace-status")).not.toContain("scan of your pages"));
+      expect(indexed).toBe(2);
+      expect(text(root, ".query-workspace-status")).toContain("2 results");
+    } finally { dispose(); vi.useRealTimers(); }
+  });
+
   it("peels a QueryBuilder child before its Advanced parent and preserves the draft", async () => {
     const route: QueryRoute = {
       kind: "query",
@@ -665,7 +721,7 @@ describe("QueryWorkspace", () => {
     // question asked afterwards.
     expect(deps.runGraphSearch).toHaveBeenLastCalledWith(
       "alpha", 40, 100, "query-workspace:query-test", true,
-      { pageView: { view: "board" }, blockView: { view: "board" } },
+      { pageView: { view: "board" }, blockView: { view: "board" } }, "search_tab",
     );
 
     dispose();
