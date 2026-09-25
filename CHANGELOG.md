@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- Linked and Unlinked References answer again while the search index is building or has failed, by reading the pages as v0.6.982 did. Before, a graph whose index could not be built showed no references for the whole session. Query blocks still wait for the index (GH #594, #543).
+
 ### Changed
 
 - Diagnostics: an index failure in the diagnostic report now names the step that failed as well as its class, and with `--debug` the underlying error text reaches the debug log file on every platform; before, the Windows app dropped it, so repeated `other` failures could not be diagnosed (GH #594).

@@ -60,11 +60,19 @@ retry.
 
 ## L4 · The user always sees the state
 
-Linked References, Unlinked References and query blocks show one of: an
-answer; "indexing…" / "rebuilding the index…" while not ready; or, once Failed,
-the failure's code with **Retry** and **Create diagnostic report**
-(`src/components/IndexFailedNotice.tsx`). A failed index is shown as failed:
-there is no page-scan fallback for queries or references (D-10). Search keeps
+Query blocks show one of: an answer; "indexing…" / "rebuilding the index…"
+while not ready; or, once Failed, the failure's code with **Retry** and
+**Create diagnostic report** (`src/components/IndexFailedNotice.tsx`). There is
+no page-scan fallback for queries (D-10).
+
+Linked and Unlinked References always answer unless the only wait is short
+(Martin, 2026-09-25, GH #594; this reverses the 2026-09-24 "no fallback for
+references"): once Failed they walk the pages, as for `Stale`; while the index
+is indexing or recovering they walk the parsed pages already in memory, and
+say "indexing…" only when none are loaded, so they never parse beside a
+build. Waiting for pending edits or a busy turn stays "indexing…": the index
+answers it sooner than a walk. v0.6.982 always walked, and on a graph whose
+index fails every build the panels otherwise never answered. Search keeps
 answering from an already-parsed page cache, as it does for any unavailable
 index.
 

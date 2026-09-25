@@ -57,6 +57,18 @@ fn gh594_a_build_that_always_fails_ends_failed_and_panels_say_so() {
                 .map(|groups| groups.groups.len())
         })
     };
+    let unlinked = {
+        let graph = Arc::clone(&graph);
+        within(Duration::from_secs(10), move || {
+            crate::query::unlinked_refs_bounded_indexed_with_source(
+                &*graph,
+                "p1",
+                usize::MAX,
+                usize::MAX,
+            )
+            .map(|groups| groups.groups.groups.len())
+        })
+    };
     let recorded = crate::direct_projection::index_failures_reported_for_test()
         .into_iter()
         .any(|event| {
@@ -81,12 +93,17 @@ fn gh594_a_build_that_always_fails_ends_failed_and_panels_say_so() {
         recorded,
         "the terminal failure reached the failure observer, naming the worker turn that failed"
     );
-    match backlinks {
-        Some(Err(QueryExecutionError::Unavailable(QueryUnavailableReason::IndexFailed(class)))) => {
-            assert_eq!(class, IndexFailureClass::FileInUse)
-        }
-        other => panic!("the Linked References read must report the failed index: {other:?}"),
-    }
+    // The panels still answer from the pages (Martin, 2026-09-25, L4): on a
+    // graph whose index fails every build they otherwise never answer.
+    assert_eq!(
+        backlinks.as_ref().map(|answer| answer.as_ref().ok().copied()),
+        Some(Some(1)),
+        "Linked References with a failed index: {backlinks:?}"
+    );
+    assert!(
+        matches!(unlinked, Some(Ok(_))),
+        "Unlinked References with a failed index: {unlinked:?}"
+    );
 
     // Retry reopens the graph, as the next launch does; with the fault gone
     // the index builds and the panel answers.
@@ -228,6 +245,58 @@ fn gh594_a_reference_panel_asked_while_indexing_is_told_at_once() {
         "Unlinked References while indexing: {unlinked:?}"
     );
     assert!(elapsed < Duration::from_secs(3), "told after {elapsed:?}");
+}
+
+/// While a build runs, a panel answers from the parsed pages already in
+/// memory rather than waiting out the build (GH #594: ~20 s on 13k pages),
+/// and never parses the graph beside the build to do it.
+#[test]
+fn gh594_a_reference_panel_asked_while_indexing_answers_from_parsed_pages() {
+    let root = r10_scratch("gh594-panel-parsed");
+    r10_pages(&root, 12);
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.page_snapshot(false).unwrap();
+    let registration = graph.register_index_owner();
+    let parses = graph.page_build_parses_test();
+    let backlinks = {
+        let graph = Arc::clone(&graph);
+        within(Duration::from_secs(5), move || {
+            crate::query::backlinks_bounded_indexed(&*graph, "p1", usize::MAX, usize::MAX)
+                .map(|groups| groups.groups.len())
+        })
+    };
+    let unlinked = {
+        let graph = Arc::clone(&graph);
+        within(Duration::from_secs(5), move || {
+            crate::query::unlinked_refs_bounded_indexed_with_source(
+                &*graph,
+                "p1",
+                usize::MAX,
+                usize::MAX,
+            )
+            .map(|groups| groups.groups.groups.len())
+        })
+    };
+    let progress = graph.direct_projection_progress();
+    let parses_after = graph.page_build_parses_test();
+    drop(registration);
+    crate::direct_projection::release_projection(&*graph);
+    drop(graph);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        matches!(progress, Some(ProjectionProgress::Working(_))),
+        "the index was still working: {progress:?}"
+    );
+    assert_eq!(
+        backlinks.as_ref().map(|answer| answer.as_ref().ok().copied()),
+        Some(Some(1)),
+        "Linked References while indexing: {backlinks:?}"
+    );
+    assert!(matches!(unlinked, Some(Ok(_))), "Unlinked References while indexing: {unlinked:?}");
+    assert_eq!(parses_after, parses, "the panels parsed the graph beside the build");
 }
 
 /// `docs/contracts/index-readiness.md` states these values; they are the code's.

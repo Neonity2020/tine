@@ -344,40 +344,46 @@ fn within<T: Send + 'static>(
     receiver.recv_timeout(limit).ok()
 }
 
-/// A failed index is reported, at once, by every read that needs it, and
-/// the reads that can fall back answer (GH #594 L3/L4).
+/// A failed index is reported, at once, by a query, and the reference
+/// panels answer from the pages, matching a parse-only graph (GH #594 L3/L4).
 fn check_failed_reads(
+    root: &Path,
     graph: &Arc<Graph>,
+    bad: &[String],
     class: crate::query::IndexFailureClass,
     findings: &mut Vec<String>,
 ) {
     use crate::query::{QueryExecutionError, QueryUnavailableReason};
     const PROMPTLY: Duration = Duration::from_secs(5);
-    let reads: [(&str, fn(&Graph) -> Result<(), QueryExecutionError>); 3] = [
-        ("query", |graph| {
+    let query = {
+        let graph = Arc::clone(graph);
+        within(PROMPTLY, move || {
             graph
                 .run_query_bounded(QUERIES[0], 100, 1 << 20)
                 .map(|_| ())
-        }),
-        ("linked references", |graph| {
-            crate::query::backlinks_bounded_indexed(graph, "p1", 100, 1 << 20).map(|_| ())
-        }),
-        ("unlinked references", |graph| {
-            crate::query::unlinked_refs_bounded_indexed(graph, "p1", 100, 1 << 20).map(|_| ())
-        }),
-    ];
-    for (what, read) in reads {
-        let graph = Arc::clone(graph);
-        match within(PROMPTLY, move || read(&graph)) {
-            Some(Err(QueryExecutionError::Unavailable(QueryUnavailableReason::IndexFailed(
-                reported,
-            )))) if reported == class => {}
-            None => findings.push(format!("{what} over a failed index did not return")),
-            Some(other) => findings.push(format!(
-                "{what} over an index failed with {class:?} said {other:?}"
-            )),
-        }
+        })
+    };
+    match query {
+        Some(Err(QueryExecutionError::Unavailable(QueryUnavailableReason::IndexFailed(
+            reported,
+        )))) if reported == class => {}
+        None => findings.push("a query over a failed index did not return".to_owned()),
+        Some(other) => findings.push(format!(
+            "a query over an index failed with {class:?} said {other:?}"
+        )),
     }
+    let answered = {
+        let graph = Arc::clone(graph);
+        within(PROMPTLY, move || {
+            crate::query::backlinks_bounded_indexed(&*graph, "p1", 100, 1 << 20).map(|_| ())
+        })
+    };
+    if !matches!(answered, Some(Ok(()))) {
+        findings.push(format!(
+            "linked references over an index failed with {class:?} said {answered:?}"
+        ));
+    }
+    check_reference_answers(&Graph::open(root), graph, bad, "failed index", findings);
     let listed = {
         let graph = Arc::clone(graph);
         within(PROMPTLY, move || graph.list_pages().len())
@@ -427,52 +433,7 @@ fn check_answers(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<
             Err(error) => findings.push(format!("{query}: ready index refused: {error}")),
         }
     }
-    // Linked and Unlinked References, per page, as the panels ask them.
-    let rows = |groups: &[crate::model::RefGroup]| {
-        let mut rows = groups
-            .iter()
-            .filter(|group| !bad.contains(&group.page.to_lowercase()))
-            .flat_map(|group| {
-                group
-                    .blocks
-                    .iter()
-                    .map(move |block| format!("{}|{}", group.page, block.raw))
-            })
-            .collect::<Vec<_>>();
-        rows.sort();
-        rows
-    };
-    for entry in oracle.list_pages() {
-        let target = entry.name.to_lowercase();
-        if bad.contains(&target) {
-            continue;
-        }
-        let expected = crate::query::backlinks_bounded(&oracle, &target, usize::MAX, usize::MAX);
-        match crate::query::backlinks_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
-            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
-            Ok(indexed) => findings.push(format!(
-                "linked references of {target}: index {:?} != disk {:?}",
-                rows(&indexed.groups),
-                rows(&expected.groups)
-            )),
-            Err(error) => findings.push(format!(
-                "linked references of {target}: ready index refused: {error}"
-            )),
-        }
-        let expected =
-            crate::query::unlinked_refs_bounded(&oracle, &target, usize::MAX, usize::MAX);
-        match crate::query::unlinked_refs_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
-            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
-            Ok(indexed) => findings.push(format!(
-                "unlinked references of {target}: index {:?} != disk {:?}",
-                rows(&indexed.groups),
-                rows(&expected.groups)
-            )),
-            Err(error) => findings.push(format!(
-                "unlinked references of {target}: ready index refused: {error}"
-            )),
-        }
-    }
+    check_reference_answers(&oracle, graph, bad, "ready index", findings);
     let names = |graph: &Graph| {
         let mut names = graph
             .list_pages()
@@ -506,6 +467,62 @@ fn check_answers(root: &Path, graph: &Graph, bad: &[String], findings: &mut Vec<
         if !crate::model::page_cache::failure_sources(failure).any(|path| root.join(path).exists())
         {
             findings.push(format!("recorded {failure} is gone: {failures:?}"));
+        }
+    }
+}
+
+/// Linked and Unlinked References, per page, as the panels ask them, against
+/// a parse-only graph. `state` names the index state they answered over.
+fn check_reference_answers(
+    oracle: &Graph,
+    graph: &Graph,
+    bad: &[String],
+    state: &str,
+    findings: &mut Vec<String>,
+) {
+    let rows = |groups: &[crate::model::RefGroup]| {
+        let mut rows = groups
+            .iter()
+            .filter(|group| !bad.contains(&group.page.to_lowercase()))
+            .flat_map(|group| {
+                group
+                    .blocks
+                    .iter()
+                    .map(move |block| format!("{}|{}", group.page, block.raw))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    for entry in oracle.list_pages() {
+        let target = entry.name.to_lowercase();
+        if bad.contains(&target) {
+            continue;
+        }
+        let expected = crate::query::backlinks_bounded(oracle, &target, usize::MAX, usize::MAX);
+        match crate::query::backlinks_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
+            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
+            Ok(indexed) => findings.push(format!(
+                "linked references of {target}: index {:?} != disk {:?}",
+                rows(&indexed.groups),
+                rows(&expected.groups)
+            )),
+            Err(error) => findings.push(format!(
+                "linked references of {target}: {state} refused: {error}"
+            )),
+        }
+        let expected =
+            crate::query::unlinked_refs_bounded(oracle, &target, usize::MAX, usize::MAX);
+        match crate::query::unlinked_refs_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
+            Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
+            Ok(indexed) => findings.push(format!(
+                "unlinked references of {target}: index {:?} != disk {:?}",
+                rows(&indexed.groups),
+                rows(&expected.groups)
+            )),
+            Err(error) => findings.push(format!(
+                "unlinked references of {target}: {state} refused: {error}"
+            )),
         }
     }
 }
@@ -869,7 +886,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
             if !faulted {
                 findings.push(format!("the index failed with {class:?} and no fault"));
             }
-            check_failed_reads(&graph, class, &mut findings);
+            check_failed_reads(&root, &graph, &bad, class, &mut findings);
             // The user's Retry: reopen the graph. The index converges.
             drop(graph);
             session.close(&mut findings);

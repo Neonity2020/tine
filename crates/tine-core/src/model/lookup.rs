@@ -436,9 +436,16 @@ impl Graph {
     ///   these, and refusing would remove the only route to an answer rather
     ///   than delay it.
     ///
-    /// `Failed` refuses with `IndexFailed`: the index stopped trying this
-    /// session, and the panel shows that with a Retry instead of a whole-graph
-    /// walk (Martin, 2026-09-24, index liveness L4; GH #594).
+    /// A panel still answers while the index cannot (Martin, 2026-09-25,
+    /// index liveness L4; GH #594 — v0.6.982 always did, and on a graph whose
+    /// index fails every build the panels never answered at all):
+    ///
+    /// * `Failed` walks the pages, like `Stale`: nothing is coming.
+    /// * `Working` while indexing or recovering — a whole-graph build, ~20 s
+    ///   on a 13k-page graph — walks the parsed pages already in memory, and
+    ///   refuses only when there are none, so it never parses beside the
+    ///   build. Waiting for pending edits or a busy turn stays a refusal: that
+    ///   wait is short, and the index answers it far cheaper than a walk.
     pub(crate) fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
@@ -469,16 +476,22 @@ impl Graph {
             });
         }
         if crate::direct_projection::reference_narrowing_supported(names_norm, kind) {
-            match self.direct_projection_progress() {
-                Some(ProjectionProgress::Working(reason)) => {
+            if let Some(ProjectionProgress::Working(reason)) = self.direct_projection_progress() {
+                if !reason_outlasts_a_walk(reason) {
                     return Err(crate::query::QueryExecutionError::NotReady(reason));
                 }
-                Some(ProjectionProgress::Failed(class)) => {
-                    return Err(crate::query::QueryExecutionError::Unavailable(
-                        crate::query::QueryUnavailableReason::IndexFailed(class),
-                    ));
-                }
-                _ => {}
+                // The walk takes the pages it reads now: a discard after this
+                // cannot turn it into a parse (see `indexed_or_fallback`).
+                let pages = self
+                    .with_captured_pages(|pages| pages.to_vec())
+                    .ok_or(crate::query::QueryExecutionError::NotReady(reason))?;
+                return Ok(ReferenceCandidatePages {
+                    full_page_count: pages.len(),
+                    pages,
+                    blocks: None,
+                    page_owners: None,
+                    indexed: false,
+                });
             }
         }
         Ok(self.reference_candidate_pages(names_norm, self_page, kind))
@@ -514,16 +527,18 @@ impl Graph {
             return Ok(());
         }
         match projection.progress_at(self.cache_generation()) {
-            ProjectionProgress::Working(reason) => {
+            // The candidate read decides again, on the pages it takes.
+            ProjectionProgress::Working(reason)
+                if !reason_outlasts_a_walk(reason) || !self.has_parsed_cache() =>
+            {
                 Err(crate::query::QueryExecutionError::NotReady(reason))
-            }
-            ProjectionProgress::Failed(class) => {
-                Err(crate::query::QueryExecutionError::Unavailable(
-                    crate::query::QueryUnavailableReason::IndexFailed(class),
-                ))
             }
             _ => Ok(()),
         }
+    }
+
+    fn has_parsed_cache(&self) -> bool {
+        self.cache.read().unwrap().is_some()
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {
@@ -696,5 +711,16 @@ impl Graph {
         self.load_validated_graph_text_target(&permit, &entry.path)?
             .map(|loaded| loaded.document)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+}
+
+/// Whether a reference panel waiting on the index would wait longer than
+/// walking the parsed pages takes: a whole-graph build or recovery does, a
+/// pending edit or a busy turn does not.
+fn reason_outlasts_a_walk(reason: crate::query::QueryReadinessReason) -> bool {
+    use crate::query::QueryReadinessReason as Reason;
+    match reason {
+        Reason::Indexing | Reason::Recovering => true,
+        Reason::PendingEdits | Reason::Busy => false,
     }
 }
