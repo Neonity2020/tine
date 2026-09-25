@@ -11,6 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Changed
 
 - Diagnostics: an index failure in the diagnostic report now names the step that failed as well as its class, and with `--debug` the underlying error text reaches the debug log file on every platform; before, the Windows app dropped it, so repeated `other` failures could not be diagnosed (GH #594).
+- Diagnostics: the experimental 32-bit Windows build no longer records its manual-update policy as an updater failure on every launch, and each session's start in the report names the build version and architecture, so a report can tell which build a previous session ran (GH #594).
 
 ## [0.6.986] - 2026-09-25
 

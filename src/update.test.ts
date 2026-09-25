@@ -240,7 +240,9 @@ describe("update checks", () => {
     });
     expect(toastCalls(pushToastMock).some(([, , options]) => options?.action?.label === "Install update")).toBe(false);
     expect(updaterCheckMock).not.toHaveBeenCalled();
-    expect(diagnosticFrontendEventMock).toHaveBeenCalledWith(
+    // GH #594: manual-only by policy is not an updater failure.
+    expect(diagnosticFrontendEventMock).toHaveBeenCalledWith("updater_manual_only");
+    expect(diagnosticFrontendEventMock).not.toHaveBeenCalledWith(
       "updater_failure",
       undefined,
       undefined,

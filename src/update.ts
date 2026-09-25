@@ -258,11 +258,10 @@ export async function offerUpdate(version: string, current: string): Promise<voi
   if (generation !== offerGeneration) return;
   if (offeredUpdateToastId !== null) dismissToast(offeredUpdateToastId);
   if (architecture === "x86") {
-    const failure: UpdaterFailure = {
-      stage: "target_selection",
-      cause: "unsupported_target",
-    };
-    emitUpdaterDiagnostic(failure, "automatic updater target unavailable for x86");
+    // Not a failure: this build is manual-update by policy. Recording it as
+    // `updater.failure unsupported_target` on every launch sent a reporter's
+    // report down the wrong path (GH #594).
+    void backend().diagnosticFrontendEvent("updater_manual_only").catch(() => {});
     offeredUpdateToastId = pushToast(
       `Tine ${version} is available, but automatic updates are not supported by this experimental 32-bit Windows build. Download the x86 package manually.`,
       "warn",

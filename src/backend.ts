@@ -1109,7 +1109,7 @@ export interface Backend {
   saveGraphVerificationReport(text: string): Promise<boolean>;
   onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "updater_manual_only" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
@@ -2175,7 +2175,7 @@ class TauriBackend implements Backend {
     return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
   }
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "updater_manual_only" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
