@@ -2,7 +2,7 @@ import { createEffect, createSignal, on, onCleanup, Show } from "solid-js";
 import type { IndexingProgress } from "../backend";
 import { graphBinding } from "../persistence";
 import { graphEpoch } from "../ui";
-import { followIndexingProgress, indexingProgressLabel } from "../indexingProgress";
+import { followIndexingProgress, indexingProgressLabel, indexingProgressShortLabel } from "../indexingProgress";
 
 /** A compact toolbar indicator for graph-sized index work (GH #543): the
  *  launch pass and any later repair in the same graph session.
@@ -48,6 +48,7 @@ export function IndexingProgressBar() {
             title={label()}
           >
             <span class="indexing-progress-label">{label()}</span>
+            <span class="indexing-progress-short" aria-hidden="true">{indexingProgressShortLabel(current())}</span>
             <span class="indexing-progress-track">
               <span
                 class="indexing-progress-fill"

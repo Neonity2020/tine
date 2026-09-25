@@ -14,6 +14,9 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.indexing-progress-short {
+  display: none;
+}
 .indexing-progress-track {
   position: relative;
   flex: 0 0 auto;
@@ -45,9 +48,19 @@
   }
 }
 /* The toolbar's right side does not shrink, so a narrow window or a phone
-   keeps only the bar; its tooltip and accessible name still carry the count. */
+   keeps one word and the bar; its tooltip and accessible name still carry the
+   count. A bare bar did not say what it was (GH #594). */
 @media (pointer: coarse), (max-width: 1000px) {
   .indexing-progress-label {
+    display: none;
+  }
+  .indexing-progress-short {
+    display: inline;
+  }
+}
+/* A phone-width toolbar has no room for the word either. */
+@media (max-width: 480px) {
+  .indexing-progress-short {
     display: none;
   }
 }

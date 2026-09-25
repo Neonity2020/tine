@@ -39,3 +39,11 @@ describe("IndexingProgressBar", () => {
     expect(followers[1].signal?.aborted).toBe(false);
   });
 });
+
+describe("indexingProgressShortLabel", () => {
+  it("names the work in one word for a narrow toolbar (GH #594)", async () => {
+    const { indexingProgressShortLabel } = await import("../indexingProgress");
+    expect(indexingProgressShortLabel({ phase: "indexing", done: 1, total: 10 })).toBe("Indexing");
+    expect(indexingProgressShortLabel({ phase: "checking", done: 0, total: 0 })).toBe("Checking index");
+  });
+});

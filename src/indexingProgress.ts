@@ -11,6 +11,12 @@ const WATCH_MS = 5_000;
 /** A graph that finishes indexing faster than this never shows the bar. */
 const SHOW_AFTER_MS = 700;
 
+/** The one word a narrow toolbar keeps beside the bar (EllisMorrow, GH #594:
+ *  a bare bar did not say what it was). */
+export function indexingProgressShortLabel(progress: IndexingProgress): string {
+  return progress.phase === "checking" ? "Checking index" : "Indexing";
+}
+
 export function indexingProgressLabel(progress: IndexingProgress): string {
   const subject =
     progress.phase === "checking"
