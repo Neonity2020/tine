@@ -96,7 +96,9 @@ fn gh594_a_build_that_always_fails_ends_failed_and_panels_say_so() {
     // The panels still answer from the pages (Martin, 2026-09-25, L4): on a
     // graph whose index fails every build they otherwise never answer.
     assert_eq!(
-        backlinks.as_ref().map(|answer| answer.as_ref().ok().copied()),
+        backlinks
+            .as_ref()
+            .map(|answer| answer.as_ref().ok().copied()),
         Some(Some(1)),
         "Linked References with a failed index: {backlinks:?}"
     );
@@ -291,12 +293,20 @@ fn gh594_a_reference_panel_asked_while_indexing_answers_from_parsed_pages() {
         "the index was still working: {progress:?}"
     );
     assert_eq!(
-        backlinks.as_ref().map(|answer| answer.as_ref().ok().copied()),
+        backlinks
+            .as_ref()
+            .map(|answer| answer.as_ref().ok().copied()),
         Some(Some(1)),
         "Linked References while indexing: {backlinks:?}"
     );
-    assert!(matches!(unlinked, Some(Ok(_))), "Unlinked References while indexing: {unlinked:?}");
-    assert_eq!(parses_after, parses, "the panels parsed the graph beside the build");
+    assert!(
+        matches!(unlinked, Some(Ok(_))),
+        "Unlinked References while indexing: {unlinked:?}"
+    );
+    assert_eq!(
+        parses_after, parses,
+        "the panels parsed the graph beside the build"
+    );
 }
 
 /// `docs/contracts/index-readiness.md` states these values; they are the code's.
@@ -620,7 +630,10 @@ fn gh543_the_search_tab_answers_from_the_pages_while_the_index_cannot() {
     );
     let answer = search(&unindexed, SearchTab).expect("the search tab answers");
     assert!(!answer.hits.is_empty(), "the page scan finds the tasks");
-    assert!(answer.page_scan, "the answer says it came from the page scan");
+    assert!(
+        answer.page_scan,
+        "the answer says it came from the page scan"
+    );
     let wire = serde_json::to_value(&answer).unwrap();
     assert_eq!(wire["page_scan"], serde_json::json!(true));
     drop(unindexed);
@@ -634,7 +647,10 @@ fn gh543_the_search_tab_answers_from_the_pages_while_the_index_cannot() {
     let answer = search(&graph, SearchTab).expect("the ready index answers the tab");
     assert!(!answer.hits.is_empty());
     assert!(!answer.page_scan, "an indexed answer is not flagged");
-    assert!(serde_json::to_value(&answer).unwrap().get("page_scan").is_none());
+    assert!(serde_json::to_value(&answer)
+        .unwrap()
+        .get("page_scan")
+        .is_none());
     r10_finish(root, graph, owner);
 }
 

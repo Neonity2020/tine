@@ -511,8 +511,7 @@ fn check_reference_answers(
                 "linked references of {target}: {state} refused: {error}"
             )),
         }
-        let expected =
-            crate::query::unlinked_refs_bounded(oracle, &target, usize::MAX, usize::MAX);
+        let expected = crate::query::unlinked_refs_bounded(oracle, &target, usize::MAX, usize::MAX);
         match crate::query::unlinked_refs_bounded_indexed(graph, &target, usize::MAX, usize::MAX) {
             Ok(indexed) if rows(&indexed.groups) == rows(&expected.groups) => {}
             Ok(indexed) => findings.push(format!(

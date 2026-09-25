@@ -1236,14 +1236,18 @@ mod tests {
     #[test]
     fn a_session_start_names_its_version_and_arch() {
         let fields = runtime_started_fields();
-        assert_eq!(fields.get("version"), Some(&json!(env!("CARGO_PKG_VERSION"))));
+        assert_eq!(
+            fields.get("version"),
+            Some(&json!(env!("CARGO_PKG_VERSION")))
+        );
         assert_eq!(fields.get("arch"), Some(&json!(std::env::consts::ARCH)));
         assert_eq!(fields.len(), 2);
         let production = include_str!("debug.rs")
             .split("#[cfg(test)]")
             .next()
             .expect("production diagnostics precede their tests");
-        assert!(production.contains("record_fixed_event(\"runtime.started\", runtime_started_fields())"));
+        assert!(production
+            .contains("record_fixed_event(\"runtime.started\", runtime_started_fields())"));
     }
 
     /// GH #594: the x86 build's manual-update policy is its own event, not

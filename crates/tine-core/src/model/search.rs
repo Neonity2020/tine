@@ -99,12 +99,7 @@ impl Graph {
             display,
             consumer,
         );
-        self.read_friendly_plan(
-            &plan,
-            explain,
-            None,
-            consumer.answers_before_ready(),
-        )
+        self.read_friendly_plan(&plan, explain, None, consumer.answers_before_ready())
     }
 
     /// Interactive search lane: a newer request in the same lane cooperatively
