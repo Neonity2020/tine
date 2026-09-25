@@ -300,7 +300,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     const state = source("src-tauri/src/state.rs");
     const parity = source("src-tauri/src/backend_command_parity.rs");
     expect(commandError).toContain("impl Serialize for CommandError");
-    expect(commandError).toContain("serializer.serialize_str(&self.wire())");
+    expect(commandError).toContain("serializer.serialize_str(&wire)");
     expect(commandError).not.toMatch(/impl From<(?:String|&str)> for CommandError/);
     expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
