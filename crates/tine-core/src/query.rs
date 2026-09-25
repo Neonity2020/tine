@@ -29,7 +29,8 @@ mod oracle_gate1;
 #[path = "query/oracle_walk_tests.rs"]
 mod oracle_walk;
 pub use execution_error::{
-    IndexFailureClass, QueryExecutionError, QueryReadinessReason, QueryUnavailableReason,
+    IndexFailureAt, IndexFailureClass, IndexFailureSite, QueryExecutionError, QueryReadinessReason,
+    QueryUnavailableReason,
 };
 mod advanced_patterns;
 use advanced_patterns::{scan_groups, where_groups};

@@ -265,7 +265,7 @@ impl LedgerStore {
         if let Err(error) = outcome {
             // Best-effort cache: log, never surface (spec: errors writing the
             // ledger are logged, not surfaced).
-            eprintln!("concord-ledger: background update failed: {error}");
+            crate::backend_error::core_diag!("concord-ledger: background update failed: {error}");
         }
     }
 

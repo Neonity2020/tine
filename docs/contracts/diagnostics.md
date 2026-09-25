@@ -19,6 +19,16 @@ channel and may contain a directed path or OS error; it is never folded into the
 automatic recorder. A src-tauri failure that must remain always-on instead uses
 a fixed-shape event or a fixed content-free terminal line.
 
+`tine-core` writes every line through `backend_error::diagnostic_line` (the
+`core_diag!` macro): stderr, plus the host's sink, which `debug_init` points
+at the same debug log file. The Windows release app has no console, so before
+this a core line reached no reporter, even from a `--debug` run (GH #594).
+`production_core_writes_stderr_only_through_diagnostic_line` keeps it the only
+writer; each `core_diag!` site is still classified in the print census. Under
+the debug opt-in, every command failure's wire text is also written there
+(`command_error.rs`), except query availability, which the recorder already
+carries as a reason.
+
 ## One flag answers "are debug diagnostics on"
 
 `TINE_DEBUG` and `--debug` are parsed in exactly one function,
@@ -69,8 +79,9 @@ its closed save-failure code and guarded-index counters as `direct.save`. Page
 identity, paths, error prose, and draft content never enter the event.
 
 Every failed index build or update attempt has one fixed-shape native receipt,
-`index.failure`: its class (`IndexFailureClass::as_str`), its attempt number and
-whether it left the index failed for the session. Core reports it through
+`index.failure`: its class (`IndexFailureClass::as_str`), the site that decided
+it (`IndexFailureSite::as_str`), its attempt number and whether it left the index
+failed for the session. Core reports it through
 `tine_core::set_index_failure_observer`, which `debug.rs::flight_init` installs;
 the error text itself stays behind the debug flag (GH #594, see
 `docs/contracts/index-readiness.md`).

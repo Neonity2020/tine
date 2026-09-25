@@ -354,9 +354,16 @@ pub(super) fn isolate_page_parse(
         }
         Ok(None) => Ok(None),
         Err(payload) => {
-            let _ = payload;
             if crate::backend_error::runtime_debug_diagnostics_enabled() {
-                eprintln!("Tine search index skipped one page after a parse/projection panic");
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|reason| (*reason).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-text panic".to_owned());
+                crate::backend_error::core_diag!(
+                    "[tine] search index skipped {} after a parse/projection panic: {reason}",
+                    e.rel_path
+                );
             }
             Err(e.rel_path)
         }

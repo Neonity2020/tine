@@ -2622,7 +2622,7 @@ pub(crate) fn projection_diag(message: impl FnOnce() -> String) {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis();
-    eprintln!("[tine] projection +{elapsed}ms {}", message());
+    crate::backend_error::core_diag!("[tine] projection +{elapsed}ms {}", message());
 }
 
 #[cfg(test)]
@@ -2633,9 +2633,11 @@ pub(crate) fn projection_diag_lines_test() -> u64 {
 fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
     #[cfg(test)]
     REPORTED_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
-    eprintln!("[tine] Direct Files SQLite projection {family}");
+    crate::backend_error::core_diag!("[tine] Direct Files SQLite projection {family}");
     if crate::backend_error::runtime_debug_diagnostics_enabled() {
-        eprintln!("[tine] Direct Files SQLite projection {family}; directed detail: {detail}");
+        crate::backend_error::core_diag!(
+            "[tine] Direct Files SQLite projection {family}; directed detail: {detail}"
+        );
     }
 }
 
@@ -2705,7 +2707,8 @@ impl Drop for RepairInFlight {
 fn worker_cannot_start(shared: &ProjectionShared, error: &str) {
     owner::note_failed(
         &mut shared.pending.lock().unwrap(),
-        crate::query::IndexFailureClass::of_message(error),
+        crate::query::IndexFailureClass::of_message(error)
+            .at(crate::query::IndexFailureSite::WorkerSetup),
     );
     shared.worker_available.store(false, Ordering::Release);
     shared.changed.notify_all();
@@ -2721,7 +2724,9 @@ fn projection_worker(shared: Arc<ProjectionShared>, launch_config: Option<Arc<Pa
         return;
     };
     if let Err(error) = std::fs::create_dir_all(parent) {
-        eprintln!("[tine] Direct Files SQLite projection disabled: create directory: {error}");
+        crate::backend_error::core_diag!(
+            "[tine] Direct Files SQLite projection disabled: create directory: {error}"
+        );
         worker_cannot_start(&shared, &error.to_string());
         return;
     }
@@ -3055,13 +3060,15 @@ fn projection_worker(shared: Arc<ProjectionShared>, launch_config: Option<Arc<Pa
                 if owes_new_image {
                     pending.rebuild = true;
                 }
-                let class = match &error {
+                let failure = match &error {
                     ProjectionRefusal::Failed(message) => {
                         crate::query::IndexFailureClass::of_message(message)
+                            .at(crate::query::IndexFailureSite::WorkerTurn)
                     }
-                    ProjectionRefusal::Stopped => crate::query::IndexFailureClass::Other,
+                    ProjectionRefusal::Stopped => crate::query::IndexFailureClass::Other
+                        .at(crate::query::IndexFailureSite::WorkerClosing),
                 };
-                note_unsettled(&mut pending, class);
+                note_unsettled(&mut pending, failure);
                 shared.worker_busy.store(false, Ordering::Release);
                 drop(pending);
                 shared.changed.notify_all();

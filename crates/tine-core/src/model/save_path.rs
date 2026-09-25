@@ -99,7 +99,9 @@ impl Graph {
     pub fn save_page(&self, page: &PageDto, base_rev: Option<&str>) -> io::Result<String> {
         if page.guide {
             #[cfg(debug_assertions)]
-            eprintln!("attempted to persist an ephemeral bundled Guide page");
+            crate::backend_error::core_diag!(
+                "attempted to persist an ephemeral bundled Guide page"
+            );
             return Ok("guide-ephemeral".into());
         }
         let write = self.admit_graph_text_writer()?;
@@ -283,7 +285,9 @@ impl Graph {
     ) -> io::Result<String> {
         if page.guide {
             #[cfg(debug_assertions)]
-            eprintln!("attempted to force-persist an ephemeral bundled Guide page");
+            crate::backend_error::core_diag!(
+                "attempted to force-persist an ephemeral bundled Guide page"
+            );
             return Ok("guide-ephemeral".into());
         }
         let write = self.admit_graph_text_writer()?;

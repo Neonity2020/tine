@@ -3568,7 +3568,9 @@ pub(crate) fn publish_graph_documents_inner(
                 ));
             }
             if crate::backend_error::runtime_debug_diagnostics_enabled() {
-                eprintln!("tine export: refusing one ambiguous public page identity");
+                crate::backend_error::core_diag!(
+                    "tine export: refusing one ambiguous public page identity"
+                );
             }
             continue;
         }
@@ -3608,7 +3610,7 @@ pub(crate) fn publish_graph_documents_inner(
     let names: Vec<&str> = public.iter().map(|(n, _, _)| *n).collect();
     let (slugs, collisions) = build_slug_map(&names);
     if !collisions.is_empty() && crate::backend_error::runtime_debug_diagnostics_enabled() {
-        eprintln!(
+        crate::backend_error::core_diag!(
             "tine export: resolved {} public-page slug collisions",
             collisions.len()
         );

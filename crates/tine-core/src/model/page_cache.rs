@@ -38,7 +38,7 @@ pub(super) enum SurveyOutcome {
     /// No projection can take them: none attached, the graph text scope or
     /// the stored image unreadable, the writer lease held elsewhere, or the
     /// worker gone. The class is why, for the attempt it costs (GH #594).
-    Unavailable(crate::query::IndexFailureClass),
+    Unavailable(crate::query::IndexFailureAt),
     Cancelled,
 }
 
@@ -163,7 +163,7 @@ impl Graph {
             for (worker, handle) in handles.into_iter().enumerate() {
                 match handle.join() {
                     Ok(shard) => built.append(shard),
-                    Err(_) => eprintln!(
+                    Err(_) => crate::backend_error::core_diag!(
                         "Tine search index worker {worker} panicked after per-page isolation; its shard was not indexed"
                     ),
                 }
@@ -723,7 +723,7 @@ impl Graph {
         projection: &crate::direct_projection::DirectProjection,
         need: crate::direct_projection::IndexNeed,
         cancelled: &impl Fn() -> bool,
-    ) -> Option<Result<(), crate::query::IndexFailureClass>> {
+    ) -> Option<Result<(), crate::query::IndexFailureAt>> {
         #[cfg(test)]
         self.page_build_test
             .owner_passes
@@ -745,7 +745,8 @@ impl Graph {
             if projection.index_need_now().0 != need {
                 Ok(())
             } else {
-                Err(crate::query::IndexFailureClass::NoProgress)
+                Err(crate::query::IndexFailureClass::NoProgress
+                    .at(crate::query::IndexFailureSite::PassUnsettled))
             }
         }))
     }
@@ -756,12 +757,15 @@ impl Graph {
     fn fresh_index_pass(
         &self,
         cancelled: &impl Fn() -> bool,
-    ) -> Result<(), Option<crate::query::IndexFailureClass>> {
+    ) -> Result<(), Option<crate::query::IndexFailureAt>> {
         self.build_page_cache_outcome(cancelled)?;
         if self.offer_installed_cache() == projection_lifetime::FullOfferOutcome::Queued {
             Ok(())
         } else {
-            Err(Some(crate::query::IndexFailureClass::NoProgress))
+            Err(Some(
+                crate::query::IndexFailureClass::NoProgress
+                    .at(crate::query::IndexFailureSite::FreshOfferRefused),
+            ))
         }
     }
 
@@ -788,14 +792,20 @@ impl Graph {
         if cancelled() {
             return SurveyOutcome::Cancelled;
         }
+        let unavailable =
+            |site| SurveyOutcome::Unavailable(crate::query::IndexFailureClass::Other.at(site));
         let Some(projection) = self.direct_projection.get() else {
-            return SurveyOutcome::Unavailable(crate::query::IndexFailureClass::Other);
+            return unavailable(crate::query::IndexFailureSite::SurveyNoProjection);
         };
         match projection.wait_index_need(cancelled) {
-            crate::direct_projection::IndexNeed::Terminal
-            | crate::direct_projection::IndexNeed::LeaseWait
-            | crate::direct_projection::IndexNeed::Failed => {
-                return SurveyOutcome::Unavailable(crate::query::IndexFailureClass::Other)
+            crate::direct_projection::IndexNeed::Terminal => {
+                return unavailable(crate::query::IndexFailureSite::SurveyWorkerGone)
+            }
+            crate::direct_projection::IndexNeed::LeaseWait => {
+                return unavailable(crate::query::IndexFailureSite::SurveyLeaseWait)
+            }
+            crate::direct_projection::IndexNeed::Failed => {
+                return unavailable(crate::query::IndexFailureSite::SurveyIndexFailed)
             }
             crate::direct_projection::IndexNeed::SettingUp => return SurveyOutcome::Cancelled,
             _ => {}
@@ -818,7 +828,10 @@ impl Graph {
             }
         }
         let Ok(permit) = self.admit_retained_graph_text_writer() else {
-            return SurveyOutcome::Unavailable(crate::query::IndexFailureClass::WriterRefused);
+            return SurveyOutcome::Unavailable(
+                crate::query::IndexFailureClass::WriterRefused
+                    .at(crate::query::IndexFailureSite::SurveyWriterRefused),
+            );
         };
         let parse_config = Arc::new(self.config().parse_config());
         let digest = parse_config.digest();
@@ -846,7 +859,10 @@ impl Graph {
         // than what the survey found there (see `publish_page_index_failures`).
         let structural = self.cache_structural_gen.begin_pass();
         let Some(stored) = projection.stored_revisions() else {
-            return SurveyOutcome::Unavailable(crate::query::IndexFailureClass::Corrupt);
+            return SurveyOutcome::Unavailable(
+                crate::query::IndexFailureClass::Corrupt
+                    .at(crate::query::IndexFailureSite::SurveyStoredUnreadable),
+            );
         };
         let differs = |rel_path: &str, revision: &str| {
             stored.get(rel_path).map(String::as_str)
@@ -880,7 +896,8 @@ impl Graph {
         } else {
             let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
                 return SurveyOutcome::Unavailable(
-                    crate::query::IndexFailureClass::GraphUnreadable,
+                    crate::query::IndexFailureClass::GraphUnreadable
+                        .at(crate::query::IndexFailureSite::SurveyUnlisted),
                 );
             };
             #[cfg(test)]
@@ -1176,8 +1193,8 @@ impl Graph {
     fn build_page_cache_outcome(
         &self,
         cancelled: &impl Fn() -> bool,
-    ) -> Result<(), Option<crate::query::IndexFailureClass>> {
-        let done = |installed: bool, class: crate::query::IndexFailureClass| {
+    ) -> Result<(), Option<crate::query::IndexFailureAt>> {
+        let done = |installed: bool, class: crate::query::IndexFailureAt| {
             if cancelled() {
                 Err(None)
             } else if installed {
@@ -1200,14 +1217,20 @@ impl Graph {
         }
         let permit = match self.admit_retained_graph_text_writer() {
             Ok(permit) => permit,
-            Err(_) => return Err(Some(crate::query::IndexFailureClass::WriterRefused)),
+            Err(_) => {
+                return Err(Some(
+                    crate::query::IndexFailureClass::WriterRefused
+                        .at(crate::query::IndexFailureSite::FreshWriterRefused),
+                ))
+            }
         };
         let expected_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let (flight, owner) = self.claim_page_build(expected_generation);
         if !owner {
             return done(
                 flight.wait().installed(),
-                crate::query::IndexFailureClass::NoProgress,
+                crate::query::IndexFailureClass::NoProgress
+                    .at(crate::query::IndexFailureSite::FreshJoinedBuild),
             );
         }
         if cancelled() {
@@ -1231,7 +1254,8 @@ impl Graph {
                 self.finish_page_build(&flight, outcome);
                 return done(
                     outcome.installed(),
-                    crate::query::IndexFailureClass::GraphUnreadable,
+                    crate::query::IndexFailureClass::GraphUnreadable
+                        .at(crate::query::IndexFailureSite::FreshUnlisted),
                 );
             }
         };
@@ -1281,7 +1305,10 @@ impl Graph {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             self.finish_page_build(&flight, PageBuildOutcome::Failed);
-            return Err(Some(crate::query::IndexFailureClass::Other));
+            return Err(Some(
+                crate::query::IndexFailureClass::Other
+                    .at(crate::query::IndexFailureSite::FreshNotInstalled),
+            ));
         }
         #[cfg(test)]
         {
@@ -1312,7 +1339,10 @@ impl Graph {
             rounds += 1;
             if rounds > 3 {
                 self.finish_page_build(&flight, PageBuildOutcome::Failed);
-                return Err(Some(crate::query::IndexFailureClass::PagesKeptChanging));
+                return Err(Some(
+                    crate::query::IndexFailureClass::PagesKeptChanging
+                        .at(crate::query::IndexFailureSite::FreshPagesKeptChanging),
+                ));
             }
             baselines = self.reparse_into(&permit, &mut built, &changed);
         }
@@ -1324,7 +1354,8 @@ impl Graph {
         self.finish_page_build(&flight, outcome);
         done(
             outcome.installed(),
-            crate::query::IndexFailureClass::NoProgress,
+            crate::query::IndexFailureClass::NoProgress
+                .at(crate::query::IndexFailureSite::FreshNotInstalled),
         )
     }
 

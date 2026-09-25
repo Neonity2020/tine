@@ -76,6 +76,9 @@ pub(crate) fn debug_init() {
     // through `runtime_debug_diagnostics_enabled()`.
     tine_core::backend_error::set_runtime_debug_diagnostics(debug_opt_in_requested());
     DEBUG_START.get_or_init(std::time::Instant::now);
+    // tine-core's lines already went to stderr; this adds them to the file,
+    // which is what a Windows reporter can actually send (GH #594).
+    tine_core::backend_error::set_diagnostic_line_sink(write_debug_file);
     DEBUG_LOG.get_or_init(|| {
         if !debug_enabled() {
             return None;
@@ -102,6 +105,11 @@ pub(crate) fn diag(msg: impl std::fmt::Display) {
     }
     let msg = msg.to_string();
     eprintln!("[tine] {msg}");
+    write_debug_file(&msg);
+}
+
+/// Append one line to the opt-in debug log, when it is open.
+fn write_debug_file(msg: &str) {
     if let Some(Some(lock)) = DEBUG_LOG.get() {
         if let Ok(mut file) = lock.lock() {
             let _ = writeln!(file, "[+{:>7}ms] {msg}", elapsed_ms());
@@ -560,6 +568,7 @@ pub(crate) fn record_direct_save(
 fn record_index_failure(event: tine_core::IndexFailureEvent) {
     let mut fields = Map::new();
     fields.insert("class".into(), json!(event.class.as_str()));
+    fields.insert("site".into(), json!(event.site.as_str()));
     fields.insert("attempt".into(), json!(event.attempt));
     fields.insert("terminal".into(), json!(event.terminal));
     record_fixed_event("index.failure", fields);
@@ -1194,7 +1203,14 @@ mod tests {
             .find("fn record_index_failure(")
             .expect("the recorder exists")..];
         let body = &body[..body.find("\n}\n").expect("its body ends")];
-        assert_eq!(body.matches("fields.insert(").count(), 3, "{body}");
+        for site in tine_core::query::IndexFailureSite::ALL {
+            let code = site.as_str();
+            assert!(
+                !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{code:?}"
+            );
+        }
+        assert_eq!(body.matches("fields.insert(").count(), 4, "{body}");
         assert!(production.contains("set_index_failure_observer(record_index_failure)"));
     }
 

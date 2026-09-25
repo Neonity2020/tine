@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- Diagnostics: an index failure in the diagnostic report now names the step that failed as well as its class, and with `--debug` the underlying error text reaches the debug log file on every platform; before, the Windows app dropped it, so repeated `other` failures could not be diagnosed (GH #594).
+
 ## [0.6.986] - 2026-09-25
 
 ### Fixed

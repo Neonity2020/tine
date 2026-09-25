@@ -270,9 +270,10 @@ fn finish(shared: &ProjectionShared, outcome: CheckOutcome, boot: Option<i64>) {
             },
         ),
         CheckOutcome::Damaged => {
-            eprintln!("[tine] the search index is damaged; rebuilding it");
+            crate::backend_error::core_diag!("[tine] the search index is damaged; rebuilding it");
             owner::report_index_failure(IndexFailureEvent {
                 class: crate::query::IndexFailureClass::Corrupt,
+                site: crate::query::IndexFailureSite::IntegrityCheck,
                 attempt: 0,
                 terminal: false,
             });

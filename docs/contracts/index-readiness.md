@@ -71,7 +71,10 @@ index.
 ## L5 · Every failure is observable
 
 Each failed attempt reaches the flight recorder as `index.failure` with its
-class, attempt number and whether it was terminal
+class, the site that decided it (`IndexFailureSite::as_str`: the worker turn
+or setup, the fresh build and which step, the survey and why, a pass that left
+its need standing), attempt number and whether it was terminal. Under `--debug`
+the error text behind the class reaches the debug log
 (`docs/contracts/diagnostics.md`). The classes, `IndexFailureClass::as_str`:
 
 | Code | Cause |

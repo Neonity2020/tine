@@ -258,7 +258,17 @@ impl Serialize for CommandError {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.wire())
+        let wire = self.wire();
+        // The one point every command failure passes. Its text reached only
+        // the frontend, which reports a fixed code, so a `--debug` log could
+        // not say why a command failed (GH #594). Query availability is
+        // already in the report as its own reason.
+        if crate::debug::debug_enabled()
+            && !matches!(self, Self::Core(CoreCommandError::QueryExecution(_)))
+        {
+            crate::debug::diag(format!("command failed: {wire}"));
+        }
+        serializer.serialize_str(&wire)
     }
 }
 

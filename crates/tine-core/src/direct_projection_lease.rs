@@ -112,7 +112,7 @@ pub(super) fn take_writer_lease(shared: &Arc<ProjectionShared>) -> Option<Writer
         #[cfg(test)]
         shared.lease_contended.store(true, Ordering::Release);
         if failures == 1 {
-            eprintln!(
+            crate::backend_error::core_diag!(
                 "[tine] Direct Files SQLite projection waiting: another graph instance owns it or its lease cannot be opened: {error}"
             );
         }

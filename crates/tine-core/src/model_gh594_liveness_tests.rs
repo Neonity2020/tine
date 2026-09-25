@@ -59,7 +59,11 @@ fn gh594_a_build_that_always_fails_ends_failed_and_panels_say_so() {
     };
     let recorded = crate::direct_projection::index_failures_reported_for_test()
         .into_iter()
-        .any(|event| event.class == IndexFailureClass::FileInUse && event.terminal);
+        .any(|event| {
+            event.class == IndexFailureClass::FileInUse
+                && event.site == crate::query::IndexFailureSite::WorkerTurn
+                && event.terminal
+        });
     owner.stop();
     crate::direct_projection::release_projection(&*graph);
     drop(graph);
@@ -75,7 +79,7 @@ fn gh594_a_build_that_always_fails_ends_failed_and_panels_say_so() {
     );
     assert!(
         recorded,
-        "the terminal failure reached the failure observer"
+        "the terminal failure reached the failure observer, naming the worker turn that failed"
     );
     match backlinks {
         Some(Err(QueryExecutionError::Unavailable(QueryUnavailableReason::IndexFailed(class)))) => {

@@ -3,7 +3,7 @@
 //! it. Everything here is read and changed under `pending`.
 
 use super::*;
-use crate::query::IndexFailureClass;
+use crate::query::{IndexFailureAt, IndexFailureClass, IndexFailureSite};
 
 /// What whole-graph work the index needs next; see [`index_need`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,39 +255,50 @@ pub(crate) const INDEX_ATTEMPTS: u32 = 3;
 /// reader while nothing ever recovered, and each retry parsed the whole graph
 /// again (GH #594). New facts do not cut the wait short: that would make every
 /// save a rebuild trigger while the failure lasts.
-pub(super) fn note_unsettled(pending: &mut PendingProjection, class: IndexFailureClass) {
+pub(super) fn note_unsettled(pending: &mut PendingProjection, failure: IndexFailureAt) {
+    let IndexFailureAt { class, site } = failure;
     pending.unsettled_passes = pending.unsettled_passes.saturating_add(1);
     pending.last_failure = Some(class);
     let passes = pending.unsettled_passes;
     report_index_failure(IndexFailureEvent {
         class,
+        site,
         attempt: passes,
         terminal: passes >= INDEX_ATTEMPTS,
     });
+    let what = || format!("{} at {}", class.as_str(), site.as_str());
     if passes >= INDEX_ATTEMPTS {
         pending.failed = Some(class);
         pending.retry_after = None;
-        projection_diag(|| format!("unsettled pass {passes} ({}); index failed", class.as_str()));
+        projection_diag(|| format!("unsettled pass {passes} ({}); index failed", what()));
         return;
     }
     if passes == 1 {
-        projection_diag(|| format!("unsettled pass 1 ({}); retrying at once", class.as_str()));
+        projection_diag(|| format!("unsettled pass 1 ({}); retrying at once", what()));
         return;
     }
     let wait = std::time::Duration::from_secs(1);
     pending.retry_after = Some(std::time::Instant::now() + wait);
-    projection_diag(|| format!("unsettled pass {passes}; next owner pass in {wait:?}"));
+    projection_diag(|| {
+        format!(
+            "unsettled pass {passes} ({}); next owner pass in {wait:?}",
+            what()
+        )
+    });
 }
 
 /// A failure no further attempt can get past (the worker cannot set up its
 /// image): the index is `Failed` at once. The user's Retry reopens the graph,
 /// which starts a new worker, exactly as the next launch would.
-pub(super) fn note_failed(pending: &mut PendingProjection, class: IndexFailureClass) {
+pub(super) fn note_failed(pending: &mut PendingProjection, failure: IndexFailureAt) {
+    let IndexFailureAt { class, site } = failure;
     pending.last_failure = Some(class);
     pending.failed = Some(class);
     pending.retry_after = None;
+    projection_diag(|| format!("index failed ({} at {})", class.as_str(), site.as_str()));
     report_index_failure(IndexFailureEvent {
         class,
+        site,
         attempt: pending.unsettled_passes.saturating_add(1),
         terminal: true,
     });
@@ -298,6 +309,8 @@ pub(super) fn note_failed(pending: &mut PendingProjection, class: IndexFailureCl
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexFailureEvent {
     pub class: IndexFailureClass,
+    /// Where the failure was decided (GH #594).
+    pub site: IndexFailureSite,
     /// 1-based, consecutive since the index was last ready; 0 when the
     /// background integrity check found the stored image damaged.
     pub attempt: u32,
@@ -546,8 +559,8 @@ impl DirectProjection {
 
     /// Record an owner pass that ended without the worker taking a payload
     /// that could make the index ready; see [`note_unsettled`].
-    pub(crate) fn note_unsettled_pass(&self, class: IndexFailureClass) {
-        note_unsettled(&mut self.shared.pending.lock().unwrap(), class);
+    pub(crate) fn note_unsettled_pass(&self, failure: IndexFailureAt) {
+        note_unsettled(&mut self.shared.pending.lock().unwrap(), failure);
         self.shared.changed.notify_all();
     }
 

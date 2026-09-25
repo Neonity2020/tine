@@ -215,6 +215,110 @@ impl IndexFailureClass {
     }
 }
 
+/// Where an index failure was decided (GH #594): a fixed code beside its
+/// class. `other` and `no_progress` alone named neither the step nor the
+/// reason, and the error text behind them reached no report and no log, so
+/// a failure that repeated on one reporter's graph could not be told apart
+/// from any other. Like the class, never taken from error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum IndexFailureSite {
+    /// A worker turn's write failed; the class is read from its error.
+    WorkerTurn,
+    /// The worker stopped while a turn was in flight.
+    WorkerClosing,
+    /// The worker could not set up its image.
+    WorkerSetup,
+    /// The background integrity check found the image damaged.
+    IntegrityCheck,
+    /// A pass reported success, but the need it ran for still stood.
+    PassUnsettled,
+    /// A fresh build finished, but the index did not take its snapshot.
+    FreshOfferRefused,
+    /// A fresh build could not be admitted as a graph-text writer.
+    FreshWriterRefused,
+    /// A fresh build joined another build that did not install a cache.
+    FreshJoinedBuild,
+    /// A fresh build could not list the graph folder.
+    FreshUnlisted,
+    /// A fresh build read the graph, but did not install its cache.
+    FreshNotInstalled,
+    /// A fresh build's pages changed under it on every re-read.
+    FreshPagesKeptChanging,
+    /// The survey found no projection attached.
+    SurveyNoProjection,
+    /// The survey found the worker gone.
+    SurveyWorkerGone,
+    /// The survey found another instance holding the index's writer lease.
+    SurveyLeaseWait,
+    /// The survey found the index already failed.
+    SurveyIndexFailed,
+    /// The survey could not be admitted as a graph-text writer.
+    SurveyWriterRefused,
+    /// The survey could not read the stored image's revisions.
+    SurveyStoredUnreadable,
+    /// The survey could not list the graph folder.
+    SurveyUnlisted,
+}
+
+impl IndexFailureSite {
+    pub const ALL: [Self; 18] = [
+        Self::WorkerTurn,
+        Self::WorkerClosing,
+        Self::WorkerSetup,
+        Self::IntegrityCheck,
+        Self::PassUnsettled,
+        Self::FreshOfferRefused,
+        Self::FreshWriterRefused,
+        Self::FreshJoinedBuild,
+        Self::FreshUnlisted,
+        Self::FreshNotInstalled,
+        Self::FreshPagesKeptChanging,
+        Self::SurveyNoProjection,
+        Self::SurveyWorkerGone,
+        Self::SurveyLeaseWait,
+        Self::SurveyIndexFailed,
+        Self::SurveyWriterRefused,
+        Self::SurveyStoredUnreadable,
+        Self::SurveyUnlisted,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerTurn => "worker_turn",
+            Self::WorkerClosing => "worker_closing",
+            Self::WorkerSetup => "worker_setup",
+            Self::IntegrityCheck => "integrity_check",
+            Self::PassUnsettled => "pass_unsettled",
+            Self::FreshOfferRefused => "fresh_offer_refused",
+            Self::FreshWriterRefused => "fresh_writer_refused",
+            Self::FreshJoinedBuild => "fresh_joined_build",
+            Self::FreshUnlisted => "fresh_unlisted",
+            Self::FreshNotInstalled => "fresh_not_installed",
+            Self::FreshPagesKeptChanging => "fresh_pages_kept_changing",
+            Self::SurveyNoProjection => "survey_no_projection",
+            Self::SurveyWorkerGone => "survey_worker_gone",
+            Self::SurveyLeaseWait => "survey_lease_wait",
+            Self::SurveyIndexFailed => "survey_index_failed",
+            Self::SurveyWriterRefused => "survey_writer_refused",
+            Self::SurveyStoredUnreadable => "survey_stored_unreadable",
+            Self::SurveyUnlisted => "survey_unlisted",
+        }
+    }
+}
+
+/// One index failure: why, and where it was decided.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct IndexFailureAt {
+    pub class: IndexFailureClass,
+    pub site: IndexFailureSite,
+}
+
+impl IndexFailureClass {
+    pub const fn at(self, site: IndexFailureSite) -> IndexFailureAt {
+        IndexFailureAt { class: self, site }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryExecutionError {
     NotReady(QueryReadinessReason),

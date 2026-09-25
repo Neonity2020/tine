@@ -11,10 +11,11 @@ impl Graph {
     pub fn sync_file(&self, path: &Path) -> Option<PageEntry> {
         match self.sync_file_checked(path) {
             Ok(entry) => entry,
-            Err(_error) => {
-                #[cfg(debug_assertions)]
+            Err(error) => {
                 if crate::backend_error::runtime_debug_diagnostics_enabled() {
-                    eprintln!("file reconcile deferred after a content-free I/O failure");
+                    crate::backend_error::core_diag!(
+                        "[tine] file reconcile deferred after an I/O failure: {error}"
+                    );
                 }
                 None
             }
