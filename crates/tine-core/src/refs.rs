@@ -78,6 +78,16 @@ impl ReferenceSourceExclusions {
     }
 }
 
+/// Whether `name` names a page at all: its [`page_key`] is non-empty. `[[ ]]`,
+/// `[[/]]`, `#/`, `tags:: /` and an ideographic-space `[[　]]` all fold to
+/// the empty key, which no page can own. Every reference, tag and alias source
+/// drops such a name, so the in-memory graph and the index agree -- and the
+/// index, which refuses an empty name, is never handed one: a single `[[/]]`
+/// used to fail the whole graph's index build (GH #594).
+pub fn names_a_page(name: &str) -> bool {
+    !page_key(name).is_empty()
+}
+
 pub fn page_key(name: &str) -> String {
     // Preserve Tine's historical surrounding-whitespace tolerance. Otherwise
     // this is OG page-name-sanity-lc: lowercase, remove one slash at each

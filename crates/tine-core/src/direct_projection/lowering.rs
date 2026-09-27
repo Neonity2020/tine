@@ -355,7 +355,7 @@ pub(super) fn physical_page(
         PhysicalPage {
             position: None,
             name: entry.name.clone(),
-            name_key: crate::refs::page_key(&entry.name),
+            name_key: page_name_key(entry),
             path: entry.rel_path.clone(),
             text_kind: page_kind_to_sql(entry.kind),
             // The page's own day: `PageEntry::date_key`, which a `title::` can
@@ -505,6 +505,21 @@ pub(super) fn lower_blocks(
         structural_path.pop();
     }
     Ok(())
+}
+
+/// The page's name key in the index. A page whose name folds to nothing (a
+/// file named `%2F.md` or ` .md`, a `title:: /`) is still a page and stays
+/// searchable, but no reference can reach it, and the index refuses an empty
+/// name: that one page used to fail the whole graph's build (GH #594). It is
+/// keyed by its path instead, behind an uppercase prefix -- [`crate::refs::page_key`]
+/// lowercases, so no real page name can ever produce this key.
+fn page_name_key(entry: &PageEntry) -> String {
+    let key = crate::refs::page_key(&entry.name);
+    if key.is_empty() {
+        format!("NAMELESS:{}", entry.rel_path)
+    } else {
+        key
+    }
 }
 
 pub(super) fn append_reference_postings(

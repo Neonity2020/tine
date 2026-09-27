@@ -8011,6 +8011,32 @@
   "failBefore": "proven"
  },
  "notes": "Blocking stateful UX. GH #550 / #543 family, launch design D2-D4 (Martin 2026-09-24, BW4). Every display read waited for the launch survey (seconds on a 10k graph, longer on Android). Display reads now name a currency: inside Graph::display_read they are LaunchStored and are answered from the image the last session left while serving_stored holds (same facts version and parse config, no fresh build owed, no edit of this session pending); acting reads (try_list_pages, templates, name-only creation evidence) and queries outside a display read stay Current and wait. Stored answers are never memoized. The frontend asks at open and re-asks on warm-cache-done (correctLaunchAnswers). Necessity: the three serving tests fail on a3e7bfda (Ctrl-K NotReady, read-back times out); the two guard tests pass there by design; the frontend re-ask tests fail with the indexCorrectionRev reads removed; the navigation-index test fails with the old warm wait. Contract docs/contracts/index-readiness.md L8. Not measured on a phone or on Windows."
+},
+{
+ "id": "REG-INDEX-EMPTY-PAGE-NAME-594",
+ "title": "A reference, tag, alias or page name that folds to nothing does not stop the search index from being built",
+ "family": "search",
+ "sources": {
+  "issues": [
+   594
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_gh594_empty_name_tests.rs::gh594_a_name_that_folds_to_nothing_does_not_fail_the_index_build",
+   "crates/tine-core/src/model_gh594_empty_name_tests.rs::gh594_random_reference_punctuation_never_fails_the_index_build"
+  ],
+  "scenario": null,
+  "failBefore": "tine-agents/evidence/batch-gh594-empty-name/necessity-empty-name.txt (18 of the listed shapes failed the whole build; the random guard failed on seed 0)"
+ },
+ "notes": "Blocking core operation. Both reporters' v0.6.986 debug logs (Windows 13k pages, macOS 1.2k pages) show the build failing on every attempt with 'invalid materialization input: name key and spelling must be non-empty': tine-storage's intern_name refuses an empty name, and one page naming a page whose key folds to nothing ([[ ]], [[/]], #/, tags:: /, alias:: /, [[　]] ideographic space, a title:: / or a file named %2F.md / %20.md) failed the whole graph's index, three times per session and again every launch. Such a name names no page, so every source drops it at the source (refs::names_a_page: block refs, tags, tags::/alias:: property refs, alias spellings), keeping the in-memory graph and the index in agreement; a page whose own name folds to nothing is still indexed and searchable under a path key no page_key can produce (lowering::page_name_key). Class guard: randomized reference punctuation over one graph."
 }
 ]
 }

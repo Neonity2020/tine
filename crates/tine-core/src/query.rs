@@ -680,7 +680,7 @@ pub(crate) fn document_alias_spellings(doc: &Document) -> Vec<(String, String)> 
                 }
                 for alias in v.split([',', '，']) {
                     let alias = strip_ref(alias.trim());
-                    if !alias.is_empty() {
+                    if refs::names_a_page(&alias) {
                         aliases.push((alias.clone(), refs::page_key(&alias)));
                     }
                 }

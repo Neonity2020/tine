@@ -277,7 +277,8 @@ impl DocBlock {
             let tags = tags_from_blocks(&proj.blocks);
             let visible = visible_minus_properties(&self.raw, &proj.blocks);
             let visible_lower = crate::search_query::canonical_fold(&visible);
-            let refs_page = proj.refs.page;
+            let mut refs_page = proj.refs.page;
+            refs_page.retain(|name| crate::refs::names_a_page(name));
             let refs_norm = refs_page
                 .iter()
                 .map(|r| crate::refs::normalize(r))
@@ -497,7 +498,7 @@ mod crumb_line_tests {
 
 fn push_tag(out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, tag: String) {
     let tag = tag.trim().to_string();
-    if tag.is_empty() {
+    if !crate::refs::names_a_page(&tag) {
         return;
     }
     let key = tag.to_lowercase();
@@ -880,7 +881,7 @@ pub(crate) fn property_reference_page_names(text: &str) -> Vec<String> {
                 .and_then(|inner| inner.strip_suffix("]]"))
                 .unwrap_or(value)
                 .trim();
-            if !value.is_empty() {
+            if crate::refs::names_a_page(value) {
                 names.push(value.to_string());
             }
         }
