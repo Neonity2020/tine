@@ -36,9 +36,16 @@ export type JournalDateParts = { y: number; m: number; d: number };
 type BackendClock = { offset_minutes: number; unix_ms: number };
 let zoneSkewMs = 0;
 
+/** Stale zone rules move an offset by an hour or two (a DST rule, a zone
+ *  re-basing); a wider disagreement is likelier a backend that failed to detect
+ *  the zone at all (and fell back to UTC), where the WebView is the better
+ *  witness. */
+const MAX_ZONE_SKEW_MINUTES = 180;
+
 function skewFor(clock: BackendClock): number {
   const browserOffset = -new Date(clock.unix_ms).getTimezoneOffset();
-  return (clock.offset_minutes - browserOffset) * 60_000;
+  const skew = clock.offset_minutes - browserOffset;
+  return Math.abs(skew) > MAX_ZONE_SKEW_MINUTES ? 0 : skew * 60_000;
 }
 
 {

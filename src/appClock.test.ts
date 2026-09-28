@@ -27,4 +27,11 @@ describe("appNow follows the backend clock (GH #607)", () => {
     expect(localDayKey()).toBe(20260927);
     expect(appNow().getHours()).toBe(23);
   });
+
+  it("keeps the WebView clock when the backend disagrees by more than stale rules can", () => {
+    const now = Date.now();
+    const browserOffset = -new Date(now).getTimezoneOffset();
+    setBackendClock({ offset_minutes: browserOffset + 8 * 60, unix_ms: now });
+    expect(Math.abs(appNow().getTime() - Date.now())).toBeLessThan(1000);
+  });
 });
