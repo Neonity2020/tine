@@ -36,7 +36,7 @@ import { followLinkUnderCaret, openLinkUnderCaretInSidebar } from "./followLink"
 import { dismissTopTransient } from "./transientLayers";
 import { carryDaysBack } from "./carry";
 import { openConfiguredHomePage } from "./homePage";
-import { journalTitle, parseJournalTitle } from "./journal";
+import { journalTitle, parseJournalTitle, appNow } from "./journal";
 import {
   openJournals,
   goBack,
@@ -200,8 +200,8 @@ export function goAdjacentJournal(dir: 1 | -1) {
   const r = route();
   const anchor =
     r.kind === "page" && r.pageKind === "journal"
-      ? parseJournalTitle(r.name) ?? new Date()
-      : new Date();
+      ? parseJournalTitle(r.name) ?? appNow()
+      : appNow();
   const target = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + dir);
   openPage(journalTitle(target), "journal");
 }

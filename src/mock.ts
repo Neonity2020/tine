@@ -865,6 +865,10 @@ export function mockBackend(): Backend {
     async bindCaptureGraph() {},
     async forgetKnownGraph() {},
     async revealKnownGraph() {},
+    async localClock() {
+      const now = Date.now();
+      return { offset_minutes: -new Date(now).getTimezoneOffset(), unix_ms: now };
+    },
     async appPlatform(): Promise<"android" | "ios" | "desktop"> {
       const requested = new URLSearchParams(globalThis.location?.search ?? "").get("platform");
       if (requested === "android" || requested === "ios") return requested;

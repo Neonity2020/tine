@@ -11,7 +11,7 @@ import { dirtyPages, graphBinding, renameFlushFailureMessage, savingPages } from
 import { clearAssetBlobCache } from "./assetCache";
 import { resetTabsToJournals, openPage, restoreSession, flushSession, route, sameRoute, type PageTarget } from "./router";
 import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
-import { journalTitle, localDayKey, setJournalTitleFormat } from "./journal";
+import { journalTitle, localDayKey, setJournalTitleFormat, appNow } from "./journal";
 import { applyTemplateVars, prepareTemplateVars } from "./editor/templateVars";
 import { listGraphPages } from "./pageList";
 import { CUSTOM_CSS_STYLE_ID, ensureLsShimStyle } from "./lsShim";
@@ -892,7 +892,7 @@ export async function createNewGraph(): Promise<LoadGraphPathOutcome> {
  *  Journals view isn't empty on first open. Best-effort; never blocks. */
 async function seedTodayJournal(): Promise<void> {
   try {
-    const title = journalTitle(new Date());
+    const title = journalTitle(appNow());
     const existing = await backend().getPage(title, "journal");
     if (existing && existing.blocks.some((b) => b.raw.trim() !== "")) return;
     await backend().savePage(

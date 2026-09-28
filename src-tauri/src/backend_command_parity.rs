@@ -395,6 +395,7 @@ mod tests {
         // SPEC §7.1: a total predicate over the IR it is handed. There is no
         // failure mode to report -- the OG DSL either can say this query or
         // cannot, and saying so is the whole point of the command.
+        "local_clock",
         "query_og_expressible",
         "get_smooth_scroll",
         "get_watch_mode",
@@ -970,6 +971,7 @@ mod tests {
             ("load_plugin_registry_cache", APP_FILE),
             ("load_session", APP_FILE),
             ("load_workspaces", APP_FILE),
+            ("local_clock", PURE),
             ("open_asset", ONE_FILE),
             ("open_external", STATE),
             ("read_custom_css", ONE_FILE),

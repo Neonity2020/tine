@@ -11992,6 +11992,46 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before: tine-agents/evidence/batch-gh594/necessity-ctrlk.txt (the previous answer was blanked on the new keystroke). Stateful UX, Martin's Ctrl-K latency follow-up to GH #543. Blanking the list on every keystroke made each search look slower than it was. Enter on a stale list defers to the fresh answer so it never opens a row of the earlier query."
+    },
+    {
+      "id": "UI-JOURNALS-BACKEND-DAY-AUTHORITY-607",
+      "title": "Journals keep loading when the WebView's time-zone rules disagree with the system's",
+      "family": "journals",
+      "sources": {
+        "issues": [607],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx::loads the backend's day when the WebView's zone rules run an hour ahead (GH #607)",
+          "src/appClock.test.ts",
+          "src/appClock.guard.test.ts"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Blocking core operation. Linux AppImage, America/Mexico_City: the bundled WebKit ICU still applied the abolished DST (UTC-5) while the backend's chrono::Local read the OS zone rules (UTC-6), so for an hour each night the frontend asked for one day and the backend answered for another; the feed refuses a mismatched as_of_day and journals stopped loading. The backend's zone rules are now the calendar authority: appNow() in src/journal.ts shifts the WebView clock by the offset difference sampled from local_clock (zero when both agree), and every frontend read of now goes through it (guard). Fail-before: the Page test fails with the correction disabled (a second request, feed never installed). Not reproduced in a real AppImage with stale ICU."
+    },
+    {
+      "id": "UI-QUERY-COLUMNS-OFFER-PAGE-606",
+      "title": "A query table's column picker offers Page, so a custom column selection can keep it",
+      "family": "queries",
+      "sources": {
+        "issues": [606],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryDisplay.test.tsx::offers column tokens, including Page, but no formula"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Blocking stateful UX. Page is a default block-query column and `tine.columns:: page` already rendered it, but the Display panel's picker skipped it, so choosing columns by hand dropped Page for good. Fail-before: the previous version of this test asserted Page was absent. The reporter's second ask (open the picker pre-filled with the visible default columns) is not addressed here."
     }
   ]
 }

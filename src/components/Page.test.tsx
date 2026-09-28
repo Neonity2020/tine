@@ -25,7 +25,7 @@ import {
   type Node as StoreNode,
 } from "../store";
 import { editingId, editingOwner, activeSurface, endEdit, startEditing } from "../editorController";
-import { journalTitle } from "../journal";
+import { journalTitle, setBackendClock } from "../journal";
 import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
@@ -708,6 +708,24 @@ describe("Journals feed generation lifecycle", () => {
     await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
     expect(api).toHaveBeenCalledTimes(2);
     expect(doc.feed).toContain("matched-day");
+  });
+
+  it("loads the backend's day when the WebView's zone rules run an hour ahead (GH #607)", async () => {
+    // Mexico City after DST was abolished: the AppImage's bundled ICU reads
+    // 00:33 on the 16th, the OS rules (the backend) 23:33 on the 15th.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2030, 6, 16, 0, 33));
+    const now = Date.now();
+    setBackendClock({ offset_minutes: -new Date(now).getTimezoneOffset() - 60, unix_ms: now });
+    try {
+      const api = vi.spyOn(backend(), "journalFeedPage")
+        .mockResolvedValue(feedResponse([journalDto("backend-day")], { as_of_day: 20300715 }));
+      await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
+      expect(api).toHaveBeenCalledTimes(1);
+      expect(doc.feed).toContain("backend-day");
+    } finally {
+      setBackendClock({ offset_minutes: -new Date(now).getTimezoneOffset(), unix_ms: now });
+    }
   });
 
   it("revalidates on focus and visible rollover, but bounds a second clock mismatch", async () => {

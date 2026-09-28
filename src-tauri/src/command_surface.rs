@@ -93,6 +93,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "load_plugin_registry_cache",
     "load_session",
     "load_workspaces",
+    "local_clock",
     "merge_pages",
     "open_asset",
     "open_external",

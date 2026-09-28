@@ -51,6 +51,7 @@ import { Editor, SurfaceContext } from "./Block";
 import { isBareTagName } from "../tags";
 import { hydrateVisibleQueryPages, SHEET_RENDER_PAGE } from "../sheet/queryHydration";
 import { registerTransientLayer } from "../transientLayers";
+import { appNow } from "../journal";
 
 interface RowRecord extends FormulaEvalRow {}
 
@@ -195,7 +196,7 @@ export function SheetBoard(props: {
   });
 
   const baseColumns = createMemo<BoardColumn[]>(() => {
-    const now = new Date();
+    const now = appNow();
     // An explicitly ungrouped query is ONE column holding the whole result —
     // not the task-marker board that the ABSENCE of a grouping produces.
     if (ungrouped()) return [{ key: null, label: "All results", rows: rows() }];

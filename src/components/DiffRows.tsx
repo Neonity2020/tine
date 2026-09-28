@@ -10,6 +10,7 @@
 // instead of a second copy, should one ever be justified.
 import { For, Show, createMemo, createSignal, type JSX } from "solid-js";
 import type { DiffRow, MergeDecision, MergedSource, RowKind } from "../types";
+import { appNow } from "../journal";
 
 /** Why this body is on offer. The two sources carry different guarantees, so
  *  the strip says which one produced the text: Tine composed it from two edits
@@ -109,7 +110,7 @@ export function humanizeSideLabel(label: string): { text: string; title?: string
   const [, y, mo, d] = m;
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const month = months[Number(mo) - 1] ?? mo;
-  const year = new Date().getFullYear() === Number(y) ? "" : ` ${y}`;
+  const year = appNow().getFullYear() === Number(y) ? "" : ` ${y}`;
   return { text: `Sync copy · ${month} ${Number(d)}${year}`, title: label };
 }
 

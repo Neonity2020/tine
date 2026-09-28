@@ -18,7 +18,7 @@
 
 import { backend } from "./backend";
 import { carryUnfinished, ensurePageLoaded, pageByName } from "./store";
-import { journalTitle } from "./journal";
+import { journalTitle, appNow } from "./journal";
 import { requestCrossPageMove } from "./crossPageMove";
 import { graphBinding } from "./persistence";
 import { carryHeaderText, carryKeepsContext, pushToast } from "./ui";
@@ -43,7 +43,7 @@ async function ensureLoaded(name: string, kind: "journal" | "page"): Promise<boo
 /** Make sure today's journal is in the working set (synthesize an empty one if
  *  it has no file yet, like the feed does). */
 async function ensureToday(): Promise<string | null> {
-  const t = journalTitle(new Date());
+  const t = journalTitle(appNow());
   if (!pageByName(t)) {
     const binding = graphBinding();
     const dto = await backend().getPage(t, "journal");
@@ -105,7 +105,7 @@ async function runCarry(today: string, days: readonly string[], blockedToast: st
  *  day" means the most recent journal before today that actually has content
  *  (not literally yesterday, which is often blank). */
 export async function carryPrevDay(): Promise<void> {
-  const today = new Date();
+  const today = appNow();
   const todayKey =
     today.getFullYear() * 10000 + (today.getMonth() + 1) * 100 + today.getDate();
   let days: number[] = [];
@@ -137,7 +137,7 @@ export async function carryDay(pageName: string): Promise<void> {
 export async function carryDaysBack(days: number): Promise<void> {
   const today = await ensureToday();
   if (!today) return;
-  const base = new Date();
+  const base = appNow();
   const candidates: string[] = [];
   for (let i = 1; i <= days; i++) {
     const d = new Date(base);

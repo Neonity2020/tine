@@ -26,7 +26,7 @@ import { ExternalChangeBar } from "./ExternalChangeBar";
 import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
-import { journalTitle, localDayKey, localDayRolloverDelay, currentDayKey, localDateFromDayKey } from "../journal";
+import { journalTitle, localDayKey, localDayRolloverDelay, currentDayKey, localDateFromDayKey, appNow } from "../journal";
 import { editingId, endEditForSurface, startEditing } from "../editorController";
 import type { JournalFeedPage, PageDto, RefGroup } from "../types";
 import { tagRef } from "../tags";
@@ -169,7 +169,7 @@ let journalRefreshFlight: {
  * template is durably ensured before the feed is allowed to observe that day. */
 async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promise<unknown | null> {
   if (!ownerIsLive(owner)) return null;
-  const date = new Date();
+  const date = appNow();
   const day = localDayKey(date);
   const rollover = journalAsOfDay !== null && journalAsOfDay !== day && doc.feed.length > 0;
   const current = journalRefreshFlight;
@@ -239,7 +239,7 @@ function paneContextFromContext() {
 // (the file is created lazily on first edit — Tine writes on save). So prepend
 // an empty today page unless the newest journal on disk already is today.
 export function withToday(js: PageDto[]): PageDto[] {
-  const title = journalTitle(new Date());
+  const title = journalTitle(appNow());
   if (js.some((p) => p.name === title)) return js;
   return [emptyPage(title, "journal"), ...js];
 }
@@ -449,7 +449,7 @@ export function PageView(): JSX.Element {
     const restart = () => { void refreshJournalFeedForCurrentDay(owner); };
     const arm = () => {
       if (disposed || !ownerIsLive(owner)) return;
-      const now = new Date();
+      const now = appNow();
       timer = window.setTimeout(() => {
         // One-shot rather than 24h arithmetic (DST-safe).  Re-arm after every
         // trigger, including a deferred/error response, while this owner lives.
@@ -1195,7 +1195,7 @@ export function TagPageTable(props: { pageName: string }): JSX.Element {
   const addRow = async () => {
     const ok = await appendToTodayJournal(`${tagRef(props.pageName)} `);
     if (!ok) return;
-    const today = pageByName(journalTitle(new Date()));
+    const today = pageByName(journalTitle(appNow()));
     const id = today?.roots[today.roots.length - 1];
     if (id && doc.byId[id]) startEditing(id, doc.byId[id].raw.length);
   };

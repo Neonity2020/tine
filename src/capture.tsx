@@ -25,6 +25,7 @@ import {
 import { startEditing } from "./editorController";
 import { installKeybindings, eventToBindingString } from "./keybindings";
 import { backend } from "./backend";
+import { installBackendClock } from "./journal";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
 import { createCaptureBlurGate, resettleIfVisible } from "./captureVisibility";
@@ -611,4 +612,5 @@ function Capture() {
 // ready falls back to raw text (AstBody/InlineText) and swaps in once `parserReady`
 // flips (typically tens of ms, well before you finish typing the first block).
 void initParser().catch((e) => console.error("lsdoc-wasm init failed:", e));
+installBackendClock(() => backend().localClock());
 render(() => <Capture />, document.getElementById("capture-root")!);

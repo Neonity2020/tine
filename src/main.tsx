@@ -5,7 +5,8 @@ import { restoreSession } from "./router";
 import { initParser } from "./render/parse";
 import { applyTheme, applyAccent, pushToast } from "./ui";
 import { startCommunityExtensions } from "./plugins/startup";
-import { isTauri } from "./backend";
+import { backend, isTauri } from "./backend";
+import { installBackendClock } from "./journal";
 import { isPublishedExport, loadPublishedSnapshot } from "./publishedBackend";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 // Full upstream Inter variable fonts retain OpenType stylistic sets/character
@@ -33,6 +34,7 @@ if ((window as { __tineUnsupportedEngine?: boolean }).__tineUnsupportedEngine) {
 }
 
 installPlatformAttribute();
+if (isTauri()) installBackendClock(() => backend().localClock());
 installSystemInsetOwner();
 const published = isPublishedExport();
 installEditableEmojiPlatform();

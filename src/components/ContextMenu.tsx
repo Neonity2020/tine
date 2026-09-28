@@ -25,7 +25,7 @@ import { prepareRename, refreshAfterRename, renameOrMergePage } from "../graph";
 import { backend } from "../backend";
 import { isMobilePlatform } from "../nativeChrome";
 import { carryDay } from "../carry";
-import { journalTitle } from "../journal";
+import { journalTitle, appNow } from "../journal";
 import { BLOCK_COLOR_NAMES, BLOCK_COLOR_SWATCH } from "../blockColors";
 import {
   doc,
@@ -1029,7 +1029,7 @@ function PageMenu(props: {
       : []),
     ...(!readOnly() ? [{ id: "page-properties", label: "Page properties…", run: () => openPageProps(props.name, props.x, props.y) }] : []),
     // Carry a past day's unfinished tasks to today (journal days only, not today).
-    ...(!readOnly() && props.pageKind === "journal" && props.name !== journalTitle(new Date())
+    ...(!readOnly() && props.pageKind === "journal" && props.name !== journalTitle(appNow())
       ? [{ id: "carry-unfinished", label: "Carry unfinished tasks → today", run: () => void carryDay(props.name) }]
       : []),
   ];

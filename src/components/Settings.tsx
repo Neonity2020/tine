@@ -135,7 +135,7 @@ import {
 import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
 import type { AssetInfo, TrashStats, JournalFile, PageEntry } from "../types";
 import { ConflictFileRow } from "./JournalConflictFileRow";
-import { formatJournal } from "../journal";
+import { formatJournal, appNow } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
   COMMUNITY_REGISTRY_ENABLED,
@@ -1820,7 +1820,7 @@ function JournalTemplateField(): JSX.Element {
  *  (today rendered in it). Includes the graph's current value even if it isn't
  *  one of the presets, so a hand-edited config.edn round-trips. */
 function DateFormatSelect(): JSX.Element {
-  const today = new Date();
+  const today = appNow();
   const current = () => graphMeta()?.journal_page_title_format || "MMM do, yyyy";
   const options = () => (DATE_FORMATS.includes(current()) ? DATE_FORMATS : [current(), ...DATE_FORMATS]);
   return (

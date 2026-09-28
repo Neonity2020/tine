@@ -11,7 +11,7 @@ import { ensurePageLoaded } from "./lifecycle";
 import { graphBindingRuntime } from "../graphBindingRuntime";
 import { graphEpoch, graphMeta, graphTransitioning, pushToast } from "../ui";
 import { hideAll, isBuiltinHidden, joinProps, splitProps } from "../editor/properties";
-import { journalTitle } from "../journal";
+import { journalTitle, appNow } from "../journal";
 import { parseOutline } from "../editor/outline";
 import { produce, unwrap } from "solid-js/store";
 import { pushUndo, withUndoUnit } from "./undo";
@@ -351,7 +351,7 @@ export function pasteClipboardPayload(
  *  (`ensurePageLoaded` is a no-op when already loaded). Returns whether the write
  *  reached disk. */
 export async function appendToTodayJournal(markdown: string): Promise<boolean> {
-  return captureOutlineInto(journalTitle(new Date()), "journal", parseOutline(markdown));
+  return captureOutlineInto(journalTitle(appNow()), "journal", parseOutline(markdown));
 }
 
 /** In-app quick capture into a (new or existing) named PAGE — the heading-filled

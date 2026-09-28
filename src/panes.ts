@@ -26,7 +26,7 @@ import {
   registerPaneRouteProvider,
   installHistoryRouteContextAdapter,
 } from "./store";
-import { journalTitle } from "./journal";
+import { journalTitle, appNow } from "./journal";
 import { isSinglePaneShell } from "./nativeChrome";
 import {
   companionPane,
@@ -236,7 +236,7 @@ export function closeLayoutPane(
 
 function routeForJournalsDuplicate(anchor: string | null): Route {
   const selectedDay = anchor ? doc.byId[anchor]?.page : undefined;
-  const today = journalTitle(new Date());
+  const today = journalTitle(appNow());
   const name =
     (selectedDay && doc.feed.includes(selectedDay) ? selectedDay : undefined) ??
     (doc.feed.includes(today) ? today : doc.feed[0] ?? today);

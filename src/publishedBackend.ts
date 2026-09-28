@@ -627,6 +627,11 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     async appArchitecture() {
       return "web";
     },
+    // A published export has no backend clock; the browser's is the authority.
+    async localClock() {
+      const now = Date.now();
+      return { offset_minutes: -new Date(now).getTimezoneOffset(), unix_ms: now };
+    },
     async listKnownGraphs() {
       return [];
     },
@@ -872,6 +877,7 @@ export const PUBLISHED_ANSWERED_METHODS = [
 
 export const PUBLISHED_CONSTANT_METHODS = [
   "appPlatform",
+  "localClock",
   "appArchitecture",
   "listKnownGraphs",
   "gpuEnv",

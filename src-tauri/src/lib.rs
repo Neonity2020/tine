@@ -76,8 +76,8 @@ use debug::{
 use graph::{
     app_platform, approve_external_assets, begin_direct_cross_page_move, capture_graph_binding,
     capture_target, create_graph, default_graph_parent, finish_direct_cross_page_move,
-    indexing_progress, inspect_graph_access, load_graph, open_graph_window, retry_index,
-    startup_graph_path, warm_done,
+    indexing_progress, inspect_graph_access, load_graph, local_clock, open_graph_window,
+    retry_index, startup_graph_path, warm_done,
 };
 use graph_verification::{
     cancel_graph_verification, create_graph_verification, save_graph_verification_report,
@@ -640,6 +640,13 @@ pub fn run() {
         crate::graph::app_platform()
     ));
 
+    // The backend's zone offset at launch, so the frontend's first "today" is
+    // already the backend's (GH #607); `local_clock` keeps it current.
+    let (offset_minutes, unix_ms) = tine_core::date::JournalDate::local_utc_offset_now();
+    let builder = builder.append_invoke_initialization_script(format!(
+        "globalThis.__TINE_LOCAL_CLOCK__ = {{ offset_minutes: {offset_minutes}, unix_ms: {unix_ms} }};"
+    ));
+
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let builder = builder.append_invoke_initialization_script(format!(
         "globalThis.__TINE_NATIVE_FRAME__ = {native_frame_active};"
@@ -830,6 +837,7 @@ pub fn run() {
             capture_frontend_ready,
             create_graph,
             app_platform,
+            local_clock,
             default_graph_parent,
             #[cfg(not(target_os = "ios"))]
             android_folder_picker::pick_graph_folder,

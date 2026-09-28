@@ -33,7 +33,7 @@ import { flushPageToQuiescence, forgetSaveState, graphBinding, resetSaveState, t
 import { graphBindingRuntime } from "./graphBindingRuntime";
 import { isBuiltinHidden, isPropertiesOnly, joinProps, splitProps } from "./editor/properties";
 import { isOrdered, orderListTypeFromRaw, rawWithCollapsed, rawWithInheritedOrderListType, rawWithOrderListType, registerSelectedIds } from "./store/properties";
-import { journalTitle } from "./journal";
+import { journalTitle, appNow } from "./journal";
 import { notifyModeReset, notifyOutlineSelectionStarted } from "./modeHooks";
 import { produce } from "solid-js/store";
 import { projectPageDto, toDto } from "./store/mutationPlans";
@@ -568,7 +568,7 @@ export function emptyPage(name: string, kind: "journal" | "page"): PageDto {
  *  writable — `upsertPage` lifts the delete tombstone, so the first keystroke saves
  *  a fresh file, exactly like reopening the journal. */
 export async function restoreTodayJournalInFeed(): Promise<boolean> {
-  const title = journalTitle(new Date());
+  const title = journalTitle(appNow());
   if (doc.feed.includes(title)) return true;
   const binding = graphBinding();
   if (!(await upsertUnlessDirty(emptyPage(title, "journal"), binding))) return false;
@@ -2590,7 +2590,7 @@ export function carryUnfinished(
   keepContext: boolean,
   header: string | null
 ): number {
-  const today = journalTitle(new Date());
+  const today = journalTitle(appNow());
   if (!pageWritable(today) || fromPages.some((page) => pageByName(page) && !pageWritable(page))) return 0;
   type Item = { id: string; from: string; parent: string | null };
   const plan: Item[] = [];

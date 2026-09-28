@@ -142,7 +142,7 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
-import { journalTitle, parseJournalTitle } from "../journal";
+import { journalTitle, parseJournalTitle, appNow } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
@@ -1148,7 +1148,7 @@ function CalGlyph(): JSX.Element {
   );
 }
 
-function timeStamp(d = new Date()): string {
+function timeStamp(d = appNow()): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 // Template support: session-cached list of templates, dynamic-var substitution,
@@ -2416,7 +2416,7 @@ export function Editor(props: { id: string }): JSX.Element {
       case "today":
         // GH #220: the link must use the graph's configured journal title
         // format, or it points at a page that isn't the journal day.
-        replaceTrigger(pageInsert(journalTitle(new Date())));
+        replaceTrigger(pageInsert(journalTitle(appNow())));
         return;
       case "thatday": {
         // GH #252: insert a ref to the CONTAINING journal page's date (not

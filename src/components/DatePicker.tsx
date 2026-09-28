@@ -4,6 +4,7 @@ import { readSchedule, setSchedule } from "../store";
 import { fieldLabel, readField, writeField, type FieldId } from "../sheet/fields";
 import { parseIsoDateLike } from "../sheet/typed";
 import { registerTransientLayer } from "../transientLayers";
+import { appNow } from "../journal";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -54,7 +55,7 @@ function Picker(props: { bid: string; which: DatePickerTarget; x: number; y: num
     });
     onCleanup(unregister);
   });
-  const today = new Date();
+  const today = appNow();
   const scheduleSel = isScheduleTarget(props.which) ? readSchedule(props.bid, props.which) : null;
   const sel = scheduleSel ?? (isScheduleTarget(props.which) ? null : propDateSelection(props.bid, props.which.field));
   const [view, setView] = createSignal({
@@ -78,7 +79,7 @@ function Picker(props: { bid: string; which: DatePickerTarget; x: number; y: num
   const [time, setTime] = createSignal<string | null>(sel?.time ?? null);
   // Default seed when "Add time" is first clicked: the current local time.
   const nowHHmm = () => {
-    const n = new Date();
+    const n = appNow();
     return `${String(n.getHours()).padStart(2, "0")}:${String(n.getMinutes()).padStart(2, "0")}`;
   };
 
