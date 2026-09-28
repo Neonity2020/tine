@@ -423,13 +423,16 @@ describe("the display field vocabulary", () => {
     } finally { h.dispose(); }
   });
 
-  it("offers column tokens, with no formula and no page breadcrumb", () => {
+  it("offers column tokens, including Page, but no formula", () => {
+    // GH #606: Page is a default column, so a custom selection must be able to
+    // keep it; `tine.columns:: page` already renders it.
     expect(entries("column")).toEqual([
       "state",
       "priority",
       "scheduled",
       "deadline",
       "tags",
+      "page",
       "cost",
       "severity",
     ]);

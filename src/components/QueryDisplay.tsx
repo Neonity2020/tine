@@ -156,7 +156,6 @@ export function displayFieldEntries(input: {
   } else {
     if (input.slot === "group" || input.slot === "column") {
       for (const field of BUILTIN_FIELDS) {
-        if (input.slot === "column" && field === "page") continue; // the table's own breadcrumb
         push(input.slot === "group" ? field : field, fieldLabel(field), "◆");
       }
     }
