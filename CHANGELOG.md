@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.987] - 2026-09-28
+
 ### Fixed
 
 - The search index could not be built at all, on every launch, when any page contained a reference whose name is blank or only a slash, such as `[[ ]]`, `[[/]]`, `#/`, `tags:: /` or `[[　]]` (an ideographic space); Linked/Unlinked References and queries then showed "couldn't be built (code: other)". Such references are now ignored, as they name no page, and a page whose own name is blank or `/` is indexed normally (GH #594).

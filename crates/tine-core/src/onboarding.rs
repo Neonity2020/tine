@@ -861,6 +861,10 @@ mod tests {
             .markdown
             .contains("References or queries say the search index couldn't be built"));
         assert!(page.markdown.contains("Tine stopped retrying"));
+        // GH #594: references and search do not depend on a built index.
+        assert!(page
+            .markdown
+            .contains("keep answering by reading your pages"));
         for code in [
             "file_in_use",
             "disk_full",
@@ -1981,6 +1985,10 @@ mod tests {
             "says it is searching",
             "Retry",
             "nothing matched",
+            // GH #594 / #543: references and the search tab answer without it.
+            "they read your pages instead",
+            "a scan of your pages, in page order",
+            "**Indexing** beside the bar",
         ] {
             assert!(
                 page.contains(phrase),

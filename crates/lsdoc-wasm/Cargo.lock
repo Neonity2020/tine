@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "tine-search"
-version = "0.6.986"
+version = "0.6.987"
 dependencies = [
  "regex",
  "unicode-normalization",
